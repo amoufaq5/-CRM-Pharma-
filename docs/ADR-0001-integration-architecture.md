@@ -72,6 +72,25 @@ Manifest-driven RBAC with classification-driven, fail-closed response redaction.
    `(tenant_id, id)` (column store). Deterministic client-minted ids give us idempotent
    writes that do not depend on the ERP's broken idempotency store.
 
+**And one fact that qualifies the first.** Fact 1 describes the **column store**
+(`--store pg-columns`). **Every deployment artifact in the repo runs `--store pg` — the
+JSONB store** — where all records of all entities of all tenants live in one
+`meta.operate_entity_records` table with the business data in an untyped `document JSONB`
+column. There are no per-entity tables and therefore nothing to point a foreign key at.
+`deploy/docker-compose.yml` and `deploy/docker-compose.ai.yml` pass `--store pg` as
+hardcoded list items with no env override; `deploy/VERCEL-SUPABASE.md` documents the same;
+the dev script and the CLI both default to `memory`. Nothing deploys `pg-columns`.
+
+Worse, `pg-columns` is not merely unused, it is **new**: ADR-0283 (2026-08-26, Accepted,
+the second-newest ADR in the repo) records that `pack-erp-core` **booted on `pg-columns`
+for the first time** in that change — before it, the flagship pack died at startup on
+`gin_trgm_ops does not accept data type character` (a `country_code` → `CHAR(2)` field),
+and any manifest that gained a field bricked the server on restart. The column store is
+days old in usable form, has never been deployed, and has no CI behind it.
+
+This does not change the recommendation, but it changes what the recommendation is
+*conditional on*, and it is now the first thing to resolve. See R17/R18 in the report.
+
 **The stated prior.** The CRM is a system of engagement with a very different write
 pattern from the ERP — high-frequency, mobile-originated, offline-tolerant, mostly its own
 data — but it must never hold a second copy of the truth for employees, products, or
@@ -103,15 +122,26 @@ Concretely, and these specifics are the decision, not commentary on it:
    Provision at minimum: `erp_owner` (migrations), `erp_app` (ERP runtime),
    `crm_app` (CRM runtime, owns `crm.*`, `SELECT`-only on ERP tables).
 
-3. **Foreign keys from `crm.*` into ERP tables, using the ERP's composite shape:**
+3. **Foreign keys from `crm.*` into ERP tables, using the ERP's composite shape** —
+   **conditional on the ERP moving to `--store pg-columns`, which it has not (R17):**
    ```sql
-   FOREIGN KEY (tenant_id, employee_id) REFERENCES employee (tenant_id, id)
-   FOREIGN KEY (tenant_id, item_id)     REFERENCES item     (tenant_id, id)
-   FOREIGN KEY (tenant_id, account_id)  REFERENCES account  (tenant_id, id)
+   -- entity tables land in `public` when --schema is omitted, not `meta`
+   FOREIGN KEY (tenant_id, employee_id) REFERENCES public.employee (tenant_id, id)
+   FOREIGN KEY (tenant_id, item_id)     REFERENCES public.item     (tenant_id, id)
+   FOREIGN KEY (tenant_id, account_id)  REFERENCES public.account  (tenant_id, id)
    ```
    All `ON DELETE RESTRICT`. This is the mechanism that makes "never a second copy of the
    truth" **enforced by Postgres rather than promised in a design doc**, and it is
-   available only in this option. It requires `--store pg-columns`; see Consequences.
+   available only in this option.
+
+   **On the JSONB store this is impossible** — there are no per-entity tables. If the
+   platform will not move to `pg-columns`, fall back to **3-degraded**: CRM columns hold
+   the ERP's `TEXT` record id with **no FK**, integrity is enforced by the ACL on write
+   and by a scheduled referential-integrity check that reports orphans, and the ADR's
+   central claim weakens from "the database prevents a second copy of the truth" to "our
+   code does". That is still better than option (c) — local reads and one backup timeline
+   survive — but it is a materially weaker position and should be recorded as such rather
+   than glossed. **Q1 decides which of 3 or 3-degraded we build.**
 
 4. **Read path: an anti-corruption layer, always.** No CRM feature code touches an ERP
    table or endpoint directly. The ACL is one module exposing CRM-shaped domain types
@@ -283,12 +313,20 @@ model while keeping option (b)'s shared-fate availability. Worst of both.
 
 **Negative**
 
-- **`--store pg-columns` becomes a hard deployment requirement.** The JSONB store
-  (`--store pg`) keeps every record in one `meta.operate_entity_records` table with a JSONB
-  `document`, so there is nothing to point a foreign key at and item 3 of the decision
-  collapses. The reference deployment in `deploy/docker-compose.yml` currently runs
-  `--store pg`. **Confirming and, if necessary, migrating the ERP to `pg-columns` is a
-  prerequisite, not a detail — it is Q1 and it blocks the schema work.**
+- **`--store pg-columns` is a hard requirement for the full decision, and it is not met
+  today.** Verified: every deployment artifact runs `--store pg`, hardcoded, with no env
+  override (R17). On the JSONB store item 3 collapses entirely. Migrating means
+  backfilling every existing record from `meta.operate_entity_records` into typed tables —
+  **no migration tool for this exists** — and adopting a code path that first booted
+  `pack-erp-core` successfully six days ago (ADR-0283) and has never run in production.
+  If the answer to Q1 is no, we build **3-degraded** and this ADR's integrity claim is
+  weakened accordingly. **This blocks all CRM schema work.**
+- **`--per-tenant-manifests` makes the guarantee per-tenant rather than per-deployment.**
+  Even on `pg-columns`, a tenant serving a custom manifest falls back to the JSONB store
+  (`node.ts:1023–1031`) because column plans are derived from the boot manifest. Such a
+  tenant has no typed tables and no FKs, and nothing signals which regime a given tenant
+  is in. Either that flag stays off wherever the CRM runs, or the CRM tolerates both — and
+  tolerating both means building 3-degraded anyway (R18).
 - Shared-fate availability and joint operational decisions on the database.
 - Cross-schema FKs couple CRM DDL to ERP physical layout, in a repo with no CI. We must
   run our own contract test against a real ERP schema on every CRM build.
@@ -339,8 +377,12 @@ below starts until they are answered.
    and owns nothing of the ERP's. **Write a live cross-tenant read test and put it in CI**
    — RLS is bypassed by the table owner, so this is verified empirically, never by
    inspection.
-2. **Confirm `--store pg-columns`** and capture the live ERP schema (table names, column
-   names, `(tenant_id, id)` PKs) as a fixture the CRM's CI asserts against.
+2. **Resolve Q1 before writing any DDL.** The ERP is on `--store pg` today, so as things
+   stand there is no table to reference. If it moves to `pg-columns`, capture the live
+   schema (table names — `snake_case`, singular — column names, `(tenant_id, id)` PKs, and
+   the containing schema, which is `public` unless `--schema` is passed) as a fixture the
+   CRM's CI asserts against on every build. If it does not move, build 3-degraded and add
+   the orphan-check job to the plan.
 3. **ACL skeleton with generated types.** Fetch `GET /v1/meta/schema`, generate slugs,
    field names, enum values and filterable-field sets, fail the build on drift. Handle both
    error shapes. Never hand-write a slug.
@@ -380,7 +422,7 @@ delivery guarantee; any CRM role owning an ERP table.
 
 | # | Question | Owner | Deadline |
 |---|---|---|---|
-| Q1 | Is the ERP deployed with `--store pg-columns`? If it is on `--store pg` (as `deploy/docker-compose.yml` shows), everything is one JSONB table, cross-schema FKs are impossible, and the core of this ADR collapses. **Blocks all schema work.** | Platform | 2026-09-08 |
+| Q1 | **Answered — the ERP is on `--store pg` (JSONB), in every deployment artifact, hardcoded.** Cross-schema FKs are impossible as things stand, and `pg-columns` first booted `pack-erp-core` on 2026-08-26 (ADR-0283) with no production use and no CI. The open question is now the decision, not the fact: **will the platform migrate to `pg-columns` (accepting a JSONB→typed-table backfill for which no tool exists, on a days-old code path), or do we build 3-degraded with ACL-enforced integrity and an orphan-check job?** **Blocks all schema work.** | Platform + Eng leadership | 2026-09-08 |
 | Q2 | Who owns `Lead` and `Opportunity`? The ERP already models both with full lifecycles, but they carry `owner_id → Employee` with **no row-level scoping**, so the ERP cannot show a rep only their own. Options: CRM owns pipeline and pushes only won deals as `SalesOrder`; or ERP owns it and the CRM filters client-side. Affects the data model and the offline bundle. | Product + Platform | 2026-09-12 |
 | Q3 | What is the authoritative mapping from a CRM login to an ERP `Employee`? Nothing in the ERP links them. Candidates: `work_email`, `employee_number`, or a CRM-owned mapping table (recommended). Which is stable across rehire, transfer and email change? **Blocks all rep-scoped work.** | Platform + HR | 2026-09-08 |
 | Q4 | Where do samples and promo material live? Recommendation from the report: CRM-owned custody with lot and expiry, mirroring aggregate issues to `StockMovement`. Is a regulator likely to demand that ERP inventory be the sample system of record? If so, the ERP needs lot/expiry/custody built first, which is a platform project. | Compliance + Product | 2026-09-19 |
@@ -390,6 +432,7 @@ delivery guarantee; any CRM role owning an ERP table.
 | Q8 | Which IdP mints the ERP service credentials, and does it support **Ed25519**? The JWKS parser accepts `kty=OKP, crv=Ed25519` **only** — an RS256 IdP silently yields zero usable keys. Also: static `--api-key` values are passed as argv (visible in `ps`) and require a restart to rotate. What is the rotation story? | Platform + Security | 2026-09-12 |
 | Q9 | Will the platform implement `meta.webhook_deliveries`? The tables and state machine exist with no code. If it ships, the CRM can move from polling to push and the sync story improves materially. If it will not ship this year, we design for polling and stop waiting. | Platform | 2026-09-26 |
 | Q10 | What are the agreed triggers for moving to option (c)? Proposal, to be ratified now rather than argued during an incident: (i) two ERP-caused CRM outages in a quarter; (ii) CRM write volume forcing connection-pool changes that degrade the ERP; (iii) a residency or regulatory rule requiring physical separation; (iv) PostGIS refused (Q7) *and* geospatial proving load-bearing. | Eng leadership | 2026-09-26 |
+| Q11 | Is `--per-tenant-manifests` on, or planned, wherever the CRM will run? If yes, the FK guarantee is per-tenant rather than per-deployment (R18) and we build 3-degraded regardless of Q1's outcome. | Platform | 2026-09-08 |
 
 ## References
 

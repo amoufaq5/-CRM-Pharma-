@@ -148,17 +148,35 @@ What the code does is **shared-schema, shared-table, row-level security**:
 
 Two entity-store flavours behind one `EntityStore` contract:
 
-| Store | Shape | Flag |
-|---|---|---|
-| `PostgresEntityStore` | One table for everything: `meta.operate_entity_records(tenant_id, entity, record_id, document JSONB)`, unique on `(tenant_id, entity, record_id)` | `--store pg` |
-| `ColumnMappedEntityStore` | Real per-entity typed tables, DDL derived from the manifest | `--store pg-columns` |
+| Store | Shape | Flag | Default schema |
+|---|---|---|---|
+| `PostgresEntityStore` | One table for everything: `meta.operate_entity_records(tenant_id, entity, record_id, document JSONB)`, unique on `(tenant_id, entity, record_id)` | `--store pg` | `meta` |
+| `ColumnMappedEntityStore` | Real per-entity typed tables, DDL derived from the manifest | `--store pg-columns` | **`public`** |
+
+> **⚠️ Every deployment artifact in the repo runs `--store pg` — the JSONB store.**
+> `deploy/docker-compose.yml` (l.63–64) and `deploy/docker-compose.ai.yml` (l.66–67) both
+> pass `--store` / `pg` as **hardcoded list items**, not `${…}` substitutions (unlike
+> `--pack`, which is `${OPERATE_PACK:-erp-core}`), so there is no env override.
+> `deploy/VERCEL-SUPABASE.md` (l.71) documents the same. `docker-compose.ai-gpu.yml` adds
+> no store flag. `scripts/run-dev.ps1` defaults to `memory`, and the CLI's own default when
+> `--store` is omitted is `memory` (`cli.ts:142`). **Nothing anywhere in the repo deploys
+> `pg-columns`.** See R17 — this is decisive for the integration architecture.
+>
+> Note also the schema difference: `options.schema` defaults to `null` (`cli.ts:143`), and
+> `ColumnMappedEntityStore` falls back to `opts.schema ?? "public"` while the JSONB store
+> falls back to `"meta"`. So under `pg-columns` with no `--schema`, entity tables land in
+> **`public`** (`public.employee`, `public.item`, `public.account`) — even though the CLI
+> help text for the *other* subcommands says "default meta".
 
 The column store is the interesting one and the one to integrate against:
 
 - Table per entity, PK `(tenant_id, id)` where `id` is `TEXT`.
 - **Composite tenant-scoped foreign keys** — an FK is `(tenant_id, <ref>_id) REFERENCES
-  <target>(tenant_id, id)` with per-relation `ON DELETE`. Reference columns are `TEXT`,
-  not `UUID`, precisely so this type-checks.
+  <target>(tenant_id, id)` with per-relation `ON DELETE` (default `RESTRICT`). Reference
+  columns are `TEXT`, not `UUID`, precisely so this type-checks. Emitted as a
+  `DROP CONSTRAINT IF EXISTS` → `ADD CONSTRAINT` pair in a **second pass after every table
+  exists**, so reference cycles are safe; a target entity not in the manifest is skipped
+  silently. Verified in `packages/operate-runtime-pg/src/entity-ddl.ts:167–199`.
 - m2m join tables, per-entity `pg_trgm` GIN indexes on plaintext text columns,
   pgcrypto `BYTEA` for `phi`/`regulated` columns, and SQL-level pushdown of
   filter/sort/keyset/projection.
@@ -947,7 +965,7 @@ checkpoints. Two audit paths that do not know about each other.
 | Capability | Status |
 |---|---|
 | Postgres with tenant RLS and a disciplined migration applier | ✅ solid |
-| Composite tenant-scoped FKs `(tenant_id, id)` in the column store | ✅ solid — and the technical foundation of option (b) |
+| Composite tenant-scoped FKs `(tenant_id, id)` in the column store | ⚠️ correct in code, **but the column store is not deployed** — every deploy artifact runs `--store pg` (JSONB), where no such table exists. See R17. |
 | Manifest-compiled REST CRUD + lifecycle transitions | ✅ solid |
 | Keyset pagination, typed filters, `?q` trigram search, `?fields` projection | ✅ solid |
 | RFC 9457 problem details at the gateway | ⚠️ two error shapes coexist |
@@ -1137,6 +1155,67 @@ mistyped filter returns *more* rows, not an error.
 filterable field from `GET /v1/meta/schema` rather than hand-writing them, and **assert on
 the shape of results** rather than trusting that a filter applied. Generate the ACL client
 from `/v1/meta/schema` at build time and fail the build when it drifts.
+
+### R17 — The ERP is deployed on `--store pg` (JSONB), not `pg-columns`. Cross-schema foreign keys are impossible today. **(critical — this is Q1, and it gates the integration architecture)**
+
+Checked every deployment artifact in the repo. All of them run the **JSONB store**:
+
+| Artifact | Store |
+|---|---|
+| `deploy/docker-compose.yml` l.63–64 | `--store` `pg` — **hardcoded list items**, not `${…}`, so no env override (contrast `--pack ${OPERATE_PACK:-erp-core}` two lines above) |
+| `deploy/docker-compose.ai.yml` l.66–67 | `--store` `pg` (the overlay repeats the whole command because Compose replaces rather than merges) |
+| `deploy/VERCEL-SUPABASE.md` l.71 | `--pack erp-core --store pg --port 8787 …` |
+| `deploy/docker-compose.ai-gpu.yml` | no store flag (overlays the model service only) |
+| `scripts/run-dev.ps1` l.25 | `[string]$Store = "memory"` |
+| CLI default when `--store` is omitted | `memory` (`cli.ts:142`) |
+
+**Nothing in the repository deploys `pg-columns`.**
+
+On `--store pg` every record of every entity of every tenant is one row in
+`meta.operate_entity_records`, with the business data in an untyped JSONB `document`
+column. There are no per-entity tables, therefore **no columns to reference, therefore no
+foreign keys** — from the CRM or from anywhere. Filters, sorts and projections are JSONB
+path expressions, and the only indexes are `(tenant_id, entity)` plus the uniqueness
+constraint.
+
+And `pg-columns` is not a settled alternative you can simply switch on. **ADR-0283
+(2026-08-26, Accepted — the second-newest ADR in the repo, six days before this report)
+is titled "The served table is what the manifest says" and records that `pack-erp-core`
+booted on `pg-columns` for the first time in that change.** Before it, the flagship pack
+died at startup with `operator class "gin_trgm_ops" does not accept data type character`
+because `country_code` emits `CHAR(2)` — confirmed by the author as pre-existing by
+reproducing it on the unmodified tree. The same ADR fixed a second defect: `ensureSchema`
+issued only `CREATE TABLE IF NOT EXISTS`, so **any manifest that gained a field bricked
+the server on restart** (`fatal: column "triage_level" does not exist`).
+
+So the column store is six days old in any usable form, has never been deployed, and has
+no CI behind it.
+
+*Consequences:* the ADR's headline argument — enforced `(tenant_id, id)` foreign keys from
+a CRM schema into ERP tables — is **conditional on a store migration that has not
+happened**. Two paths: (i) migrate the ERP deployment to `--store pg-columns`, which means
+backfilling every existing JSONB record into typed tables (no migration tool exists for
+this) and accepting a barely-exercised code path; or (ii) accept that the CRM's
+"references" to ERP records are unenforced `TEXT` ids validated by the ACL rather than by
+Postgres, which materially weakens option (b) — it keeps the local-read and single-backup
+advantages but loses the integrity guarantee that distinguished it from option (c).
+**Do not start CRM schema work until this is decided.**
+
+### R18 — Under `--per-tenant-manifests`, a `pg-columns` deployment is silently mixed. **(high, if per-tenant manifests are ever enabled)**
+
+`apps/operate-server/src/node.ts:1023–1031`: when `--per-tenant-manifests` is on, a tenant
+serving a custom (AI-Architect-authored) manifest is served from the **JSONB
+`PostgresEntityStore`** — even in a `pg-columns` deployment — because the column plans are
+derived from the boot manifest at startup and the store "only knows the boot pack's
+entities". The comment is explicit that this is to avoid 500ing on every unplanned entity.
+
+*Consequences:* in such a deployment, tenants on the boot pack have typed tables with FKs
+and tenants on a custom manifest have JSONB rows with neither. A CRM foreign key would
+hold for some tenants and be structurally impossible for others, with nothing signalling
+which is which. Combined with R12 (per-tenant manifests never get DDL at all), this means
+**option (b)'s integrity guarantee is per-tenant, not per-deployment.** Either
+`--per-tenant-manifests` stays off wherever the CRM is deployed, or the CRM must tolerate
+both cases — which in practice means tolerating the weaker one.
 
 ### R14 — No PostGIS. `geo_point` would not create. **(low-medium)**
 
