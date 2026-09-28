@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| **Status** | Proposed — all eleven open questions answered 2026-09-26; awaiting sign-off to move to Accepted |
+| **Status** | **Accepted** (2026-09-28) — all eleven open questions answered 2026-09-26 |
 | **Date** | 2026-09-01 (questions resolved 2026-09-26) |
 | **Authors** | amoufaq5 (with AI assistance) |
-| **Reviewers** | _pending_ |
+| **Reviewers** | amoufaq5 |
 | **Supersedes** | _N/A_ |
 | **Superseded by** | _N/A_ |
 | **Related** | `docs/ERP_INTEGRATION_REPORT.md`; CrossEngin ADR-0002 (Multi-Tenancy Model, *Proposed*), ADR-0078 (operate-runtime serving), ADR-0279 (tenant-scope audit), ADR-0283 (emitter reconciliation) |
@@ -113,15 +113,31 @@ Concretely, and these specifics are the decision, not commentary on it:
    ERP lacks), its own release cadence, and its own runtime.
 
 2. **`crm` schema in the ERP's database**, owned by a **`crm_app` role that owns no ERP
-   object and is neither superuser nor the ERP migration role**. RLS on every CRM table,
-   with the ERP's exact policy text so one mental model covers both:
+   object and is neither superuser nor the ERP migration role**. RLS **plus `FORCE ROW
+   LEVEL SECURITY`** on every CRM table, with the ERP's exact policy text so one mental
+   model covers both:
    ```sql
    USING (tenant_id = current_setting('app.current_tenant_id', true)::UUID)
    ```
-   This is load-bearing: **a table's owner bypasses RLS**, verified empirically and
-   documented in the ERP's `CLAUDE.md`. Ownership discipline *is* the isolation guarantee.
-   Provision at minimum: `erp_owner` (migrations), `erp_app` (ERP runtime),
-   `crm_app` (CRM runtime, owns `crm.*`, `SELECT`-only on ERP tables).
+   The policy text carries **one deliberate divergence**: ours wraps the setting in
+   `NULLIF(current_setting('app.current_tenant_id', true), '')`. The ERP's un-guarded form
+   raises `invalid input syntax for type uuid: ""` rather than returning no rows on any
+   connection that has previously held a tenant context — the normal state of a pooled
+   backend after its first request (report R20, verified live). `NULLIF` collapses both
+   cases to "no rows", so a forgotten `withTenantContext` fails identically every time.
+   Same security, predictable failure.
+
+   `FORCE` is not optional for us and the reason is specific: **a table's owner bypasses
+   RLS**, and `crm_app` *owns* `crm.*`. Without `FORCE`, our own application role would
+   read every tenant's CRM rows regardless of context — the policy would be decoration.
+   Verified live on Postgres 16.13 (see `packages/db/src/rls.contract.test.ts`): an owner
+   with tenant-1 context read all 3 rows of a 2-tenant table; under `FORCE` it read 2.
+
+   The ERP does **not** use `FORCE` on its own tables, which is why its isolation depends
+   on ownership discipline rather than on the policy. We therefore provision, at minimum:
+   `erp_owner` (ERP migrations), `erp_app` (ERP runtime), `crm_app` (CRM runtime, owns
+   `crm.*`, `SELECT`-only on the ERP). `crm_app` owning an ERP object is a cross-tenant
+   leak, so CI asserts it owns none.
 
 3. **No foreign keys into ERP tables. Integrity is enforced by the ACL plus a scheduled
    orphan check** ("3-degraded", ratified 2026-09-26). The FK design in the Alternatives

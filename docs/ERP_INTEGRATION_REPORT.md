@@ -1251,6 +1251,38 @@ snapshot table with real column types. This promotes the snapshot tables from a
 performance convenience to a **correctness requirement**, and it is the single strongest
 practical argument for the platform eventually moving to `pg-columns`.
 
+### R20 — The tenant-isolation policy raises rather than returning empty on a pooled connection. **(medium — affects the ERP itself, and every client of it)**
+
+Every tenant-scoped table in CrossEngin carries the same policy:
+
+```sql
+USING (tenant_id = current_setting('app.current_tenant_id', true)::UUID)
+```
+
+Verified live on Postgres 16.13 that this behaves **two different ways** depending on what
+the connection did previously:
+
+| Connection state | `current_setting(…, true)` | Result |
+|---|---|---|
+| Fresh — GUC never set | `NULL` | predicate is `NULL` → **0 rows** |
+| Reused after any tenant-scoped transaction | `''` (the GUC's reset value) | `''::UUID` → **`ERROR: invalid input syntax for type uuid: ""`** |
+
+`set_config(..., is_local => true)` discards the *value* at transaction end, but the GUC
+itself now exists on that backend and reverts to the empty string rather than to unset.
+
+Both behaviours are fail-closed — neither leaks a row — so this is a robustness and
+observability problem, not a security one. But in a connection-pooled server, which
+`operate-server` is, the second row is the **normal** case after the first request. So the
+ERP's documented posture ("an unresolvable identity yields an empty result set, never an
+unfiltered one", `CLAUDE.md`) holds only on a pristine connection; in practice a query that
+misses `withTenantContext` surfaces as a type-cast error, most likely as a 500.
+
+*Consequences:* the CRM's own policies wrap the setting in `NULLIF(..., '')`, which
+collapses both cases to "no rows" so a forgotten tenant context fails the same way every
+time. This is the **only** deliberate divergence from the ERP's policy text and it is
+recorded in ADR-0001 item 2. Worth passing to the platform team: it is a one-word change
+per policy on their side, and it would make their fail-closed claim true as written.
+
 ### R14 — No PostGIS. `geo_point` would not create. **(low-medium)**
 
 `geo_point` → `geography(POINT)` and `geo_polygon` → `geography(POLYGON)` are in the

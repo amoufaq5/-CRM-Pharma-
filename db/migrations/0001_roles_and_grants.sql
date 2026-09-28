@@ -1,0 +1,38 @@
+-- 0001_roles_and_grants.sql
+--
+-- DBA STEP. Run once per cluster as a superuser, NOT by the CRM at runtime.
+-- Roles are cluster-wide objects; the CRM's own migrations (0002+) run as
+-- crm_app and must never need this file's privileges.
+--
+-- ADR-0001 decision item 2. The separation below is the isolation guarantee, not
+-- a convention: a table's OWNER bypasses row-level security (verified live, see
+-- packages/db/src/rls.contract.test.ts), so crm_app owning an ERP object would
+-- read every tenant's data regardless of RLS policy.
+--
+--   erp_owner  owns the ERP's meta schema and its tables (CrossEngin migrations)
+--   erp_app    the ERP runtime; non-owner, so RLS confines it
+--   crm_app    the CRM runtime; owns crm.*, SELECT-only on the ERP, owns nothing of it
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'crm_app') THEN
+    CREATE ROLE crm_app LOGIN;
+  END IF;
+END
+$$;
+
+-- crm_app must never be able to escalate past RLS.
+ALTER ROLE crm_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
+
+CREATE SCHEMA IF NOT EXISTS crm AUTHORIZATION crm_app;
+
+-- Read-only reach into the ERP. Deliberately narrow: USAGE on the schema and
+-- SELECT on the single table the JSONB store keeps records in. No INSERT, no
+-- UPDATE, no DELETE, no ownership, and no default privileges on future objects —
+-- a new ERP table is invisible to the CRM until someone grants it explicitly and
+-- adds it to the allow-list fixture (ADR-0001 Q5).
+GRANT USAGE ON SCHEMA meta TO crm_app;
+GRANT SELECT ON meta.operate_entity_records TO crm_app;
+
+-- The CRM writes to the ERP over its HTTP API, never over SQL (ADR-0001 item 5),
+-- so no write grant is issued here and none should be added.

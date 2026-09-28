@@ -1,0 +1,27 @@
+{
+  "name": "crm-pharma",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pharma field-force CRM — system of engagement over the CrossEngin ERP",
+  "packageManager": "pnpm@10.33.0",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc --build",
+    "typecheck": "tsc --build --force",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "node --experimental-strip-types packages/db/src/bin/migrate.ts",
+    "clean": "tsc --build --clean"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "pg": "^8.13.0",
+    "zod": "^3.24.0"
+  }
+}
