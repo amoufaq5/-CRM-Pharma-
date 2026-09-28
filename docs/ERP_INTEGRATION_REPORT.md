@@ -967,7 +967,7 @@ checkpoints. Two audit paths that do not know about each other.
 | Postgres with tenant RLS and a disciplined migration applier | ✅ solid |
 | Composite tenant-scoped FKs `(tenant_id, id)` in the column store | ⚠️ correct in code, **but the column store is not deployed** — every deploy artifact runs `--store pg` (JSONB), where no such table exists. See R17. |
 | Manifest-compiled REST CRUD + lifecycle transitions | ✅ solid |
-| Keyset pagination, typed filters, `?q` trigram search, `?fields` projection | ✅ solid |
+| Keyset pagination, typed filters, `?q` search, `?fields` projection | ⚠️ solid on `pg-columns`; on the deployed JSONB store filters and sorts are **text comparisons** (numeric predicates are wrong) and `?q` has no trigram index. See R19. |
 | RFC 9457 problem details at the gateway | ⚠️ two error shapes coexist |
 | Manifest-driven RBAC + classification-driven response redaction | ✅ solid |
 | Double-entry GL with tax breakdown, FX, payment application, period locks | ✅ solid, the best part of the codebase |
@@ -1216,6 +1216,40 @@ which is which. Combined with R12 (per-tenant manifests never get DDL at all), t
 **option (b)'s integrity guarantee is per-tenant, not per-deployment.** Either
 `--per-tenant-manifests` stays off wherever the CRM is deployed, or the CRM must tolerate
 both cases — which in practice means tolerating the weaker one.
+
+### R19 — On the deployed JSONB store, every filter and sort compares as **text**. Numeric comparisons are wrong. **(high — direct consequence of R17)**
+
+The two stores build their list SQL through the same `ListSqlAdapter` seam but supply
+opposite `castSuffix` implementations:
+
+| Store | `columnExpr` | `castSuffix` | Effect |
+|---|---|---|---|
+| `ColumnMappedEntityStore` (`column-store.ts:169–179`) | `"total"` (real typed column) | `` `::${m.sqlType}` `` → `::NUMERIC(16,2)` | filters and sorts compare **on the native type** |
+| `PostgresEntityStore` (`entity-ops.ts:43–47`) — **the deployed one** | `document ->> 'total'` | `() => ""` — **no cast** | filters and sorts compare **as text** |
+
+So on the deployed configuration:
+
+- `?total[gt]=1000` is a **string** comparison. `"999" > "1000"` is true in text collation, so
+  the filter returns rows it should exclude and excludes rows it should return.
+- `?sort=amount` orders lexicographically: `100`, `20`, `9`. The keyset cursor is built from
+  the same text values, so pagination is *internally consistent with the wrong order* —
+  it will not error, it will just be wrong, page after page.
+- ISO-8601 dates and datetimes are **safe by accident**: lexicographic order equals
+  chronological order for `YYYY-MM-DD` and RFC 3339. `?due_date[gte]=…` is correct.
+- Booleans and enums are safe (equality only). Decimals, integers and money are not.
+
+There is no index to help either. `meta.operate_entity_records` carries only
+`(tenant_id, entity)` and the unique `(tenant_id, entity, record_id)` — **no GIN on
+`document`** — so any business-field predicate is a scan within the tenant+entity slice.
+And the CRM cannot add one: creating an index on `meta.operate_entity_records` requires
+ownership of that table, which is precisely what R16 forbids the CRM role from having.
+
+*Consequences:* the CRM must never rely on the ERP API (or on raw JSONB reads) for numeric
+filtering, numeric sorting, or aggregation. Anything of that shape — "invoices over
+X", "top accounts by balance", "items under reorder point" — belongs in a CRM-owned
+snapshot table with real column types. This promotes the snapshot tables from a
+performance convenience to a **correctness requirement**, and it is the single strongest
+practical argument for the platform eventually moving to `pg-columns`.
 
 ### R14 — No PostGIS. `geo_point` would not create. **(low-medium)**
 
