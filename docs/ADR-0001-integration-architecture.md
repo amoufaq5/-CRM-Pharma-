@@ -264,25 +264,47 @@ Concretely, and these specifics are the decision, not commentary on it:
     short-lived Ed25519 tokens removes all three, and it means no third-party IdP has to
     support Ed25519 for us to satisfy the ERP's verifier.
 
-11. **Rep expense claims carry a cost centre, resolved to Sales & Marketing, and the
-    relay posts the GL entry** (Q6). The ERP's `Expense` has no `cost_center_id`, no lines,
-    and — decisively — **no GL write-effect at all**, so a claim can reach `reimbursed`
-    without ever touching the ledger. Therefore:
-    - Each CRM claim carries `cost_center_id`, defaulted from the rep's department and
-      overridable, resolved against the ERP's `CostCenter` (which *is* hierarchical and
-      *does* appear on `JournalLine`). Attribution is to the **Sales & Marketing cost
-      centre**, not per campaign — campaign remains a CRM reporting dimension and never
-      reaches the GL.
-    - On `reimburse`, the relay posts a balanced `JournalEntry` carrying `cost_center_id`
-      on each line (debit the S&M expense account, credit employee payable), then drives
-      the ERP `Expense` transition. The journal entry is the attribution; the `Expense`
-      record is the claim.
-    - The relay must handle `lockedDocumentGuard` refusing a write into a closed
-      `FiscalPeriod` by retrying into the next open period rather than dead-lettering — a
-      late claim against a closed month is routine, not an error.
-    - Posting needs the `controller` role, so the tenant's ERP service credential must
-      hold it. That widens the credential; it is the price of GL attribution and should be
-      reviewed as such rather than waved through.
+11. **Rep expense claims post to a SEPARATE Sales & Marketing expense account,
+    which can optionally be hooked to a cost centre** (Q6, resolved 2026-09-29).
+    Not a cost-centre tag on the ERP's existing expense account, and not per
+    campaign — campaign stays a CRM reporting dimension and never reaches the GL.
+
+    This is the ordinary `JournalLine` shape: `ledger_account_id` is required and
+    carries the S&M account, `cost_center_id` is optional and carries the
+    dimension. The distinction matters because the ERP's `FinanceSettings`
+    already has a single `expenseAccountCode`, used for AP bill recognition;
+    reusing it would merge rep spend into supplier invoices in the P&L, which is
+    the thing a separate account exists to prevent.
+
+    - `crm.expense_account_map` maps the CRM's own (richer) category vocabulary
+      to a `LedgerAccount.account_code` of type `expense`, plus an optional
+      `CostCenter.code`. **Codes, not record ids** — that is the ERP's own
+      convention (`FinanceSettings` holds `account_code` strings and resolves
+      them at posting time via `resolveAccountId`), and a code survives the
+      record-id churn a JSONB-store reload can cause.
+    - The account and cost centre are **snapshotted onto the claim at
+      submission**, never looked up at posting time. Re-mapping a category next
+      quarter must not retroactively re-attribute a claim that is already
+      posted; an accountant reading a journal entry needs it to still mean what
+      it meant. Enforced by `expense_claim_snapshot_before_submit`.
+    - A NULL cost centre is valid and is the right default until Finance names
+      the codes: `JournalLine.cost_center_id` is nullable, so "post to the S&M
+      account with no dimension" is a legitimate posting.
+    - On `reimburse`, the relay posts a balanced `JournalEntry` — debit the S&M
+      account, credit employee payable — carrying `cost_center_id` on each line
+      where one is set, then drives the ERP `Expense` transition. The journal
+      entry is the attribution; the `Expense` record is the claim.
+    - The relay retries into the next open period rather than dead-lettering
+      when `lockedDocumentGuard` refuses a closed `FiscalPeriod` — a late claim
+      against a closed month is routine, not an error.
+    - **The approval graph is the CRM's**, and four-eyes is enforced in the CRM
+      schema (`expense_claim_four_eyes`) because nothing downstream will: the
+      ERP's `Expense` workflow is a flat role check that never reads
+      `Employee.manager_id`, has no amount bands and no separation of duties, so
+      the same principal can submit and approve (report R7).
+    - Posting needs the `controller` role, so the tenant's ERP service
+      credential must hold it. That widens the credential; it is the price of GL
+      attribution and should be reviewed as such rather than waved through.
 
 12. **Deploy as separate containers against a shared database.** The CRM API and the
     ERP `operate-server` are independent processes with independent restarts and
@@ -515,7 +537,7 @@ reasoning behind each constrains what follows.
 | Q3 | Login → `Employee` mapping? | **A CRM-owned mapping table**, keyed on `employee_number` (the only field immutable by intent), with `work_email` as a reconciliation hint only. |
 | Q4 | Samples and promo material? | **CRM custody**, first-class, with lot and expiry. Aggregate issues mirror to the ERP's `StockMovement` when material leaves ERP-controlled stock. |
 | Q5 | Which ERP data may the ACL read directly? | **A named, versioned allow-list, asserted in CRM CI** against the live schema on every build. Note this is now a list of *entity names* read out of `meta.operate_entity_records`, not tables (R17). |
-| Q6 | Expense attribution? | **Yes — by cost centre, to Sales & Marketing; not by campaign.** Campaign stays a CRM reporting dimension. See decision item 11 for the GL posting. |
+| Q6 | Expense attribution? | **A separate Sales & Marketing expense account, optionally hooked to a cost centre** (refined 2026-09-29 from the first reading). Not a cost-centre tag on the ERP's existing `expenseAccountCode`, and not per campaign. See decision item 11. |
 | Q7 | PostGIS on the shared database? | **Yes.** Territories, GPS check-in and route optimisation are CRM-side with real geometry. Removes trigger (iv) from Q10. |
 | Q8 | IdP and credential design? | **Two-tier** (decision item 10): any OIDC IdP for human login (RS256 fine), CRM-minted 5–15 minute **Ed25519** service JWTs for ERP calls, published via our own JWKS endpoint, private key in KMS. Retires `--api-key` entirely. |
 | Q9 | Will `meta.webhook_deliveries` ship? | **Yes.** We still build polling first (it does not exist yet), behind a `ChangeSource` interface so the swap costs nothing. |
@@ -526,8 +548,9 @@ reasoning behind each constrains what follows.
 
 | Question | Owner | Deadline |
 |---|---|---|
-| **Confirm the Q6 reading.** "Expenses of sales and marketing as part of it" was interpreted as *attribute to the S&M cost centre, not per campaign*. If it meant something else — a separate S&M expense **account** in the chart of accounts, or an S&M budget line the claims draw down — decision item 11 changes shape. | Finance | _set a date_ |
-| Which `CostCenter` code is "Sales & Marketing" per tenant, and does it already exist in the ERP for each? `CostCenter.segment` has no `functional` value (`operating\|geographic\|product\|service\|other`), so S&M would sit under `operating`. | Finance | _set a date_ |
+| **Which `LedgerAccount.account_code` is the S&M expense account per tenant, and does it exist yet?** It must be `account_type = 'expense'` and `is_postable`. Until Finance names it, `crm.expense_account_map` has no rows and no claim can leave draft — deliberately, since posting to a guessed account is worse than blocking. | Finance | _set a date_ |
+| Which `CostCenter.code` (if any) to hook per category. Optional by design — NULL posts to the account with no dimension. `CostCenter.segment` has no `functional` value (`operating\|geographic\|product\|service\|other`), so S&M would sit under `operating`. | Finance | _set a date_ |
+| Does the CRM need more than one S&M account (e.g. splitting congresses from detailing samples), or does one account with cost-centre and CRM-side category reporting suffice? The map is per-category already, so several accounts cost nothing structurally. | Finance | _set a date_ |
 | Which OIDC IdP for human login (Q8 tier 1), and does the CRM service credential holding `controller` (needed for the GL posting in item 11) pass security review? | Security | _set a date_ |
 | Staleness budget per snapshot table (item 8) — how old may a product price or a rep roster be on a mobile device before the UI blocks the action rather than warning? | Product | _set a date_ |
 | Does the platform have a date for `meta.webhook_deliveries` (Q9)? Affects only when we retire `PollingChangeSource`, not whether we build it. | Platform | _set a date_ |
