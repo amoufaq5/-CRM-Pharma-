@@ -24,6 +24,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/scheduler/` | The background process. Drives the relay and the refresher per tenant, on a timer. |
 | `packages/territory/` | Territories, rep assignment, and the row-level scoping the ERP cannot do. |
 | `packages/visit/` | Visits and detailing lines. Offline-first, territory-scoped, immutable once final. |
+| `packages/api/` | The HTTP API. JWT auth, one error shape, territory-scoped on every read. |
 | `scripts/setup-test-db.sh` | Brings a database to the state the contract tests expect. |
 
 ## Running it
@@ -39,6 +40,31 @@ pnpm test
 ```
 
 CI runs exactly this against a `postgres:16` service container on every push.
+
+## The API
+
+```bash
+PGHOST=… PGDATABASE=… PGUSER=… \
+OIDC_ISSUER=… OIDC_AUDIENCE=… OIDC_JWKS_URL=… \
+PORT=8080 pnpm api
+```
+
+`GET /healthz` is public. Everything else needs `Authorization: Bearer <token>` and resolves
+the caller through `crm.rep_profile.subject` — a genuine token from the right IdP is **not**
+authorisation on its own.
+
+| | |
+|---|---|
+| `GET /v1/me` | the rep, their territories, their account count |
+| `GET /v1/accounts` | **their** accounts; `?on=YYYY-MM-DD` for a historical view |
+| `GET /v1/products` | catalogue from the typed snapshot; `?minPrice`/`?maxPrice` are numerically correct |
+| `GET\|POST /v1/visits` | list own / record (upsert by device-minted id) |
+| `POST /v1/visits/:id/transition` | lifecycle |
+| `POST /v1/visits/:id/notes` | the one edit a final visit allows |
+| `POST /v1/sync/visits` | offline flush, **per-row** results |
+
+Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
+emits two on the same API, and a client that handles only one misreads the other.
 
 ## The background process
 

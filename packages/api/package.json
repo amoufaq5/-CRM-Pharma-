@@ -1,0 +1,19 @@
+{
+  "name": "@crm/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "bin": { "crm-api": "./dist/bin/api.js" },
+  "scripts": { "build": "tsc", "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "dependencies": {
+    "@crm/acl": "workspace:*",
+    "@crm/db": "workspace:*",
+    "@crm/territory": "workspace:*",
+    "@crm/visit": "workspace:*",
+    "pg": "^8.13.0",
+    "zod": "^3.24.0"
+  }
+}

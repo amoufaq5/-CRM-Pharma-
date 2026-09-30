@@ -39,7 +39,11 @@ export interface RecordVisitInput {
   readonly plannedFor?: string | null;
   readonly occurredAt?: string | null;
   readonly durationMinutes?: number | null;
-  readonly checkin?: { latitude: number; longitude: number; accuracyM?: number } | null;
+  // `| undefined` on the inner field, not just optional: a zod-parsed body
+  // legitimately carries `accuracyM: undefined`, and under
+  // exactOptionalPropertyTypes that is a different type from the key being
+  // absent. Widening here is honest about what callers actually pass.
+  readonly checkin?: { latitude: number; longitude: number; accuracyM?: number | undefined } | null;
   readonly outcome?: string | null;
   readonly notes?: string | null;
 }
@@ -191,7 +195,11 @@ export async function setVisitProducts(
   tx: PoolClient,
   tenantId: string,
   visitId: string,
-  products: ReadonlyArray<{ erpItemId: string; keyMessage?: string; reaction?: string }>,
+  products: ReadonlyArray<{
+    erpItemId: string;
+    keyMessage?: string | undefined;
+    reaction?: string | undefined;
+  }>,
 ): Promise<readonly VisitProduct[]> {
   try {
     await tx.query("DELETE FROM crm.visit_product WHERE visit_id = $1", [visitId]);

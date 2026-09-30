@@ -21,6 +21,9 @@
     },
     {
       "path": "./packages/scheduler"
+    },
+    {
+      "path": "./packages/api"
     }
   ]
 }

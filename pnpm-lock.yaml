@@ -34,6 +34,27 @@ importers:
         specifier: ^3.24.0
         version: 3.25.76
 
+  packages/api:
+    dependencies:
+      '@crm/acl':
+        specifier: workspace:*
+        version: link:../acl
+      '@crm/db':
+        specifier: workspace:*
+        version: link:../db
+      '@crm/territory':
+        specifier: workspace:*
+        version: link:../territory
+      '@crm/visit':
+        specifier: workspace:*
+        version: link:../visit
+      pg:
+        specifier: ^8.13.0
+        version: 8.23.0
+      zod:
+        specifier: ^3.24.0
+        version: 3.25.76
+
   packages/db:
     dependencies:
       pg:

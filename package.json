@@ -17,7 +17,8 @@
     "clean": "tsc --build --clean",
     "erp:codegen": "pnpm --filter @crm/acl erp:codegen",
     "erp:codegen:check": "pnpm --filter @crm/acl erp:codegen:check",
-    "scheduler": "pnpm --filter @crm/scheduler build && node packages/scheduler/dist/bin/scheduler.js"
+    "scheduler": "pnpm --filter @crm/scheduler build && node packages/scheduler/dist/bin/scheduler.js",
+    "api": "pnpm --filter @crm/api build && node packages/api/dist/bin/api.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
