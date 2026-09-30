@@ -52,6 +52,24 @@ importers:
         specifier: ^8.13.0
         version: 8.23.0
 
+  packages/scheduler:
+    dependencies:
+      '@crm/acl':
+        specifier: workspace:*
+        version: link:../acl
+      '@crm/db':
+        specifier: workspace:*
+        version: link:../db
+      '@crm/relay':
+        specifier: workspace:*
+        version: link:../relay
+      '@crm/sync':
+        specifier: workspace:*
+        version: link:../sync
+      pg:
+        specifier: ^8.13.0
+        version: 8.23.0
+
   packages/sync:
     dependencies:
       '@crm/acl':

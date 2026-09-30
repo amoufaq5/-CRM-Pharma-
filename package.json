@@ -16,7 +16,8 @@
     "db:migrate": "node --experimental-strip-types packages/db/src/bin/migrate.ts",
     "clean": "tsc --build --clean",
     "erp:codegen": "pnpm --filter @crm/acl erp:codegen",
-    "erp:codegen:check": "pnpm --filter @crm/acl erp:codegen:check"
+    "erp:codegen:check": "pnpm --filter @crm/acl erp:codegen:check",
+    "scheduler": "pnpm --filter @crm/scheduler build && node packages/scheduler/dist/bin/scheduler.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

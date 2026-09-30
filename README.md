@@ -21,6 +21,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/acl/schema/` | A captured `/v1/meta/schema`, so CI can check for drift without a live ERP. |
 | `packages/relay/` | The outbox relay: claim, dispatch, classify, settle. Multi-worker safe, with leases. |
 | `packages/sync/` | Snapshot refresh: strict coercion into typed columns, incremental + full sweep. |
+| `packages/scheduler/` | The background process. Drives the relay and the refresher per tenant, on a timer. |
 | `scripts/setup-test-db.sh` | Brings a database to the state the contract tests expect. |
 
 ## Running it
@@ -36,6 +37,23 @@ pnpm test
 ```
 
 CI runs exactly this against a `postgres:16` service container on every push.
+
+## The background process
+
+```bash
+PGHOST=… PGDATABASE=… PGUSER=… ERP_BASE_URL=… ERP_TOKEN=… pnpm scheduler
+```
+
+Long-running by necessity — the same constraint `operate-server` has on the ERP side, since
+its schedulers are in-process too. Serverless can host the CRM's API but not this.
+
+Tenants come from `crm.tenant`, the CRM's **own** registry: `crm_app` holds `SELECT` on
+exactly one ERP table, and widening that for a tenant list would break the allow-list
+discipline. It also reflects reality — the CRM serves a subset of ERP tenants, with
+scheduling knobs the ERP has no concept of.
+
+`ERP_TOKEN` is a development-only static credential and the process refuses to start with
+it under `NODE_ENV=production`.
 
 ## Three rules that are not negotiable
 

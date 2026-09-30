@@ -12,6 +12,9 @@
     },
     {
       "path": "./packages/sync"
+    },
+    {
+      "path": "./packages/scheduler"
     }
   ]
 }

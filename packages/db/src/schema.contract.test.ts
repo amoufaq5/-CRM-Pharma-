@@ -24,6 +24,23 @@ describe("CRM schema invariants", () => {
     await pool?.end();
   });
 
+  /**
+   * Tables carrying a `tenant_id` that are deliberately NOT tenant-scoped.
+   *
+   * Adding to this list must be a conscious act, visible in a diff, and each
+   * entry needs a reason that survives review — which is why the list is
+   * explicit rather than a structural rule like "exempt when tenant_id is the
+   * primary key". A rule that clever would silently exempt a real data table
+   * someone happened to key that way.
+   */
+  const RLS_EXEMPT: Readonly<Record<string, string>> = {
+    // The registry of which tenants exist. RLS here would be circular: reading
+    // which tenants exist would require having already chosen one. Holds ids,
+    // a display name and scheduling config — nothing a tenant would call theirs,
+    // which the next test enforces.
+    tenant: "the tenant registry itself; RLS would be circular",
+  };
+
   it("every tenant-scoped crm table has RLS ENABLED and FORCED", async () => {
     const { rows } = await client.query<{
       relname: string;
@@ -39,10 +56,35 @@ describe("CRM schema invariants", () => {
 
     expect(rows.length).toBeGreaterThan(0);
     for (const t of rows) {
+      if (t.relname in RLS_EXEMPT) continue;
       expect(t.rls, `${t.relname} must ENABLE ROW LEVEL SECURITY`).toBe(true);
       // FORCE is the one that matters here: crm_app OWNS these tables, and an
       // owner is exempt from a policy it is not forced under.
       expect(t.forced, `${t.relname} must FORCE ROW LEVEL SECURITY`).toBe(true);
+    }
+  });
+
+  it("an RLS-exempt table holds no tenant data", async () => {
+    // The exemption is only defensible while the table stays a registry. If
+    // someone adds a column that belongs to a tenant, this fails and the
+    // exemption has to be re-argued rather than quietly inherited.
+    const ALLOWED_REGISTRY_COLUMNS = new Set([
+      "tenant_id",
+      "display_name",
+      "status",
+      "created_at",
+      "updated_at",
+    ]);
+    for (const table of Object.keys(RLS_EXEMPT)) {
+      const { rows } = await client.query<{ attname: string }>(
+        `SELECT a.attname FROM pg_attribute a
+           JOIN pg_class c ON c.oid = a.attrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'crm' AND c.relname = $1 AND a.attnum > 0 AND NOT a.attisdropped`,
+        [table],
+      );
+      const unexpected = rows.map((r) => r.attname).filter((c) => !ALLOWED_REGISTRY_COLUMNS.has(c));
+      expect(unexpected, `crm.${table} is RLS-exempt (${RLS_EXEMPT[table]}) and must stay a registry`).toEqual([]);
     }
   });
 
