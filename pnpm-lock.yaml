@@ -28,8 +28,26 @@ importers:
         specifier: ^2.1.0
         version: 2.1.9(@types/node@22.20.4)
 
+  packages/acl:
+    dependencies:
+      zod:
+        specifier: ^3.24.0
+        version: 3.25.76
+
   packages/db:
     dependencies:
+      pg:
+        specifier: ^8.13.0
+        version: 8.23.0
+
+  packages/relay:
+    dependencies:
+      '@crm/acl':
+        specifier: workspace:*
+        version: link:../acl
+      '@crm/db':
+        specifier: workspace:*
+        version: link:../db
       pg:
         specifier: ^8.13.0
         version: 8.23.0

@@ -19,6 +19,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/db/` | Tenant context, migration runner, and the **contract tests** that assert isolation against a real Postgres. |
 | `packages/acl/` | The anti-corruption layer: the ERP HTTP client, generated types, error normalisation, the `ChangeSource` seam. |
 | `packages/acl/schema/` | A captured `/v1/meta/schema`, so CI can check for drift without a live ERP. |
+| `packages/relay/` | The outbox relay: claim, dispatch, classify, settle. Multi-worker safe, with leases. |
 | `scripts/setup-test-db.sh` | Brings a database to the state the contract tests expect. |
 
 ## Running it
@@ -45,6 +46,11 @@ application never connects as one. Both are asserted in CI.
 **2. Never write an ERP table over SQL.** Writes go through the ERP's HTTP API via the
 outbox, so its RBAC, write-guards, period locks, sequences, audit and double-entry GL
 effects all still run. The database permits a direct write; the design does not.
+
+Retries are safe because the relay mints the ERP record id itself and the ERP is unique on
+`(tenant_id, entity, record_id)` — a durable constraint. Not because of the
+`Idempotency-Key` header, whose store is in-memory in the deployed binary, dies on restart
+and does not span instances.
 
 **3. Never hand-write a resource path or a filter.** Both come from the server's own
 `/v1/meta/schema`, via generated types. The ERP's pluraliser is naive (`Opportunity` →

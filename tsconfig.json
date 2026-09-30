@@ -1,7 +1,14 @@
 {
   "files": [],
   "references": [
-    { "path": "./packages/db" },
-    { "path": "./packages/acl" }
+    {
+      "path": "./packages/db"
+    },
+    {
+      "path": "./packages/acl"
+    },
+    {
+      "path": "./packages/relay"
+    }
   ]
 }
