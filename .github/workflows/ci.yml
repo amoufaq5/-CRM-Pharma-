@@ -54,6 +54,13 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
+      # The ERP has no CI of its own, so a change to its served schema lands
+      # unannounced. Without this gate the first we would hear of it is a filter
+      # quietly returning the wrong rows in production — the ERP ignores a
+      # non-filterable param silently rather than rejecting it.
+      - name: ERP schema drift check
+        run: pnpm erp:codegen:check
+
       - name: Provision roles and schema
         run: ./scripts/setup-test-db.sh
 

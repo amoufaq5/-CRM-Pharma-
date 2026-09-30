@@ -17,7 +17,8 @@ cannot do (20 recorded risks; §13 is the important part).
 |---|---|
 | `db/migrations/` | Numbered SQL. `0001`/`0002` are DBA steps (cluster roles, `CREATE EXTENSION`); the rest run as `crm_app`. |
 | `packages/db/` | Tenant context, migration runner, and the **contract tests** that assert isolation against a real Postgres. |
-| `packages/acl/` | The anti-corruption layer: ERP error normalisation, slug derivation, the `ChangeSource` seam. |
+| `packages/acl/` | The anti-corruption layer: the ERP HTTP client, generated types, error normalisation, the `ChangeSource` seam. |
+| `packages/acl/schema/` | A captured `/v1/meta/schema`, so CI can check for drift without a live ERP. |
 | `scripts/setup-test-db.sh` | Brings a database to the state the contract tests expect. |
 
 ## Running it
@@ -45,7 +46,13 @@ application never connects as one. Both are asserted in CI.
 outbox, so its RBAC, write-guards, period locks, sequences, audit and double-entry GL
 effects all still run. The database permits a direct write; the design does not.
 
-**3. Never read a number from the ERP.** The deployed ERP runs `--store pg`, where every
+**3. Never hand-write a resource path or a filter.** Both come from the server's own
+`/v1/meta/schema`, via generated types. The ERP's pluraliser is naive (`Opportunity` →
+`/v1/opportunitys`), and an unknown filter param is *silently dropped* rather than
+rejected — so a mistyped filter returns more rows, not an error. `pnpm erp:codegen:check`
+gates this in CI.
+
+**4. Never read a number from the ERP.** The deployed ERP runs `--store pg`, where every
 filter and sort is a *text* comparison: `?total[gte]=1000` returns 999, and `?sort=amount`
 orders 100, 20, 9. Numeric filters, sorts and aggregations read the typed snapshot tables.
 Pinned by test, so it cannot quietly become folklore.

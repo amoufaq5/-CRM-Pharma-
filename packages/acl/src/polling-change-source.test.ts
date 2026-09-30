@@ -1,0 +1,104 @@
+import { describe, expect, it } from "vitest";
+import { ErpClient, type FetchLike, type TenantCredential } from "./client.js";
+import { PollingChangeSource } from "./polling-change-source.js";
+import { ERP_SCHEMA_FIXTURE } from "./fixtures.js";
+
+const TENANT = "11111111-1111-4111-8111-111111111111";
+
+function harness(pages: Array<{ data: unknown[]; nextCursor: string | null }>) {
+  const urls: string[] = [];
+  const queue = [...pages];
+  const fetchImpl: FetchLike = (url) => {
+    urls.push(url);
+    const body = url.endsWith("/v1/meta/schema")
+      ? ERP_SCHEMA_FIXTURE
+      : (() => {
+          const p = queue.shift() ?? { data: [], nextCursor: null };
+          return { data: p.data, page: { nextCursor: p.nextCursor } };
+        })();
+    return Promise.resolve({
+      status: 200,
+      headers: { get: () => null },
+      text: () => Promise.resolve(JSON.stringify(body)),
+    });
+  };
+  const credential: TenantCredential = { token: () => Promise.resolve("t") };
+  const client = new ErpClient({ baseUrl: "https://erp.example", credential, fetch: fetchImpl });
+  return { source: new PollingChangeSource({ client }), urls };
+}
+
+describe("PollingChangeSource", () => {
+  it("queries updated_at INCLUSIVELY, ascending", async () => {
+    const { source, urls } = harness([{ data: [], nextCursor: null }]);
+    await source.changesSince(TENANT, "Item", "2026-09-01T00:00:00.000Z");
+    const q = new URL(urls.at(-1)!).searchParams;
+    // gte, not gt: two records can share an updated_at to the millisecond, and
+    // re-reading one is free while skipping one is a silent hole.
+    expect(q.get("updated_at[gte]")).toBe("2026-09-01T00:00:00.000Z");
+    expect(q.get("sort")).toBe("updated_at");
+    expect(q.get("order")).toBe("asc");
+  });
+
+  it("returns the changed records with their ids and timestamps", async () => {
+    const { source } = harness([
+      {
+        data: [
+          { id: "i1", sku: "A", updated_at: "2026-09-02T00:00:00.000Z" },
+          { id: "i2", sku: "B", updated_at: "2026-09-03T00:00:00.000Z" },
+        ],
+        nextCursor: null,
+      },
+    ]);
+    const batch = await source.changesSince(TENANT, "Item", "2026-09-01T00:00:00.000Z");
+    expect(batch.records.map((r) => r.recordId)).toEqual(["i1", "i2"]);
+    expect(batch.records[0]?.entity).toBe("Item");
+  });
+
+  it("advances the high-water mark only when the page is drained", async () => {
+    // Advancing mid-page would skip the remainder if the process died before the
+    // next call — a silent hole in the snapshot rather than a repeated read.
+    const { source } = harness([
+      { data: [{ id: "i1", updated_at: "2026-09-02T00:00:00.000Z" }], nextCursor: "cur1" },
+    ]);
+    const batch = await source.changesSince(TENANT, "Item", "2026-09-01T00:00:00.000Z");
+    expect(batch.cursor).toBe("cur1");
+    expect(batch.highWaterMark).toBeNull();
+  });
+
+  it("reports the newest timestamp once there is no next cursor", async () => {
+    const { source } = harness([
+      {
+        data: [
+          { id: "i1", updated_at: "2026-09-02T00:00:00.000Z" },
+          { id: "i2", updated_at: "2026-09-05T00:00:00.000Z" },
+        ],
+        nextCursor: null,
+      },
+    ]);
+    const batch = await source.changesSince(TENANT, "Item", "2026-09-01T00:00:00.000Z");
+    expect(batch.highWaterMark).toBe("2026-09-05T00:00:00.000Z");
+  });
+
+  it("skips a record with no id or no updated_at rather than guessing", async () => {
+    const { source } = harness([
+      {
+        data: [
+          { sku: "no-id", updated_at: "2026-09-02T00:00:00.000Z" },
+          { id: "i2" },
+          { id: "i3", updated_at: "2026-09-04T00:00:00.000Z" },
+        ],
+        nextCursor: null,
+      },
+    ]);
+    const batch = await source.changesSince(TENANT, "Item", "2026-09-01T00:00:00.000Z");
+    // Neither can be stored or resumed from; they reappear next pass if real.
+    expect(batch.records.map((r) => r.recordId)).toEqual(["i3"]);
+    expect(batch.highWaterMark).toBe("2026-09-04T00:00:00.000Z");
+  });
+
+  it("passes a cursor through to continue a partially drained sweep", async () => {
+    const { source, urls } = harness([{ data: [], nextCursor: null }]);
+    await source.changesSince(TENANT, "Item", "2026-09-01T00:00:00.000Z", "cur1");
+    expect(new URL(urls.at(-1)!).searchParams.get("cursor")).toBe("cur1");
+  });
+});
