@@ -91,6 +91,15 @@ importers:
         specifier: ^8.13.0
         version: 8.23.0
 
+  packages/visit:
+    dependencies:
+      '@crm/db':
+        specifier: workspace:*
+        version: link:../db
+      pg:
+        specifier: ^8.13.0
+        version: 8.23.0
+
 packages:
 
   '@esbuild/aix-ppc64@0.21.5':

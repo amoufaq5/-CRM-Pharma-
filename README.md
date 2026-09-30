@@ -23,6 +23,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/sync/` | Snapshot refresh: strict coercion into typed columns, incremental + full sweep. |
 | `packages/scheduler/` | The background process. Drives the relay and the refresher per tenant, on a timer. |
 | `packages/territory/` | Territories, rep assignment, and the row-level scoping the ERP cannot do. |
+| `packages/visit/` | Visits and detailing lines. Offline-first, territory-scoped, immutable once final. |
 | `scripts/setup-test-db.sh` | Brings a database to the state the contract tests expect. |
 
 ## Running it
@@ -100,7 +101,15 @@ every commission dispute asks. Territory and account assignments keep their hist
 database exclusion constraint makes overlapping coverage impossible rather than something a
 nightly report finds.
 
-**7. Snapshots need a periodic full sweep, not just incremental refresh.** The ERP keeps no
+**7. Record ids for anything a device creates come from the device.** A rep works with no
+signal; the id is minted offline so a retried sync collapses into the same row instead of
+duplicating a call report. Same guarantee the outbox relies on.
+
+**8. A visit is authorised against the date it happened, not today.** An account that moved
+territory in July must not invalidate June's visit, nor hand it to whoever holds the
+account now. This is what effective-dated territories are for.
+
+**9. Snapshots need a periodic full sweep, not just incremental refresh.** The ERP keeps no
 tombstones, so polling `updated_at` can never observe a deletion. Only a full sweep
 reconciles; `last_full_sweep_at` is tracked separately so a snapshot that has only ever
 been refreshed incrementally is visible as such.
