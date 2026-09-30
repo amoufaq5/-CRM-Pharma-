@@ -9,6 +9,10 @@
 -- it the policy would be decoration on our own tables.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;     -- gen_random_uuid()
+-- btree_gist: equality operators for uuid/text inside a GiST index, so an
+-- EXCLUDE constraint can combine them with a daterange overlap. Used by the
+-- effective-dated assignment tables to make overlapping coverage impossible.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 -- PostGIS is approved (ADR-0001 Q7) but deliberately NOT required here. It
 -- arrives with the migration that first creates a geometry column (territories,

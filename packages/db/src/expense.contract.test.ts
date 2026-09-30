@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { testPool, TENANT_A } from "./testing.js";
+import { testPool, TENANT_DB_EXPENSE as TENANT_A } from "./testing.js";
 import { withTenantContext } from "./tenant-context.js";
 
 /**

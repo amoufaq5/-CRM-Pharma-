@@ -8,13 +8,15 @@ import { Scheduler, type SchedulerEvent } from "./scheduler.js";
 import { claimDueJobs, ensureJobs, jobHealth, recordResult } from "./store.js";
 import { JOB_NAMES } from "./jobs.js";
 
-// A distinct tenant pair per suite. Sharing fixture rows across suites couples
-// them to vitest's beforeAll/afterAll interleaving, which is not a property
-// worth depending on — and which cost an hour the first time it bit.
-const TENANT = "11111111-1111-4111-8111-111111111111";
-const OTHER = "22222222-2222-4222-8222-222222222222";
-const LOOP_TENANT = "33333333-3333-4333-8333-333333333333";
-const RESULT_TENANT = "44444444-4444-4444-8444-444444444444";
+// A distinct tenant per suite, from the shared registry in @crm/db/testing.
+// Sharing fixture rows couples suites to vitest's hook interleaving and to each
+// other's cleanup, neither of which is worth depending on.
+import {
+  TENANT_SCHEDULER_A as TENANT,
+  TENANT_SCHEDULER_B as OTHER,
+  TENANT_SCHEDULER_LOOP as LOOP_TENANT,
+  TENANT_SCHEDULER_RESULT as RESULT_TENANT,
+} from "@crm/db/testing";
 
 function pool(): Pool {
   return new Pool({

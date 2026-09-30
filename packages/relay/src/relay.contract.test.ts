@@ -7,7 +7,7 @@ import { withTenantContext } from "@crm/db";
 import { OutboxRelay, type RelayEvent } from "./relay.js";
 import { claimBatch, outboxLag, reclaimStale } from "./store.js";
 
-const TENANT = "11111111-1111-4111-8111-111111111111";
+import { TENANT_RELAY as TENANT } from "@crm/db/testing";
 
 function pool(): Pool {
   return new Pool({

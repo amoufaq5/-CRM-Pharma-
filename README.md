@@ -22,6 +22,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/relay/` | The outbox relay: claim, dispatch, classify, settle. Multi-worker safe, with leases. |
 | `packages/sync/` | Snapshot refresh: strict coercion into typed columns, incremental + full sweep. |
 | `packages/scheduler/` | The background process. Drives the relay and the refresher per tenant, on a timer. |
+| `packages/territory/` | Territories, rep assignment, and the row-level scoping the ERP cannot do. |
 | `scripts/setup-test-db.sh` | Brings a database to the state the contract tests expect. |
 
 ## Running it
@@ -87,7 +88,19 @@ Money stays a **string** all the way from the ERP into `NUMERIC`. float64 cannot
 will not coerce rejects the record by name — it is never nulled, because a null price makes
 a product look free.
 
-**5. Snapshots need a periodic full sweep, not just incremental refresh.** The ERP keeps no
+**5. Authorisation for "my accounts" lives here, in SQL.** The ERP has no row-level
+scoping at all — `requiresAbac` is computed and discarded, so any role sees every row in
+the tenant. `crm.visible_account_ids(rep, on_date)` is the one definition, in the database
+so every caller gets the same answer. Reimplementing it per caller is how it starts
+disagreeing with itself.
+
+**6. Assignments are effective-dated, never overwritten.** The ERP has no effective dating
+anywhere, so a reassignment erases who held a customer when the order landed — the question
+every commission dispute asks. Territory and account assignments keep their history, and a
+database exclusion constraint makes overlapping coverage impossible rather than something a
+nightly report finds.
+
+**7. Snapshots need a periodic full sweep, not just incremental refresh.** The ERP keeps no
 tombstones, so polling `updated_at` can never observe a deletion. Only a full sweep
 reconciles; `last_full_sweep_at` is tracked separately so a snapshot that has only ever
 been refreshed incrementally is visible as such.

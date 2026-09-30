@@ -7,7 +7,7 @@ import { withTenantContext } from "@crm/db";
 import { SnapshotRefresher } from "./refresh.js";
 import { evaluateStaleness, readFreshness } from "./snapshot-store.js";
 
-const TENANT = "11111111-1111-4111-8111-111111111111";
+import { TENANT_SYNC as TENANT } from "@crm/db/testing";
 
 function pool(): Pool {
   return new Pool({

@@ -14,6 +14,9 @@
       "path": "./packages/sync"
     },
     {
+      "path": "./packages/territory"
+    },
+    {
       "path": "./packages/scheduler"
     }
   ]
