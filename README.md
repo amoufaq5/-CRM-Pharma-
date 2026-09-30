@@ -20,6 +20,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/acl/` | The anti-corruption layer: the ERP HTTP client, generated types, error normalisation, the `ChangeSource` seam. |
 | `packages/acl/schema/` | A captured `/v1/meta/schema`, so CI can check for drift without a live ERP. |
 | `packages/relay/` | The outbox relay: claim, dispatch, classify, settle. Multi-worker safe, with leases. |
+| `packages/sync/` | Snapshot refresh: strict coercion into typed columns, incremental + full sweep. |
 | `scripts/setup-test-db.sh` | Brings a database to the state the contract tests expect. |
 
 ## Running it
@@ -62,3 +63,13 @@ gates this in CI.
 filter and sort is a *text* comparison: `?total[gte]=1000` returns 999, and `?sort=amount`
 orders 100, 20, 9. Numeric filters, sorts and aggregations read the typed snapshot tables.
 Pinned by test, so it cannot quietly become folklore.
+
+Money stays a **string** all the way from the ERP into `NUMERIC`. float64 cannot represent
+`1234567890.12`, and a rounded price in a typed column reads as authoritative. A value that
+will not coerce rejects the record by name — it is never nulled, because a null price makes
+a product look free.
+
+**5. Snapshots need a periodic full sweep, not just incremental refresh.** The ERP keeps no
+tombstones, so polling `updated_at` can never observe a deletion. Only a full sweep
+reconciles; `last_full_sweep_at` is tracked separately so a snapshot that has only ever
+been refreshed incrementally is visible as such.
