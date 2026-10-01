@@ -1,4 +1,7 @@
 import {
+  addTarget,
+  approvePlan,
+  createPlan,
   cycleOn,
   listCycles,
   listPlanProducts,
@@ -7,10 +10,18 @@ import {
   planAdherence,
   planSummary,
   getPlan,
+  removeTarget,
+  returnPlanToDraft,
+  setPlanProducts,
+  submitPlan,
+  supersedePlan,
+  teamAdherence,
+  teamPlans,
+  withdrawPlan,
 } from "@crm/callplan";
 import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
 import { withTenantContext } from "@crm/db";
-import { visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
+import { canSupervise, teamRoster, visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
 import {
   appendNote,
   getVisit,
@@ -24,14 +35,23 @@ import {
 } from "@crm/visit";
 import {
   acceptTransfer,
+  cancelCount,
+  commitCount,
+  countLines,
   disburseSamples,
   enqueueErpMirror,
   expiringHoldings,
   getLot,
   holdingsFor,
   ledgerFor,
+  getCount,
+  listCounts,
+  openCount,
   outstandingTransfers,
   receiveSamples,
+  recordCountLine,
+  teamExpiringHoldings,
+  teamExposure,
   transferOut,
 } from "@crm/sample";
 import type { Pool, PoolClient } from "pg";
@@ -109,6 +129,39 @@ async function requireAccountAccess(
 }
 
 
+
+const PlanBody = z.object({
+  cycleId: UUID,
+  /** Omitted means "mine". A manager may build a plan for a rep they supervise. */
+  repProfileId: UUID.nullish(),
+});
+
+const TargetBody = z.object({
+  erpAccountId: ERP_ID,
+  erpContactId: ERP_ID.nullish(),
+  segment: z.string().min(1).max(32).nullish(),
+  targetCalls: z.number().int().min(1).max(100),
+  notes: z.string().max(2000).nullish(),
+});
+
+const PlanProductsBody = z.object({
+  products: z
+    .array(z.object({ erpItemId: ERP_ID, keyMessage: z.string().max(2000).nullish() }))
+    .max(50),
+});
+
+const CountBody = z.object({
+  /** Omitted means a self-count. A manager passes a rep to record a supervised one. */
+  repProfileId: UUID.nullish(),
+  countedAt: z.string().datetime(),
+  note: z.string().max(2000).nullish(),
+});
+
+const CountLineBody = z.object({
+  lotId: UUID,
+  countedQuantity: z.union([z.string().regex(/^\d{1,13}(\.\d{1,3})?$/), z.number().min(0)]),
+});
+
 const DisbursementBody = z.object({
   id: UUID,
   lotId: UUID,
@@ -168,19 +221,63 @@ async function recordDisbursement(
 }
 
 /**
- * Refuses a plan that is not the caller's.
+ * Refuses a plan the caller may neither own nor supervise.
  *
- * A 404 rather than a 403: whether a plan exists is itself information about another
- * rep's territory, and the ERP leaks exactly this kind of thing by having no row-level
- * scoping at all (report R2).
+ * A 404 rather than a 403, consistently for every record scoped this way: whether a
+ * plan exists is itself information about another rep's territory, and the ERP leaks
+ * exactly this class of thing by having no row-level scoping at all (report R2).
+ *
+ * The supervision check is `crm.rep_can_supervise`, which answers yes for the caller
+ * themselves — so this one helper covers "my plan" and "my team's plan" without the
+ * route having to know which it is holding.
  */
-async function requireOwnPlan(tx: PoolClient, p: Principal, planId: string): Promise<NonNullable<Awaited<ReturnType<typeof getPlan>>>> {
+async function requireVisiblePlan(
+  tx: PoolClient,
+  p: Principal,
+  planId: string,
+  on?: string,
+): Promise<NonNullable<Awaited<ReturnType<typeof getPlan>>>> {
   const plan = await getPlan(tx, planId);
-  if (plan === null || plan.rep_profile_id !== p.repProfileId) {
+  if (plan === null || !(await canSupervise(tx, p.repProfileId, plan.rep_profile_id, on))) {
     throw notFound(`no call plan ${planId}`);
   }
   return plan;
 }
+
+/**
+ * Refuses a rep the caller may not read, for a route that takes a rep id.
+ *
+ * Every team route goes through here. The predicate is in SQL (0019) and RLS does not
+ * help: a manager and a peer's rep are in the same tenant, so the policy admits both
+ * rows and this check is the only thing between them. A route that forgets it leaks.
+ */
+async function requireSupervision(tx: PoolClient, p: Principal, repProfileId: string, on?: string): Promise<void> {
+  if (!(await canSupervise(tx, p.repProfileId, repProfileId, on))) {
+    throw notFound(`no rep ${repProfileId} on your team`);
+  }
+}
+
+
+/**
+ * Refuses a count the caller may neither own nor supervise.
+ *
+ * The count belongs to the rep whose stock it counts, not to whoever performed it — so a
+ * manager who counted a rep's bag reaches it through supervision, and a rep reaches
+ * their own count the same way (`rep_can_supervise` answers yes for self).
+ */
+async function requireOwnOrSupervisedCount(
+  tx: PoolClient,
+  p: Principal,
+  countId: string,
+): Promise<NonNullable<Awaited<ReturnType<typeof getCount>>>> {
+  const count = await getCount(tx, countId);
+  if (count === null || !(await canSupervise(tx, p.repProfileId, count.rep_profile_id))) {
+    throw notFound(`no sample count ${countId}`);
+  }
+  return count;
+}
+
+const PLAN_STATUS = z.enum(["draft", "submitted", "approved", "superseded", "withdrawn"]);
 
 export function buildRouter(deps: HandlerDeps): Router<Principal> {
   const router = new Router<Principal>();
@@ -601,7 +698,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       const id = parse(UUID, ctx.params["id"]);
       const body = await inTenant(deps, ctx.principal, async (tx) => {
-        const plan = await requireOwnPlan(tx, ctx.principal, id);
+        const plan = await requireVisiblePlan(tx, ctx.principal, id);
         return {
           ...plan,
           targets: await listTargets(tx, id),
@@ -627,7 +724,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       const id = parse(UUID, ctx.params["id"]);
       const body = await inTenant(deps, ctx.principal, async (tx) => {
-        await requireOwnPlan(tx, ctx.principal, id);
+        await requireVisiblePlan(tx, ctx.principal, id);
         return { summary: await planSummary(tx, id), targets: await planAdherence(tx, id) };
       });
       return { status: 200, body };
@@ -827,6 +924,423 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
 
       const accepted = results.filter((r) => r.ok).length;
       return { status: 200, body: { accepted, rejected: results.length - accepted, results } };
+    },
+  });
+
+  // ---- call plan lifecycle -------------------------------------------------
+
+  /**
+   * Creates a plan, for the caller or for a rep they supervise.
+   *
+   * A manager building a plan for a new rep is the case four-eyes exists for: the plan
+   * is the rep's, the submission is the manager's, and the approval has to be someone
+   * else's again. All three are recorded separately for exactly that reason.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/call-plans",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const input = parse(PlanBody, ctx.body);
+      const p = ctx.principal;
+      const repProfileId = input.repProfileId ?? p.repProfileId;
+      const plan = await inTenant(deps, p, async (tx) => {
+        await requireSupervision(tx, p, repProfileId);
+        return createPlan(tx, p.tenantId, { cycleId: input.cycleId, repProfileId });
+      });
+      return { status: 201, body: plan };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/call-plans/:id/targets",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const planId = parse(UUID, ctx.params["id"]);
+      const input = parse(TargetBody, ctx.body);
+      const p = ctx.principal;
+      const target = await inTenant(deps, p, async (tx) => {
+        await requireVisiblePlan(tx, p, planId);
+        return addTarget(tx, p.tenantId, {
+          planId,
+          erpAccountId: input.erpAccountId,
+          targetCalls: input.targetCalls,
+          erpContactId: input.erpContactId ?? null,
+          segment: input.segment ?? null,
+          notes: input.notes ?? null,
+        });
+      });
+      return { status: 201, body: target };
+    },
+  });
+
+  router.add({
+    method: "DELETE",
+    pattern: "/v1/call-plans/:id/targets/:targetId",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const planId = parse(UUID, ctx.params["id"]);
+      const targetId = parse(UUID, ctx.params["targetId"]);
+      const p = ctx.principal;
+      const removed = await inTenant(deps, p, async (tx) => {
+        await requireVisiblePlan(tx, p, planId);
+        return removeTarget(tx, targetId);
+      });
+      if (!removed) throw notFound(`no target ${targetId}`);
+      return { status: 204 };
+    },
+  });
+
+  /** Replaces the product emphasis wholesale; positions come from the array order. */
+  router.add({
+    method: "PUT",
+    pattern: "/v1/call-plans/:id/products",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const planId = parse(UUID, ctx.params["id"]);
+      const { products } = parse(PlanProductsBody, ctx.body);
+      const p = ctx.principal;
+      const data = await inTenant(deps, p, async (tx) => {
+        await requireVisiblePlan(tx, p, planId);
+        return setPlanProducts(
+          tx,
+          p.tenantId,
+          planId,
+          products.map((pr) => ({ erpItemId: pr.erpItemId, keyMessage: pr.keyMessage ?? null })),
+        );
+      });
+      return { status: 200, body: { data } };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/call-plans/:id/submit",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const planId = parse(UUID, ctx.params["id"]);
+      const p = ctx.principal;
+      const plan = await inTenant(deps, p, async (tx) => {
+        await requireVisiblePlan(tx, p, planId);
+        return submitPlan(tx, planId, p.repProfileId);
+      });
+      return { status: 200, body: plan };
+    },
+  });
+
+  /**
+   * Approves a plan.
+   *
+   * Nothing is checked here beyond "may the caller see this plan" — the three rules that
+   * matter are in the database: the approver is not the rep (CHECK), not the submitter
+   * (CHECK), and manages a territory the rep is assigned to (trigger). Re-implementing
+   * them in the route would give the offline path and this one two different answers.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/call-plans/:id/approve",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const planId = parse(UUID, ctx.params["id"]);
+      const note = parse(z.object({ note: z.string().max(2000).nullish() }), ctx.body ?? {});
+      const p = ctx.principal;
+      const plan = await inTenant(deps, p, async (tx) => {
+        await requireVisiblePlan(tx, p, planId);
+        return approvePlan(tx, planId, p.repProfileId, { note: note.note ?? null });
+      });
+      return { status: 200, body: plan };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/call-plans/:id/return",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const planId = parse(UUID, ctx.params["id"]);
+      const p = ctx.principal;
+      const plan = await inTenant(deps, p, async (tx) => {
+        await requireVisiblePlan(tx, p, planId);
+        return returnPlanToDraft(tx, planId);
+      });
+      return { status: 200, body: plan };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/call-plans/:id/withdraw",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const planId = parse(UUID, ctx.params["id"]);
+      const p = ctx.principal;
+      const plan = await inTenant(deps, p, async (tx) => {
+        await requireVisiblePlan(tx, p, planId);
+        return withdrawPlan(tx, planId);
+      });
+      return { status: 200, body: plan };
+    },
+  });
+
+  /**
+   * The only way to change an approved plan. Both rows stay in the record.
+   *
+   * Deliberately NOT privileged: a rep may supersede their own approved plan. It
+   * destroys nothing — the original stays, with its approval intact, and the replacement
+   * is a draft that needs the same four-eyed approval again. What a rep cannot do is
+   * edit an approved plan or make one disappear, and neither becomes possible here.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/call-plans/:id/supersede",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const planId = parse(UUID, ctx.params["id"]);
+      const input = parse(z.object({ copyTargets: z.boolean().optional() }), ctx.body ?? {});
+      const p = ctx.principal;
+      const body = await inTenant(deps, p, async (tx) => {
+        await requireVisiblePlan(tx, p, planId);
+        return supersedePlan(tx, p.tenantId, planId, {
+          ...(input.copyTargets !== undefined ? { copyTargets: input.copyTargets } : {}),
+        });
+      });
+      return { status: 201, body };
+    },
+  });
+
+  // ---- cycle counts -------------------------------------------------------
+
+  /**
+   * Opens a count of a rep's bag.
+   *
+   * `countedBy` is always the caller and `repProfileId` defaults to them, so a
+   * self-count and a supervised one go through the same route and the difference stays
+   * visible in the data — which is what a reviewer needs, since a self-count is the
+   * weaker evidence.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/counts",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const input = parse(CountBody, ctx.body);
+      const p = ctx.principal;
+      const repProfileId = input.repProfileId ?? p.repProfileId;
+      const count = await inTenant(deps, p, async (tx) => {
+        await requireSupervision(tx, p, repProfileId);
+        return openCount(tx, p.tenantId, {
+          repProfileId,
+          countedBy: p.repProfileId,
+          countedAt: new Date(input.countedAt),
+          note: input.note ?? null,
+        });
+      });
+      return { status: 201, body: count };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/counts/:id/lines",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const countId = parse(UUID, ctx.params["id"]);
+      const input = parse(CountLineBody, ctx.body);
+      const p = ctx.principal;
+      const line = await inTenant(deps, p, async (tx) => {
+        await requireOwnOrSupervisedCount(tx, p, countId);
+        return recordCountLine(tx, p.tenantId, {
+          countId,
+          lotId: input.lotId,
+          countedQuantity: input.countedQuantity,
+        });
+      });
+      return { status: 201, body: line };
+    },
+  });
+
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/counts/:id",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const countId = parse(UUID, ctx.params["id"]);
+      const p = ctx.principal;
+      const body = await inTenant(deps, p, async (tx) => {
+        const count = await requireOwnOrSupervisedCount(tx, p, countId);
+        return { ...count, lines: await countLines(tx, countId) };
+      });
+      return { status: 200, body };
+    },
+  });
+
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/counts",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const rep = ctx.query.get("rep");
+      const p = ctx.principal;
+      const data = await inTenant(deps, p, async (tx) => {
+        const repProfileId = rep !== null ? parse(UUID, rep) : p.repProfileId;
+        await requireSupervision(tx, p, repProfileId);
+        return listCounts(tx, { repProfileId });
+      });
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Commits the count: one adjustment per variance, written through the ledger.
+   *
+   * Returns how many were written, because that number is the finding — a count that
+   * produced three adjustments is a different conversation from one that produced none.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/counts/:id/commit",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const countId = parse(UUID, ctx.params["id"]);
+      const p = ctx.principal;
+      const adjustments = await inTenant(deps, p, async (tx) => {
+        await requireOwnOrSupervisedCount(tx, p, countId);
+        return commitCount(tx, countId);
+      });
+      return { status: 200, body: { adjustments } };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/counts/:id/cancel",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const countId = parse(UUID, ctx.params["id"]);
+      const p = ctx.principal;
+      await inTenant(deps, p, async (tx) => {
+        await requireOwnOrSupervisedCount(tx, p, countId);
+        await cancelCount(tx, countId);
+      });
+      return { status: 204 };
+    },
+  });
+
+  // ---- manager views ------------------------------------------------------
+
+  /**
+   * The team roster.
+   *
+   * Empty for a rep with no manager assignment, which is the correct answer rather than
+   * a 403: "you supervise nobody" is a fact about the hierarchy, not a refusal.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, (tx) => teamRoster(tx, ctx.principal.repProfileId, on));
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * The team's plans — and with `?status=submitted`, the manager's approval queue.
+   *
+   * Scoped inside the SQL by `crm.managed_rep_ids`, not by filtering afterwards on a
+   * rep id the caller supplied: a `?rep=` the route forgets to check is one `AND` away
+   * from a peer's plans.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team/call-plans",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const cycle = ctx.query.get("cycle");
+      const status = ctx.query.get("status");
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        teamPlans(tx, ctx.principal.repProfileId, {
+          ...(cycle !== null ? { cycleId: parse(UUID, cycle) } : {}),
+          ...(status !== null ? { status: parse(PLAN_STATUS, status) } : {}),
+          ...(on !== undefined ? { on } : {}),
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * The territory review: one row per rep for one cycle.
+   *
+   * A rep with no plan appears with nulls rather than being left out — "who has not got
+   * a plan" is the first question this screen is opened to answer.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team/adherence",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const cycle = ctx.query.get("cycle");
+      if (cycle === null) throw validationFailed("a cycle is required", { cycle: "required" });
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        teamAdherence(tx, ctx.principal.repProfileId, parse(UUID, cycle), on),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /** Expiring stock across the team — the compliance screen. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team/samples/expiring",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const within = ctx.query.get("withinDays");
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        teamExpiringHoldings(tx, ctx.principal.repProfileId, {
+          ...(within !== null ? { withinDays: parse(z.coerce.number().int().min(0).max(1000), within) } : {}),
+          ...(on !== undefined ? { asOf: on } : {}),
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Custody exposure per rep, ordered by whose bag has gone longest without a count.
+   *
+   * The count document only earns its keep if someone can see whose count is overdue;
+   * a rep never counted sorts first, ahead of one counted long ago.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team/samples/exposure",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        teamExposure(tx, ctx.principal.repProfileId, { ...(on !== undefined ? { asOf: on } : {}) }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /** One rep's custody ledger, for an audit. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team/samples/ledger",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const rep = ctx.query.get("rep");
+      if (rep === null) throw validationFailed("a rep is required", { rep: "required" });
+      const p = ctx.principal;
+      const data = await inTenant(deps, p, async (tx) => {
+        const repProfileId = parse(UUID, rep);
+        await requireSupervision(tx, p, repProfileId, onDate(ctx));
+        return ledgerFor(tx, { repProfileId });
+      });
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /** One rep's visits, for an activity review. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team/visits",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const rep = ctx.query.get("rep");
+      if (rep === null) throw validationFailed("a rep is required", { rep: "required" });
+      const p = ctx.principal;
+      const data = await inTenant(deps, p, async (tx) => {
+        const repProfileId = parse(UUID, rep);
+        await requireSupervision(tx, p, repProfileId, onDate(ctx));
+        return listVisits(tx, { repProfileId, limit: 200 });
+      });
+      return { status: 200, body: { data } };
     },
   });
 

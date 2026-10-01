@@ -22,3 +22,9 @@ export {
   type Territory,
   type TerritoryAssignment,
 } from "./store.js";
+export {
+  canSupervise,
+  managedRepIds,
+  teamRoster,
+  type TeamMember,
+} from "./supervision.js";

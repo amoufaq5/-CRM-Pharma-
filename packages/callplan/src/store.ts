@@ -438,3 +438,67 @@ export async function planSummary(tx: PoolClient, planId: string): Promise<PlanS
   const { rows } = await tx.query<PlanSummary>(`SELECT * FROM crm.call_plan_summary($1)`, [planId]);
   return rows[0]!;
 }
+
+export interface TeamAdherenceRow {
+  readonly rep_profile_id: string;
+  readonly display_name: string;
+  readonly employee_number: string;
+  /** Null when the rep has no live plan for this cycle — the row still appears. */
+  readonly call_plan_id: string | null;
+  readonly plan_status: CallPlanStatus | null;
+  readonly targets: number | null;
+  readonly targets_met: number | null;
+  readonly targets_touched: number | null;
+  readonly planned_calls: number | null;
+  readonly actual_calls: number | null;
+  readonly coverage_pct: string | null;
+  readonly attainment_pct: string | null;
+}
+
+/**
+ * The territory review: one row per supervised rep for one cycle.
+ *
+ * A rep with no plan appears with nulls rather than being omitted. "Who has not got a
+ * plan this cycle" is the first question this screen is opened to answer, and an inner
+ * join would answer it by hiding them — the team would look fully covered because the
+ * gaps were not in the result set.
+ */
+export async function teamAdherence(
+  tx: PoolClient,
+  managerRepProfileId: string,
+  cycleId: string,
+  on?: string,
+): Promise<readonly TeamAdherenceRow[]> {
+  const { rows } = await tx.query<TeamAdherenceRow>(
+    `SELECT * FROM crm.cycle_team_adherence($1, $2, COALESCE($3::date, CURRENT_DATE))`,
+    [managerRepProfileId, cycleId, on ?? null],
+  );
+  return rows;
+}
+
+/**
+ * Plans belonging to a manager's team, newest first.
+ *
+ * Scoped by `crm.managed_rep_ids` in SQL rather than by a rep id the caller supplies:
+ * a `?rep=` parameter the route filters on afterwards is one forgotten `AND` away from
+ * reading a peer's plans.
+ */
+export async function teamPlans(
+  tx: PoolClient,
+  managerRepProfileId: string,
+  opts: { cycleId?: string; status?: CallPlanStatus; on?: string } = {},
+): Promise<ReadonlyArray<CallPlan & { readonly display_name: string }>> {
+  const { rows } = await tx.query<CallPlan & { display_name: string }>(
+    `SELECT ${PLAN_COLUMNS.split(", ").map((c) => `cp.${c}`).join(", ")}, rp.display_name
+       FROM crm.call_plan cp
+       JOIN crm.rep_profile rp ON rp.id = cp.rep_profile_id
+      WHERE cp.rep_profile_id IN (
+              SELECT rep_profile_id FROM crm.managed_rep_ids($1, COALESCE($4::date, CURRENT_DATE))
+            )
+        AND ($2::uuid IS NULL OR cp.cycle_id = $2)
+        AND ($3::text IS NULL OR cp.status = $3)
+      ORDER BY cp.created_at DESC`,
+    [managerRepProfileId, opts.cycleId ?? null, opts.status ?? null, opts.on ?? null],
+  );
+  return rows;
+}

@@ -44,6 +44,8 @@ describe("the API, end to end", () => {
   let baseUrl = "";
   let rep = "";
   let otherRep = "";
+  let manager = "";
+  let region = "";
   let auh = "";
   let dxb = "";
 
@@ -101,20 +103,26 @@ describe("the API, end to end", () => {
     await withTenantContext(admin, TENANT, async (tx) => {
       const reps = await tx.query<{ id: string }>(
         `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name, erp_employee_id)
-         VALUES ($1,'idp|rep1','E1','Rep One','rec_e1'), ($1,'idp|rep2','E2','Rep Two',NULL)
+         VALUES ($1,'idp|rep1','E1','Rep One','rec_e1'), ($1,'idp|rep2','E2','Rep Two',NULL),
+                ($1,'idp|mgr','E3','The Manager',NULL)
          RETURNING id`,
         [TENANT],
       );
-      [rep, otherRep] = reps.rows.map((r) => r.id) as [string, string];
+      [rep, otherRep, manager] = reps.rows.map((r) => r.id) as [string, string, string];
+      // A region above both territories, so the manager reaches both reps through the
+      // hierarchy rather than by being assigned to each.
       const terrs = await tx.query<{ id: string }>(
-        `INSERT INTO crm.territory (tenant_id, code, name) VALUES ($1,'AUH','Abu Dhabi'), ($1,'DXB','Dubai') RETURNING id`,
+        `INSERT INTO crm.territory (tenant_id, code, name)
+         VALUES ($1,'GULF','Gulf region'), ($1,'AUH','Abu Dhabi'), ($1,'DXB','Dubai') RETURNING id`,
         [TENANT],
       );
-      [auh, dxb] = terrs.rows.map((r) => r.id) as [string, string];
+      [region, auh, dxb] = terrs.rows.map((r) => r.id) as [string, string, string];
+      await tx.query("UPDATE crm.territory SET parent_id = $1 WHERE id IN ($2,$3)", [region, auh, dxb]);
       await tx.query(
-        `INSERT INTO crm.territory_assignment (tenant_id, territory_id, rep_profile_id, valid_from)
-         VALUES ($1,$2,$3,'2026-01-01'), ($1,$4,$5,'2026-01-01')`,
-        [TENANT, auh, rep, dxb, otherRep],
+        `INSERT INTO crm.territory_assignment (tenant_id, territory_id, rep_profile_id, role, valid_from)
+         VALUES ($1,$2,$3,'primary','2026-01-01'), ($1,$4,$5,'primary','2026-01-01'),
+                ($1,$6,$7,'manager','2026-01-01')`,
+        [TENANT, auh, rep, dxb, otherRep, region, manager],
       );
       await tx.query(
         `INSERT INTO crm.account_assignment (tenant_id, erp_account_id, territory_id, valid_from)
@@ -759,6 +767,402 @@ describe("the API, end to end", () => {
       const res = await call("GET", "/v1/samples/ledger");
       expect(res.status).toBe(200);
       expect(res.body.data[0].kind).toBe("receipt");
+    });
+  });
+
+  describe("the call plan lifecycle over HTTP", () => {
+    let cycleId = "";
+
+    const aCycle = async (): Promise<string> => {
+      let id = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const c = await tx.query<{ id: string }>(
+          `INSERT INTO crm.cycle (tenant_id, code, name, starts_on, ends_on, status)
+           VALUES ($1,'LC','Lifecycle','2026-10-01','2026-12-31','active') RETURNING id`,
+          [TENANT],
+        );
+        id = c.rows[0]!.id;
+      });
+      return id;
+    };
+
+    const mgr = (): string => token({ sub: "idp|mgr", tenant: TENANT });
+
+    beforeEach(async () => {
+      cycleId = await aCycle();
+    });
+
+    it("runs draft → submitted → approved, with the manager approving", async () => {
+      const created = await call("POST", "/v1/call-plans", { body: { cycleId } });
+      expect(created.status).toBe(201);
+      const planId = created.body.id as string;
+
+      const target = await call("POST", `/v1/call-plans/${planId}/targets`, {
+        body: { erpAccountId: "acct_auh", targetCalls: 2, segment: "A" },
+      });
+      expect(target.status).toBe(201);
+
+      const products = await call("PUT", `/v1/call-plans/${planId}/products`, {
+        body: { products: [{ erpItemId: "rec_i1", keyMessage: "first line" }, { erpItemId: "rec_i2" }] },
+      });
+      expect(products.status).toBe(200);
+      // Positions come from the array order, so a gap or a duplicate is inexpressible.
+      expect(products.body.data.map((pr: { position: number }) => pr.position)).toEqual([1, 2]);
+
+      expect((await call("POST", `/v1/call-plans/${planId}/submit`, { body: {} })).body.status).toBe("submitted");
+
+      // The rep cannot approve their own plan — four-eyes, enforced in the schema.
+      const selfApprove = await call("POST", `/v1/call-plans/${planId}/approve`, { body: {} });
+      expect(selfApprove.status).toBe(403);
+
+      const approved = await call("POST", `/v1/call-plans/${planId}/approve`, {
+        auth: mgr(),
+        body: { note: "agreed" },
+      });
+      expect(approved.status).toBe(200);
+      expect(approved.body.approved_by).toBe(manager);
+    });
+
+    /**
+     * A peer rep is refused by `crm.rep_can_supervise`, before any lifecycle rule runs.
+     * Without it the database would still refuse on four-eyes grounds, but only because
+     * the approver happened not to be the submitter — which is not the same guarantee.
+     */
+    it("refuses a peer rep's approval with a 404, not a lifecycle error", async () => {
+      const planId = (await call("POST", "/v1/call-plans", { body: { cycleId } })).body.id as string;
+      await call("POST", `/v1/call-plans/${planId}/submit`, { body: {} });
+      const res = await call("POST", `/v1/call-plans/${planId}/approve`, {
+        auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        body: {},
+      });
+      expect(res.status).toBe(404);
+    });
+
+    it("lets a manager build a plan for a rep they supervise", async () => {
+      const created = await call("POST", "/v1/call-plans", {
+        auth: mgr(),
+        body: { cycleId, repProfileId: rep },
+      });
+      expect(created.status).toBe(201);
+      expect(created.body.rep_profile_id).toBe(rep);
+
+      // The manager submitted it, so the approval must come from someone else again.
+      const planId = created.body.id as string;
+      await call("POST", `/v1/call-plans/${planId}/submit`, { auth: mgr(), body: {} });
+      const res = await call("POST", `/v1/call-plans/${planId}/approve`, { auth: mgr(), body: {} });
+      expect(res.status).toBe(403);
+    });
+
+    it("refuses building a plan for a rep the caller does not supervise", async () => {
+      const res = await call("POST", "/v1/call-plans", { body: { cycleId, repProfileId: otherRep } });
+      expect(res.status).toBe(404);
+    });
+
+    it("refuses editing an approved plan, and supersedes instead", async () => {
+      const planId = (await call("POST", "/v1/call-plans", { body: { cycleId } })).body.id as string;
+      await call("POST", `/v1/call-plans/${planId}/targets`, {
+        body: { erpAccountId: "acct_auh", targetCalls: 2 },
+      });
+      await call("POST", `/v1/call-plans/${planId}/submit`, { body: {} });
+      await call("POST", `/v1/call-plans/${planId}/approve`, { auth: mgr(), body: {} });
+
+      const frozen = await call("POST", `/v1/call-plans/${planId}/targets`, {
+        body: { erpAccountId: "acct_auh", targetCalls: 3 },
+      });
+      expect(frozen.status).toBe(409);
+      expect(frozen.body.type).toContain("/errors/plan-final");
+
+      const superseded = await call("POST", `/v1/call-plans/${planId}/supersede`, { body: {} });
+      expect(superseded.status).toBe(201);
+      expect(superseded.body.replacement.revision).toBe(2);
+      // The replacement inherited the target and is editable again.
+      const replacement = superseded.body.replacement.id as string;
+      expect((await call("GET", `/v1/call-plans/${replacement}`)).body.targets).toHaveLength(1);
+      expect(
+        (await call("DELETE", `/v1/call-plans/${replacement}/targets/${
+          (await call("GET", `/v1/call-plans/${replacement}`)).body.targets[0].id
+        }`)).status,
+      ).toBe(204);
+    });
+
+    it("sends a submitted plan back for rework", async () => {
+      const planId = (await call("POST", "/v1/call-plans", { body: { cycleId } })).body.id as string;
+      await call("POST", `/v1/call-plans/${planId}/submit`, { body: {} });
+      const returned = await call("POST", `/v1/call-plans/${planId}/return`, { auth: mgr(), body: {} });
+      expect(returned.body.status).toBe("draft");
+      expect((await call("POST", `/v1/call-plans/${planId}/withdraw`, { body: {} })).body.status).toBe("withdrawn");
+    });
+  });
+
+  describe("manager views", () => {
+    const mgr = (): string => token({ sub: "idp|mgr", tenant: TENANT });
+
+    const aPlanFor = async (repId: string, cycleId: string): Promise<string> => {
+      let id = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const pl = await tx.query<{ id: string }>(
+          `INSERT INTO crm.call_plan (tenant_id, cycle_id, rep_profile_id) VALUES ($1,$2,$3) RETURNING id`,
+          [TENANT, cycleId, repId],
+        );
+        id = pl.rows[0]!.id;
+      });
+      return id;
+    };
+
+    const aCycle = async (): Promise<string> => {
+      let id = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const c = await tx.query<{ id: string }>(
+          `INSERT INTO crm.cycle (tenant_id, code, name, starts_on, ends_on, status)
+           VALUES ($1,'MV','Manager view','2026-10-01','2026-12-31','active') RETURNING id`,
+          [TENANT],
+        );
+        id = c.rows[0]!.id;
+      });
+      return id;
+    };
+
+    it("lists the team through the hierarchy", async () => {
+      const res = await call("GET", "/v1/team", { auth: mgr() });
+      expect(res.status).toBe(200);
+      expect(res.body.data.map((m: { rep_profile_id: string }) => m.rep_profile_id).sort()).toEqual(
+        [rep, otherRep].sort(),
+      );
+      expect(res.body.data[0].territory_codes).toBeInstanceOf(Array);
+    });
+
+    /**
+     * "You supervise nobody" is a fact about the hierarchy, not a refusal — so an
+     * ordinary rep gets an empty list rather than a 403, and nothing about anyone else's
+     * team leaks either way.
+     */
+    it("returns an empty team for a rep who manages nobody", async () => {
+      const res = await call("GET", "/v1/team");
+      expect(res.status).toBe(200);
+      expect(res.body.data).toEqual([]);
+    });
+
+    it("shows the team's plans and filters to the approval queue", async () => {
+      const cycleId = await aCycle();
+      const planA = await aPlanFor(rep, cycleId);
+      await aPlanFor(otherRep, cycleId);
+
+      const all = await call("GET", `/v1/team/call-plans?cycle=${cycleId}`, { auth: mgr() });
+      expect(all.body.data).toHaveLength(2);
+      expect(all.body.data[0].display_name).toBeTypeOf("string");
+
+      await withTenantContext(admin, TENANT, async (tx) => {
+        await tx.query(
+          "UPDATE crm.call_plan SET status='submitted', submitted_by=$2, submitted_at=now() WHERE id=$1",
+          [planA, rep],
+        );
+      });
+      const queue = await call("GET", `/v1/team/call-plans?cycle=${cycleId}&status=submitted`, { auth: mgr() });
+      expect(queue.body.data.map((pl: { id: string }) => pl.id)).toEqual([planA]);
+    });
+
+    it("gives a rep no team plans at all", async () => {
+      const cycleId = await aCycle();
+      await aPlanFor(otherRep, cycleId);
+      expect((await call("GET", `/v1/team/call-plans?cycle=${cycleId}`)).body.data).toEqual([]);
+    });
+
+    /**
+     * The row with nulls is the point. "Who has not got a plan this cycle" is the first
+     * question a territory review asks, and omitting those reps would answer it by
+     * making the team look fully covered.
+     */
+    it("rolls adherence up per rep, including a rep with no plan", async () => {
+      const cycleId = await aCycle();
+      const planA = await aPlanFor(rep, cycleId);
+      await withTenantContext(admin, TENANT, async (tx) => {
+        await tx.query(
+          `INSERT INTO crm.call_plan_target (tenant_id, call_plan_id, erp_account_id, target_calls)
+           VALUES ($1,$2,'acct_auh',2)`,
+          [TENANT, planA],
+        );
+        await tx.query(
+          `INSERT INTO crm.visit (id, tenant_id, rep_profile_id, erp_account_id, status, occurred_at)
+           VALUES (gen_random_uuid(),$1,$2,'acct_auh','completed','2026-10-05T09:00:00Z')`,
+          [TENANT, rep],
+        );
+      });
+
+      const res = await call("GET", `/v1/team/adherence?cycle=${cycleId}`, { auth: mgr() });
+      expect(res.status).toBe(200);
+      expect(res.body.data).toHaveLength(2);
+
+      const withPlan = res.body.data.find((r: { rep_profile_id: string }) => r.rep_profile_id === rep);
+      expect(withPlan.actual_calls).toBe(1);
+      expect(withPlan.attainment_pct).toBe("50.0");
+
+      const withoutPlan = res.body.data.find((r: { rep_profile_id: string }) => r.rep_profile_id === otherRep);
+      expect(withoutPlan.call_plan_id).toBeNull();
+      expect(withoutPlan.targets).toBeNull();
+    });
+
+    it("requires a cycle for the adherence rollup rather than guessing one", async () => {
+      const res = await call("GET", "/v1/team/adherence", { auth: mgr() });
+      expect(res.status).toBe(422);
+      expect(res.body.errors.cycle).toBe("required");
+    });
+
+    describe("custody oversight", () => {
+      const stock = async (repId: string, expiry: string, qty: number): Promise<void> => {
+        await withTenantContext(admin, TENANT, async (tx) => {
+          const lot = await tx.query<{ id: string }>(
+            `INSERT INTO crm.sample_lot (tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+             VALUES ($1,'rec_i1',$2,$3,'drug_sample') RETURNING id`,
+            [TENANT, `LOT-${repId.slice(0, 8)}-${expiry}`, expiry],
+          );
+          await tx.query(
+            `INSERT INTO crm.sample_transaction
+               (id, tenant_id, lot_id, rep_profile_id, kind, quantity, erp_warehouse_id, occurred_at)
+             VALUES (gen_random_uuid(),$1,$2,$3,'receipt',$4,'rec_wh1','2026-10-01T08:00:00Z')`,
+            [TENANT, lot.rows[0]!.id, repId, qty],
+          );
+        });
+      };
+
+      it("reports expiring stock across the whole team", async () => {
+        await stock(rep, "2026-11-15", 5);
+        await stock(otherRep, "2026-11-20", 3);
+        await stock(rep, "2027-11-20", 9);
+
+        const res = await call("GET", "/v1/team/samples/expiring?withinDays=60&on=2026-10-01", { auth: mgr() });
+        expect(res.status).toBe(200);
+        expect(res.body.data).toHaveLength(2);
+        // Soonest first, and each row names the rep holding it.
+        expect(res.body.data[0].expiry_date).toBe("2026-11-15");
+        expect(res.body.data[0].display_name).toBeTypeOf("string");
+      });
+
+      it("gives a rep only their own expiring stock through the team route", async () => {
+        await stock(otherRep, "2026-11-20", 3);
+        expect((await call("GET", "/v1/team/samples/expiring?on=2026-10-01")).body.data).toEqual([]);
+      });
+
+      /**
+       * Ordered by whose bag has gone longest without a count, nulls first: the count
+       * document only earns its keep if someone can see whose count is overdue.
+       */
+      it("reports exposure per rep, uncounted first", async () => {
+        await stock(rep, "2026-11-15", 5);
+        await stock(otherRep, "2026-12-15", 7);
+        await withTenantContext(admin, TENANT, async (tx) => {
+          await tx.query("UPDATE crm.sample_holding SET last_counted_at = now() WHERE rep_profile_id = $1", [rep]);
+        });
+
+        const res = await call("GET", "/v1/team/samples/exposure?on=2026-10-01", { auth: mgr() });
+        expect(res.status).toBe(200);
+        expect(res.body.data).toHaveLength(2);
+        expect(res.body.data[0].rep_profile_id).toBe(otherRep);
+        expect(res.body.data[0].last_counted_at).toBeNull();
+        expect(res.body.data[0].units_on_hand).toBe("7.000");
+        expect(res.body.data[1].last_counted_at).not.toBeNull();
+      });
+
+      it("shows one rep's custody ledger to their manager and to nobody else", async () => {
+        await stock(rep, "2026-11-15", 5);
+        const ok = await call("GET", `/v1/team/samples/ledger?rep=${rep}`, { auth: mgr() });
+        expect(ok.status).toBe(200);
+        expect(ok.body.data[0].kind).toBe("receipt");
+
+        const peer = await call("GET", `/v1/team/samples/ledger?rep=${rep}`, {
+          auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        });
+        expect(peer.status).toBe(404);
+      });
+
+      it("shows one rep's visits to their manager", async () => {
+        await withTenantContext(admin, TENANT, async (tx) => {
+          await tx.query(
+            `INSERT INTO crm.visit (id, tenant_id, rep_profile_id, erp_account_id, status, occurred_at)
+             VALUES (gen_random_uuid(),$1,$2,'acct_auh','completed','2026-10-05T09:00:00Z')`,
+            [TENANT, rep],
+          );
+        });
+        const res = await call("GET", `/v1/team/visits?rep=${rep}`, { auth: mgr() });
+        expect(res.status).toBe(200);
+        expect(res.body.data).toHaveLength(1);
+        expect((await call("GET", `/v1/team/visits?rep=${rep}`, { auth: token({ sub: "idp|rep2", tenant: TENANT }) })).status).toBe(404);
+      });
+    });
+
+    describe("supervised cycle counts", () => {
+      it("records a manager's count of a rep's bag and commits the variance", async () => {
+        let lotId = "";
+        await withTenantContext(admin, TENANT, async (tx) => {
+          const lot = await tx.query<{ id: string }>(
+            `INSERT INTO crm.sample_lot (tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+             VALUES ($1,'rec_i1','LOT-COUNT','2027-12-31','drug_sample') RETURNING id`,
+            [TENANT],
+          );
+          lotId = lot.rows[0]!.id;
+          await tx.query(
+            `INSERT INTO crm.sample_transaction
+               (id, tenant_id, lot_id, rep_profile_id, kind, quantity, erp_warehouse_id, occurred_at)
+             VALUES (gen_random_uuid(),$1,$2,$3,'receipt',20,'rec_wh1','2026-10-01T08:00:00Z')`,
+            [TENANT, lotId, rep],
+          );
+        });
+
+        const count = await call("POST", "/v1/samples/counts", {
+          auth: mgr(),
+          body: { repProfileId: rep, countedAt: "2026-10-20T09:00:00.000Z", note: "supervised" },
+        });
+        expect(count.status).toBe(201);
+        // The difference between a self-count and a supervised one stays in the data,
+        // because a self-count is the weaker evidence.
+        expect(count.body.counted_by).toBe(manager);
+        expect(count.body.rep_profile_id).toBe(rep);
+
+        const countId = count.body.id as string;
+        const line = await call("POST", `/v1/samples/counts/${countId}/lines`, {
+          auth: mgr(),
+          body: { lotId, countedQuantity: 17 },
+        });
+        expect(line.body.expected_quantity).toBe("20.000");
+
+        const detail = await call("GET", `/v1/samples/counts/${countId}`, { auth: mgr() });
+        expect(detail.body.lines[0].variance).toBe("-3.000");
+
+        const committed = await call("POST", `/v1/samples/counts/${countId}/commit`, { auth: mgr(), body: {} });
+        expect(committed.body.adjustments).toBe(1);
+
+        // The balance moved through the ledger, not by an edit.
+        const ledger = await call("GET", `/v1/team/samples/ledger?rep=${rep}`, { auth: mgr() });
+        expect(ledger.body.data[0].kind).toBe("adjustment_out");
+        expect(ledger.body.data[0].reason).toMatch(/cycle count/);
+      });
+
+      it("refuses to count a rep the caller does not supervise", async () => {
+        const res = await call("POST", "/v1/samples/counts", {
+          body: { repProfileId: otherRep, countedAt: "2026-10-20T09:00:00.000Z" },
+        });
+        expect(res.status).toBe(404);
+      });
+
+      it("lets a rep open a self-count, recorded as such", async () => {
+        const res = await call("POST", "/v1/samples/counts", {
+          body: { countedAt: "2026-10-20T09:00:00.000Z" },
+        });
+        expect(res.status).toBe(201);
+        expect(res.body.rep_profile_id).toBe(rep);
+        expect(res.body.counted_by).toBe(rep);
+        expect((await call("POST", `/v1/samples/counts/${res.body.id as string}/cancel`, { body: {} })).status).toBe(204);
+      });
+
+      it("hides a count of someone else's bag behind a 404", async () => {
+        const count = await call("POST", "/v1/samples/counts", {
+          auth: mgr(),
+          body: { repProfileId: rep, countedAt: "2026-10-20T09:00:00.000Z" },
+        });
+        const res = await call("GET", `/v1/samples/counts/${count.body.id as string}`, {
+          auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        });
+        expect(res.status).toBe(404);
+      });
     });
   });
 

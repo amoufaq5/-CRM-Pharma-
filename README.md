@@ -22,7 +22,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/relay/` | The outbox relay: claim, dispatch, classify, settle. Multi-worker safe, with leases. |
 | `packages/sync/` | Snapshot refresh: strict coercion into typed columns, incremental + full sweep. |
 | `packages/scheduler/` | The background process. Drives the relay and the refresher per tenant, on a timer. |
-| `packages/territory/` | Territories, rep assignment, and the row-level scoping the ERP cannot do. |
+| `packages/territory/` | Territories, rep assignment, supervision, and the row-level scoping the ERP cannot do. |
 | `packages/visit/` | Visits and detailing lines. Offline-first, territory-scoped, immutable once final. |
 | `packages/api/` | The HTTP API. JWT auth, one error shape, territory-scoped on every read. |
 | `packages/credential/` | The ERP service credential: Ed25519 signing, the JWKS, the key lifecycle, per-tenant roles. |
@@ -77,6 +77,16 @@ authorisation on its own.
 | `POST /v1/samples/transfers/:id/accept` | the receiving rep accepts |
 | `GET /v1/samples/ledger` | the append-only custody log |
 | `POST /v1/sync/disbursements` | offline flush, **per-row** results |
+| `POST /v1/call-plans` | create, for self or a supervised rep; then `/targets`, `/products` |
+| `POST /v1/call-plans/:id/{submit,approve,return,withdraw,supersede}` | the lifecycle |
+| `POST /v1/samples/counts` | open a count — self or supervised; then `/lines`, `/commit` |
+| `GET /v1/team` | the roster, through the territory hierarchy |
+| `GET /v1/team/call-plans` | the team's plans; `?status=submitted` is the approval queue |
+| `GET /v1/team/adherence` | the territory review: one row per rep, **including reps with no plan** |
+| `GET /v1/team/samples/exposure` | what each rep holds, ordered by whose count is most overdue |
+| `GET /v1/team/samples/expiring` | expiring stock across the team |
+| `GET /v1/team/samples/ledger` | one rep's custody log, for an audit |
+| `GET /v1/team/visits` | one rep's activity |
 
 Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
 emits two on the same API, and a client that handles only one misreads the other.
@@ -256,3 +266,25 @@ eyes says "someone else", the territory hierarchy says "the right someone else".
 all"; attainment is "did we call as often as we said", capped per target. Reporting only the
 second is how a field force looks fully compliant while a third of its customers were never
 seen.
+
+**19. "Whose data may I read?" has one definition, in SQL.** `crm.rep_can_supervise`
+answers it for every team route. RLS is no help — a manager and a peer's rep are in the
+same tenant, so the policy admits both rows and this predicate is the only thing between
+them. A route that forgets it leaks; a route that uses it cannot. Scoping happens *inside*
+the query, never by filtering afterwards on a rep id the caller supplied.
+
+**20. Supervision follows the hierarchy, not co-location, and it is dated.** A rep
+assigned `primary` to the same territory as another is a colleague, not a supervisor.
+And a manager who took over a district in October supervises whoever held its territories
+on the date asked about — which is what makes last quarter's numbers readable after
+anyone changes job.
+
+**21. "My team" excludes me; "may I read this" includes me.** Two functions, each named
+for the question it answers. A manager in their own roster makes every count off by one;
+a manager who cannot read their own records is absurd. Collapsing them into one would
+force every caller to remember which semantics it had.
+
+**22. A rep with no plan appears in the rollup, with nulls.** "Who has not got a plan
+this cycle" is the first question a territory review asks, and an inner join would answer
+it by omitting them — the team would look fully covered because the gaps were not in the
+result set.

@@ -523,7 +523,7 @@ blocked. Order matters for the reasons given, not for missing inputs.
    full rebuild exercised in CI. These are the read path, not an optimisation (item 8) —
    every numeric filter and sort in the product depends on them, because the ERP cannot
    answer one correctly (R19).
-7. Only then: visits, call plans, sample custody, offline sync. **All built** (migrations 0012–0018).
+7. Only then: visits, call plans, sample custody, offline sync. **All built** (migrations 0012–0019), with the manager-facing views over them.
 
 **API details that will bite** (all evidenced in the report):
 
@@ -583,7 +583,7 @@ reasoning behind each constrains what follows.
 | A transfer that is never accepted leaves material in `quantity_in_transit` indefinitely. It stays visible (`GET /v1/samples/transfers`) and accounted for, but there is no recall or timeout — the sender cannot take it back, and an adjustment only touches `quantity_on_hand`. | Product | _set a date_ |
 | Signature images have nowhere to live. `signature_sha256` commits to what the device captured; the blob needs the object storage report §13 records as absent. Until then a disbursement says a signature was taken and fixes which one, without being able to produce it. | Product | _set a date_ |
 | Controlled substances are flagged (`sample_lot.controlled`) and not otherwise handled. Unit-level serial custody is a stricter obligation than this schema discharges. | Compliance | _set a date_ |
-| A manager cannot read their team's plans or holdings over HTTP. Every route is scoped to the caller; `crm.managed_territory_ids` answers the supervisory question in SQL and no route asks it yet. | Product | _set a date_ |
+| Two outbox rows enqueued in ONE transaction have no deterministic order: `created_at` defaults to `now()`, which is the transaction timestamp, so both carry the same value to the microsecond. The relay copes — a transition that reaches the ERP before its create is classified `retry_ordering` and retried — so this is a latent inefficiency rather than a defect. A `BIGSERIAL` on `crm.outbox` would remove it. Found by a test that assumed a sequence the table does not provide. | Platform | _set a date_ |
 | Nothing writes off expired stock automatically. `crm.expiring_sample_holdings` is the query a nightly job would act on and the scheduler has no job for it, so expired material leaves a rep's balance only when someone does it by hand. | Product | _set a date_ |
 
 > The deadlines in the original table (8–26 September) all lapsed before the answers came

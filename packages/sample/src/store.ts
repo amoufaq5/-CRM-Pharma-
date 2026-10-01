@@ -517,3 +517,98 @@ export async function getCount(tx: PoolClient, countId: string): Promise<SampleC
   );
   return rows[0] ?? null;
 }
+
+export interface TeamExpiringHolding extends ExpiringHolding {
+  readonly display_name: string;
+}
+
+export interface TeamExposure {
+  readonly rep_profile_id: string;
+  readonly display_name: string;
+  readonly lots_held: number;
+  readonly units_on_hand: string;
+  readonly units_in_transit: string;
+  readonly earliest_expiry: string | null;
+  readonly expired_lots: number;
+  /** Null means never counted — a stronger finding than an old date. */
+  readonly last_counted_at: Date | null;
+}
+
+/** Expiring stock across a manager's team. Scoped in SQL by `crm.managed_rep_ids`. */
+export async function teamExpiringHoldings(
+  tx: PoolClient,
+  managerRepProfileId: string,
+  opts: { withinDays?: number; asOf?: string } = {},
+): Promise<readonly TeamExpiringHolding[]> {
+  const { rows } = await tx.query<TeamExpiringHolding>(
+    `SELECT rep_profile_id, display_name, lot_id, erp_item_id, lot_number,
+            expiry_date::text AS expiry_date, days_remaining,
+            quantity_on_hand::text AS quantity_on_hand
+       FROM crm.team_expiring_holdings($1, $2, COALESCE($3::date, CURRENT_DATE))`,
+    [managerRepProfileId, opts.withinDays ?? 60, opts.asOf ?? null],
+  );
+  return rows;
+}
+
+/**
+ * Custody exposure per rep: what they hold, what is expired, and when their bag was
+ * last counted.
+ *
+ * Ordered by `last_counted_at` with nulls first, so whoever has never been counted is
+ * at the top rather than sorted as though they were counted long ago.
+ */
+export async function teamExposure(
+  tx: PoolClient,
+  managerRepProfileId: string,
+  opts: { asOf?: string } = {},
+): Promise<readonly TeamExposure[]> {
+  const { rows } = await tx.query<TeamExposure>(
+    `SELECT rep_profile_id, display_name, lots_held,
+            units_on_hand::text AS units_on_hand,
+            units_in_transit::text AS units_in_transit,
+            earliest_expiry::text AS earliest_expiry,
+            expired_lots, last_counted_at
+       FROM crm.team_sample_exposure($1, COALESCE($2::date, CURRENT_DATE))`,
+    [managerRepProfileId, opts.asOf ?? null],
+  );
+  return rows;
+}
+
+export interface SampleCountLine {
+  readonly lot_id: string;
+  readonly lot_number: string;
+  readonly counted_quantity: string;
+  readonly expected_quantity: string;
+  readonly variance: string;
+}
+
+/** A count's lines with the variance a reviewer approves, computed once in SQL. */
+export async function countLines(tx: PoolClient, countId: string): Promise<readonly SampleCountLine[]> {
+  const { rows } = await tx.query<SampleCountLine>(
+    `SELECT cl.lot_id, l.lot_number,
+            cl.counted_quantity::text AS counted_quantity,
+            cl.expected_quantity::text AS expected_quantity,
+            (cl.counted_quantity - cl.expected_quantity)::text AS variance
+       FROM crm.sample_count_line cl
+       JOIN crm.sample_lot l ON l.id = cl.lot_id
+      WHERE cl.count_id = $1
+      ORDER BY l.lot_number`,
+    [countId],
+  );
+  return rows;
+}
+
+export async function listCounts(
+  tx: PoolClient,
+  opts: { repProfileId?: string; status?: "open" | "committed" | "cancelled" } = {},
+): Promise<readonly SampleCount[]> {
+  const { rows } = await tx.query<SampleCount>(
+    `SELECT id, rep_profile_id, counted_by, status, counted_at, committed_at, note
+       FROM crm.sample_count
+      WHERE ($1::uuid IS NULL OR rep_profile_id = $1)
+        AND ($2::text IS NULL OR status = $2)
+      ORDER BY counted_at DESC`,
+    [opts.repProfileId ?? null, opts.status ?? null],
+  );
+  return rows;
+}

@@ -25,14 +25,24 @@ describe("mirroring sample movements to the ERP", () => {
   const inTenant = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> =>
     withTenantContext(client, TENANT, fn);
 
-  const outbox = async (tx: PoolClient): Promise<ReadonlyArray<Record<string, unknown>>> => {
-    const { rows } = await tx.query<Record<string, unknown>>(
+  /**
+   * The outbox rows for this tenant, keyed by target record id.
+   *
+   * NOT ordered by `created_at`, and that is a finding rather than a preference: `now()`
+   * is the TRANSACTION timestamp, so two rows enqueued in one transaction carry the same
+   * `created_at` to the microsecond and any order between them is arbitrary. The relay
+   * copes — an ERP transition that arrives before its create is classified
+   * `retry_ordering` and retried — but a test must not assume a sequence the table does
+   * not provide.
+   */
+  const outbox = async (tx: PoolClient): Promise<Map<string, Record<string, unknown>>> => {
+    const { rows } = await tx.query<Record<string, unknown> & { target_record_id: string }>(
       `SELECT entity, operation, payload, target_record_id::text AS target_record_id,
               source_table, source_id, state
-         FROM crm.outbox WHERE tenant_id = $1 ORDER BY created_at`,
+         FROM crm.outbox WHERE tenant_id = $1`,
       [TENANT],
     );
-    return rows;
+    return new Map(rows.map((r) => [r.target_record_id, r]));
   };
 
   beforeAll(async () => {
@@ -110,17 +120,17 @@ describe("mirroring sample movements to the ERP", () => {
       expect(await enqueueErpMirror(tx, TENANT, movement, lot)).toBe(true);
 
       const rows = await outbox(tx);
-      expect(rows).toHaveLength(1);
-      expect(rows[0]!["entity"]).toBe("StockMovement");
-      expect(rows[0]!["operation"]).toBe("create");
-      expect(rows[0]!["target_record_id"]).toBe(mirrorRecordId(movement.id));
-      expect(rows[0]!["state"]).toBe("pending");
+      expect(rows.size).toBe(1);
+      const row = rows.get(mirrorRecordId(movement.id))!;
+      expect(row["entity"]).toBe("StockMovement");
+      expect(row["operation"]).toBe("create");
+      expect(row["state"]).toBe("pending");
       // Correlates back to the CRM row that produced it, which is what support needs
       // when the ERP rejects something three days later.
-      expect(rows[0]!["source_table"]).toBe("crm.sample_transaction");
-      expect(rows[0]!["source_id"]).toBe(movement.id);
+      expect(row["source_table"]).toBe("crm.sample_transaction");
+      expect(row["source_id"]).toBe(movement.id);
 
-      const payload = rows[0]!["payload"] as Record<string, unknown>;
+      const payload = row["payload"] as Record<string, unknown>;
       expect(payload["movement_type"]).toBe("issue");
       expect(payload["quantity"]).toBe("40.000");
     });
@@ -151,8 +161,14 @@ describe("mirroring sample movements to the ERP", () => {
       await enqueueErpMirror(tx, TENANT, returned, lot);
 
       const rows = await outbox(tx);
-      expect(rows).toHaveLength(2);
-      expect((rows[1]!["payload"] as Record<string, unknown>)["movement_type"]).toBe("receipt");
+      expect(rows.size).toBe(2);
+      // Addressed by target id rather than by position: both rows share a `created_at`.
+      expect((rows.get(mirrorRecordId(received.id))!["payload"] as Record<string, unknown>)["movement_type"]).toBe(
+        "issue",
+      );
+      expect((rows.get(mirrorRecordId(returned.id))!["payload"] as Record<string, unknown>)["movement_type"]).toBe(
+        "receipt",
+      );
     });
   });
 
@@ -184,7 +200,7 @@ describe("mirroring sample movements to the ERP", () => {
         signatureSha256: "b".repeat(64),
       });
       expect(await enqueueErpMirror(tx, TENANT, given, lot)).toBe(false);
-      expect(await outbox(tx)).toHaveLength(1);
+      expect((await outbox(tx)).size).toBe(1);
     });
   });
 
@@ -210,7 +226,7 @@ describe("mirroring sample movements to the ERP", () => {
 
       const replay = await receiveSamples(tx, TENANT, input);
       expect(await enqueueErpMirror(tx, TENANT, replay, lot)).toBe(false);
-      expect(await outbox(tx)).toHaveLength(1);
+      expect((await outbox(tx)).size).toBe(1);
     });
   });
 
@@ -237,7 +253,7 @@ describe("mirroring sample movements to the ERP", () => {
     ).rejects.toThrow(/something later/);
 
     await inTenant(async (tx) => {
-      expect(await outbox(tx)).toHaveLength(0);
+      expect((await outbox(tx)).size).toBe(0);
       const { rows } = await tx.query<{ n: string }>(
         "SELECT count(*) AS n FROM crm.sample_transaction WHERE tenant_id = $1",
         [TENANT],
