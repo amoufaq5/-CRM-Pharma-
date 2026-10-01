@@ -1,5 +1,5 @@
 /** The jobs the scheduler runs. Mirrors the CHECK on `crm.scheduled_job.job`. */
-export const JOB_NAMES = ["relay_drain", "snapshot_incremental", "snapshot_full"] as const;
+export const JOB_NAMES = ["relay_drain", "snapshot_incremental", "snapshot_full", "expiry_sweep"] as const;
 export type JobName = (typeof JOB_NAMES)[number];
 
 /**
@@ -15,11 +15,16 @@ export type JobName = (typeof JOB_NAMES)[number];
  *   tombstones and incremental polling can never observe a record's absence.
  *   Daily is the trade between cost and how long a deleted product may linger
  *   on a rep's device.
+ * - **expiry_sweep (24h).** Expiry is a date, so there is nothing a shorter interval
+ *   could notice — and the obligations it raises carry deadlines in days. Daily is
+ *   also what makes "discovered_on" mean something: a sweep that ran hourly would
+ *   record the same date and cost twelve times as much.
  */
 export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   relay_drain: 30_000,
   snapshot_incremental: 5 * 60_000,
   snapshot_full: 24 * 60 * 60_000,
+  expiry_sweep: 24 * 60 * 60_000,
 };
 
 /**

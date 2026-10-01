@@ -44,15 +44,20 @@ import {
   getLot,
   holdingsFor,
   ledgerFor,
+  disposalPolicy,
   getCount,
   listCounts,
   openCount,
   outstandingTransfers,
   receiveSamples,
+  openObligations,
   recordCountLine,
+  returnToWarehouse,
   teamExpiringHoldings,
   teamExposure,
+  teamObligations,
   transferOut,
+  writeOff,
 } from "@crm/sample";
 import type { Pool, PoolClient } from "pg";
 import { z } from "zod";
@@ -192,6 +197,27 @@ const TransferBody = z.object({
 });
 
 const AcceptBody = z.object({ id: UUID, occurredAt: z.string().datetime() });
+
+const QUANTITY = z.union([z.string().regex(/^\d{1,13}(\.\d{1,3})?$/), z.number().positive()]);
+
+const WriteOffBody = z.object({
+  id: UUID,
+  lotId: UUID,
+  quantity: QUANTITY,
+  occurredAt: z.string().datetime(),
+  kind: z.enum(["destruction", "expiry_writeoff"]),
+  /** Required by the schema too; stated here so the 422 names the field. */
+  reason: z.string().min(1).max(500),
+});
+
+const ReturnBody = z.object({
+  id: UUID,
+  lotId: UUID,
+  quantity: QUANTITY,
+  occurredAt: z.string().datetime(),
+  erpWarehouseId: ERP_ID,
+  reason: z.string().max(500).nullish(),
+});
 
 /**
  * Records a disbursement.
@@ -1340,6 +1366,115 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         await requireSupervision(tx, p, repProfileId, onDate(ctx));
         return listVisits(tx, { repProfileId, limit: 200 });
       });
+      return { status: 200, body: { data } };
+    },
+  });
+
+  // ---- getting expired stock out of custody -------------------------------
+
+  /**
+   * Records a destruction or an expiry write-off.
+   *
+   * The resolution path for a disposal obligation, and the reason the nightly sweep does
+   * not write stock off by itself: the material leaves custody when a PERSON says it did,
+   * with a reason attached. `destruction` and `expiry_writeoff` are kept apart on purpose
+   * — one says it was destroyed, the other that it stopped being counted — and a reader
+   * who needs to tell those apart can.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/write-offs",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const input = parse(WriteOffBody, ctx.body);
+      const p = ctx.principal;
+      const row = await inTenant(deps, p, (tx) =>
+        writeOff(tx, p.tenantId, {
+          id: input.id,
+          lotId: input.lotId,
+          repProfileId: p.repProfileId,
+          quantity: input.quantity,
+          occurredAt: new Date(input.occurredAt),
+          kind: input.kind,
+          reason: input.reason,
+        }),
+      );
+      return { status: 201, body: row };
+    },
+  });
+
+  /**
+   * Returns material to a warehouse — the other resolution path, and the better one for
+   * stock a warehouse can dispose of centrally.
+   *
+   * Mirrors to the ERP as a `receipt`, since the stock re-enters ERP-controlled inventory.
+   * The inversion is the same one the receipt route has, in the other direction.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/returns",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const input = parse(ReturnBody, ctx.body);
+      const p = ctx.principal;
+      const body = await inTenant(deps, p, async (tx) => {
+        const lot = await getLot(tx, input.lotId);
+        if (lot === null) throw notFound(`no sample lot ${input.lotId}`);
+        const row = await returnToWarehouse(tx, p.tenantId, {
+          id: input.id,
+          lotId: input.lotId,
+          repProfileId: p.repProfileId,
+          quantity: input.quantity,
+          occurredAt: new Date(input.occurredAt),
+          erpWarehouseId: input.erpWarehouseId,
+          reason: input.reason ?? null,
+        });
+        const mirrored = await enqueueErpMirror(tx, p.tenantId, row, lot);
+        return { ...row, erpMirrorEnqueued: mirrored };
+      });
+      return { status: 201, body };
+    },
+  });
+
+  /** What the caller must dispose of, soonest deadline first. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/obligations",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        openObligations(tx, ctx.principal.repProfileId, { ...(on !== undefined ? { asOf: on } : {}) }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * The tenant's disposal policy, read-only.
+   *
+   * No write route, deliberately. The grace period and the promo auto-write-off flag are
+   * SOP parameters with a regulatory flavour, and every principal here is a rep profile —
+   * there is no compliance role to restrict a write to, and "supervises at least one rep"
+   * would let a first-line manager change a tenant-wide commitment. Until there is a role
+   * model, this is set by an administrator in SQL. Read is open because every rep is
+   * subject to it and ought to be able to see the deadline they are held to.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/disposal-policy",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const body = await inTenant(deps, ctx.principal, (tx) => disposalPolicy(tx, ctx.principal.tenantId));
+      return { status: 200, body };
+    },
+  });
+
+  /** Outstanding disposals across the team — the compliance chase list. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team/samples/obligations",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        teamObligations(tx, ctx.principal.repProfileId, { ...(on !== undefined ? { asOf: on } : {}) }),
+      );
       return { status: 200, body: { data } };
     },
   });

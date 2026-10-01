@@ -83,3 +83,6 @@ export const TENANT_SAMPLE_MIRROR = "cc000000-0000-4000-8000-000000000003";
 
 /** packages/territory — supervision.contract. */
 export const TENANT_SUPERVISION = "da000000-0000-4000-8000-000000000001";
+
+/** packages/sample — expiry-sweep.contract. */
+export const TENANT_EXPIRY_SWEEP = "ce000000-0000-4000-8000-000000000004";

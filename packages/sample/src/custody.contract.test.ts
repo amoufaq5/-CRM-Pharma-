@@ -157,13 +157,26 @@ describe("sample custody", () => {
       expiryDate: opts.expiry === undefined ? "2027-12-31" : opts.expiry,
     });
 
-  const stock = async (tx: PoolClient, lot: SampleLot, qty: number, rep = REP): Promise<void> => {
+  /**
+   * Puts stock in a rep's bag.
+   *
+   * `receivedOn` defaults to a date comfortably inside every fixture lot's shelf life,
+   * because 0020 refuses a receipt of ALREADY-expired stock — which is also how it works
+   * in reality: material goes stale in the bag, it does not arrive stale.
+   */
+  const stock = async (
+    tx: PoolClient,
+    lot: SampleLot,
+    qty: number,
+    rep = REP,
+    receivedOn = "2026-01-15",
+  ): Promise<void> => {
     await receiveSamples(tx, TENANT, {
       id: randomUUID(),
       lotId: lot.id,
       repProfileId: rep,
       quantity: qty,
-      occurredAt: DAY("2026-10-01"),
+      occurredAt: DAY(receivedOn),
       erpWarehouseId: "SM-WH-1",
     });
   };

@@ -129,6 +129,9 @@ importers:
       '@crm/relay':
         specifier: workspace:*
         version: link:../relay
+      '@crm/sample':
+        specifier: workspace:*
+        version: link:../sample
       '@crm/sync':
         specifier: workspace:*
         version: link:../sync

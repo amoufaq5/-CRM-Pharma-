@@ -74,6 +74,9 @@ describe("the API, end to end", () => {
                              "crm.sample_transaction", "crm.sample_holding"]) {
           await tx.query(`ALTER TABLE ${table} DISABLE TRIGGER USER`);
         }
+        // Obligations reference the lot with ON DELETE RESTRICT, so they go first.
+        await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.disposal_policy WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_count_line WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_count WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [t]);
@@ -562,15 +565,18 @@ describe("the API, end to end", () => {
       return id;
     };
 
-    const receipt = (lotId: string, quantity: number): Promise<{ status: number; body: Record<string, unknown> }> =>
+    /**
+     * `occurredAt` is a parameter because a receipt of ALREADY-expired stock is refused
+     * (0020): to put expired material in a bag the fixture has to receive it before the
+     * expiry, which is also the only way it happens in reality.
+     */
+    const receipt = (
+      lotId: string,
+      quantity: number,
+      occurredAt = "2026-10-01T08:00:00.000Z",
+    ): Promise<{ status: number; body: Record<string, unknown> }> =>
       call("POST", "/v1/samples/receipts", {
-        body: {
-          id: randomUUID(),
-          lotId,
-          quantity,
-          occurredAt: "2026-10-01T08:00:00.000Z",
-          erpWarehouseId: "rec_wh1",
-        },
+        body: { id: randomUUID(), lotId, quantity, occurredAt, erpWarehouseId: "rec_wh1" },
       });
 
     /**
@@ -707,8 +713,9 @@ describe("the API, end to end", () => {
     it("flushes a batch of disbursements with per-row results", async () => {
       const good = await aLot();
       const expired = await aLot("2026-09-01");
-      await receipt(good, 10);
-      await receipt(expired, 10);
+      expect((await receipt(good, 10)).status).toBe(201);
+      // Received while still in date; it goes stale in the bag.
+      expect((await receipt(expired, 10, "2026-08-01T08:00:00.000Z")).status).toBe(201);
 
       const res = await call("POST", "/v1/sync/disbursements", {
         body: {
@@ -759,6 +766,156 @@ describe("the API, end to end", () => {
       expect(replay.body.accepted).toBe(1);
       // Deducted once, not twice. The device-minted id is what makes that true.
       expect((await call("GET", "/v1/samples/holdings")).body.data[0].quantity_on_hand).toBe("7.000");
+    });
+
+    it("refuses a receipt of already-expired stock", async () => {
+      // If the warehouse sends expired stock the rep does not take custody of it — the
+      // warehouse takes it back. Accepting the record would raise a disposal obligation
+      // for material that should never have arrived.
+      const dead = await aLot("2026-09-01");
+      const res = await receipt(dead, 5, "2026-10-01T08:00:00.000Z");
+      expect(res.status).toBe(409);
+      expect(res.body.type).toContain("/errors/lot-expired");
+    });
+
+    describe("disposal obligations", () => {
+      /**
+       * The sweep is the scheduler's job; here it is called directly so the route can be
+       * tested against a real obligation rather than a fabricated row.
+       */
+      const sweep = async (asOf: string): Promise<void> => {
+        const { sweepExpiredStock } = await import("@crm/sample");
+        await withTenantContext(admin, TENANT, (tx) =>
+          sweepExpiredStock(tx, TENANT, { asOf: new Date(`${asOf}T02:00:00Z`) }),
+        );
+      };
+
+      const expiredInBag = async (repId: string, quantity: number): Promise<string> => {
+        const lotId = await aLot("2026-09-30");
+        if (repId === rep) {
+          expect((await receipt(lotId, quantity, "2026-08-01T08:00:00.000Z")).status).toBe(201);
+        } else {
+          expect(
+            (
+              await call("POST", "/v1/samples/receipts", {
+                auth: token({ sub: "idp|rep2", tenant: TENANT }),
+                body: {
+                  id: randomUUID(),
+                  lotId,
+                  quantity,
+                  occurredAt: "2026-08-01T08:00:00.000Z",
+                  erpWarehouseId: "rec_wh1",
+                },
+              })
+            ).status,
+          ).toBe(201);
+        }
+        return lotId;
+      };
+
+      it("lists what the caller must dispose of, with the deadline", async () => {
+        const lotId = await expiredInBag(rep, 10);
+        await sweep("2026-10-10");
+
+        const res = await call("GET", "/v1/samples/obligations?on=2026-10-10");
+        expect(res.status).toBe(200);
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.data[0].lot_id).toBe(lotId);
+        expect(res.body.data[0].due_by).toBe("2026-11-09");
+        expect(res.body.data[0].days_overdue).toBe(-30);
+        expect(res.body.data[0].quantity_on_hand).toBe("10.000");
+      });
+
+      it("closes the obligation once a destruction is recorded", async () => {
+        const lotId = await expiredInBag(rep, 10);
+        await sweep("2026-10-10");
+
+        const destroyed = await call("POST", "/v1/samples/write-offs", {
+          body: {
+            id: randomUUID(),
+            lotId,
+            quantity: 10,
+            occurredAt: "2026-10-15T09:00:00.000Z",
+            kind: "destruction",
+            reason: "destroyed at depot, witnessed by QA",
+          },
+        });
+        expect(destroyed.status).toBe(201);
+
+        await sweep("2026-10-16");
+        expect((await call("GET", "/v1/samples/obligations?on=2026-10-16")).body.data).toEqual([]);
+      });
+
+      it("refuses a write-off with no reason", async () => {
+        const lotId = await expiredInBag(rep, 5);
+        const res = await call("POST", "/v1/samples/write-offs", {
+          body: {
+            id: randomUUID(),
+            lotId,
+            quantity: 5,
+            occurredAt: "2026-10-15T09:00:00.000Z",
+            kind: "destruction",
+          },
+        });
+        expect(res.status).toBe(422);
+      });
+
+      it("returns stock to the warehouse and mirrors it to the ERP", async () => {
+        const lotId = await expiredInBag(rep, 10);
+        await withTenantContext(admin, TENANT, async (tx) => {
+          await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [TENANT]);
+        });
+
+        const returned = await call("POST", "/v1/samples/returns", {
+          body: {
+            id: randomUUID(),
+            lotId,
+            quantity: 10,
+            occurredAt: "2026-10-15T09:00:00.000Z",
+            erpWarehouseId: "rec_wh1",
+            reason: "expired, returned for central disposal",
+          },
+        });
+        expect(returned.status).toBe(201);
+        expect(returned.body.erpMirrorEnqueued).toBe(true);
+
+        await withTenantContext(admin, TENANT, async (tx) => {
+          const { rows } = await tx.query<{ payload: Record<string, unknown> }>(
+            "SELECT payload FROM crm.outbox WHERE tenant_id = $1",
+            [TENANT],
+          );
+          expect(rows).toHaveLength(1);
+          // Stock re-entering ERP inventory is an ERP `receipt` — the mirror inverts in
+          // the other direction from a rep receipt.
+          expect(rows[0]!.payload["movement_type"]).toBe("receipt");
+        });
+      });
+
+      it("shows a manager the team's outstanding disposals and a peer nothing", async () => {
+        await expiredInBag(rep, 10);
+        await expiredInBag(otherRep, 4);
+        await sweep("2026-10-10");
+
+        const mgrView = await call("GET", "/v1/team/samples/obligations?on=2026-10-10", {
+          auth: token({ sub: "idp|mgr", tenant: TENANT }),
+        });
+        expect(mgrView.status).toBe(200);
+        expect(mgrView.body.data).toHaveLength(2);
+        expect(mgrView.body.data[0].display_name).toBeTypeOf("string");
+
+        // A rep manages nobody, so the team view is empty — not their own row.
+        expect((await call("GET", "/v1/team/samples/obligations?on=2026-10-10")).body.data).toEqual([]);
+      });
+
+      it("serves the tenant's disposal policy read-only", async () => {
+        const res = await call("GET", "/v1/samples/disposal-policy");
+        expect(res.status).toBe(200);
+        expect(res.body.grace_days).toBe(30);
+        expect(res.body.auto_writeoff_promo).toBe(false);
+        // No write route: these are SOP parameters and there is no compliance role to
+        // restrict a write to.
+        expect((await call("PUT", "/v1/samples/disposal-policy", { body: { graceDays: 1 } })).status).toBe(405);
+      });
     });
 
     it("shows the ledger, newest first", async () => {

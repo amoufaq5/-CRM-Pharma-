@@ -139,6 +139,87 @@ describe("scheduler against a real database", () => {
     }
   });
 
+  /**
+   * The expiry sweep is the only job that calls nothing outside the CRM's own tables, so
+   * the test exercises the real thing rather than a stub — and asserts the summary line,
+   * because for this job the log IS the notification: there is no channel that tells a
+   * rep an obligation was raised.
+   */
+  it("runs the expiry sweep and reports what it found", async () => {
+    const { relay } = stubRelay();
+    const { refresher } = stubRefresher();
+    const events: SchedulerEvent[] = [];
+
+    let lotId = "";
+    let repId = "";
+    await withTenantContext(admin, TENANT, async (tx) => {
+      const r = await tx.query<{ id: string }>(
+        `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name)
+         VALUES ($1,'sched-sweep','SS-1','Sweep Rep') RETURNING id`,
+        [TENANT],
+      );
+      repId = r.rows[0]!.id;
+      const l = await tx.query<{ id: string }>(
+        `INSERT INTO crm.sample_lot (tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+         VALUES ($1,'item-sweep','LOT-SCHED','2026-03-31','drug_sample') RETURNING id`,
+        [TENANT],
+      );
+      lotId = l.rows[0]!.id;
+      // Received well inside its shelf life; it goes stale in the bag.
+      await tx.query(
+        `INSERT INTO crm.sample_transaction
+           (id, tenant_id, lot_id, rep_profile_id, kind, quantity, erp_warehouse_id, occurred_at)
+         VALUES (gen_random_uuid(),$1,$2,$3,'receipt',12,'wh1','2026-01-10T08:00:00Z')`,
+        [TENANT, lotId, repId],
+      );
+    });
+
+    await new Scheduler({
+      pool: p,
+      relay,
+      refresher,
+      random: () => 0.5,
+      now: () => new Date("2026-04-10T02:00:00Z"),
+      onEvent: (e) => events.push(e),
+    }).tick();
+
+    const ok = events.find((e) => e.type === "job_ok" && e.job === "expiry_sweep");
+    expect(ok).toBeDefined();
+    expect((ok as { detail: string }).detail).toContain("expired=1");
+    expect((ok as { detail: string }).detail).toContain("opened=1");
+    expect((ok as { detail: string }).detail).toContain("autoWrittenOff=0");
+    expect((ok as { detail: string }).detail).toContain("graceDays=30");
+
+    await withTenantContext(admin, TENANT, async (tx) => {
+      const { rows } = await tx.query<{ status: string; due_by: string }>(
+        "SELECT status, due_by::text AS due_by FROM crm.disposal_obligation WHERE tenant_id = $1",
+        [TENANT],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.status).toBe("open");
+      expect(rows[0]!.due_by).toBe("2026-05-10");
+
+      // The drug sample is still on the balance. The job noticed; it did not pretend the
+      // stock had gone.
+      const held = await tx.query<{ q: string }>(
+        "SELECT quantity_on_hand::text AS q FROM crm.sample_holding WHERE lot_id = $1",
+        [lotId],
+      );
+      expect(held.rows[0]!.q).toBe("12.000");
+
+      await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.disposal_policy WHERE tenant_id = $1", [TENANT]);
+      await tx.query("ALTER TABLE crm.sample_transaction DISABLE TRIGGER USER");
+      await tx.query("ALTER TABLE crm.sample_holding DISABLE TRIGGER USER");
+      await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.sample_holding WHERE tenant_id = $1", [TENANT]);
+      await tx.query("ALTER TABLE crm.sample_transaction ENABLE TRIGGER USER");
+      await tx.query("ALTER TABLE crm.sample_holding ENABLE TRIGGER USER");
+      await tx.query("DELETE FROM crm.sample_lot WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.rep_profile WHERE id = $1", [repId]);
+    });
+  });
+
   it("does not re-run a job before it is due", async () => {
     const { relay, calls } = stubRelay();
     const { refresher } = stubRefresher();
@@ -242,8 +323,8 @@ describe("scheduler against a real database", () => {
         withTenantContext(b, TENANT, (tx) => claimDueJobs(tx, TENANT, now, () => 0.5)),
       ]);
       const jobs = [...first, ...second].map((j) => j.job);
-      expect(jobs).toHaveLength(3);
-      expect(new Set(jobs).size).toBe(3); // no job claimed twice
+      expect(jobs).toHaveLength(JOB_NAMES.length);
+      expect(new Set(jobs).size).toBe(JOB_NAMES.length); // no job claimed twice
     } finally {
       a.release();
       b.release();

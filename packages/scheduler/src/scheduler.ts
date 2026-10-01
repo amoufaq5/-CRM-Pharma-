@@ -1,5 +1,6 @@
 import { withTenantContext } from "@crm/db";
 import type { OutboxRelay } from "@crm/relay";
+import { sweepExpiredStock } from "@crm/sample";
 import type { SnapshotRefresher } from "@crm/sync";
 import type { Pool, PoolClient } from "pg";
 
@@ -184,6 +185,24 @@ export class Scheduler {
           `claimed=${r.claimed} delivered=${r.delivered} retried=${r.retried} dead=${r.dead} ` +
           `pending=${r.lag.pending} oldest=${r.lag.oldestPendingAgeSeconds ?? "-"}s`
         );
+      }
+      case "expiry_sweep": {
+        // The only job that works purely inside the CRM's own tables — no ERP call — so
+        // it runs in one transaction and either the whole night's sweep lands or none of
+        // it does. That is the right granularity for something that runs again tomorrow.
+        const client = await this.options.pool.connect();
+        try {
+          const r = await withTenantContext(client, tenantId, (tx) =>
+            sweepExpiredStock(tx, tenantId, { asOf: this.now() }),
+          );
+          return (
+            `expired=${r.expiredHoldings} opened=${r.opened} resolved=${r.resolved} ` +
+            `overdue=${r.markedOverdue} autoWrittenOff=${r.autoWrittenOff} ` +
+            `unattributed=${r.unattributed} graceDays=${r.policy.grace_days}`
+          );
+        } finally {
+          client.release();
+        }
       }
       case "snapshot_incremental":
       case "snapshot_full": {

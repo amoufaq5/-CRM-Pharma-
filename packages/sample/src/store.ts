@@ -612,3 +612,63 @@ export async function listCounts(
   );
   return rows;
 }
+
+export interface DisposalObligation {
+  readonly id: string;
+  readonly rep_profile_id: string;
+  readonly display_name: string;
+  readonly lot_id: string;
+  readonly erp_item_id: string;
+  readonly lot_number: string;
+  readonly material_kind: MaterialKind;
+  readonly expired_on: string;
+  readonly discovered_on: string;
+  readonly due_by: string;
+  /** Positive once past the deadline, negative while there is still time. */
+  readonly days_overdue: number;
+  readonly status: "open" | "overdue";
+  readonly quantity_on_hand: string;
+}
+
+/** One rep's outstanding disposals, soonest deadline first. */
+export async function openObligations(
+  tx: PoolClient,
+  repProfileId: string,
+  opts: { asOf?: string } = {},
+): Promise<readonly DisposalObligation[]> {
+  const { rows } = await tx.query<DisposalObligation>(
+    `SELECT id, rep_profile_id, display_name, lot_id, erp_item_id, lot_number, material_kind,
+            expired_on::text AS expired_on, discovered_on::text AS discovered_on,
+            due_by::text AS due_by, days_overdue, status,
+            quantity_on_hand::text AS quantity_on_hand
+       FROM crm.open_disposal_obligations($1, COALESCE($2::date, CURRENT_DATE))`,
+    [repProfileId, opts.asOf ?? null],
+  );
+  return rows;
+}
+
+/**
+ * Outstanding disposals across a manager's team.
+ *
+ * Scoped by `crm.managed_rep_ids` inside the query, like every other team read — not by
+ * filtering a rep id afterwards.
+ */
+export async function teamObligations(
+  tx: PoolClient,
+  managerRepProfileId: string,
+  opts: { asOf?: string } = {},
+): Promise<readonly DisposalObligation[]> {
+  const { rows } = await tx.query<DisposalObligation>(
+    `SELECT o.id, o.rep_profile_id, o.display_name, o.lot_id, o.erp_item_id, o.lot_number,
+            o.material_kind, o.expired_on::text AS expired_on,
+            o.discovered_on::text AS discovered_on, o.due_by::text AS due_by,
+            o.days_overdue, o.status, o.quantity_on_hand::text AS quantity_on_hand
+       FROM crm.open_disposal_obligations(NULL, COALESCE($2::date, CURRENT_DATE)) o
+      WHERE o.rep_profile_id IN (
+              SELECT rep_profile_id FROM crm.managed_rep_ids($1, COALESCE($2::date, CURRENT_DATE))
+            )
+      ORDER BY o.due_by, o.display_name`,
+    [managerRepProfileId, opts.asOf ?? null],
+  );
+  return rows;
+}

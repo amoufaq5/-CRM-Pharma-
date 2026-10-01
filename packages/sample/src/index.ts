@@ -26,6 +26,7 @@ export {
   listCounts,
   listLots,
   openCount,
+  openObligations,
   outstandingTransfers,
   receiveSamples,
   recordCountLine,
@@ -34,8 +35,10 @@ export {
   setLotStatus,
   teamExpiringHoldings,
   teamExposure,
+  teamObligations,
   transferOut,
   writeOff,
+  type DisposalObligation,
   type ExpiringHolding,
   type LotStatus,
   type MaterialKind,
@@ -48,4 +51,13 @@ export {
   type TeamExposure,
   type TransactionKind,
 } from "./store.js";
+export {
+  DEFAULT_GRACE_DAYS,
+  disposalPolicy,
+  setDisposalPolicy,
+  sweepExpiredStock,
+  type DisposalPolicy,
+  type ExpirySweepOptions,
+  type ExpirySweepResult,
+} from "./expiry-sweep.js";
 export { enqueueErpMirror, erpMirrorFor, mirrorRecordId, type ErpStockMirror } from "./erp-mirror.js";

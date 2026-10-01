@@ -21,7 +21,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/acl/schema/` | A captured `/v1/meta/schema`, so CI can check for drift without a live ERP. |
 | `packages/relay/` | The outbox relay: claim, dispatch, classify, settle. Multi-worker safe, with leases. |
 | `packages/sync/` | Snapshot refresh: strict coercion into typed columns, incremental + full sweep. |
-| `packages/scheduler/` | The background process. Drives the relay and the refresher per tenant, on a timer. |
+| `packages/scheduler/` | The background process. Drives the relay, the refresher and the expiry sweep per tenant, on a timer. |
 | `packages/territory/` | Territories, rep assignment, supervision, and the row-level scoping the ERP cannot do. |
 | `packages/visit/` | Visits and detailing lines. Offline-first, territory-scoped, immutable once final. |
 | `packages/api/` | The HTTP API. JWT auth, one error shape, territory-scoped on every read. |
@@ -87,6 +87,11 @@ authorisation on its own.
 | `GET /v1/team/samples/expiring` | expiring stock across the team |
 | `GET /v1/team/samples/ledger` | one rep's custody log, for an audit |
 | `GET /v1/team/visits` | one rep's activity |
+| `GET /v1/samples/obligations` | what the caller must dispose of, with the deadline |
+| `POST /v1/samples/write-offs` | a destruction or an expiry write-off, with a reason |
+| `POST /v1/samples/returns` | back to a warehouse; mirrored to the ERP as a `receipt` |
+| `GET /v1/samples/disposal-policy` | the tenant's grace period, read-only |
+| `GET /v1/team/samples/obligations` | the team's outstanding disposals — the chase list |
 
 Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
 emits two on the same API, and a client that handles only one misreads the other.
@@ -288,3 +293,23 @@ force every caller to remember which semantics it had.
 this cycle" is the first question a territory review asks, and an inner join would answer
 it by omitting them — the team would look fully covered because the gaps were not in the
 result set.
+
+**23. The expiry sweep does not write off a drug sample, and that is the design.** At 3am
+the carton is still in the rep's bag. A job that removed it from the balance would make
+the system assert the stock is gone when it is not, and the question an inspector asks is
+"where did these expired units actually go?" — to which "a scheduled job stopped counting
+them" is worse than an untidy balance, because it reads like an answer. So the sweep
+raises a dated obligation and chases it; the material leaves custody when a person records
+a destruction or a return. Promotional material is different, and is treated differently:
+auto write-off is available for it, per tenant, opt-in, and never reaches a drug sample.
+
+**24. A resolution is attributed from the ledger, not declared.** The sweep sees a holding
+at zero and reads the last decreasing movement to say *how* — destroyed, returned, written
+off, transferred, adjusted — and records which transaction it was. Stock that vanished with
+nothing to explain it stays **open** and is counted as unattributed, because closing it
+with a guessed reason would put a fabricated disposal in the record.
+
+**25. Expired stock cannot be received into custody.** If the warehouse sends it, the rep
+does not take custody — the warehouse takes it back. Accepting a transfer of expired stock
+*is* allowed: material already in custody has to be somewhere, and refusing the acceptance
+would strand it in transit with nobody accountable.
