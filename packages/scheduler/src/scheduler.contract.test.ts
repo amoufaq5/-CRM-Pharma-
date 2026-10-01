@@ -153,6 +153,13 @@ describe("scheduler against a real database", () => {
     let lotId = "";
     let repId = "";
     await withTenantContext(admin, TENANT, async (tx) => {
+      // Tolerate residue from an earlier failed run: the fixture owns this subject, and a
+      // half-cleaned database should not make the next run fail for the wrong reason.
+      await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
+      await tx.query(
+        `DELETE FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'sched-sweep'`,
+        [TENANT],
+      );
       const r = await tx.query<{ id: string }>(
         `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name)
          VALUES ($1,'sched-sweep','SS-1','Sweep Rep') RETURNING id`,
@@ -207,6 +214,10 @@ describe("scheduler against a real database", () => {
       );
       expect(held.rows[0]!.q).toBe("12.000");
 
+      // The sweep now tells the rep, and a notification references rep_profile with
+      // ON DELETE RESTRICT — so it goes before the profile does.
+      await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
       await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [TENANT]);
       await tx.query("DELETE FROM crm.disposal_policy WHERE tenant_id = $1", [TENANT]);
       await tx.query("ALTER TABLE crm.sample_transaction DISABLE TRIGGER USER");

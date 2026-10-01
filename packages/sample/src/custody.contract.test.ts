@@ -14,6 +14,8 @@ import {
   TransferMismatchError,
   translateSampleError,
 } from "./errors.js";
+import { inbox } from "@crm/notify";
+
 import {
   acceptTransfer,
   adjust,
@@ -89,6 +91,8 @@ describe("sample custody", () => {
         await tx.query(`ALTER TABLE ${t} DISABLE TRIGGER USER`);
       }
       try {
+        await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
+        await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_count_line WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_count WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [TENANT]);
@@ -492,6 +496,34 @@ describe("sample custody", () => {
         expect(after.quantity_on_hand).toBe("30.000");
         expect(after.quantity_in_transit).toBe("0.000");
         expect(await onHand(tx, lot.id, OTHER_REP)).toBe("20.000");
+      });
+    });
+
+    /**
+     * The receiving rep has no other reason to expect it: an unaccepted transfer was
+     * previously visible only to whoever thought to look, and unaccepted material sits in
+     * transit indefinitely.
+     */
+    it("tells the receiving rep that material is waiting for them", async () => {
+      await inTenant(async (tx) => {
+        const lot = await aLot(tx);
+        await stock(tx, lot, 50);
+        await transferOut(tx, TENANT, {
+          id: randomUUID(),
+          lotId: lot.id,
+          repProfileId: REP,
+          quantity: 20,
+          occurredAt: DAY("2026-10-06"),
+          toRepProfileId: OTHER_REP,
+        });
+
+        const items = await inbox(tx, OTHER_REP);
+        expect(items).toHaveLength(1);
+        expect(items[0]!.kind).toBe("sample_transfer_awaiting_acceptance");
+        expect(items[0]!.subject).toContain(lot.lot_number);
+        expect(items[0]!.body).toMatch(/in-transit until you accept/);
+        // Not the sender, who just did it.
+        expect(await inbox(tx, REP)).toHaveLength(0);
       });
     });
 

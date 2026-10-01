@@ -1,5 +1,11 @@
 /** The jobs the scheduler runs. Mirrors the CHECK on `crm.scheduled_job.job`. */
-export const JOB_NAMES = ["relay_drain", "snapshot_incremental", "snapshot_full", "expiry_sweep"] as const;
+export const JOB_NAMES = [
+  "relay_drain",
+  "snapshot_incremental",
+  "snapshot_full",
+  "expiry_sweep",
+  "notify_dispatch",
+] as const;
 export type JobName = (typeof JOB_NAMES)[number];
 
 /**
@@ -19,12 +25,15 @@ export type JobName = (typeof JOB_NAMES)[number];
  *   could notice — and the obligations it raises carry deadlines in days. Daily is
  *   also what makes "discovered_on" mean something: a sweep that ran hourly would
  *   record the same date and cost twelve times as much.
+ * - **notify_dispatch (30s).** A notification is only useful while it is still news, so
+ *   this matches the relay rather than the sweep. The work is usually zero rows.
  */
 export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   relay_drain: 30_000,
   snapshot_incremental: 5 * 60_000,
   snapshot_full: 24 * 60 * 60_000,
   expiry_sweep: 24 * 60 * 60_000,
+  notify_dispatch: 30_000,
 };
 
 /**

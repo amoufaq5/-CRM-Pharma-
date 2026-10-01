@@ -4,6 +4,8 @@ import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
 import { TENANT_EXPIRY_SWEEP as TENANT, testPool } from "@crm/db/testing";
 
+import { inbox } from "@crm/notify";
+
 import { DEFAULT_GRACE_DAYS, setDisposalPolicy, sweepExpiredStock } from "./expiry-sweep.js";
 import {
   disburseSamples,
@@ -45,6 +47,8 @@ describe("the expiry sweep", () => {
         await tx.query(`ALTER TABLE ${t} DISABLE TRIGGER USER`);
       }
       try {
+        await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
+        await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.disposal_policy WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [TENANT]);
@@ -510,6 +514,88 @@ describe("the expiry sweep", () => {
         await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 20 });
         expect((await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") })).autoWrittenOff).toBe(1);
         expect((await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-11") })).autoWrittenOff).toBe(0);
+      });
+    });
+  });
+
+  describe("telling someone", () => {
+    /**
+     * The gap this closes. Before notifications the sweep raised an obligation at 3am and
+     * the rep found out whenever they next happened to open the app — which for an expired
+     * drug sample is not good enough.
+     */
+    it("tells the rep in the same transaction as the obligation", async () => {
+      await inTenant(async (tx) => {
+        const lot = await heldStock(tx, { expiry: "2026-03-31", quantity: 10 });
+        const result = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
+        expect(result.notified).toBe(1);
+
+        const items = await inbox(tx, REP);
+        expect(items).toHaveLength(1);
+        expect(items[0]!.kind).toBe("disposal_obligation_raised");
+        expect(items[0]!.severity).toBe("warning");
+        expect(items[0]!.subject).toContain(lot.lot_number);
+        // The deadline travels in the body, so a rep reading the inbox knows by when.
+        expect(items[0]!.body).toContain("2026-05-10");
+        expect(items[0]!.read_at).toBeNull();
+      });
+    });
+
+    it("does not tell them again on the next night", async () => {
+      await inTenant(async (tx) => {
+        await heldStock(tx, { expiry: "2026-03-31" });
+        await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
+        const second = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-11") });
+        expect(second.notified).toBe(0);
+        expect(await inbox(tx, REP)).toHaveLength(1);
+      });
+    });
+
+    /**
+     * Overdue escalates rather than repeats: the rep already knows, and accountability for
+     * an overdue regulated disposal does not stop at the person holding the carton.
+     */
+    it("escalates an overdue obligation to the rep urgently and to their supervisor", async () => {
+      await inTenant(async (tx) => {
+        // Give the rep a manager: the standing fixture has none.
+        await tx.query(
+          `INSERT INTO crm.territory_assignment (tenant_id, territory_id, rep_profile_id, role, valid_from)
+           VALUES ($1,$2,$3,'manager','2026-01-01')`,
+          [TENANT, TERRITORY, OTHER_REP],
+        );
+        try {
+          await heldStock(tx, { expiry: "2026-03-31" });
+          await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
+          const late = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-05-11") });
+          expect(late.markedOverdue).toBe(1);
+          // One for the rep, one for the manager.
+          expect(late.notified).toBe(2);
+
+          const repItems = await inbox(tx, REP);
+          const overdue = repItems.find((i) => i.kind === "disposal_obligation_overdue")!;
+          expect(overdue.severity).toBe("urgent");
+
+          const mgrItems = await inbox(tx, OTHER_REP);
+          expect(mgrItems).toHaveLength(1);
+          // Warning for the supervisor, urgent for the holder: the same fact, weighted by
+          // who can act on it.
+          expect(mgrItems[0]!.severity).toBe("warning");
+        } finally {
+          await tx.query("DELETE FROM crm.territory_assignment WHERE rep_profile_id = $1", [OTHER_REP]);
+        }
+      });
+    });
+
+    it("tells nobody about an automatic promo write-off, which is not news", async () => {
+      await inTenant(async (tx) => {
+        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true });
+        await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 20 });
+        const result = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
+        expect(result.autoWrittenOff).toBe(1);
+        // The obligation was raised and resolved in the same pass, so the rep was told once
+        // about something already handled. That is the honest cost of raising before
+        // writing off, and it is one notification rather than a nightly stream.
+        expect(result.notified).toBe(1);
       });
     });
   });

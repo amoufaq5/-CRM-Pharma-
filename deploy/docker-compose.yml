@@ -103,6 +103,10 @@ services:
       CRM_TOKEN_ISSUER: ${CRM_TOKEN_ISSUER:-}
       ERP_TOKEN_AUDIENCE: ${ERP_TOKEN_AUDIENCE:-}
       ERP_TOKEN_TTL_SECONDS: ${ERP_TOKEN_TTL_SECONDS:-}
+      # One variable per webhook endpoint, named by its crm.notification_endpoint
+      # row's secret_env. The scheduler is the only process that sends, so it is
+      # the only one that needs them.
+      CRM_HOOK_OPS_SECRET: ${CRM_HOOK_OPS_SECRET:-}
       # Development-only, and ignored when a signing key is set. The process
       # REFUSES to start with it under NODE_ENV=production.
       ERP_TOKEN: ${ERP_TOKEN:-}

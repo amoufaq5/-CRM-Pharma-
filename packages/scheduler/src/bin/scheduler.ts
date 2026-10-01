@@ -2,6 +2,7 @@
 import { Pool } from "pg";
 import { ErpClient, type FetchLike } from "@crm/acl";
 import { buildServiceCredential } from "@crm/credential";
+import { NotificationDispatcher, WebhookSender, type FetchLike as NotifyFetch } from "@crm/notify";
 import { OutboxRelay } from "@crm/relay";
 import { SnapshotRefresher } from "@crm/sync";
 
@@ -90,6 +91,13 @@ async function main(): Promise<void> {
     pool,
     relay: new OutboxRelay({ pool, client, workerId }),
     refresher: new SnapshotRefresher({ pool, client }),
+    // The webhook sender reads each endpoint's secret from the environment by name, so
+    // nothing secret is in the database and the process needs no configuration beyond the
+    // variables those endpoints point at.
+    notifications: new NotificationDispatcher({
+      pool,
+      senders: [new WebhookSender({ fetch: globalThis.fetch as unknown as NotifyFetch })],
+    }),
     ...(process.env["TICK_INTERVAL_MS"] !== undefined
       ? { tickIntervalMs: Number(process.env["TICK_INTERVAL_MS"]) }
       : {}),

@@ -74,7 +74,11 @@ describe("the API, end to end", () => {
                              "crm.sample_transaction", "crm.sample_holding"]) {
           await tx.query(`ALTER TABLE ${table} DISABLE TRIGGER USER`);
         }
-        // Obligations reference the lot with ON DELETE RESTRICT, so they go first.
+        // Notifications reference rep_profile with ON DELETE RESTRICT, and obligations
+        // reference the lot the same way, so both go before their targets.
+        await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.disposal_policy WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_count_line WHERE tenant_id = $1", [t]);
@@ -1320,6 +1324,104 @@ describe("the API, end to end", () => {
         });
         expect(res.status).toBe(404);
       });
+    });
+  });
+
+  describe("the inbox", () => {
+    const mgr = (): string => token({ sub: "idp|mgr", tenant: TENANT });
+
+    /** Raised through the real producer rather than an inserted row. */
+    const aSubmittedPlan = async (): Promise<void> => {
+      let cycleId = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const c = await tx.query<{ id: string }>(
+          `INSERT INTO crm.cycle (tenant_id, code, name, starts_on, ends_on, status)
+           VALUES ($1,'IB','Inbox','2026-10-01','2026-12-31','active') RETURNING id`,
+          [TENANT],
+        );
+        cycleId = c.rows[0]!.id;
+      });
+      const plan = await call("POST", "/v1/call-plans", { body: { cycleId } });
+      await call("POST", `/v1/call-plans/${plan.body.id as string}/submit`, { body: {} });
+    };
+
+    it("serves the caller's notifications with an unread count", async () => {
+      await aSubmittedPlan();
+
+      // The manager was told; the rep who submitted it was not.
+      const theirs = await call("GET", "/v1/notifications", { auth: mgr() });
+      expect(theirs.status).toBe(200);
+      expect(theirs.body.data).toHaveLength(1);
+      expect(theirs.body.data[0].kind).toBe("call_plan_submitted");
+      expect((await call("GET", "/v1/notifications/unread-count", { auth: mgr() })).body.count).toBe(1);
+
+      expect((await call("GET", "/v1/notifications")).body.data).toEqual([]);
+      expect((await call("GET", "/v1/notifications/unread-count")).body.count).toBe(0);
+    });
+
+    it("marks one read, idempotently, and filters to unread", async () => {
+      await aSubmittedPlan();
+      const id = (await call("GET", "/v1/notifications", { auth: mgr() })).body.data[0].id as string;
+
+      expect((await call("POST", `/v1/notifications/${id}/read`, { auth: mgr(), body: {} })).status).toBe(204);
+      expect((await call("GET", "/v1/notifications/unread-count", { auth: mgr() })).body.count).toBe(0);
+      // Reading again is success: a client retrying must not get an error.
+      expect((await call("POST", `/v1/notifications/${id}/read`, { auth: mgr(), body: {} })).status).toBe(204);
+
+      expect((await call("GET", "/v1/notifications?unread=true", { auth: mgr() })).body.data).toEqual([]);
+      expect((await call("GET", "/v1/notifications", { auth: mgr() })).body.data).toHaveLength(1);
+    });
+
+    /** A 404, not a 403: whether a notification exists is information about someone's work. */
+    it("hides another rep's notification behind a 404", async () => {
+      await aSubmittedPlan();
+      const id = (await call("GET", "/v1/notifications", { auth: mgr() })).body.data[0].id as string;
+      const res = await call("POST", `/v1/notifications/${id}/read`, { body: {} });
+      expect(res.status).toBe(404);
+      expect(res.body.type).toContain("/errors/not-found");
+    });
+
+    it("marks everything read and reports how many", async () => {
+      await aSubmittedPlan();
+      const res = await call("POST", "/v1/notifications/read-all", { auth: mgr(), body: {} });
+      expect(res.body.marked).toBe(1);
+      expect((await call("POST", "/v1/notifications/read-all", { auth: mgr(), body: {} })).body.marked).toBe(0);
+    });
+
+    it("reaches the receiving rep when material is transferred to them", async () => {
+      let lotId = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const l = await tx.query<{ id: string }>(
+          `INSERT INTO crm.sample_lot (tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+           VALUES ($1,'rec_i1','LOT-INBOX','2027-12-31','drug_sample') RETURNING id`,
+          [TENANT],
+        );
+        lotId = l.rows[0]!.id;
+      });
+      await call("POST", "/v1/samples/receipts", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 10,
+          occurredAt: "2026-10-01T08:00:00.000Z",
+          erpWarehouseId: "rec_wh1",
+        },
+      });
+      await call("POST", "/v1/samples/transfers", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 4,
+          occurredAt: "2026-10-06T08:00:00.000Z",
+          toRepProfileId: otherRep,
+        },
+      });
+
+      const theirs = await call("GET", "/v1/notifications", {
+        auth: token({ sub: "idp|rep2", tenant: TENANT }),
+      });
+      expect(theirs.body.data).toHaveLength(1);
+      expect(theirs.body.data[0].kind).toBe("sample_transfer_awaiting_acceptance");
     });
   });
 

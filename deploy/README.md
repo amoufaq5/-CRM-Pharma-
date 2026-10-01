@@ -269,6 +269,43 @@ Scheduled jobs need no provisioning: the scheduler creates missing rows at their
 default cadence on every tick, so a tenant added by hand — or a job added by a
 later release — starts running without a backfill.
 
+## Notifications
+
+Two channels. **In-app** needs no configuration: a notification is a row, written by
+whatever raised it, and `GET /v1/notifications` serves it. **Webhook** pushes an HMAC-signed
+POST at a URL — one of these into Slack, Teams or PagerDuty is how an overdue regulated
+disposal reaches someone who is not looking at the app.
+
+```sql
+INSERT INTO crm.notification_endpoint
+  (tenant_id, channel, url, secret_env, min_severity, description)
+VALUES ('<tenant uuid>', 'webhook', 'https://hooks.slack.com/services/…',
+        'CRM_HOOK_OPS_SECRET', 'warning', 'ops channel');
+```
+
+`secret_env` is the NAME of an environment variable, never the secret — the same discipline
+as the service signing key. Put the value in `deploy/.env`, give it to the **scheduler**
+(the only process that sends), and the sender signs with it. A missing variable
+dead-letters the delivery rather than sending unsigned.
+
+`min_severity` defaults to `warning`, which keeps routine `info` events (a call plan
+approved) out of a paging channel. `kinds` is NULL for everything, or an allow-list.
+
+What a receiver must do: recompute `HMAC-SHA256(secret, "<x-crm-timestamp>.<raw body>")`,
+compare it with `x-crm-signature` in constant time, and reject anything whose timestamp is
+outside a few minutes. `verifyWebhook` in `@crm/notify` is the reference. Delivery is
+at-least-once, so collapse duplicates on `x-crm-delivery`.
+
+Dead letters: `SELECT * FROM crm.notification_delivery WHERE state = 'dead'`. A 4xx dies on
+the first attempt (it will not succeed on retry); 408, 429 and 5xx retry eight times over
+roughly twenty minutes.
+
+There is no email or SMS sender. `ChannelSender` in `@crm/notify` is the seam, and nothing
+was written against it deliberately: a provider client could not be verified from the
+environment this was built in, and the ERP's own notification package shows where
+unverifiable senders end up — eighteen declared providers, one implementation. A webhook
+covers the paging case today. ADR-0001 records it as open.
+
 ## Operating it
 
 **Logs** are one JSON object per line on stdout from all three processes, ready
@@ -287,8 +324,10 @@ until the outbox lag says otherwise.
 **What to watch.** `crm.outbox` depth and oldest `next_run_at` (writes to the ERP
 are backing up), `crm.snapshot_freshness.last_full_sweep_at` (a snapshot that has
 only ever been refreshed incrementally cannot have observed a deletion — the ERP
-keeps no tombstones), `consecutive_failures` on `crm.scheduled_job`, and a 503 from
-`/.well-known/jwks.json` (no key published — every ERP call is about to fail).
+keeps no tombstones), `consecutive_failures` on `crm.scheduled_job`, a 503 from
+`/.well-known/jwks.json` (no key published — every ERP call is about to fail),
+`crm.notification_delivery` in state `dead` (someone is not being told something), and
+`crm.disposal_obligation` in state `overdue` (expired stock still in a bag).
 
 **Backups are the ERP's.** One database, one backup. Note that the CRM holds data
 the ERP has no copy of — visits, territories, assignment history — so a restore

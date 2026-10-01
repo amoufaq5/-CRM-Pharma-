@@ -86,3 +86,6 @@ export const TENANT_SUPERVISION = "da000000-0000-4000-8000-000000000001";
 
 /** packages/sample — expiry-sweep.contract. */
 export const TENANT_EXPIRY_SWEEP = "ce000000-0000-4000-8000-000000000004";
+
+/** packages/notify — raise.contract and dispatch.contract. */
+export const TENANT_NOTIFY = "cf000000-0000-4000-8000-000000000005";

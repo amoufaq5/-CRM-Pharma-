@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 
+import { raiseForSupervisors, raiseNotification } from "@crm/notify";
+
 import { translateSampleError } from "./errors.js";
 
 /**
@@ -44,6 +46,8 @@ export interface ExpirySweepResult {
   readonly autoWrittenOff: number;
   /** Stock that has gone with no decreasing movement to explain it — see below. */
   readonly unattributed: number;
+  /** In-app notifications raised, counting one per recipient. */
+  readonly notified: number;
   readonly policy: DisposalPolicy;
 }
 
@@ -178,6 +182,7 @@ export async function sweepExpiredStock(
     );
 
     let opened = 0;
+    let notified = 0;
     const dueBy = isoDate(new Date(asOf.getTime() + policy.grace_days * 86_400_000));
     for (const holding of expired) {
       const { rowCount } = await tx.query(
@@ -193,7 +198,33 @@ export async function sweepExpiredStock(
         [tenantId, holding.rep_profile_id, holding.lot_id, holding.quantity_on_hand,
          holding.expiry_date, today, dueBy],
       );
-      opened += rowCount ?? 0;
+      if ((rowCount ?? 0) === 0) continue;
+      opened += 1;
+
+      // Told in the SAME transaction as the obligation. Previously this was the whole gap:
+      // the sweep raised an obligation at 3am and the rep found out whenever they next
+      // happened to open the app.
+      await raiseNotification(tx, tenantId, {
+        recipientRepProfileId: holding.rep_profile_id,
+        kind: "disposal_obligation_raised",
+        severity: "warning",
+        subject: `Expired stock to dispose of: lot ${holding.lot_number}`,
+        body:
+          `${holding.quantity_on_hand} unit(s) of lot ${holding.lot_number} expired on ` +
+          `${holding.expiry_date}. Record a destruction or return it to a warehouse by ${dueBy}.`,
+        // Scoped to the lot and the event, with no date in it: the key is what makes a
+        // nightly sweep tell them once rather than every night.
+        dedupKey: `disposal:${holding.lot_id}:raised`,
+        subjectTable: "crm.disposal_obligation",
+        payload: {
+          lotNumber: holding.lot_number,
+          materialKind: holding.material_kind,
+          expiredOn: holding.expiry_date,
+          dueBy,
+          quantity: holding.quantity_on_hand,
+        },
+      });
+      notified += 1;
     }
 
     // ---- 3. auto write-off, promotional material only --------------------
@@ -232,20 +263,72 @@ export async function sweepExpiredStock(
     }
 
     // ---- 4. mark the stragglers overdue ----------------------------------
-    const { rowCount: markedOverdue } = await tx.query(
+    //
+    // RETURNING rather than a bare UPDATE, because each one has to be escalated: an
+    // overdue regulated disposal goes to the rep AND up the hierarchy. A count would have
+    // been enough for the log line and useless for telling anyone.
+    const { rows: nowOverdue } = await tx.query<{
+      id: string;
+      rep_profile_id: string;
+      lot_id: string;
+      due_by: string;
+    }>(
       `UPDATE crm.disposal_obligation
           SET status = 'overdue', updated_at = now()
-        WHERE tenant_id = $1 AND status = 'open' AND due_by < $2::date`,
+        WHERE tenant_id = $1 AND status = 'open' AND due_by < $2::date
+        RETURNING id, rep_profile_id, lot_id, due_by::text AS due_by`,
       [tenantId, today],
     );
+
+    for (const row of nowOverdue) {
+      const { rows: lotRows } = await tx.query<{ lot_number: string }>(
+        `SELECT lot_number FROM crm.sample_lot WHERE id = $1`,
+        [row.lot_id],
+      );
+      const lotNumber = lotRows[0]?.lot_number ?? row.lot_id;
+      const detail = {
+        subject: `OVERDUE: expired stock not disposed of (lot ${lotNumber})`,
+        dedupKey: `disposal:${row.lot_id}:overdue`,
+        subjectTable: "crm.disposal_obligation",
+        subjectId: row.id,
+        payload: { lotNumber, dueBy: row.due_by },
+      } as const;
+
+      await raiseNotification(tx, tenantId, {
+        ...detail,
+        recipientRepProfileId: row.rep_profile_id,
+        kind: "disposal_obligation_overdue",
+        // Urgent for the rep holding it: this is the finding an inspection would open with.
+        severity: "urgent",
+        body:
+          `Lot ${lotNumber} was due to be disposed of by ${row.due_by} and is still on your ` +
+          `balance. Record a destruction or return it to a warehouse now.`,
+      });
+      notified += 1;
+
+      // Escalated, not just repeated: the rep already knows. The supervisor is told
+      // because accountability for an overdue regulated disposal does not stop at the
+      // person holding the carton.
+      const escalations = await raiseForSupervisors(tx, tenantId, row.rep_profile_id, {
+        ...detail,
+        kind: "disposal_obligation_overdue",
+        severity: "warning",
+        body:
+          `Lot ${lotNumber} on a rep's balance was due for disposal by ${row.due_by} and has ` +
+          `not been actioned.`,
+      }, { on: today });
+      notified += escalations.length;
+    }
+    const markedOverdue = nowOverdue.length;
 
     return {
       expiredHoldings: expired.length,
       opened,
       resolved,
-      markedOverdue: markedOverdue ?? 0,
+      markedOverdue,
       autoWrittenOff,
       unattributed,
+      notified,
       policy,
     };
   } catch (err) {

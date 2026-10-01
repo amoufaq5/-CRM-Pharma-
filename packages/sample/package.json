@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@crm/db": "workspace:*",
+    "@crm/notify": "workspace:*",
     "@crm/relay": "workspace:*",
     "pg": "^8.13.0"
   }

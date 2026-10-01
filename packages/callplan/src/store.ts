@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg";
+import { raiseForSupervisors, raiseNotification } from "@crm/notify";
 
 import {
   CallPlanNotFoundError,
@@ -286,29 +287,105 @@ export async function listPlanProducts(tx: PoolClient, planId: string): Promise<
   return rows;
 }
 
+/**
+ * Submits a plan for approval, and tells whoever can approve it.
+ *
+ * The notification goes to `crm.supervisors_of` the plan's rep — the same hierarchy that
+ * decides whether an approval is allowed (0016), so the people told are exactly the people
+ * who can act. A submitted plan previously sat in a queue nobody was informed about.
+ */
 export async function submitPlan(
   tx: PoolClient,
   planId: string,
   submittedBy: string,
   now = new Date(),
 ): Promise<CallPlan> {
-  return transition(tx, planId, {
+  const plan = await transition(tx, planId, {
     sql: `UPDATE crm.call_plan
              SET status = 'submitted', submitted_by = $2, submitted_at = $3, updated_at = now()
            WHERE id = $1
            RETURNING ${PLAN_COLUMNS}`,
     params: [planId, submittedBy, now],
   });
+
+  const { rows } = await tx.query<{ display_name: string; cycle_code: string; tenant_id: string }>(
+    `SELECT rp.display_name, c.code AS cycle_code, cp.tenant_id
+       FROM crm.call_plan cp
+       JOIN crm.rep_profile rp ON rp.id = cp.rep_profile_id
+       JOIN crm.cycle c ON c.id = cp.cycle_id
+      WHERE cp.id = $1`,
+    [planId],
+  );
+  const info = rows[0];
+  if (info !== undefined) {
+    await raiseForSupervisors(tx, info.tenant_id, plan.rep_profile_id, {
+      kind: "call_plan_submitted",
+      severity: "info",
+      subject: `${info.display_name} submitted a call plan for ${info.cycle_code}`,
+      body:
+        `${info.display_name}'s call plan for cycle ${info.cycle_code} is waiting for approval. ` +
+        `You cannot approve a plan you submitted yourself.`,
+      // Keyed on the plan and the revision-independent event: a plan returned and
+      // resubmitted is the same plan, and re-notifying on every resubmission would train
+      // the manager to ignore it.
+      dedupKey: `call_plan:${planId}:submitted`,
+      subjectTable: "crm.call_plan",
+      subjectId: planId,
+      payload: { cycleCode: info.cycle_code, repDisplayName: info.display_name },
+    });
+  }
+  return plan;
 }
 
 /** Sends a submitted plan back for rework. The round trip the lifecycle map allows. */
 export async function returnPlanToDraft(tx: PoolClient, planId: string): Promise<CallPlan> {
-  return transition(tx, planId, {
+  const plan = await transition(tx, planId, {
     sql: `UPDATE crm.call_plan
              SET status = 'draft', approved_by = NULL, approved_at = NULL, updated_at = now()
            WHERE id = $1
            RETURNING ${PLAN_COLUMNS}`,
     params: [planId],
+  });
+  await notifyPlanOwner(tx, plan, "call_plan_returned", "sent back for rework", null);
+  return plan;
+}
+
+/**
+ * Tells the rep whose plan it is what happened to it.
+ *
+ * The decision is news to them and to nobody else, so it does not go up the hierarchy —
+ * the approver already knows, having just made it.
+ */
+async function notifyPlanOwner(
+  tx: PoolClient,
+  plan: CallPlan,
+  kind: "call_plan_approved" | "call_plan_returned",
+  verb: string,
+  note: string | null,
+): Promise<void> {
+  const { rows } = await tx.query<{ tenant_id: string; cycle_code: string }>(
+    `SELECT cp.tenant_id, c.code AS cycle_code
+       FROM crm.call_plan cp JOIN crm.cycle c ON c.id = cp.cycle_id
+      WHERE cp.id = $1`,
+    [plan.id],
+  );
+  const info = rows[0];
+  if (info === undefined) return;
+  await raiseNotification(tx, info.tenant_id, {
+    recipientRepProfileId: plan.rep_profile_id,
+    kind,
+    severity: "info",
+    subject: `Your call plan for ${info.cycle_code} was ${verb}`,
+    body:
+      `Your call plan for cycle ${info.cycle_code} was ${verb}.` +
+      (note !== null && note !== "" ? ` Note: ${note}` : "") +
+      (kind === "call_plan_returned" ? " It is editable again." : ""),
+    // Includes the revision, so a resubmitted-and-re-decided plan notifies again — unlike
+    // the submission, where a repeat would be noise, a second decision is new information.
+    dedupKey: `call_plan:${plan.id}:${kind}:r${plan.revision}`,
+    subjectTable: "crm.call_plan",
+    subjectId: plan.id,
+    payload: { cycleCode: info.cycle_code, revision: plan.revision },
   });
 }
 
@@ -325,13 +402,15 @@ export async function approvePlan(
   approvedBy: string,
   opts: { note?: string | null; now?: Date } = {},
 ): Promise<CallPlan> {
-  return transition(tx, planId, {
+  const plan = await transition(tx, planId, {
     sql: `UPDATE crm.call_plan
              SET status = 'approved', approved_by = $2, approved_at = $3, approval_note = $4, updated_at = now()
            WHERE id = $1
            RETURNING ${PLAN_COLUMNS}`,
     params: [planId, approvedBy, opts.now ?? new Date(), opts.note ?? null],
   });
+  await notifyPlanOwner(tx, plan, "call_plan_approved", "approved", opts.note ?? null);
+  return plan;
 }
 
 export async function withdrawPlan(tx: PoolClient, planId: string): Promise<CallPlan> {

@@ -25,6 +25,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/territory/` | Territories, rep assignment, supervision, and the row-level scoping the ERP cannot do. |
 | `packages/visit/` | Visits and detailing lines. Offline-first, territory-scoped, immutable once final. |
 | `packages/api/` | The HTTP API. JWT auth, one error shape, territory-scoped on every read. |
+| `packages/notify/` | Notifications: the in-app inbox, HMAC-signed webhooks, the dispatcher. |
 | `packages/credential/` | The ERP service credential: Ed25519 signing, the JWKS, the key lifecycle, per-tenant roles. |
 | `packages/callplan/` | Cycles, call plans and adherence. Four-eyed approval, frozen once approved. |
 | `packages/sample/` | Sample and promo-material custody: lots, expiry, balances, transfers, counts, the ERP mirror. |
@@ -92,6 +93,10 @@ authorisation on its own.
 | `POST /v1/samples/returns` | back to a warehouse; mirrored to the ERP as a `receipt` |
 | `GET /v1/samples/disposal-policy` | the tenant's grace period, read-only |
 | `GET /v1/team/samples/obligations` | the team's outstanding disposals — the chase list |
+| `GET /v1/notifications` | the inbox; `?unread=true` filters |
+| `GET /v1/notifications/unread-count` | a real count of a real column |
+| `POST /v1/notifications/:id/read` | idempotent; keeps the first read timestamp |
+| `POST /v1/notifications/read-all` | |
 
 Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
 emits two on the same API, and a client that handles only one misreads the other.
@@ -313,3 +318,25 @@ with a guessed reason would put a fabricated disposal in the record.
 does not take custody — the warehouse takes it back. Accepting a transfer of expired stock
 *is* allowed: material already in custody has to be somewhere, and refusing the acceptance
 would strand it in transit with nobody accountable.
+
+**26. A notification is raised in the same transaction as the thing it is about.** There is
+no state where a disposal obligation exists and nobody was told, nor one where someone was
+told about an obligation that rolled back. In-app delivery *is* the row; the webhook call
+is queued and made later, because an external call must never sit inside a business
+transaction.
+
+**27. Read state is a column, not an approximation.** `read_at` per notification per
+recipient, so an unread badge is a count. The ERP has no per-user read state and
+approximates "unread" by recency, which goes wrong the moment someone reads on two devices.
+
+**28. A webhook signature commits to the timestamp as well as the body.** Signing the body
+alone lets anyone who captured one delivery replay it forever. `verifyWebhook` ships
+alongside the sender so the receiving end has a reference rather than a reimplementation,
+and the tests verify against it — so both halves are known to agree. A missing secret
+dead-letters the delivery rather than sending unsigned.
+
+**29. Two channels, both real; email and SMS are a seam and nothing more.** The ERP's
+notification package declares 6 channels and 18 providers and has a working implementation
+for one of them, a gap that sat in its ADRs for releases. One working channel is worth more
+than six stubs, so this ships in-app and webhook — verified against a real HTTP server that
+checks the signature — and says plainly that nothing else is built.

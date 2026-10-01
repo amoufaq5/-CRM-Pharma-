@@ -1,5 +1,6 @@
 import { withTenantContext } from "@crm/db";
 import type { OutboxRelay } from "@crm/relay";
+import type { NotificationDispatcher } from "@crm/notify";
 import { sweepExpiredStock } from "@crm/sample";
 import type { SnapshotRefresher } from "@crm/sync";
 import type { Pool, PoolClient } from "pg";
@@ -11,6 +12,12 @@ export interface SchedulerOptions {
   readonly pool: Pool;
   readonly relay: OutboxRelay;
   readonly refresher: SnapshotRefresher;
+  /**
+   * Optional: without it the `notify_dispatch` job reports that it is unconfigured rather
+   * than failing. In-app notifications still land — they are rows, written by whatever
+   * raised them — so a deployment with no webhook endpoints needs no dispatcher.
+   */
+  readonly notifications?: NotificationDispatcher;
   /** How often to look for due work. Not the job cadence — that is per job. */
   readonly tickIntervalMs?: number;
   readonly now?: () => Date;
@@ -203,6 +210,15 @@ export class Scheduler {
         } finally {
           client.release();
         }
+      }
+      case "notify_dispatch": {
+        const dispatcher = this.options.notifications;
+        if (dispatcher === undefined) return "no dispatcher configured; in-app notifications unaffected";
+        const r = await dispatcher.drainTenant(tenantId);
+        return (
+          `claimed=${r.claimed} delivered=${r.delivered} retried=${r.retried} ` +
+          `dead=${r.dead} pending=${r.pending}`
+        );
       }
       case "snapshot_incremental":
       case "snapshot_full": {

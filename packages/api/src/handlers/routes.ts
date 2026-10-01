@@ -20,6 +20,7 @@ import {
   withdrawPlan,
 } from "@crm/callplan";
 import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
+import { inbox, markAllRead, markRead, unreadCount } from "@crm/notify";
 import { withTenantContext } from "@crm/db";
 import { canSupervise, teamRoster, visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
 import {
@@ -1476,6 +1477,75 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         teamObligations(tx, ctx.principal.repProfileId, { ...(on !== undefined ? { asOf: on } : {}) }),
       );
       return { status: 200, body: { data } };
+    },
+  });
+
+  // ---- the inbox ----------------------------------------------------------
+
+  /**
+   * What the caller has been told, newest first.
+   *
+   * Every notification is addressed to one rep, so there is no scoping decision to get
+   * wrong here — `recipient_rep_profile_id` IS the authorisation.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/notifications",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const unreadOnly = ctx.query.get("unread") === "true";
+      const limit = ctx.query.get("limit");
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        inbox(tx, ctx.principal.repProfileId, {
+          unreadOnly,
+          ...(limit !== null ? { limit: parse(z.coerce.number().int().min(1).max(200), limit) } : {}),
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * The unread count — an actual count of an actual column.
+   *
+   * The ERP cannot answer this: it keeps no per-user read state, so its "unread" is a
+   * recency approximation that goes wrong as soon as someone reads on two devices.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/notifications/unread-count",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const count = await inTenant(deps, ctx.principal, (tx) =>
+        unreadCount(tx, ctx.principal.repProfileId),
+      );
+      return { status: 200, body: { count } };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/notifications/read-all",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const marked = await inTenant(deps, ctx.principal, (tx) =>
+        markAllRead(tx, ctx.principal.repProfileId),
+      );
+      return { status: 200, body: { marked } };
+    },
+  });
+
+  /**
+   * Marks one read. Idempotent, and keeps the FIRST read timestamp: when they saw it is
+   * the fact worth keeping, not when they last tapped it.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/notifications/:id/read",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const ok = await inTenant(deps, ctx.principal, (tx) => markRead(tx, ctx.principal.repProfileId, id));
+      // A 404 rather than a 403: whether a notification exists is itself information about
+      // someone else's work.
+      if (!ok) throw notFound(`no notification ${id}`);
+      return { status: 204 };
     },
   });
 

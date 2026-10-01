@@ -1,5 +1,7 @@
 import type { PoolClient } from "pg";
 
+import { raiseNotification } from "@crm/notify";
+
 import { SampleCountError, SampleLotNotFoundError, translateSampleError } from "./errors.js";
 
 /**
@@ -276,17 +278,50 @@ export function disburseSamples(
   return insertMovement(tx, tenantId, { ...input, kind: "disbursement" });
 }
 
-/** Sends material to another rep. It leaves the bag and enters in-transit. */
-export function transferOut(
+/**
+ * Sends material to another rep. It leaves the bag and enters in-transit.
+ *
+ * Notifies the RECEIVING rep in the same transaction, because they have no other reason to
+ * expect it: an unaccepted transfer was previously visible only to whoever thought to look
+ * at `GET /v1/samples/transfers`, and material nobody accepts sits in transit indefinitely.
+ */
+export async function transferOut(
   tx: PoolClient,
   tenantId: string,
   input: MovementBase & { toRepProfileId: string },
 ): Promise<SampleTransaction> {
-  return insertMovement(tx, tenantId, {
+  const movement = await insertMovement(tx, tenantId, {
     ...input,
     kind: "transfer_out",
     counterpartyRepProfileId: input.toRepProfileId,
   });
+
+  const { rows } = await tx.query<{ lot_number: string; display_name: string }>(
+    `SELECT l.lot_number, rp.display_name
+       FROM crm.sample_lot l, crm.rep_profile rp
+      WHERE l.id = $1 AND rp.id = $2`,
+    [input.lotId, input.repProfileId],
+  );
+  const lotNumber = rows[0]?.lot_number ?? input.lotId;
+  const sender = rows[0]?.display_name ?? "another rep";
+
+  await raiseNotification(tx, tenantId, {
+    recipientRepProfileId: input.toRepProfileId,
+    kind: "sample_transfer_awaiting_acceptance",
+    severity: "warning",
+    subject: `${sender} sent you ${String(input.quantity)} of lot ${lotNumber}`,
+    body:
+      `${sender} transferred ${String(input.quantity)} unit(s) of lot ${lotNumber} to you. ` +
+      `It stays on their balance as in-transit until you accept it.`,
+    // Keyed on the transfer, so a replayed offline sync of the same transfer does not
+    // notify twice.
+    dedupKey: `transfer:${movement.id}:awaiting`,
+    subjectTable: "crm.sample_transaction",
+    subjectId: movement.id,
+    payload: { lotNumber, quantity: String(input.quantity), fromRepProfileId: input.repProfileId },
+  });
+
+  return movement;
 }
 
 /**

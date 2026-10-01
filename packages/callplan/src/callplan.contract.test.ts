@@ -11,6 +11,8 @@ import {
   PlanFrozenError,
   TargetOutsideTerritoryError,
 } from "./errors.js";
+import { inbox } from "@crm/notify";
+
 import type { CallPlan, Cycle } from "./store.js";
 import {
   activateCycle,
@@ -141,6 +143,8 @@ describe("call plans", () => {
         await tx.query(`ALTER TABLE ${table} DISABLE TRIGGER USER`);
       }
       try {
+        await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
+        await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.visit WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.call_plan_target WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.call_plan_product WHERE tenant_id = $1", [TENANT]);
@@ -480,6 +484,89 @@ describe("call plans", () => {
         const plan = await approvedPlan(tx);
         const { replacement } = await supersedePlan(tx, TENANT, plan.id, { copyTargets: false });
         expect(await listTargets(tx, replacement.id)).toHaveLength(0);
+      });
+    });
+  });
+
+  describe("telling someone", () => {
+    /**
+     * A submitted plan used to sit in a queue nobody was told about. The recipients come
+     * from the same hierarchy that decides who may approve it, so the people told are
+     * exactly the people who can act.
+     */
+    it("tells whoever can approve a submitted plan", async () => {
+      await inTenant(async (tx) => {
+        const cycle = await aCycle(tx);
+        const plan = await createPlan(tx, TENANT, { cycleId: cycle.id, repProfileId: REP });
+        await submitPlan(tx, plan.id, REP);
+
+        const mgrItems = await inbox(tx, MANAGER);
+        expect(mgrItems).toHaveLength(1);
+        expect(mgrItems[0]!.kind).toBe("call_plan_submitted");
+        expect(mgrItems[0]!.subject).toContain("CP-Q4");
+        expect(mgrItems[0]!.subject_id).toBe(plan.id);
+
+        // Not the peer, who cannot approve it; and not the rep, who just did it.
+        expect(await inbox(tx, PEER)).toHaveLength(0);
+        expect(await inbox(tx, REP)).toHaveLength(0);
+      });
+    });
+
+    it("does not re-notify on a resubmission, which would train the manager to ignore it", async () => {
+      await inTenant(async (tx) => {
+        const cycle = await aCycle(tx);
+        const plan = await createPlan(tx, TENANT, { cycleId: cycle.id, repProfileId: REP });
+        await submitPlan(tx, plan.id, REP);
+        await returnPlanToDraft(tx, plan.id);
+        await submitPlan(tx, plan.id, REP);
+        expect((await inbox(tx, MANAGER)).filter((i) => i.kind === "call_plan_submitted")).toHaveLength(1);
+      });
+    });
+
+    it("tells the rep when their plan is approved, and nobody else", async () => {
+      await inTenant(async (tx) => {
+        const cycle = await aCycle(tx);
+        const plan = await createPlan(tx, TENANT, { cycleId: cycle.id, repProfileId: REP });
+        await submitPlan(tx, plan.id, REP);
+        await approvePlan(tx, plan.id, MANAGER, { note: "looks right" });
+
+        const items = (await inbox(tx, REP)).filter((i) => i.kind === "call_plan_approved");
+        expect(items).toHaveLength(1);
+        expect(items[0]!.body).toContain("looks right");
+        // The approver already knows; they just decided it.
+        expect((await inbox(tx, MANAGER)).filter((i) => i.kind === "call_plan_approved")).toHaveLength(0);
+      });
+    });
+
+    it("tells the rep when their plan is sent back, saying it is editable again", async () => {
+      await inTenant(async (tx) => {
+        const cycle = await aCycle(tx);
+        const plan = await createPlan(tx, TENANT, { cycleId: cycle.id, repProfileId: REP });
+        await submitPlan(tx, plan.id, REP);
+        await returnPlanToDraft(tx, plan.id);
+        const items = (await inbox(tx, REP)).filter((i) => i.kind === "call_plan_returned");
+        expect(items).toHaveLength(1);
+        expect(items[0]!.body).toMatch(/editable again/);
+      });
+    });
+
+    /**
+     * Unlike a resubmission, a second DECISION is new information — so the dedup key carries
+     * the revision and the rep hears about each one.
+     */
+    it("tells the rep again when a later revision is decided", async () => {
+      await inTenant(async (tx) => {
+        const cycle = await aCycle(tx);
+        const plan = await createPlan(tx, TENANT, { cycleId: cycle.id, repProfileId: REP });
+        await addTarget(tx, TENANT, { planId: plan.id, erpAccountId: "CP-ACC-1", targetCalls: 1 });
+        await submitPlan(tx, plan.id, REP);
+        await approvePlan(tx, plan.id, MANAGER);
+
+        const { replacement } = await supersedePlan(tx, TENANT, plan.id);
+        await submitPlan(tx, replacement.id, REP);
+        await approvePlan(tx, replacement.id, MANAGER);
+
+        expect((await inbox(tx, REP)).filter((i) => i.kind === "call_plan_approved")).toHaveLength(2);
       });
     });
   });
