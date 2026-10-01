@@ -1,3 +1,13 @@
+import {
+  cycleOn,
+  listCycles,
+  listPlanProducts,
+  listPlans,
+  listTargets,
+  planAdherence,
+  planSummary,
+  getPlan,
+} from "@crm/callplan";
 import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
 import { withTenantContext } from "@crm/db";
 import { visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
@@ -12,6 +22,18 @@ import {
   VISIT_STATUSES,
   type VisitStatus,
 } from "@crm/visit";
+import {
+  acceptTransfer,
+  disburseSamples,
+  enqueueErpMirror,
+  expiringHoldings,
+  getLot,
+  holdingsFor,
+  ledgerFor,
+  outstandingTransfers,
+  receiveSamples,
+  transferOut,
+} from "@crm/sample";
 import type { Pool, PoolClient } from "pg";
 import { z } from "zod";
 
@@ -84,6 +106,80 @@ async function requireAccountAccess(
   if (rows[0]?.ok !== true) {
     throw forbidden(`account ${erpAccountId} is not in your territory${on !== undefined ? ` on ${on}` : ""}`);
   }
+}
+
+
+const DisbursementBody = z.object({
+  id: UUID,
+  lotId: UUID,
+  quantity: z.union([z.string().regex(/^\d{1,13}(\.\d{1,3})?$/, "expected a decimal quantity"), z.number().positive()]),
+  occurredAt: z.string().datetime(),
+  erpAccountId: ERP_ID,
+  erpContactId: ERP_ID.nullish(),
+  recipientName: z.string().min(1).max(200),
+  /** The sha256 of the signature captured on the device. See 0017 on why a hash. */
+  signatureSha256: z.string().regex(/^[0-9a-f]{64}$/, "expected a lowercase sha256 hex digest"),
+  visitId: UUID.nullish(),
+});
+
+const ReceiptBody = z.object({
+  id: UUID,
+  lotId: UUID,
+  quantity: z.union([z.string().regex(/^\d{1,13}(\.\d{1,3})?$/), z.number().positive()]),
+  occurredAt: z.string().datetime(),
+  erpWarehouseId: ERP_ID,
+});
+
+const TransferBody = z.object({
+  id: UUID,
+  lotId: UUID,
+  quantity: z.union([z.string().regex(/^\d{1,13}(\.\d{1,3})?$/), z.number().positive()]),
+  occurredAt: z.string().datetime(),
+  toRepProfileId: UUID,
+});
+
+const AcceptBody = z.object({ id: UUID, occurredAt: z.string().datetime() });
+
+/**
+ * Records a disbursement.
+ *
+ * No outbox write, deliberately: a hand-over is invisible to the ERP because the
+ * material left its warehouse when the rep received it. Mirroring it would subtract the
+ * same quantity from the warehouse twice. The receipt route is where the mirror belongs.
+ */
+async function recordDisbursement(
+  tx: PoolClient,
+  p: Principal,
+  input: z.infer<typeof DisbursementBody>,
+): Promise<unknown> {
+  const row = await disburseSamples(tx, p.tenantId, {
+    id: input.id,
+    lotId: input.lotId,
+    repProfileId: p.repProfileId,
+    quantity: input.quantity,
+    occurredAt: new Date(input.occurredAt),
+    erpAccountId: input.erpAccountId,
+    recipientName: input.recipientName,
+    signatureSha256: input.signatureSha256,
+    ...(input.erpContactId != null ? { erpContactId: input.erpContactId } : {}),
+    ...(input.visitId != null ? { visitId: input.visitId } : {}),
+  });
+  return row;
+}
+
+/**
+ * Refuses a plan that is not the caller's.
+ *
+ * A 404 rather than a 403: whether a plan exists is itself information about another
+ * rep's territory, and the ERP leaks exactly this kind of thing by having no row-level
+ * scoping at all (report R2).
+ */
+async function requireOwnPlan(tx: PoolClient, p: Principal, planId: string): Promise<NonNullable<Awaited<ReturnType<typeof getPlan>>>> {
+  const plan = await getPlan(tx, planId);
+  if (plan === null || plan.rep_profile_id !== p.repProfileId) {
+    throw notFound(`no call plan ${planId}`);
+  }
+  return plan;
 }
 
 export function buildRouter(deps: HandlerDeps): Router<Principal> {
@@ -460,6 +556,277 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         status: 200,
         body: { accepted, rejected: results.length - accepted, results },
       };
+    },
+  });
+
+  // ---- call plans ---------------------------------------------------------
+
+  router.add({
+    method: "GET",
+    pattern: "/v1/cycles",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, async (tx) =>
+        on !== undefined ? [await cycleOn(tx, on)].filter((c) => c !== null) : await listCycles(tx),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * The caller's own plans, and only those.
+   *
+   * A manager's view of their team's plans is a separate route with a separate
+   * authorisation question (`crm.managed_territory_ids`), and inventing it here by
+   * accepting a `?rep=` parameter is how one rep ends up reading another's targets.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/call-plans",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const cycleId = ctx.query.get("cycle");
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        listPlans(tx, {
+          repProfileId: ctx.principal.repProfileId,
+          ...(cycleId !== null ? { cycleId: parse(UUID, cycleId) } : {}),
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  router.add({
+    method: "GET",
+    pattern: "/v1/call-plans/:id",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        const plan = await requireOwnPlan(tx, ctx.principal, id);
+        return {
+          ...plan,
+          targets: await listTargets(tx, id),
+          products: await listPlanProducts(tx, id),
+        };
+      });
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Planned versus actual, straight from `crm.call_plan_adherence`.
+   *
+   * Computed in SQL rather than here so a manager's report, an incentive run and this
+   * route cannot disagree about what counts as a call. Both numbers are returned
+   * because they answer different questions: coverage is "did we reach them at all",
+   * attainment is "did we call as often as we said" — and a field force can look
+   * compliant on the second while a third of its customers were never seen.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/call-plans/:id/adherence",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        await requireOwnPlan(tx, ctx.principal, id);
+        return { summary: await planSummary(tx, id), targets: await planAdherence(tx, id) };
+      });
+      return { status: 200, body };
+    },
+  });
+
+  // ---- sample custody -----------------------------------------------------
+
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/holdings",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        holdingsFor(tx, ctx.principal.repProfileId, { includeEmpty: ctx.query.get("all") === "true" }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/ledger",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const lot = ctx.query.get("lot");
+      const limit = ctx.query.get("limit");
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        ledgerFor(tx, {
+          repProfileId: ctx.principal.repProfileId,
+          ...(lot !== null ? { lotId: parse(UUID, lot) } : {}),
+          ...(limit !== null ? { limit: parse(z.coerce.number().int().min(1).max(500), limit) } : {}),
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * What the caller is holding that is about to expire.
+   *
+   * Expired stock in a rep's bag is the most common sample-audit finding there is, and
+   * the ERP cannot express the question at all — it has no lot and no expiry.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/expiring",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const within = ctx.query.get("withinDays");
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        expiringHoldings(tx, {
+          repProfileId: ctx.principal.repProfileId,
+          ...(within !== null ? { withinDays: parse(z.coerce.number().int().min(0).max(1000), within) } : {}),
+          ...(onDate(ctx) !== undefined ? { asOf: onDate(ctx)! } : {}),
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Records a hand-over to a prescriber.
+   *
+   * The id comes from the DEVICE: a rep hands samples over at a clinic desk with no
+   * signal, and a retried sync must collapse into the same row rather than hand the
+   * doctor's samples out twice in the record.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/disbursements",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const input = parse(DisbursementBody, ctx.body);
+      const row = await inTenant(deps, ctx.principal, (tx) => recordDisbursement(tx, ctx.principal, input));
+      return { status: 201, body: row };
+    },
+  });
+
+  /**
+   * The rep confirms receipt of stock from a warehouse.
+   *
+   * The one movement that crosses into ERP-controlled stock, so this is the one route
+   * that writes the outbox — the mirrored `StockMovement` (an `issue`, from the ERP's
+   * side of the door) is enqueued in the SAME transaction. A receipt that committed
+   * without its mirror would leave the ERP's warehouse balance permanently overstated.
+   *
+   * WORTH KNOWING: the rep declares this, rather than acknowledging an issue the
+   * warehouse raised. The stronger model is warehouse-initiated with rep
+   * acknowledgement, and it needs an admin surface that does not exist yet. What makes
+   * the weaker one defensible meanwhile is that nothing here is editable — the ledger is
+   * append-only, a correction needs a reason, and the cycle count reconciles against
+   * physical stock.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/receipts",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const input = parse(ReceiptBody, ctx.body);
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        const lot = await getLot(tx, input.lotId);
+        if (lot === null) throw notFound(`no sample lot ${input.lotId}`);
+        const row = await receiveSamples(tx, ctx.principal.tenantId, {
+          id: input.id,
+          lotId: input.lotId,
+          repProfileId: ctx.principal.repProfileId,
+          quantity: input.quantity,
+          occurredAt: new Date(input.occurredAt),
+          erpWarehouseId: input.erpWarehouseId,
+        });
+        const mirrored = await enqueueErpMirror(tx, ctx.principal.tenantId, row, lot);
+        return { ...row, erpMirrorEnqueued: mirrored };
+      });
+      return { status: 201, body };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/transfers",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const input = parse(TransferBody, ctx.body);
+      const row = await inTenant(deps, ctx.principal, (tx) =>
+        transferOut(tx, ctx.principal.tenantId, {
+          id: input.id,
+          lotId: input.lotId,
+          repProfileId: ctx.principal.repProfileId,
+          quantity: input.quantity,
+          occurredAt: new Date(input.occurredAt),
+          toRepProfileId: input.toRepProfileId,
+        }),
+      );
+      return { status: 201, body: row };
+    },
+  });
+
+  /**
+   * Accepts a transfer sent to the caller.
+   *
+   * Quantity and lot come from the transfer, not the request: an acceptance that
+   * disagreed with what was sent would not be an acceptance, and the database refuses
+   * it anyway — this removes the chance to try.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/transfers/:id/accept",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const transferOfId = parse(UUID, ctx.params["id"]);
+      const input = parse(AcceptBody, ctx.body);
+      const row = await inTenant(deps, ctx.principal, (tx) =>
+        acceptTransfer(tx, ctx.principal.tenantId, {
+          id: input.id,
+          transferOf: transferOfId,
+          repProfileId: ctx.principal.repProfileId,
+          occurredAt: new Date(input.occurredAt),
+        }),
+      );
+      return { status: 201, body: row };
+    },
+  });
+
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/transfers",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        outstandingTransfers(tx, ctx.principal.repProfileId),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * The offline flush for disbursements, with PER-ROW results.
+   *
+   * A rep's day produces a batch, and one bad row — an expired lot, an account that
+   * moved territory — must not reject the other nineteen. Same shape as the visit sync,
+   * for the same reason.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/sync/disbursements",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const { disbursements } = parse(
+        z.object({ disbursements: z.array(DisbursementBody).max(200) }),
+        ctx.body,
+      );
+      const p = ctx.principal;
+      const results: Array<{ id: string; ok: boolean; error?: string; type?: string }> = [];
+
+      for (const input of disbursements) {
+        try {
+          await inTenant(deps, p, (tx) => recordDisbursement(tx, p, input));
+          results.push({ id: input.id, ok: true });
+        } catch (err) {
+          const { toProblem } = await import("../problems.js");
+          const problem = toProblem(err);
+          results.push({ id: input.id, ok: false, type: problem.kind, error: problem.detail ?? problem.message });
+        }
+      }
+
+      const accepted = results.filter((r) => r.ok).length;
+      return { status: 200, body: { accepted, rejected: results.length - accepted, results } };
     },
   });
 

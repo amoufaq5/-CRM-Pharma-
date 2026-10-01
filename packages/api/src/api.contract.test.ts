@@ -65,6 +65,27 @@ describe("the API, end to end", () => {
   beforeEach(async () => {
     for (const t of [TENANT, OTHER]) {
       await withTenantContext(admin, t, async (tx) => {
+        // Call plans and the sample ledger both refuse deletion by design (0016, 0018)
+        // and both reference rep_profile with ON DELETE RESTRICT, so the fixture has to
+        // disable those guards explicitly and in dependency order.
+        for (const table of ["crm.call_plan", "crm.call_plan_target", "crm.call_plan_product",
+                             "crm.sample_transaction", "crm.sample_holding"]) {
+          await tx.query(`ALTER TABLE ${table} DISABLE TRIGGER USER`);
+        }
+        await tx.query("DELETE FROM crm.sample_count_line WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.sample_count WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.sample_holding WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.sample_lot WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.call_plan_target WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.call_plan_product WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.call_plan WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.cycle WHERE tenant_id = $1", [t]);
+        for (const table of ["crm.call_plan", "crm.call_plan_target", "crm.call_plan_product",
+                             "crm.sample_transaction", "crm.sample_holding"]) {
+          await tx.query(`ALTER TABLE ${table} ENABLE TRIGGER USER`);
+        }
         await tx.query("ALTER TABLE crm.visit DISABLE TRIGGER visit_reject_delete_when_final");
         await tx.query("DELETE FROM crm.visit_product WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.visit WHERE tenant_id = $1", [t]);
@@ -423,6 +444,321 @@ describe("the API, end to end", () => {
       expect(second.body.accepted).toBe(1);
       const list = await call("GET", "/v1/visits");
       expect(list.body.data).toHaveLength(1);
+    });
+  });
+
+  describe("call plans", () => {
+    const aPlan = async (): Promise<{ cycleId: string; planId: string }> => {
+      let cycleId = "";
+      let planId = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const c = await tx.query<{ id: string }>(
+          `INSERT INTO crm.cycle (tenant_id, code, name, starts_on, ends_on, status)
+           VALUES ($1,'Q4','Q4 2026','2026-10-01','2026-12-31','active') RETURNING id`,
+          [TENANT],
+        );
+        cycleId = c.rows[0]!.id;
+        const pl = await tx.query<{ id: string }>(
+          `INSERT INTO crm.call_plan (tenant_id, cycle_id, rep_profile_id) VALUES ($1,$2,$3) RETURNING id`,
+          [TENANT, cycleId, rep],
+        );
+        planId = pl.rows[0]!.id;
+        await tx.query(
+          `INSERT INTO crm.call_plan_target (tenant_id, call_plan_id, erp_account_id, target_calls, segment)
+           VALUES ($1,$2,'acct_auh',2,'A')`,
+          [TENANT, planId],
+        );
+        await tx.query(
+          `INSERT INTO crm.call_plan_product (tenant_id, call_plan_id, erp_item_id, position)
+           VALUES ($1,$2,'rec_i1',1)`,
+          [TENANT, planId],
+        );
+      });
+      return { cycleId, planId };
+    };
+
+    it("lists the cycles and the one covering a date", async () => {
+      await aPlan();
+      const all = await call("GET", "/v1/cycles");
+      expect(all.status).toBe(200);
+      expect(all.body.data).toHaveLength(1);
+      const on = await call("GET", "/v1/cycles?on=2026-11-15");
+      expect(on.body.data[0].code).toBe("Q4");
+    });
+
+    it("returns the caller's own plan with its targets and products", async () => {
+      const { planId } = await aPlan();
+      const res = await call("GET", `/v1/call-plans/${planId}`);
+      expect(res.status).toBe(200);
+      expect(res.body.targets).toHaveLength(1);
+      expect(res.body.products[0].erp_item_id).toBe("rec_i1");
+    });
+
+    /**
+     * A 404, not a 403: whether a plan exists is itself information about another rep's
+     * territory. The ERP leaks exactly this class of thing by having no row-level
+     * scoping at all (report R2).
+     */
+    it("hides another rep's plan behind a 404", async () => {
+      let foreignPlan = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const c = await tx.query<{ id: string }>(
+          `INSERT INTO crm.cycle (tenant_id, code, name, starts_on, ends_on)
+           VALUES ($1,'Q4b','Q4 other','2026-10-01','2026-12-31') RETURNING id`,
+          [TENANT],
+        );
+        const pl = await tx.query<{ id: string }>(
+          `INSERT INTO crm.call_plan (tenant_id, cycle_id, rep_profile_id) VALUES ($1,$2,$3) RETURNING id`,
+          [TENANT, c.rows[0]!.id, otherRep],
+        );
+        foreignPlan = pl.rows[0]!.id;
+      });
+      const res = await call("GET", `/v1/call-plans/${foreignPlan}`);
+      expect(res.status).toBe(404);
+      expect(res.body.type).toContain("/errors/not-found");
+      // And it is not in the caller's list either.
+      expect((await call("GET", "/v1/call-plans")).body.data).toHaveLength(0);
+    });
+
+    it("reports adherence with both coverage and attainment", async () => {
+      const { planId } = await aPlan();
+      await withTenantContext(admin, TENANT, async (tx) => {
+        await tx.query(
+          `INSERT INTO crm.visit (id, tenant_id, rep_profile_id, erp_account_id, status, occurred_at)
+           VALUES (gen_random_uuid(),$1,$2,'acct_auh','completed','2026-10-05T09:00:00Z')`,
+          [TENANT, rep],
+        );
+      });
+      const res = await call("GET", `/v1/call-plans/${planId}/adherence`);
+      expect(res.status).toBe(200);
+      expect(res.body.targets[0].actual_calls).toBe(1);
+      expect(res.body.targets[0].met).toBe(false);
+      expect(res.body.summary.coverage_pct).toBe("100.0");
+      expect(res.body.summary.attainment_pct).toBe("50.0");
+    });
+  });
+
+  describe("sample custody", () => {
+    let lotSeq = 0;
+    const aLot = async (expiry = "2027-12-31"): Promise<string> => {
+      let id = "";
+      lotSeq += 1;
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const r = await tx.query<{ id: string }>(
+          `INSERT INTO crm.sample_lot (tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+           VALUES ($1,'rec_i1',$3,$2,'drug_sample') RETURNING id`,
+          [TENANT, expiry, `LOT-API-${lotSeq}`],
+        );
+        id = r.rows[0]!.id;
+      });
+      return id;
+    };
+
+    const receipt = (lotId: string, quantity: number): Promise<{ status: number; body: Record<string, unknown> }> =>
+      call("POST", "/v1/samples/receipts", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity,
+          occurredAt: "2026-10-01T08:00:00.000Z",
+          erpWarehouseId: "rec_wh1",
+        },
+      });
+
+    /**
+     * The receipt is the one movement that crosses into ERP stock, so it is the one
+     * route that writes the outbox — in the same transaction.
+     */
+    it("records a receipt and enqueues the mirrored StockMovement", async () => {
+      const lotId = await aLot();
+      const res = await receipt(lotId, 40);
+      expect(res.status).toBe(201);
+      expect(res.body.erpMirrorEnqueued).toBe(true);
+
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const { rows } = await tx.query<{ entity: string; payload: Record<string, unknown> }>(
+          "SELECT entity, payload FROM crm.outbox WHERE tenant_id = $1",
+          [TENANT],
+        );
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.entity).toBe("StockMovement");
+        // The CRM's receipt is the ERP's issue: the same event from the other side of
+        // the warehouse door.
+        expect(rows[0]!.payload["movement_type"]).toBe("issue");
+      });
+
+      const holdings = await call("GET", "/v1/samples/holdings");
+      expect(holdings.body.data[0].quantity_on_hand).toBe("40.000");
+    });
+
+    it("records a disbursement and does NOT mirror it", async () => {
+      const lotId = await aLot();
+      await receipt(lotId, 10);
+      const res = await call("POST", "/v1/samples/disbursements", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 2,
+          occurredAt: "2026-10-05T09:00:00.000Z",
+          erpAccountId: "acct_auh",
+          recipientName: "Dr Ada",
+          signatureSha256: "a".repeat(64),
+        },
+      });
+      expect(res.status).toBe(201);
+
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const { rows } = await tx.query<{ n: string }>("SELECT count(*) AS n FROM crm.outbox WHERE tenant_id = $1", [
+          TENANT,
+        ]);
+        // One row, from the receipt. The hand-over is invisible to the ERP because the
+        // material already left its warehouse; mirroring it would double-count.
+        expect(Number(rows[0]!.n)).toBe(1);
+      });
+      expect((await call("GET", "/v1/samples/holdings")).body.data[0].quantity_on_hand).toBe("8.000");
+    });
+
+    it("refuses a disbursement with no signature, as a validation problem", async () => {
+      const lotId = await aLot();
+      await receipt(lotId, 10);
+      const res = await call("POST", "/v1/samples/disbursements", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 1,
+          occurredAt: "2026-10-05T09:00:00.000Z",
+          erpAccountId: "acct_auh",
+          recipientName: "Dr Ada",
+        },
+      });
+      expect(res.status).toBe(422);
+      expect(res.body.type).toContain("/errors/validation-failed");
+    });
+
+    it("refuses a disbursement to an account outside the caller's territory", async () => {
+      const lotId = await aLot();
+      await receipt(lotId, 10);
+      const res = await call("POST", "/v1/samples/disbursements", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 1,
+          occurredAt: "2026-10-05T09:00:00.000Z",
+          erpAccountId: "acct_dxb",
+          recipientName: "Dr Ada",
+          signatureSha256: "a".repeat(64),
+        },
+      });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it("reports what is about to expire and nothing that is not", async () => {
+      const soon = await aLot("2026-11-15");
+      await receipt(soon, 5);
+      const res = await call("GET", "/v1/samples/expiring?withinDays=60&on=2026-10-01");
+      expect(res.status).toBe(200);
+      expect(res.body.data).toHaveLength(1);
+      expect(res.body.data[0].days_remaining).toBe(45);
+
+      const narrow = await call("GET", "/v1/samples/expiring?withinDays=10&on=2026-10-01");
+      expect(narrow.body.data).toHaveLength(0);
+    });
+
+    it("moves material to another rep and back through the transfer routes", async () => {
+      const lotId = await aLot();
+      await receipt(lotId, 20);
+      const sent = await call("POST", "/v1/samples/transfers", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 5,
+          occurredAt: "2026-10-06T08:00:00.000Z",
+          toRepProfileId: otherRep,
+        },
+      });
+      expect(sent.status).toBe(201);
+
+      const holdings = (await call("GET", "/v1/samples/holdings")).body.data[0];
+      expect(holdings.quantity_on_hand).toBe("15.000");
+      expect(holdings.quantity_in_transit).toBe("5.000");
+
+      expect((await call("GET", "/v1/samples/transfers")).body.data).toHaveLength(1);
+
+      // The other rep accepts it, with their own token.
+      const accepted = await call("POST", `/v1/samples/transfers/${sent.body.id}/accept`, {
+        auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        body: { id: randomUUID(), occurredAt: "2026-10-07T08:00:00.000Z" },
+      });
+      expect(accepted.status).toBe(201);
+      expect((await call("GET", "/v1/samples/transfers")).body.data).toHaveLength(0);
+    });
+
+    /**
+     * The offline flush. One bad row must not reject the rest of a rep's day.
+     */
+    it("flushes a batch of disbursements with per-row results", async () => {
+      const good = await aLot();
+      const expired = await aLot("2026-09-01");
+      await receipt(good, 10);
+      await receipt(expired, 10);
+
+      const res = await call("POST", "/v1/sync/disbursements", {
+        body: {
+          disbursements: [
+            {
+              id: randomUUID(),
+              lotId: good,
+              quantity: 1,
+              occurredAt: "2026-10-05T09:00:00.000Z",
+              erpAccountId: "acct_auh",
+              recipientName: "Dr Ada",
+              signatureSha256: "a".repeat(64),
+            },
+            {
+              id: randomUUID(),
+              lotId: expired,
+              quantity: 1,
+              occurredAt: "2026-10-05T09:00:00.000Z",
+              erpAccountId: "acct_auh",
+              recipientName: "Dr Ada",
+              signatureSha256: "b".repeat(64),
+            },
+          ],
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.accepted).toBe(1);
+      expect(res.body.rejected).toBe(1);
+      expect(res.body.results[0].ok).toBe(true);
+      expect(res.body.results[1].ok).toBe(false);
+      expect(res.body.results[1].error).toMatch(/expired/);
+    });
+
+    it("is idempotent on a replayed batch", async () => {
+      const lotId = await aLot();
+      await receipt(lotId, 10);
+      const row = {
+        id: randomUUID(),
+        lotId,
+        quantity: 3,
+        occurredAt: "2026-10-05T09:00:00.000Z",
+        erpAccountId: "acct_auh",
+        recipientName: "Dr Ada",
+        signatureSha256: "a".repeat(64),
+      };
+      await call("POST", "/v1/sync/disbursements", { body: { disbursements: [row] } });
+      const replay = await call("POST", "/v1/sync/disbursements", { body: { disbursements: [row] } });
+      expect(replay.body.accepted).toBe(1);
+      // Deducted once, not twice. The device-minted id is what makes that true.
+      expect((await call("GET", "/v1/samples/holdings")).body.data[0].quantity_on_hand).toBe("7.000");
+    });
+
+    it("shows the ledger, newest first", async () => {
+      const lotId = await aLot();
+      await receipt(lotId, 10);
+      const res = await call("GET", "/v1/samples/ledger");
+      expect(res.status).toBe(200);
+      expect(res.body.data[0].kind).toBe("receipt");
     });
   });
 

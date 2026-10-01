@@ -27,6 +27,12 @@
     },
     {
       "path": "./packages/api"
+    },
+    {
+      "path": "./packages/callplan"
+    },
+    {
+      "path": "./packages/sample"
     }
   ]
 }

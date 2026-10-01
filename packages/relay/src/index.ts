@@ -16,11 +16,13 @@ export {
 } from "./dispatch.js";
 export {
   claimBatch,
+  enqueueOutbox,
   markDead,
   markDelivered,
   markRetry,
   outboxLag,
   reclaimStale,
+  type EnqueueInput,
   type OutboxLag,
   type OutboxRow,
 } from "./store.js";

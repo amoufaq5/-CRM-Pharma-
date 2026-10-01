@@ -26,6 +26,8 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/visit/` | Visits and detailing lines. Offline-first, territory-scoped, immutable once final. |
 | `packages/api/` | The HTTP API. JWT auth, one error shape, territory-scoped on every read. |
 | `packages/credential/` | The ERP service credential: Ed25519 signing, the JWKS, the key lifecycle, per-tenant roles. |
+| `packages/callplan/` | Cycles, call plans and adherence. Four-eyed approval, frozen once approved. |
+| `packages/sample/` | Sample and promo-material custody: lots, expiry, balances, transfers, counts, the ERP mirror. |
 | `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints. See [`deploy/README.md`](deploy/README.md). |
 | `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres). |
 
@@ -64,6 +66,17 @@ authorisation on its own.
 | `POST /v1/visits/:id/transition` | lifecycle |
 | `POST /v1/visits/:id/notes` | the one edit a final visit allows |
 | `POST /v1/sync/visits` | offline flush, **per-row** results |
+| `GET /v1/cycles` | planning periods; `?on=` for the one covering a date |
+| `GET /v1/call-plans` | **their** plans; `/:id` adds targets and products |
+| `GET /v1/call-plans/:id/adherence` | planned vs actual, per target and in summary |
+| `GET /v1/samples/holdings` | what they are carrying, by lot |
+| `GET /v1/samples/expiring` | what is about to go out of date in their bag |
+| `POST /v1/samples/receipts` | confirm stock from a warehouse — the one route that mirrors to the ERP |
+| `POST /v1/samples/disbursements` | a hand-over, with recipient and signature hash |
+| `GET\|POST /v1/samples/transfers` | outstanding transfers / send to another rep |
+| `POST /v1/samples/transfers/:id/accept` | the receiving rep accepts |
+| `GET /v1/samples/ledger` | the append-only custody log |
+| `POST /v1/sync/disbursements` | offline flush, **per-row** results |
 
 Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
 emits two on the same API, and a client that handles only one misreads the other.
@@ -206,3 +219,40 @@ Refused by a CHECK constraint on the role and again by the minter.
 waits are enforced by the registry rather than written down, because neither failure is
 visible when you cause it — each surfaces later as a 401 that looks like an auth bug rather
 than a rotation mistake.
+
+**13. A sample balance is derived from its movements, never kept alongside them.** The ERP
+has `StockMovement` and `StockLevel` and nothing connecting them — grepping the workspace
+for `quantity_on_hand` outside the pack declaration returns zero hits, so posting a movement
+does not change a level. Here a trigger applies the movement to the balance in the same
+transaction, a movement that would drive it negative aborts, and the balance cannot be
+written directly at all. That is the difference between recorded and accountable.
+
+**14. The custody ledger is append-only, and an expiry is judged on the day of the
+hand-over.** A mistake is corrected by an adjustment carrying a reason, which leaves both
+in the log. `occurred_at`, not `now()`: a sync three days later must not retroactively
+invalidate a hand-over that was legitimate when it happened, nor legitimise one that was
+not.
+
+**15. A drug sample lot must have an expiry, and a hand-over must have a signature.** Both
+are CHECK constraints. Lot tracking exists to answer "was it in date"; in an audit, "we
+cannot say" is the same answer as "no". The signature is stored as a sha256 of what the
+device captured — there is no object storage yet, so the hash commits to an image that has
+nowhere to live, which is weaker than holding it and stronger than a boolean.
+
+**16. Only the aggregate crosses into the ERP.** A rep receiving stock mirrors one
+`StockMovement` — and note the inversion: the CRM's `receipt` is the ERP's `issue`, the same
+event from the other side of the warehouse door. Disbursements, transfers, destructions and
+adjustments happen inside custody and are invisible there; mirroring them would
+double-count. The lot and expiry go into `reason` as text because `StockMovement` has
+nowhere else to put them.
+
+**17. An approved call plan is frozen, and approval is four-eyed *and* authorised.** If "we
+planned three calls" can be edited after the calls happened, adherence measures nothing — so
+a change is a new plan that supersedes the old one and both stay in the record. The approver
+is neither the rep nor the submitter, and must actually manage the rep's territory: four
+eyes says "someone else", the territory hierarchy says "the right someone else".
+
+**18. Coverage and attainment are reported separately.** Coverage is "did we reach them at
+all"; attainment is "did we call as often as we said", capped per target. Reporting only the
+second is how a field force looks fully compliant while a third of its customers were never
+seen.

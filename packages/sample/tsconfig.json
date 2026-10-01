@@ -12,25 +12,10 @@
   ],
   "references": [
     {
-      "path": "../acl"
-    },
-    {
       "path": "../db"
     },
     {
-      "path": "../territory"
-    },
-    {
-      "path": "../visit"
-    },
-    {
-      "path": "../credential"
-    },
-    {
-      "path": "../callplan"
-    },
-    {
-      "path": "../sample"
+      "path": "../relay"
     }
   ]
 }

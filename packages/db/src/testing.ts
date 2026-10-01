@@ -71,3 +71,12 @@ export const TENANT_CREDENTIAL_B = "9b222222-2222-4222-8222-222222222222";
 
 /** packages/credential — boot.contract. */
 export const TENANT_CREDENTIAL_BOOT = "9c333333-3333-4333-8333-333333333333";
+
+/** packages/callplan. */
+export const TENANT_CALLPLAN = "ca000000-0000-4000-8000-000000000001";
+
+/** packages/sample — custody contract. */
+export const TENANT_SAMPLE = "cb000000-0000-4000-8000-000000000002";
+
+/** packages/sample — the ERP mirror contract. */
+export const TENANT_SAMPLE_MIRROR = "cc000000-0000-4000-8000-000000000003";

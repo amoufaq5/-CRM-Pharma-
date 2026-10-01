@@ -523,7 +523,7 @@ blocked. Order matters for the reasons given, not for missing inputs.
    full rebuild exercised in CI. These are the read path, not an optimisation (item 8) —
    every numeric filter and sort in the product depends on them, because the ERP cannot
    answer one correctly (R19).
-7. Only then: visits, call plans, sample custody, offline sync.
+7. Only then: visits, call plans, sample custody, offline sync. **All built** (migrations 0012–0018).
 
 **API details that will bite** (all evidenced in the report):
 
@@ -558,7 +558,7 @@ reasoning behind each constrains what follows.
 | Q1 | Migrate to `--store pg-columns`, or build 3-degraded? | **3-degraded.** No FKs; ACL-enforced integrity plus a nightly orphan check. The FK design stays documented as the target if the platform ever migrates. |
 | Q2 | Who owns `Lead` and `Opportunity`? | **The CRM owns the pipeline.** The ERP's `Lead`/`Opportunity`/`Quote` entities go unused by us; only won deals cross over, as `SalesOrder` + `SalesOrderLine`. |
 | Q3 | Login → `Employee` mapping? | **A CRM-owned mapping table**, keyed on `employee_number` (the only field immutable by intent), with `work_email` as a reconciliation hint only. |
-| Q4 | Samples and promo material? | **CRM custody**, first-class, with lot and expiry. Aggregate issues mirror to the ERP's `StockMovement` when material leaves ERP-controlled stock. |
+| Q4 | Samples and promo material? | **CRM custody**, first-class, with lot and expiry. Aggregate issues mirror to the ERP's `StockMovement` when material leaves ERP-controlled stock. **Built** — migrations 0017/0018 and `packages/sample`: the balance is derived from the ledger by a trigger in the same transaction (the thing the ERP's `StockLevel` does not do), transfers are linked with in-transit and acceptance, expiry is judged on the day of the hand-over, and the count document writes adjustments rather than editing a balance. |
 | Q5 | Which ERP data may the ACL read directly? | **A named, versioned allow-list, asserted in CRM CI** against the live schema on every build. Note this is now a list of *entity names* read out of `meta.operate_entity_records`, not tables (R17). |
 | Q6 | Expense attribution? | **A separate Sales & Marketing expense account, optionally hooked to a cost centre** (refined 2026-09-29 from the first reading). Not a cost-centre tag on the ERP's existing `expenseAccountCode`, and not per campaign. See decision item 11. |
 | Q7 | PostGIS on the shared database? | **Yes.** Territories, GPS check-in and route optimisation are CRM-side with real geometry. Removes trigger (iv) from Q10. |
@@ -579,6 +579,12 @@ reasoning behind each constrains what follows.
 | Has a CRM-minted token been accepted by a **running** operate-server? The acceptance test transcribes the ERP's verifier (alg, kid, both base64 conversions, which claims it checks) and passes, but no live handshake has happened — no ERP instance was available. | Platform | _set a date_ |
 | Staleness budget per snapshot table (item 8) — how old may a product price or a rep roster be on a mobile device before the UI blocks the action rather than warning? | Product | _set a date_ |
 | Does the platform have a date for `meta.webhook_deliveries` (Q9)? Affects only when we retire `PollingChangeSource`, not whether we build it. | Platform | _set a date_ |
+| Sample custody: may a rep declare their own receipt of stock? `POST /v1/samples/receipts` has the rep confirm it, because no warehouse-side admin surface exists yet. The stronger model is warehouse-initiated issue with rep acknowledgement. What makes the weaker one defensible meanwhile: the ledger is append-only, every correction carries a reason, and the cycle count reconciles against physical stock. | Compliance | _set a date_ |
+| A transfer that is never accepted leaves material in `quantity_in_transit` indefinitely. It stays visible (`GET /v1/samples/transfers`) and accounted for, but there is no recall or timeout — the sender cannot take it back, and an adjustment only touches `quantity_on_hand`. | Product | _set a date_ |
+| Signature images have nowhere to live. `signature_sha256` commits to what the device captured; the blob needs the object storage report §13 records as absent. Until then a disbursement says a signature was taken and fixes which one, without being able to produce it. | Product | _set a date_ |
+| Controlled substances are flagged (`sample_lot.controlled`) and not otherwise handled. Unit-level serial custody is a stricter obligation than this schema discharges. | Compliance | _set a date_ |
+| A manager cannot read their team's plans or holdings over HTTP. Every route is scoped to the caller; `crm.managed_territory_ids` answers the supervisory question in SQL and no route asks it yet. | Product | _set a date_ |
+| Nothing writes off expired stock automatically. `crm.expiring_sample_holdings` is the query a nightly job would act on and the scheduler has no job for it, so expired material leaves a rep's balance only when someone does it by hand. | Product | _set a date_ |
 
 > The deadlines in the original table (8–26 September) all lapsed before the answers came
 > in. They are left blank above rather than back-dated.

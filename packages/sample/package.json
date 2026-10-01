@@ -1,5 +1,5 @@
 {
-  "name": "@crm/api",
+  "name": "@crm/sample",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,23 +11,14 @@
       "import": "./dist/index.js"
     }
   },
-  "bin": {
-    "crm-api": "./dist/bin/api.js"
-  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
-    "@crm/acl": "workspace:*",
-    "@crm/callplan": "workspace:*",
-    "@crm/credential": "workspace:*",
     "@crm/db": "workspace:*",
-    "@crm/sample": "workspace:*",
-    "@crm/territory": "workspace:*",
-    "@crm/visit": "workspace:*",
-    "pg": "^8.13.0",
-    "zod": "^3.24.0"
+    "@crm/relay": "workspace:*",
+    "pg": "^8.13.0"
   }
 }

@@ -174,3 +174,63 @@ export async function outboxLag(tx: PoolClient, tenantId: string, now: Date): Pr
       oldest === null ? null : Math.max(0, Math.round((now.getTime() - oldest.getTime()) / 1000)),
   };
 }
+
+export interface EnqueueInput {
+  readonly entity: string;
+  /** `create`, `update`, or `transition:<name>` — see `parseOperation`. */
+  readonly operation: string;
+  readonly payload: Record<string, unknown>;
+  /**
+   * The id the ERP record will carry. Minted by the CALLER, deterministically from
+   * whatever CRM row is producing this, because that is what makes a redelivery
+   * collapse into a unique violation the classifier reads as success rather than
+   * creating a second ERP record.
+   */
+  readonly targetRecordId: string;
+  readonly sourceTable: string;
+  readonly sourceId: string;
+}
+
+/**
+ * Appends to the outbox inside the caller's transaction.
+ *
+ * The only place anything is written to `crm.outbox`, deliberately: the
+ * idempotency rule lives in the table's unique constraint and the deterministic
+ * target id, and a second producer with its own INSERT would be a second chance to
+ * get either wrong.
+ *
+ * Returns false when the row was already there. A double-tap in the mobile app, or
+ * a replayed offline batch, must be a no-op rather than two ERP writes under two
+ * different target ids — which no downstream constraint would catch, because they
+ * would be two legitimately distinct records.
+ */
+export async function enqueueOutbox(
+  tx: PoolClient,
+  tenantId: string,
+  input: EnqueueInput,
+): Promise<{ readonly enqueued: boolean; readonly id: string }> {
+  const { rows } = await tx.query<{ id: string }>(
+    `INSERT INTO crm.outbox
+       (tenant_id, entity, operation, payload, target_record_id, source_table, source_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (tenant_id, entity, operation, target_record_id) DO NOTHING
+     RETURNING id`,
+    [
+      tenantId,
+      input.entity,
+      input.operation,
+      JSON.stringify(input.payload),
+      input.targetRecordId,
+      input.sourceTable,
+      input.sourceId,
+    ],
+  );
+  if (rows[0] !== undefined) return { enqueued: true, id: rows[0].id };
+
+  const { rows: existing } = await tx.query<{ id: string }>(
+    `SELECT id FROM crm.outbox
+      WHERE tenant_id = $1 AND entity = $2 AND operation = $3 AND target_record_id = $4`,
+    [tenantId, input.entity, input.operation, input.targetRecordId],
+  );
+  return { enqueued: false, id: existing[0]!.id };
+}

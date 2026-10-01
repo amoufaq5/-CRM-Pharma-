@@ -18,6 +18,9 @@ export const PROBLEM_TYPES = {
   conflict: "conflict",
   outside_territory: "outside-territory",
   visit_final: "visit-final",
+  plan_final: "plan-final",
+  lot_expired: "lot-expired",
+  insufficient_stock: "insufficient-stock",
   method_not_allowed: "method-not-allowed",
   unsupported_media_type: "unsupported-media-type",
   payload_too_large: "payload-too-large",
@@ -34,6 +37,12 @@ const STATUS: Readonly<Record<ProblemKind, number>> = {
   conflict: 409,
   outside_territory: 403,
   visit_final: 409,
+  plan_final: 409,
+  // Both are well-formed requests the material's state refuses, which is a conflict
+  // rather than a validation failure — and a mobile client branches on them: an expired
+  // lot means bin it, a short balance means re-count the bag.
+  lot_expired: 409,
+  insufficient_stock: 409,
   method_not_allowed: 405,
   unsupported_media_type: 415,
   payload_too_large: 413,
@@ -49,6 +58,9 @@ const TITLE: Readonly<Record<ProblemKind, string>> = {
   conflict: "Conflict",
   outside_territory: "Outside your territory",
   visit_final: "Visit is final",
+  plan_final: "Call plan is final",
+  lot_expired: "Lot is expired or withdrawn",
+  insufficient_stock: "Not enough stock on hand",
   method_not_allowed: "Method not allowed",
   unsupported_media_type: "Unsupported media type",
   payload_too_large: "Payload too large",
@@ -132,6 +144,37 @@ export function toProblem(err: unknown): ApiError {
       return new ApiError("conflict", message);
     case "TerritoryCycleError":
       return new ApiError("validation_failed", message);
+    // Sample custody (0017/0018). Each one is a question a sample audit asks, so the
+    // refusal travels to the client with its reason intact rather than as a 500.
+    case "LotExpiredError":
+    case "LotNotReleasedError":
+      return new ApiError("lot_expired", message);
+    case "InsufficientHoldingError":
+      return new ApiError("insufficient_stock", message);
+    case "IncompleteRecordError":
+      return new ApiError("validation_failed", message);
+    case "LedgerImmutableError":
+    case "TransferMismatchError":
+    case "SampleCountError":
+      return new ApiError("conflict", message);
+    case "SampleLotNotFoundError":
+    case "CallPlanNotFoundError":
+      return new ApiError("not_found", message);
+
+    // Call plans (0015/0016).
+    case "TargetOutsideTerritoryError":
+      return new ApiError("outside_territory", message);
+    case "InvalidPlanTransitionError":
+    case "PlanFrozenError":
+      return new ApiError("plan_final", message);
+    case "ApprovalRefusedError":
+      return new ApiError("forbidden", message);
+    case "DuplicatePlanError":
+    case "DuplicateTargetError":
+      return new ApiError("conflict", message);
+    case "InvalidCycleError":
+      return new ApiError("validation_failed", message);
+
     case "ErpError":
       return new ApiError("upstream_unavailable", "the ERP could not be reached");
     default:
