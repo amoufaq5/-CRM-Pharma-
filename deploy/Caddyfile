@@ -1,0 +1,29 @@
+# Automatic HTTPS for the CRM API.
+#
+# TLS terminates here, so the API itself never sees a certificate. It also means
+# the API must not be published directly — `expose` rather than `ports` in
+# compose keeps it on the internal network, which matters because the API trusts
+# the Authorization header and nothing else.
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The API is the whole surface; there is no web UI in this repo yet.
+	reverse_proxy api:8080
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

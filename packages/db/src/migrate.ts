@@ -7,6 +7,24 @@ export interface Migration {
   readonly filename: string;
   readonly sql: string;
   readonly sha256: string;
+  /**
+   * True when the file declares `-- @requires: dba`.
+   *
+   * Two kinds of migration exist and they have different rules:
+   *
+   * - **DBA** migrations need privileges the application role does not have
+   *   (CREATE ROLE, CREATE EXTENSION). They run as the admin identity, they run
+   *   on EVERY deploy, and they must therefore be IDEMPOTENT. They cannot be
+   *   hash-gated because the ledger they would be recorded in is created by one
+   *   of them.
+   * - **Application** migrations run as `crm_app` and are hash-gated: applied
+   *   once, and an edit after the fact is refused.
+   *
+   * The requirement is declared IN THE FILE rather than in a list the deploy
+   * script maintains, so a new DBA migration cannot be missed by someone
+   * forgetting to update the list.
+   */
+  readonly requiresDba: boolean;
 }
 
 export interface MigrationResult {
@@ -34,7 +52,7 @@ export async function loadMigrations(dir: string): Promise<readonly Migration[]>
   return Promise.all(
     entries.map(async (filename) => {
       const sql = await readFile(join(dir, filename), "utf8");
-      return { filename, sql, sha256: sha256(sql) };
+      return { filename, sql, sha256: sha256(sql), requiresDba: /^--\s*@requires:\s*dba\s*$/m.test(sql) };
     }),
   );
 }
@@ -59,9 +77,9 @@ export class MigrationChangedError extends Error {
  * skipping it would leave the database disagreeing with the repository — so the
  * only safe move is to refuse and make someone write a new migration.
  *
- * `0001_roles_and_grants.sql` is a DBA step run as a superuser; it creates the
- * schema and the ledger this function writes to, so it is applied by hand once
- * and then recorded like any other file.
+ * Only applies the files it is given. The caller separates DBA from application
+ * migrations (see `Migration.requiresDba`) and runs this for the application
+ * ones, under the application role.
  */
 export async function applyMigrations(
   client: PoolClient,

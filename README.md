@@ -25,7 +25,8 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/territory/` | Territories, rep assignment, and the row-level scoping the ERP cannot do. |
 | `packages/visit/` | Visits and detailing lines. Offline-first, territory-scoped, immutable once final. |
 | `packages/api/` | The HTTP API. JWT auth, one error shape, territory-scoped on every read. |
-| `scripts/setup-test-db.sh` | Brings a database to the state the contract tests expect. |
+| `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints. See [`deploy/README.md`](deploy/README.md). |
+| `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres). |
 
 ## Running it
 
@@ -83,7 +84,38 @@ scheduling knobs the ERP has no concept of.
 `ERP_TOKEN` is a development-only static credential and the process refuses to start with
 it under `NODE_ENV=production`.
 
-## Three rules that are not negotiable
+## Deploying
+
+[`deploy/README.md`](deploy/README.md) is the operator's copy. The three things worth
+knowing before reading it:
+
+**The ERP goes first.** One database (ADR-0001 option b), and the CRM grants itself
+`SELECT` on `meta.operate_entity_records`, so that table has to exist before the CRM's
+first migration. `0001` checks and fails with a message naming the real cause.
+
+**The migration runner switches roles, and that is load-bearing.** It connects as the
+admin for the two DBA files — `CREATE ROLE`, `CREATE EXTENSION` — then `SET ROLE crm_app`
+for the rest, so the tables come out owned by the role that is *subject* to RLS. Getting
+this wrong is silent: migration `0010` did, once.
+
+```bash
+pnpm db:migrate:dry      # what a real run would do; exit 1 if an applied file was edited
+pnpm db:migrate          # apply
+pnpm db:migrate:verify   # the four properties above, against a throwaway database
+```
+
+**Two long-running processes, as on the ERP side.** The API is stateless and scales
+freely. The scheduler is multi-instance-safe but one is enough — and in production it
+currently refuses to start, because its ERP credential (short-lived per-tenant Ed25519
+service JWTs, ADR-0001 item 10) is not built and a static shared secret holding
+`controller` on every tenant is worse than no relay. The outbox is durable, so queued
+writes wait rather than being lost.
+
+The container plumbing in `deploy/` has **not been built or run** — the environment it was
+authored in has no Docker daemon. The migration runner it invokes was verified end to end
+against a live Postgres 16.
+
+## Rules that are not negotiable
 
 **1. `crm_app` owns nothing of the ERP's.** A table's owner bypasses row-level security —
 verified, not assumed (`packages/db/src/rls.contract.test.ts`). Ownership separation *is*

@@ -66,3 +66,60 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+  # The migration RUNNER, separately, on its own fresh database.
+  #
+  # build-and-test applies migrations with psql (scripts/setup-test-db.sh), which
+  # proves the SQL is right but says nothing about the runner that will apply it in
+  # production: the role switch, the hash ledger, the two-phase split. A deploy uses
+  # the runner, so the runner is what this checks.
+  #
+  # It needs its own database because the check starts from "the ERP exists and
+  # nothing else" and asserts an EMPTY ledger, which the other job's database does
+  # not have.
+  migration-runner:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: crm_migrate
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: crm_migrate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.33.0 }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # The runner ships as compiled output; `pnpm db:migrate` builds it, but the
+      # verify script invokes dist directly so the build has to happen first.
+      - name: Build
+        run: pnpm build
+
+      # Asserts: every crm table owned by crm_app, the schema invariants hold on a
+      # runner-built database, a second run is a no-op, and an edited
+      # already-applied migration is refused.
+      - name: Verify the migration runner
+        run: ./scripts/verify-migration-runner.sh

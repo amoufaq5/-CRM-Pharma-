@@ -1,0 +1,125 @@
+name: crm-pharma
+
+# The CRM alongside the ERP, sharing one Postgres (ADR-0001 option b).
+#
+# WHAT THIS FILE DOES NOT DO: it does not start the CrossEngin ERP. The CRM reads
+# ERP master data over SQL from the SAME database, so the ERP must be migrated
+# into `db` before `migrate` runs — the CRM's 0001 checks for
+# meta.operate_entity_records and refuses with a message saying so. Two ways to
+# satisfy that:
+#
+#   1. Point this stack's `db` at the ERP's existing Postgres (set PG* in .env)
+#      and drop the `db` service. This is the real deployment.
+#   2. For local work, run the ERP's own compose stack first against this `db`.
+#
+# Everything reads deploy/.env — copy deploy/.env.example and fill it in.
+
+x-crm-build: &crm-build
+  context: ..
+  dockerfile: deploy/Dockerfile
+
+# The APPLICATION identity. Never the admin: crm_app owns crm.* and holds SELECT
+# on one ERP table, and a table's owner bypasses RLS — so the runtime connecting
+# as the admin would silently void tenant isolation.
+x-crm-pg-env: &crm-pg-env
+  PGHOST: ${PGHOST:-db}
+  PGPORT: ${PGPORT:-5432}
+  PGDATABASE: ${POSTGRES_DB}
+  PGUSER: crm_app
+  PGPASSWORD: ${CRM_APP_PASSWORD}
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot, idempotent, gates both app services. Runs as the ADMIN because it
+  # must CREATE ROLE and CREATE EXTENSION; it switches to crm_app itself for the
+  # application migrations so the tables come out owned correctly.
+  migrate:
+    build: *crm-build
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: ${PGHOST:-db}
+      PGPORT: ${PGPORT:-5432}
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      CRM_APP_PASSWORD: ${CRM_APP_PASSWORD}
+      MIGRATIONS_DIR: /app/db/migrations
+    command: ["node", "packages/db/dist/bin/migrate.js"]
+    restart: "no"
+
+  api:
+    build: *crm-build
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *crm-pg-env
+      PORT: "8080"
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL}
+    command: ["node", "packages/api/dist/bin/api.js"]
+    expose: ["8080"]
+    healthcheck:
+      # /healthz queries the database, so this reports readiness rather than
+      # merely "the process is alive".
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  scheduler:
+    build: *crm-build
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *crm-pg-env
+      ERP_BASE_URL: ${ERP_BASE_URL}
+      # Development-only. The process REFUSES to start with this under
+      # NODE_ENV=production; see deploy/README.md on minting per-tenant Ed25519
+      # service tokens instead.
+      ERP_TOKEN: ${ERP_TOKEN:-}
+      NODE_ENV: ${SCHEDULER_NODE_ENV:-production}
+    command: ["node", "packages/scheduler/dist/bin/scheduler.js"]
+    # Exactly one is not required — claimDueJobs advances next_run_at inside the
+    # claim, so N instances share the work safely. One is simply enough.
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    depends_on:
+      api:
+        condition: service_started
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:

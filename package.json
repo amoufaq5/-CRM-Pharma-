@@ -13,12 +13,14 @@
     "typecheck": "tsc --build --force",
     "test": "vitest run",
     "test:watch": "vitest",
-    "db:migrate": "node --experimental-strip-types packages/db/src/bin/migrate.ts",
+    "db:migrate": "pnpm --filter @crm/db build && node packages/db/dist/bin/migrate.js",
     "clean": "tsc --build --clean",
     "erp:codegen": "pnpm --filter @crm/acl erp:codegen",
     "erp:codegen:check": "pnpm --filter @crm/acl erp:codegen:check",
     "scheduler": "pnpm --filter @crm/scheduler build && node packages/scheduler/dist/bin/scheduler.js",
-    "api": "pnpm --filter @crm/api build && node packages/api/dist/bin/api.js"
+    "api": "pnpm --filter @crm/api build && node packages/api/dist/bin/api.js",
+    "db:migrate:dry": "pnpm --filter @crm/db build && node packages/db/dist/bin/migrate.js --dry-run",
+    "db:migrate:verify": "pnpm build && ./scripts/verify-migration-runner.sh"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

@@ -1,4 +1,8 @@
 -- 0002_crm_schema.sql
+-- @requires: dba
+--
+-- Needs DBA privileges for CREATE EXTENSION, so everything it creates would be
+-- owned by the DBA role unless reassigned — see the ALTER TABLE ... OWNER below.
 --
 -- The CRM's own schema. Runs as crm_app.
 --
