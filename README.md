@@ -25,6 +25,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/territory/` | Territories, rep assignment, and the row-level scoping the ERP cannot do. |
 | `packages/visit/` | Visits and detailing lines. Offline-first, territory-scoped, immutable once final. |
 | `packages/api/` | The HTTP API. JWT auth, one error shape, territory-scoped on every read. |
+| `packages/credential/` | The ERP service credential: Ed25519 signing, the JWKS, the key lifecycle, per-tenant roles. |
 | `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints. See [`deploy/README.md`](deploy/README.md). |
 | `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres). |
 
@@ -81,8 +82,27 @@ exactly one ERP table, and widening that for a tenant list would break the allow
 discipline. It also reflects reality — the CRM serves a subset of ERP tenants, with
 scheduling knobs the ERP has no concept of.
 
-`ERP_TOKEN` is a development-only static credential and the process refuses to start with
-it under `NODE_ENV=production`.
+It needs a credential for the ERP. In production that is a CRM-minted Ed25519 service
+token; `ERP_TOKEN` is a development-only static credential and the process refuses to start
+with it under `NODE_ENV=production`.
+
+## The ERP credential
+
+The CRM signs its own ERP-facing token. Two tiers that never mix (ADR-0001 item 10): any
+OIDC provider for humans into the CRM (RS256 is fine — that token never reaches the ERP),
+and a short-lived Ed25519 service token per tenant for the CRM into the ERP.
+
+```bash
+pnpm key generate          # prints the private PEM once, publishes the public half
+pnpm key activate <kid>    # refuses until the JWKS has had time to propagate
+pnpm key list
+pnpm key kid-of < key.pem  # which kid a PEM signs under
+```
+
+The ERP is pointed at `https://<host>/.well-known/jwks.json` with a matching `--jwt-issuer`
+and `--jwt-audience`. Only the scheduler holds the signing key; the API publishes the JWKS
+from the database and has no private key at all, so it could not mint a token if it were
+compromised. `deploy/README.md` has the rotation procedure.
 
 ## Deploying
 
@@ -171,3 +191,18 @@ account now. This is what effective-dated territories are for.
 tombstones, so polling `updated_at` can never observe a deletion. Only a full sweep
 reconciles; `last_full_sweep_at` is tracked separately so a snapshot that has only ever
 been refreshed incrementally is visible as such.
+
+**10. The JWKS endpoint returns 503, never an empty 200.** The ERP keeps its last good key
+set when a fetch fails and *replaces* it with whatever a 200 carries — so a 200 holding
+`{"keys":[]}` disarms every verifier that fetched it and 401s every subsequent call. When
+there is nothing to publish, the safe answer is to fail the request.
+
+**11. A service token carries exactly one scope.** The ERP reads only the first
+space-separated scope as the principal's role and discards the rest, so
+`scope: "sales_rep controller"` grants `sales_rep` while reading as though it granted both.
+Refused by a CHECK constraint on the role and again by the minter.
+
+**12. A key is published before it signs, and retired only after its tokens expire.** Both
+waits are enforced by the registry rather than written down, because neither failure is
+visible when you cause it — each surfaces later as a 401 that looks like an auth bug rather
+than a rotation mistake.

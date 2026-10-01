@@ -14,10 +14,11 @@ what ships.
 
 > **Status.** The Dockerfile, compose file and Caddyfile in this directory have
 > **not been built or run** — the development container these were authored in has
-> no Docker daemon. The migration runner they invoke *was* verified end to end
-> against a live Postgres 16 (ownership, RLS forcing, idempotence, refusal of an
-> edited migration). Treat the container plumbing as unexercised until someone
-> runs `docker compose build` once.
+> no Docker daemon. What they invoke *was* verified against a live Postgres 16: the
+> migration runner (ownership, RLS forcing, idempotence, refusal of an edited
+> migration) and the service credential (key lifecycle, token minting, the
+> scheduler booting in production mode). Treat the container plumbing as
+> unexercised until someone runs `docker compose build` once.
 
 ## The one ordering constraint: the ERP goes first
 
@@ -129,28 +130,110 @@ Two properties worth keeping if you move to a secret manager:
 - **Admin credentials are only ever given to `migrate`.** Do not reuse them for
   the app services to save a variable.
 
-## The ERP credential is the open gap
+## The ERP credential
 
-`api` is complete: `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_JWKS_URL` point at any
-OIDC provider, RS256 included, and a valid token is still not authorisation — the
-API resolves `sub` through `crm.rep_profile`, and a subject with no profile gets
-403 rather than a default role.
+Two tiers, and they never mix (ADR-0001 item 10).
 
-`scheduler` is **not** complete. It needs a credential to call the ERP, and the
-decision taken under ADR-0001 Q8 was CRM-minted short-lived (5–15 minute)
-per-tenant Ed25519 service JWTs from a key in a KMS. That is not built. What
-exists is `ERP_TOKEN`, a static token, and the process **refuses to start with it
-when `NODE_ENV=production`** — which is the compose default.
+**Humans into the CRM** — `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_JWKS_URL` point at any
+OIDC provider, RS256 included. A valid token is still not authorisation: the API resolves
+`sub` through `crm.rep_profile`, and a subject with no profile gets 403 rather than a
+default role. A human's token is never forwarded to the ERP.
 
-So out of the box in production the scheduler will not start, and that is
-deliberate: a single static secret carrying `controller` on every tenant is worse
-than no relay at all. The outbox is durable, so queued writes wait rather than
-being lost. To run the scheduler against a development ERP, set `ERP_TOKEN` **and**
-`SCHEDULER_NODE_ENV=development`.
+**The CRM into the ERP** — the CRM signs its own short-lived Ed25519 service token, one per
+tenant. This is what replaces `--api-key`, whose three weaknesses it removes: the token is
+not in argv, it lives ten minutes rather than forever, and rotating it is a database row
+plus a secret rather than an ERP restart.
+
+Who holds what:
+
+| | signing key | JWKS |
+|---|---|---|
+| `scheduler` | yes — the only process with it | — |
+| `api` | **no** | publishes it from `crm.service_key` |
+
+The API cannot mint a token even if it is compromised, because it has no private key and
+the registry has no column that could hold one (asserted in
+`packages/db/src/schema.contract.test.ts`).
+
+### Setting it up
+
+```bash
+# 1. generate. Prints the private PEM ONCE and publishes its public half.
+pnpm key generate --note "initial"
+
+# 2. put the PEM where the scheduler will read it
+install -m 0600 /dev/stdin deploy/secrets/crm-signing-key.pem   # paste it
+#   then in deploy/.env: CRM_SIGNING_KEY_FILE=/run/secrets/crm-signing-key.pem
+
+# 3. make it the signing key. Refuses until the JWKS has had time to propagate.
+pnpm key activate <kid>
+
+# 4. point the ERP at us
+#   operate-server --jwks-url https://$DOMAIN/.well-known/jwks.json \
+#                  --jwks-refresh-ms 60000 \
+#                  --jwt-issuer "$CRM_TOKEN_ISSUER" \
+#                  --jwt-audience "$ERP_TOKEN_AUDIENCE"
+```
+
+`CRM_TOKEN_ISSUER` and `ERP_TOKEN_AUDIENCE` must match those two ERP flags **exactly**. The
+ERP checks `iss` and `aud` only when the claim is present — which it always is in a token we
+mint — so a mismatch is a clean 401 rather than something subtle.
+
+Each tenant also needs a row saying which ERP role its service principal holds; see
+**Provisioning a tenant** below. There is no default, deliberately.
+
+### Rotating the key
+
+Four steps, and the order is the whole point:
+
+```bash
+pnpm key generate --note "rotation $(date +%F)"   # enters the JWKS as `published`
+# wait — `activate` enforces this, it is not advice
+pnpm key activate <new kid>                        # old one drops to `published`
+# install the new PEM, restart the scheduler
+pnpm key retire <old kid>                          # once its tokens have expired
+```
+
+Both waits are enforced by the registry rather than documented and hoped for, because
+neither failure is visible when you cause it:
+
+- **Activating too early** means signing with a key verifiers have not fetched. Every
+  request 401s with `credential_not_found` until a refresh succeeds — and a failed refresh
+  keeps the stale set, so it does not necessarily self-heal.
+- **Retiring too early** removes a key from the JWKS while tokens it signed are still
+  valid, so requests that were authorised a minute ago start failing.
+
+Between steps 3 and 4 the old key is still in the JWKS, which is what makes this a rotation
+rather than an outage: a scheduler that has not restarted yet keeps working.
+
+`pnpm key list` shows every key and its state. `pnpm key kid-of < key.pem` prints the kid a
+PEM signs under — for checking that the secret an environment holds is the key its registry
+row names, which is the mismatch nothing else explains.
+
+The scheduler verifies this at boot and refuses to start if its key is absent or retired. A
+key that is merely `published` starts with a warning: its tokens verify, and that is the
+ordinary state of a process still running from before a rotation.
+
+### Revoking a tenant's access
+
+```sql
+UPDATE crm.erp_service_principal SET enabled = false WHERE tenant_id = '…';
+```
+
+Minting stops within one role-cache window. Note what this does **not** do: a token already
+issued stays valid at the ERP until it expires. There is no revocation list — that is the
+trade a ten-minute lifetime buys, and the reason the TTL is minutes rather than hours. To
+cut access immediately, retire the key (and accept that it cuts every tenant).
+
+### Running without it
+
+`ERP_TOKEN` is a static development credential, ignored entirely when a signing key is set.
+The scheduler refuses to start with it when `NODE_ENV=production`; set
+`SCHEDULER_NODE_ENV=development` to use it against a throwaway ERP.
 
 ## Provisioning a tenant
 
-Two inserts, by hand for now — there is no admin surface yet.
+Three inserts, by hand for now — there is no admin surface yet.
 
 ```sql
 -- 1. the CRM's own tenant registry. Not RLS-protected and holds no tenant data
@@ -167,6 +250,20 @@ SELECT set_config('app.current_tenant_id', '<erp tenant uuid>', false);
 INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name)
 VALUES ('<erp tenant uuid>', '<oidc sub>', 'EMP-0001', 'A. Rep');
 ```
+
+```sql
+-- 3. which ERP role this tenant's CRM service principal holds. NO DEFAULT: a
+--    tenant with no row here cannot get a token, which is the right failure.
+--    Exactly one role, and a space in it is refused by a CHECK — the ERP reads
+--    only the FIRST space-separated scope as the role, so 'sales_rep controller'
+--    would grant sales_rep while reading as though it granted both.
+INSERT INTO crm.erp_service_principal (tenant_id, erp_role)
+VALUES ('<erp tenant uuid>', 'controller');
+```
+
+`controller` is what the GL posting in ADR-0001 item 11 needs. A tenant the CRM only reads
+from can hold something narrower — the role is per tenant precisely because each tenant's
+manifest declares its own.
 
 Scheduled jobs need no provisioning: the scheduler creates missing rows at their
 default cadence on every tick, so a tenant added by hand — or a job added by a
@@ -190,7 +287,8 @@ until the outbox lag says otherwise.
 **What to watch.** `crm.outbox` depth and oldest `next_run_at` (writes to the ERP
 are backing up), `crm.snapshot_freshness.last_full_sweep_at` (a snapshot that has
 only ever been refreshed incrementally cannot have observed a deletion — the ERP
-keeps no tombstones), and `consecutive_failures` on `crm.scheduled_job`.
+keeps no tombstones), `consecutive_failures` on `crm.scheduled_job`, and a 503 from
+`/.well-known/jwks.json` (no key published — every ERP call is about to fail).
 
 **Backups are the ERP's.** One database, one backup. Note that the CRM holds data
 the ERP has no copy of — visits, territories, assignment history — so a restore

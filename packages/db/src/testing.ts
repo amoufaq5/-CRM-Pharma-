@@ -64,3 +64,10 @@ export const TENANT_VISIT = "7a111111-1111-4111-8111-111111111111";
 
 /** packages/sync — snapshot refresh. */
 export const TENANT_SYNC = "77777777-7777-4777-8777-777777777777";
+
+/** packages/credential — role-source.contract. */
+export const TENANT_CREDENTIAL_A = "9a111111-1111-4111-8111-111111111111";
+export const TENANT_CREDENTIAL_B = "9b222222-2222-4222-8222-222222222222";
+
+/** packages/credential — boot.contract. */
+export const TENANT_CREDENTIAL_BOOT = "9c333333-3333-4333-8333-333333333333";

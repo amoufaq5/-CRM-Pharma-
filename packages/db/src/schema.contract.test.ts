@@ -88,6 +88,44 @@ describe("CRM schema invariants", () => {
     }
   });
 
+  /**
+   * A table with no `tenant_id` column escapes the RLS check above entirely — there
+   * is nothing for a policy to compare. That is correct for a deployment-level
+   * table and catastrophic for one holding tenant data, so the set is enumerated
+   * rather than inferred: a new table that forgot its tenant_id fails here instead
+   * of serving every tenant's rows to everyone.
+   */
+  it("only the known deployment-level tables lack a tenant_id", async () => {
+    const PLATFORM_WIDE: Readonly<Record<string, string>> = {
+      _migrations: "the migration ledger; describes the deployment",
+      service_key: "published Ed25519 PUBLIC keys for the ERP service credential; one set signs for every tenant",
+    };
+    const { rows } = await client.query<{ relname: string }>(`
+      SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'crm' AND c.relkind = 'r'
+         AND NOT EXISTS (SELECT 1 FROM pg_attribute a
+                          WHERE a.attrelid = c.oid AND a.attname = 'tenant_id' AND NOT a.attisdropped)
+       ORDER BY c.relname`);
+    expect(rows.map((r) => r.relname)).toEqual(Object.keys(PLATFORM_WIDE).sort());
+  });
+
+  it("the key registry holds no private key material", async () => {
+    // The API publishes this table and must never be able to sign. A column that
+    // could hold a private key would make the separation a convention.
+    const { rows } = await client.query<{ attname: string }>(`
+      SELECT a.attname FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'crm' AND c.relname = 'service_key' AND a.attnum > 0 AND NOT a.attisdropped`);
+    const names = rows.map((r) => r.attname);
+    expect(names).toContain("public_jwk_x");
+    for (const name of names) {
+      expect(name, `crm.service_key.${name} looks like it could hold a secret`).not.toMatch(
+        /private|secret|seed|_d$/i,
+      );
+    }
+  });
+
   it("crm_app owns NO object in the ERP's meta schema", async () => {
     // The single most dangerous thing that could regress. An owner bypasses RLS,
     // so crm_app owning an ERP table is a silent cross-tenant read of ERP data.

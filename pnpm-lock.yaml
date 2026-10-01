@@ -39,6 +39,9 @@ importers:
       '@crm/acl':
         specifier: workspace:*
         version: link:../acl
+      '@crm/credential':
+        specifier: workspace:*
+        version: link:../credential
       '@crm/db':
         specifier: workspace:*
         version: link:../db
@@ -54,6 +57,18 @@ importers:
       zod:
         specifier: ^3.24.0
         version: 3.25.76
+
+  packages/credential:
+    dependencies:
+      '@crm/acl':
+        specifier: workspace:*
+        version: link:../acl
+      '@crm/db':
+        specifier: workspace:*
+        version: link:../db
+      pg:
+        specifier: ^8.13.0
+        version: 8.23.0
 
   packages/db:
     dependencies:
@@ -78,6 +93,9 @@ importers:
       '@crm/acl':
         specifier: workspace:*
         version: link:../acl
+      '@crm/credential':
+        specifier: workspace:*
+        version: link:../credential
       '@crm/db':
         specifier: workspace:*
         version: link:../db

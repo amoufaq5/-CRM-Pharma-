@@ -144,6 +144,41 @@ describe("the API, end to end", () => {
     });
   });
 
+  describe("GET /.well-known/jwks.json", () => {
+    /**
+     * The endpoint the ERP fetches to verify our service tokens.
+     *
+     * The 503 case is the one that matters. The ERP keeps its last good key set on
+     * a non-200 and REPLACES it with whatever a 200 carries — so a 200 with an empty
+     * `keys` array would disarm every verifier that fetched it, and every subsequent
+     * ERP call would 401 until a later refresh happened to succeed.
+     */
+    it("returns 503 rather than an empty key set when no key is published", async () => {
+      await admin.query("DELETE FROM crm.service_key");
+      const res = await call("GET", "/.well-known/jwks.json", { auth: null, tenant: null });
+      expect(res.status).toBe(503);
+      expect(JSON.stringify(res.body)).not.toContain('"keys"');
+    });
+
+    it("publishes every non-retired key, unauthenticated and cacheable", async () => {
+      const { generateServiceKeyPair, PostgresServiceKeyRegistry } = await import("@crm/credential");
+      const registry = new PostgresServiceKeyRegistry({ pool: p });
+      await admin.query("DELETE FROM crm.service_key");
+      const a = generateServiceKeyPair();
+      await registry.publish(a.jwk.x);
+
+      const res = await call("GET", "/.well-known/jwks.json", { auth: null, tenant: null });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/jwk-set+json");
+      // Deliberately overrides the API's blanket no-store: a JWKS is public keys,
+      // identical for every caller, and the ERP refetches on an unknown kid anyway.
+      expect(res.headers.get("cache-control")).toMatch(/^public, max-age=\d+$/);
+      expect(res.body.keys).toHaveLength(1);
+      expect(res.body.keys[0]).toMatchObject({ kty: "OKP", crv: "Ed25519", kid: a.kid, x: a.jwk.x });
+      await admin.query("DELETE FROM crm.service_key");
+    });
+  });
+
   describe("authentication", () => {
     it("refuses a request with no token", async () => {
       const res = await call("GET", "/v1/me", { auth: null });

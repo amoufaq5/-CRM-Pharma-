@@ -94,11 +94,23 @@ services:
     environment:
       <<: *crm-pg-env
       ERP_BASE_URL: ${ERP_BASE_URL}
-      # Development-only. The process REFUSES to start with this under
-      # NODE_ENV=production; see deploy/README.md on minting per-tenant Ed25519
-      # service tokens instead.
+      # The ONLY service that gets the signing key. The API publishes the JWKS from
+      # the database and holds no private key, so it cannot mint a token even if it
+      # is compromised; keep it that way.
+      CRM_SIGNING_KEY_FILE: ${CRM_SIGNING_KEY_FILE:-}
+      CRM_SIGNING_KEY_PEM: ${CRM_SIGNING_KEY_PEM:-}
+      # Must match operate-server's --jwt-issuer and --jwt-audience exactly.
+      CRM_TOKEN_ISSUER: ${CRM_TOKEN_ISSUER:-}
+      ERP_TOKEN_AUDIENCE: ${ERP_TOKEN_AUDIENCE:-}
+      ERP_TOKEN_TTL_SECONDS: ${ERP_TOKEN_TTL_SECONDS:-}
+      # Development-only, and ignored when a signing key is set. The process
+      # REFUSES to start with it under NODE_ENV=production.
       ERP_TOKEN: ${ERP_TOKEN:-}
       NODE_ENV: ${SCHEDULER_NODE_ENV:-production}
+    volumes:
+      # Mounted read-only when CRM_SIGNING_KEY_FILE points inside it. Remove the
+      # mount rather than leaving an empty directory if the key comes in by env.
+      - ${CRM_SECRETS_DIR:-./secrets}:/run/secrets:ro
     command: ["node", "packages/scheduler/dist/bin/scheduler.js"]
     # Exactly one is not required — claimDueJobs advances next_run_at inside the
     # claim, so N instances share the work safely. One is simply enough.

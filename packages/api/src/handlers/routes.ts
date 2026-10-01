@@ -1,3 +1,4 @@
+import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
 import { withTenantContext } from "@crm/db";
 import { visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
 import {
@@ -109,6 +110,35 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       } finally {
         client.release();
       }
+    },
+  });
+
+  /**
+   * The JWKS the ERP verifies our service tokens against (ADR-0001 item 10).
+   *
+   * Public by necessity — a verifier fetches it unauthenticated — and harmless:
+   * it contains public keys only. The signing key is never in this process at all;
+   * it lives in the scheduler, which is the one that mints tokens.
+   *
+   * The 503-rather-than-empty rule lives in `jwksResponse`, and the reason is the
+   * ERP's own refresh logic: a non-200 makes it keep the key set it has, while a
+   * 200 replaces it with whatever arrived. An empty document would therefore
+   * silently disarm every verifier that fetched it.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/.well-known/jwks.json",
+    public: true,
+    handler: async (): Promise<HandlerResult> => {
+      let keys;
+      try {
+        keys = await new PostgresServiceKeyRegistry({ pool: deps.pool }).verifiableKeys();
+      } catch {
+        // A failed read must not become an empty key set. 503 keeps every verifier
+        // on its last good document.
+        return jwksResponse([]);
+      }
+      return jwksResponse(keys);
     },
   });
 

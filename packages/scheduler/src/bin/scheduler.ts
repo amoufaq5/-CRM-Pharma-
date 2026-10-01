@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Pool } from "pg";
-import { ErpClient, type FetchLike, type TenantCredential } from "@crm/acl";
+import { ErpClient, type FetchLike } from "@crm/acl";
+import { buildServiceCredential } from "@crm/credential";
 import { OutboxRelay } from "@crm/relay";
 import { SnapshotRefresher } from "@crm/sync";
 
@@ -19,26 +20,6 @@ function env(name: string, fallback?: string): string {
   const v = process.env[name] ?? fallback;
   if (v === undefined) throw new Error(`missing required environment variable ${name}`);
   return v;
-}
-
-/**
- * A placeholder credential that reads a static token from the environment.
- *
- * The real implementation mints a short-lived Ed25519 JWT per tenant from a key
- * in a KMS (ADR-0001 item 10, decided under Q8). This exists so the process can
- * run end to end before that lands, and it FAILS LOUDLY in production rather
- * than quietly shipping a static secret: a static token is acceptable for a
- * development environment and is not acceptable in one serving real tenants.
- */
-function staticCredential(): TenantCredential {
-  const token = env("ERP_TOKEN");
-  if ((process.env["NODE_ENV"] ?? "development") === "production") {
-    throw new Error(
-      "ERP_TOKEN is a development-only static credential. Production must mint " +
-        "short-lived per-tenant Ed25519 service tokens (ADR-0001 item 10).",
-    );
-  }
-  return { token: () => Promise.resolve(token) };
 }
 
 function log(event: SchedulerEvent): void {
@@ -60,9 +41,47 @@ async function main(): Promise<void> {
     max: Number(process.env["PG_POOL_MAX"] ?? "10"),
   });
 
+  /**
+   * The ERP credential (ADR-0001 item 10).
+   *
+   * Built before anything else starts, and it verifies at boot that the signing key
+   * is published in the JWKS the API serves — a key that is absent or retired mints
+   * tokens the ERP rejects with credential_not_found, which from here looks exactly
+   * like the ERP being misconfigured.
+   *
+   * The mint event deliberately carries the kid, role and jti and NOT the token:
+   * the token is a bearer credential and must not reach a log line.
+   */
+  const built = await buildServiceCredential({
+    pool,
+    onMint: (e) =>
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          type: "token_minted",
+          tenantId: e.tenantId,
+          kid: e.kid,
+          role: e.role,
+          jti: e.jti,
+          expiresAt: new Date(e.expiresAtSeconds * 1000).toISOString(),
+        }),
+      ),
+  });
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      type: "credential",
+      kind: built.kind,
+      kid: built.kid,
+    }),
+  );
+  if (built.warning !== null) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), type: "warning", detail: built.warning }));
+  }
+
   const client = new ErpClient({
     baseUrl: env("ERP_BASE_URL"),
-    credential: staticCredential(),
+    credential: built.credential,
     fetch: globalThis.fetch as unknown as FetchLike,
   });
 

@@ -5,11 +5,23 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "bin": { "crm-scheduler": "./dist/bin/scheduler.js" },
-  "scripts": { "build": "tsc", "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "crm-scheduler": "./dist/bin/scheduler.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
   "dependencies": {
     "@crm/acl": "workspace:*",
+    "@crm/credential": "workspace:*",
     "@crm/db": "workspace:*",
     "@crm/relay": "workspace:*",
     "@crm/sync": "workspace:*",

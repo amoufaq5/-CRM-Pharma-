@@ -8,6 +8,9 @@
       "path": "./packages/acl"
     },
     {
+      "path": "./packages/credential"
+    },
+    {
       "path": "./packages/relay"
     },
     {

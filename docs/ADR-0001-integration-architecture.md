@@ -264,6 +264,29 @@ Concretely, and these specifics are the decision, not commentary on it:
     short-lived Ed25519 tokens removes all three, and it means no third-party IdP has to
     support Ed25519 for us to satisfy the ERP's verifier.
 
+    **Built** (`packages/credential/`, migration 0014). Three things the implementation
+    learned that this item did not anticipate:
+
+    - **The ERP only checks `exp`, `iss` and `aud` when the claim is present.** A token
+      minted without `exp` never expires there and nothing downstream reports it, so
+      emitting all three is entirely our responsibility. The minter requires them.
+    - **One scope, not a list.** The gateway parses every space-separated scope, but
+      `principalFromJwtClaims` takes only `grantedScopes[0]` as the role. A value like
+      `sales_rep controller` therefore grants `sales_rep` while reading as deliberate
+      least privilege. A CHECK constraint on `crm.erp_service_principal.erp_role` forbids
+      whitespace, and the minter refuses it again.
+    - **The JWKS endpoint must never serve an empty 200.** `RemoteJwksProvider` keeps its
+      cached keys on a non-200 and replaces them with whatever a 200 carries, so an empty
+      document disarms every verifier that fetches it. Ours returns 503 instead.
+
+    **"The private key lives in a KMS" needs checking before it is committed to.** The ERP
+    accepts EdDSA only, and Ed25519 signing is not universally offered by managed key
+    services — Vault's transit engine signs ed25519; several cloud KMS offerings have
+    historically exposed only ECDSA and RSA. Confirm against current documentation. The
+    signer is therefore an interface with an async `sign` and no way to read the key out,
+    so a hosted signer is a swap rather than a redesign; what ships is a local signer
+    loading a PEM from a secret at boot, which is weaker and is stated as such.
+
 11. **Rep expense claims post to a SEPARATE Sales & Marketing expense account,
     which can optionally be hooked to a cost centre** (Q6, resolved 2026-09-29).
     Not a cost-centre tag on the ERP's existing expense account, and not per
@@ -551,7 +574,9 @@ reasoning behind each constrains what follows.
 | **Which `LedgerAccount.account_code` is the S&M expense account per tenant, and does it exist yet?** It must be `account_type = 'expense'` and `is_postable`. Until Finance names it, `crm.expense_account_map` has no rows and no claim can leave draft — deliberately, since posting to a guessed account is worse than blocking. | Finance | _set a date_ |
 | Which `CostCenter.code` (if any) to hook per category. Optional by design — NULL posts to the account with no dimension. `CostCenter.segment` has no `functional` value (`operating\|geographic\|product\|service\|other`), so S&M would sit under `operating`. | Finance | _set a date_ |
 | Does the CRM need more than one S&M account (e.g. splitting congresses from detailing samples), or does one account with cost-centre and CRM-side category reporting suffice? The map is per-category already, so several accounts cost nothing structurally. | Finance | _set a date_ |
-| Which OIDC IdP for human login (Q8 tier 1), and does the CRM service credential holding `controller` (needed for the GL posting in item 11) pass security review? | Security | _set a date_ |
+| Which OIDC IdP for human login (Q8 tier 1), and does the CRM service credential holding `controller` (needed for the GL posting in item 11) pass security review? The credential itself is built; the question is whether `controller` per tenant is the right grant, and it is per-tenant configuration (`crm.erp_service_principal`) so narrowing it costs nothing structurally. | Security | _set a date_ |
+| Where does the signing key live? Ed25519 signing is not offered by every managed key service and the ERP accepts nothing else, so this is a real constraint rather than a preference. Until it is answered the key is a PEM in a secret, loaded into the scheduler's memory at boot. | Security | _set a date_ |
+| Has a CRM-minted token been accepted by a **running** operate-server? The acceptance test transcribes the ERP's verifier (alg, kid, both base64 conversions, which claims it checks) and passes, but no live handshake has happened — no ERP instance was available. | Platform | _set a date_ |
 | Staleness budget per snapshot table (item 8) — how old may a product price or a rep roster be on a mobile device before the UI blocks the action rather than warning? | Product | _set a date_ |
 | Does the platform have a date for `meta.webhook_deliveries` (Q9)? Affects only when we retire `PollingChangeSource`, not whether we build it. | Platform | _set a date_ |
 
