@@ -51,6 +51,9 @@ importers:
       '@crm/notify':
         specifier: workspace:*
         version: link:../notify
+      '@crm/relay':
+        specifier: workspace:*
+        version: link:../relay
       '@crm/sample':
         specifier: workspace:*
         version: link:../sample
@@ -114,6 +117,9 @@ importers:
       '@crm/db':
         specifier: workspace:*
         version: link:../db
+      '@crm/notify':
+        specifier: workspace:*
+        version: link:../notify
       pg:
         specifier: ^8.13.0
         version: 8.23.0

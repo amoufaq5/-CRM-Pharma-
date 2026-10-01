@@ -190,6 +190,7 @@ export class Scheduler {
         const r = await this.options.relay.drainTenant(tenantId);
         return (
           `claimed=${r.claimed} delivered=${r.delivered} retried=${r.retried} dead=${r.dead} ` +
+          `alarmed=${r.alarmed} unattributed=${r.unattributed} ` +
           `pending=${r.lag.pending} oldest=${r.lag.oldestPendingAgeSeconds ?? "-"}s`
         );
       }

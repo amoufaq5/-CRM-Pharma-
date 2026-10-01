@@ -76,6 +76,7 @@ describe("the API, end to end", () => {
         }
         // Notifications reference rep_profile with ON DELETE RESTRICT, and obligations
         // reference the lot the same way, so both go before their targets.
+        await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [t]);
@@ -1422,6 +1423,147 @@ describe("the API, end to end", () => {
       });
       expect(theirs.body.data).toHaveLength(1);
       expect(theirs.body.data[0].kind).toBe("sample_transfer_awaiting_acceptance");
+    });
+  });
+
+  describe("writes the ERP refused", () => {
+    const mgr = (): string => token({ sub: "idp|mgr", tenant: TENANT });
+
+    /** A real producer and a real dead-lettered outbox row behind it. */
+    const aDeadWrite = async (repId: string): Promise<string> => {
+      let outboxId = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const claim = await tx.query<{ id: string }>(
+          `INSERT INTO crm.expense_claim (tenant_id, rep_profile_id, crm_category, amount, currency, incurred_on)
+           VALUES ($1,$2,'detailing',40.00,'AED','2026-10-05') RETURNING id`,
+          [TENANT, repId],
+        );
+        const row = await tx.query<{ id: string }>(
+          `INSERT INTO crm.outbox
+             (tenant_id, entity, operation, payload, target_record_id, source_table, source_id,
+              state, attempts, dead_at, dead_reason)
+           VALUES ($1,'Expense','create','{}'::jsonb,$2,'crm.expense_claim',$3,
+                   'dead', 1, now(), 'ERP refused: ledger account 6200 does not exist')
+           RETURNING id`,
+          [TENANT, `crm_dead_${Math.random().toString(36).slice(2, 10)}`, claim.rows[0]!.id],
+        );
+        outboxId = row.rows[0]!.id;
+      });
+      return outboxId;
+    };
+
+    const cleanup = async (): Promise<void> => {
+      await withTenantContext(admin, TENANT, async (tx) => {
+        await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [TENANT]);
+        await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1", [TENANT]);
+      });
+    };
+
+    it("lists the caller's failed writes with the reason", async () => {
+      const id = await aDeadWrite(rep);
+      try {
+        const res = await call("GET", "/v1/erp-writes/failed");
+        expect(res.status).toBe(200);
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.data[0].id).toBe(id);
+        expect(res.body.data[0].dead_reason).toMatch(/ledger account 6200/);
+        expect(res.body.data[0].revive_count).toBe(0);
+        // And not another rep's.
+        expect((await call("GET", "/v1/erp-writes/failed", {
+          auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        })).body.data).toEqual([]);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it("shows a manager the team's, and a peer rep nothing", async () => {
+      await aDeadWrite(rep);
+      try {
+        expect((await call("GET", "/v1/team/erp-writes/failed", { auth: mgr() })).body.data).toHaveLength(1);
+        expect((await call("GET", "/v1/team/erp-writes/failed")).body.data).toEqual([]);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    /**
+     * Retrying re-sends the SAME payload, which is the useful thing once the ERP side has
+     * been fixed — and useless if the payload itself is wrong, in which case it dies again
+     * and the revive count says so.
+     */
+    it("queues a failed write again and reports the revive count", async () => {
+      const id = await aDeadWrite(rep);
+      try {
+        const res = await call("POST", `/v1/erp-writes/${id}/retry`, { body: {} });
+        expect(res.status).toBe(200);
+        expect(res.body).toMatchObject({ queued: true, reviveCount: 1 });
+
+        await withTenantContext(admin, TENANT, async (tx) => {
+          const { rows } = await tx.query<{ state: string; attempts: number; revived_by: string }>(
+            "SELECT state, attempts, revived_by FROM crm.outbox WHERE id = $1",
+            [id],
+          );
+          expect(rows[0]!.state).toBe("pending");
+          expect(rows[0]!.attempts).toBe(0);
+          expect(rows[0]!.revived_by).toBe(rep);
+        });
+
+        // No longer dead, so it is gone from the list and a second retry conflicts.
+        expect((await call("GET", "/v1/erp-writes/failed")).body.data).toEqual([]);
+        expect((await call("POST", `/v1/erp-writes/${id}/retry`, { body: {} })).status).toBe(404);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it("lets a manager retry a supervised rep's write", async () => {
+      const id = await aDeadWrite(rep);
+      try {
+        expect((await call("POST", `/v1/erp-writes/${id}/retry`, { auth: mgr(), body: {} })).status).toBe(200);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it("hides another rep's failed write behind a 404", async () => {
+      const id = await aDeadWrite(rep);
+      try {
+        const res = await call("POST", `/v1/erp-writes/${id}/retry`, {
+          auth: token({ sub: "idp|rep2", tenant: TENANT }),
+          body: {},
+        });
+        expect(res.status).toBe(404);
+        expect(res.body.type).toContain("/errors/not-found");
+      } finally {
+        await cleanup();
+      }
+    });
+
+    /**
+     * A row whose producer cannot be attributed to a rep is deliberately unreachable here:
+     * nobody was notified about it either, and an operator reaches it through the SQL
+     * listing. Making it retryable by anyone would be the wrong way to close that gap.
+     */
+    it("refuses to retry an unattributable write", async () => {
+      let id = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const row = await tx.query<{ id: string }>(
+          `INSERT INTO crm.outbox
+             (tenant_id, entity, operation, payload, target_record_id, source_table, source_id,
+              state, dead_at, dead_reason)
+           VALUES ($1,'Item','create','{}'::jsonb,$2,'crm.unmapped_thing',gen_random_uuid(),
+                   'dead', now(), 'ERP refused')
+           RETURNING id`,
+          [TENANT, `crm_orphan_${Math.random().toString(36).slice(2, 10)}`],
+        );
+        id = row.rows[0]!.id;
+      });
+      try {
+        expect((await call("POST", `/v1/erp-writes/${id}/retry`, { auth: mgr(), body: {} })).status).toBe(404);
+      } finally {
+        await cleanup();
+      }
     });
   });
 

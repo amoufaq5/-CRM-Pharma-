@@ -16,6 +16,13 @@ export const NOTIFICATION_KINDS = [
   "call_plan_returned",
   /** Material was sent to a rep who has no other reason to expect it. */
   "sample_transfer_awaiting_acceptance",
+  /**
+   * A write to the ERP failed permanently.
+   *
+   * The one signal about something the rep believes already happened: the CRM recorded it,
+   * their app said so, and the half they cannot see never landed.
+   */
+  "erp_write_failed",
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 

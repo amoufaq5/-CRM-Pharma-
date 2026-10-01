@@ -27,3 +27,13 @@ export {
   type OutboxRow,
 } from "./store.js";
 export { OutboxRelay, type RelayEvent, type RelayOptions, type RelayResult } from "./relay.js";
+export {
+  DeadLetterNotFoundError,
+  deadLetter,
+  deadLetters,
+  raiseDeadLetterAlarm,
+  reviveDeadLetter,
+  teamDeadLetters,
+  type DeadLetter,
+  type DeadLetterAlarm,
+} from "./dead-letters.js";

@@ -326,8 +326,16 @@ are backing up), `crm.snapshot_freshness.last_full_sweep_at` (a snapshot that ha
 only ever been refreshed incrementally cannot have observed a deletion — the ERP
 keeps no tombstones), `consecutive_failures` on `crm.scheduled_job`, a 503 from
 `/.well-known/jwks.json` (no key published — every ERP call is about to fail),
-`crm.notification_delivery` in state `dead` (someone is not being told something), and
-`crm.disposal_obligation` in state `overdue` (expired stock still in a bag).
+`crm.notification_delivery` in state `dead` (someone is not being told something),
+`crm.disposal_obligation` in state `overdue` (expired stock still in a bag), and
+`crm.outbox` in state `dead` — a rep's write the ERP refused permanently. The relay now
+notifies the rep and their manager when one appears, and the `unattributed` count in its log
+line is the case where it could not work out whose write it was.
+
+**A dead letter is recoverable.** Most causes are configuration on the ERP side; once fixed,
+`POST /v1/erp-writes/:id/retry` (or `SELECT crm.revive_outbox_letter(id, rep)`) queues the
+same payload again with the attempt count reset. It is not an edit — a payload that was
+wrong will die again, and `revive_count` will say so.
 
 **Backups are the ERP's.** One database, one backup. Note that the CRM holds data
 the ERP has no copy of — visits, territories, assignment history — so a restore

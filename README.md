@@ -97,6 +97,9 @@ authorisation on its own.
 | `GET /v1/notifications/unread-count` | a real count of a real column |
 | `POST /v1/notifications/:id/read` | idempotent; keeps the first read timestamp |
 | `POST /v1/notifications/read-all` | |
+| `GET /v1/erp-writes/failed` | writes the ERP refused permanently — theirs |
+| `GET /v1/team/erp-writes/failed` | the team's, for a manager |
+| `POST /v1/erp-writes/:id/retry` | queue the same payload again, once the cause is fixed |
 
 Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
 emits two on the same API, and a client that handles only one misreads the other.
@@ -340,3 +343,17 @@ notification package declares 6 channels and 18 providers and has a working impl
 for one of them, a gap that sat in its ADRs for releases. One working channel is worth more
 than six stubs, so this ships in-app and webhook — verified against a real HTTP server that
 checks the signature — and says plainly that nothing else is built.
+
+**30. A write the ERP refuses permanently is not allowed to fail quietly.** The rep's app
+already showed it as recorded — because in the CRM it is — so the only half that failed is
+the half they cannot see, and they would otherwise find out at month end. A dead letter now
+notifies the rep urgently and their manager as a warning, in the same transaction as the
+state change. Where the producing table cannot be mapped to a rep, that is **counted**, not
+glossed over: the row still appears in the listing, precisely because nobody was told.
+
+**31. A dead letter has a way back.** Most reasons a write dies permanently — a missing
+ledger account, a permission not granted, a parent record that did not exist yet — are fixed
+on the ERP side, after which the queued intent is still valid. `retry` re-sends the **same
+payload**, resets the attempt count because the cause was fixed, and keeps `dead_reason` so
+"died, tried again, died again" reads differently from a fresh failure. It is not an edit,
+and a payload that was wrong will die again with `revive_count` to say so.

@@ -3,6 +3,7 @@ import { withTenantContext } from "@crm/db";
 import type { Pool } from "pg";
 
 import { nextDelayMs, policyFor, TRANSIENT_BACKOFF } from "./backoff.js";
+import { raiseDeadLetterAlarm } from "./dead-letters.js";
 import { dispatch, parseOperation, UnknownOperationError } from "./dispatch.js";
 import { classify, type Outcome } from "./outcome.js";
 import {
@@ -41,6 +42,14 @@ export interface RelayResult {
   readonly delivered: number;
   readonly retried: number;
   readonly dead: number;
+  /** Notifications raised for dead letters, counting the rep and each supervisor. */
+  readonly alarmed: number;
+  /**
+   * Dead letters whose producing table is not mapped to a rep, so nobody was told. Counted
+   * rather than ignored: it is the one case a dead letter passes silently, and it should
+   * show up in the scheduler's log line.
+   */
+  readonly unattributed: number;
   readonly lag: OutboxLag;
 }
 
@@ -92,6 +101,8 @@ export class OutboxRelay {
       let delivered = 0;
       let retried = 0;
       let dead = 0;
+      let alarmed = 0;
+      let unattributed = 0;
 
       for (const row of rows) {
         // Deliberately outside any transaction — see the class comment.
@@ -112,6 +123,11 @@ export class OutboxRelay {
             case "dead": {
               await markDead(tx, row.id, this.now(), outcome.reason);
               dead += 1;
+              // In the SAME transaction as the state change: there must be no window in
+              // which a write is permanently dead and nobody was told.
+              const alarm = await raiseDeadLetterAlarm(tx, tenantId, row, outcome.reason);
+              alarmed += alarm.notified;
+              if (alarm.repProfileId === null) unattributed += 1;
               this.options.onEvent?.({ type: "dead", row, outcome });
               return;
             }
@@ -121,6 +137,9 @@ export class OutboxRelay {
                 const reason = `giving up after ${row.attempts} attempts — ${outcome.reason}`;
                 await markDead(tx, row.id, this.now(), reason);
                 dead += 1;
+                const alarm = await raiseDeadLetterAlarm(tx, tenantId, row, reason);
+                alarmed += alarm.notified;
+                if (alarm.repProfileId === null) unattributed += 1;
                 this.options.onEvent?.({ type: "dead", row, outcome: { ...outcome, reason } });
                 return;
               }
@@ -141,7 +160,7 @@ export class OutboxRelay {
       const lag = await withTenantContext(client, tenantId, (tx) =>
         outboxLag(tx, tenantId, this.now()),
       );
-      return { claimed: rows.length, delivered, retried, dead, lag };
+      return { claimed: rows.length, delivered, retried, dead, alarmed, unattributed, lag };
     } finally {
       client.release();
     }

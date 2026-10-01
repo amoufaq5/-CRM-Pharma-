@@ -21,6 +21,7 @@ import {
 } from "@crm/callplan";
 import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
 import { inbox, markAllRead, markRead, unreadCount } from "@crm/notify";
+import { deadLetter, deadLetters, reviveDeadLetter, teamDeadLetters } from "@crm/relay";
 import { withTenantContext } from "@crm/db";
 import { canSupervise, teamRoster, visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
 import {
@@ -64,7 +65,7 @@ import type { Pool, PoolClient } from "pg";
 import { z } from "zod";
 
 import type { Principal } from "../principal.js";
-import { forbidden, notFound, validationFailed } from "../problems.js";
+import { ApiError, forbidden, notFound, validationFailed } from "../problems.js";
 import { Router, type HandlerResult, type RequestContext } from "../router.js";
 
 export interface HandlerDeps {
@@ -1546,6 +1547,74 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       // someone else's work.
       if (!ok) throw notFound(`no notification ${id}`);
       return { status: 204 };
+    },
+  });
+
+  // ---- writes the ERP refused ---------------------------------------------
+
+  /**
+   * The caller's writes that will never reach the ERP.
+   *
+   * Named for what it means to a rep rather than for the table behind it: they do not know
+   * what an outbox is, they know they recorded something and it did not arrive.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/erp-writes/failed",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        deadLetters(tx, { repProfileId: ctx.principal.repProfileId }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /** The team's, for a manager — most causes are theirs or an administrator's to fix. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/team/erp-writes/failed",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        teamDeadLetters(tx, ctx.principal.repProfileId),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Queues a failed write to be tried again.
+   *
+   * Re-sends the SAME payload, which is the useful thing when the ERP side has changed — a
+   * ledger account created, a permission granted, a parent record that now exists — and
+   * useless when the payload itself is wrong, in which case it dies again and `revive_count`
+   * says so. It is not an edit, and the route does not pretend otherwise.
+   *
+   * Allowed for the caller's own writes and for a supervised rep's: a 404 for anyone else,
+   * since whether a failed write exists is information about someone's work.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/erp-writes/:id/retry",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const p = ctx.principal;
+      const body = await inTenant(deps, p, async (tx) => {
+        const target = await deadLetter(tx, id);
+        // A 404 for a row that is not dead, not this rep's, or produced by a table that
+        // cannot be attributed to a rep at all — in the last case nobody was notified
+        // either, and an operator reaches it through the SQL listing rather than here.
+        if (
+          target === null ||
+          target.rep_profile_id === null ||
+          !(await canSupervise(tx, p.repProfileId, target.rep_profile_id))
+        ) {
+          throw notFound(`no failed ERP write ${id}`);
+        }
+        const revived = await reviveDeadLetter(tx, id, p.repProfileId);
+        if (!revived) throw new ApiError("conflict", `failed ERP write ${id} is no longer dead`);
+        return { id, queued: true, reviveCount: target.revive_count + 1 };
+      });
+      return { status: 200, body };
     },
   });
 

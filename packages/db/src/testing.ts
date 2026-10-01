@@ -89,3 +89,6 @@ export const TENANT_EXPIRY_SWEEP = "ce000000-0000-4000-8000-000000000004";
 
 /** packages/notify — raise.contract and dispatch.contract. */
 export const TENANT_NOTIFY = "cf000000-0000-4000-8000-000000000005";
+
+/** packages/relay — dead-letters.contract. */
+export const TENANT_DEAD_LETTERS = "d1000000-0000-4000-8000-000000000006";

@@ -3,6 +3,7 @@ import { Pool, type PoolClient } from "pg";
 import { ErpClient, ErpError, type FetchLike, type TenantCredential } from "@crm/acl";
 import { ERP_SCHEMA_FIXTURE } from "@crm/acl/fixtures";
 import { withTenantContext } from "@crm/db";
+import { inbox } from "@crm/notify";
 
 import { OutboxRelay, type RelayEvent } from "./relay.js";
 import { claimBatch, outboxLag, reclaimStale } from "./store.js";
@@ -168,6 +169,65 @@ describe("outbox relay against a real database", () => {
     const after = await stateOf(id);
     expect(after.state).toBe("dead");
     expect(after.dead_reason).toContain("unbalanced_journal_entry");
+  });
+
+  /**
+   * The wiring, through the real relay rather than the alarm function alone: a dead letter
+   * must notify the rep in the SAME transaction as the state change.
+   *
+   * Note what the other dead-letter tests in this file exercise by accident — they enqueue
+   * with a source id that does not exist, so nobody can be attributed and the relay reports
+   * `unattributed`. That is the honest path, and it is worth having both covered.
+   */
+  it("notifies the rep whose write died, and counts what it cannot attribute", async () => {
+    let repId = "";
+    let claimId = "";
+    await withTenantContext(admin, TENANT, async (tx) => {
+      await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1", [TENANT]);
+      await tx.query(
+        `DELETE FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'relay-dl-rep'`,
+        [TENANT],
+      );
+      const rep = await tx.query<{ id: string }>(
+        `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name)
+         VALUES ($1,'relay-dl-rep','RDL-1','Relay Rep') RETURNING id`,
+        [TENANT],
+      );
+      repId = rep.rows[0]!.id;
+      const claim = await tx.query<{ id: string }>(
+        `INSERT INTO crm.expense_claim (tenant_id, rep_profile_id, crm_category, amount, currency, incurred_on)
+         VALUES ($1,$2,'detailing',30.00,'AED','2026-10-05') RETURNING id`,
+        [TENANT, repId],
+      );
+      claimId = claim.rows[0]!.id;
+      await tx.query(
+        `INSERT INTO crm.outbox
+           (tenant_id, entity, operation, payload, target_record_id, source_table, source_id, next_attempt_at)
+         VALUES ($1,'Item','create','{"sku":"A","name":"W"}'::jsonb,$2,'crm.expense_claim',$3, now())`,
+        [TENANT, `crm_dl_${Math.random().toString(36).slice(2, 10)}`, claimId],
+      );
+    });
+
+    // A 403: a missing `controller` role wants a human, not a backoff.
+    const result = await relay(() => ({ status: 403, body: { error: "forbidden" } })).drainTenant(TENANT);
+    expect(result.dead).toBe(1);
+    expect(result.unattributed).toBe(0);
+    expect(result.alarmed).toBeGreaterThanOrEqual(1);
+
+    await withTenantContext(admin, TENANT, async (tx) => {
+      const items = await inbox(tx, repId);
+      expect(items).toHaveLength(1);
+      expect(items[0]!.kind).toBe("erp_write_failed");
+      expect(items[0]!.severity).toBe("urgent");
+      // Named for what it means to the rep, not for the table behind it.
+      expect(items[0]!.subject).toMatch(/Not recorded in the ERP/);
+
+      await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.rep_profile WHERE id = $1", [repId]);
+    });
   });
 
   it("dead-letters a 403 — a missing `controller` role wants a human, not a backoff", async () => {
