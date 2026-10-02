@@ -155,7 +155,23 @@ describe("scheduler against a real database", () => {
     await withTenantContext(admin, TENANT, async (tx) => {
       // Tolerate residue from an earlier failed run: the fixture owns this subject, and a
       // half-cleaned database should not make the next run fail for the wrong reason.
+      //
+      // The list has to match the teardown at the end of this test, in the same FK order.
+      // It did not: it cleared notifications and the profile but not the holdings and
+      // ledger rows that reference the profile, so a run aborted midway left the NEXT run
+      // failing on `sample_holding_rep_profile_id_fkey` — a confusing way to be told
+      // "the previous run died".
+      await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
       await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.disposal_policy WHERE tenant_id = $1", [TENANT]);
+      await tx.query("ALTER TABLE crm.sample_transaction DISABLE TRIGGER USER");
+      await tx.query("ALTER TABLE crm.sample_holding DISABLE TRIGGER USER");
+      await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.sample_holding WHERE tenant_id = $1", [TENANT]);
+      await tx.query("ALTER TABLE crm.sample_transaction ENABLE TRIGGER USER");
+      await tx.query("ALTER TABLE crm.sample_holding ENABLE TRIGGER USER");
+      await tx.query("DELETE FROM crm.sample_lot WHERE tenant_id = $1", [TENANT]);
       await tx.query(
         `DELETE FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'sched-sweep'`,
         [TENANT],

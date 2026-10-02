@@ -20,7 +20,24 @@ import {
   withdrawPlan,
 } from "@crm/callplan";
 import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
-import { inbox, markAllRead, markRead, unreadCount } from "@crm/notify";
+import {
+  createEndpoint,
+  getEndpoint,
+  inbox,
+  listEndpoints,
+  markAllRead,
+  markRead,
+  unreadCount,
+  updateEndpoint,
+} from "@crm/notify";
+import {
+  ROLES,
+  grantRole,
+  listGrants,
+  revokeRole,
+  roleHolders,
+  type Role,
+} from "@crm/role";
 import { deadLetter, deadLetters, reviveDeadLetter, teamDeadLetters } from "@crm/relay";
 import { withTenantContext } from "@crm/db";
 import { canSupervise, teamRoster, visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
@@ -47,6 +64,7 @@ import {
   holdingsFor,
   ledgerFor,
   disposalPolicy,
+  setDisposalPolicy,
   getCount,
   listCounts,
   openCount,
@@ -64,7 +82,7 @@ import {
 import type { Pool, PoolClient } from "pg";
 import { z } from "zod";
 
-import type { Principal } from "../principal.js";
+import { requireRole, type Principal } from "../principal.js";
 import { ApiError, forbidden, notFound, validationFailed } from "../problems.js";
 import { Router, type HandlerResult, type RequestContext } from "../router.js";
 
@@ -1613,6 +1631,252 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         const revived = await reviveDeadLetter(tx, id, p.repProfileId);
         if (!revived) throw new ApiError("conflict", `failed ERP write ${id} is no longer dead`);
         return { id, queued: true, reviveCount: target.revive_count + 1 };
+      });
+      return { status: 200, body };
+    },
+  });
+
+  // ---- administration -----------------------------------------------------
+  //
+  // Everything below requires a ROLE (0023), not supervision. A first-line manager
+  // reads their team's data and configures nothing: the parameters here bind the whole
+  // tenant, including the manager's own numbers, so "supervises at least one rep" is
+  // precisely the wrong gate. Each route states which role it needs and gets it from
+  // the principal, resolved once per request as of today.
+
+  /**
+   * Who holds which role. Readable by any rep, deliberately.
+   *
+   * A rep who has been told to ask an administrator needs to know who that is, and the
+   * answer is a name and a role — not a permission. Hiding it would make the system
+   * unoperable without making it safer, since the grant itself is what confers power.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/roles",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const on = onDate(ctx);
+      const roleFilter = ctx.query.get("role");
+      const includeEnded = ctx.query.get("includeEnded") === "true";
+      if (roleFilter !== null && !(ROLES as readonly string[]).includes(roleFilter)) {
+        throw validationFailed("unknown role", { role: `expected one of ${ROLES.join(", ")}` });
+      }
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        listGrants(tx, ctx.principal.tenantId, {
+          ...(roleFilter !== null ? { role: roleFilter as Role } : {}),
+          ...(on !== undefined ? { asOf: on } : {}),
+          includeEnded,
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /** The role the caller holds, so a client can decide which admin screens to show. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/me/roles",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      return { status: 200, body: { roles: ctx.principal.roles } };
+    },
+  });
+
+  /**
+   * Grant a role. Administrator only, and never to oneself — the database refuses that
+   * and this route does not pre-empt it, so the four-eyes rule has exactly one home.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/admin/roles",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const input = parse(
+        z.object({
+          repProfileId: UUID,
+          role: z.enum(ROLES),
+          validFrom: ISO_DATE.optional(),
+          validTo: ISO_DATE.nullish(),
+          reason: z.string().max(500).nullish(),
+        }),
+        ctx.body,
+      );
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        grantRole(tx, ctx.principal.tenantId, {
+          repProfileId: input.repProfileId,
+          role: input.role,
+          grantedBy: ctx.principal.repProfileId,
+          ...(input.validFrom !== undefined ? { validFrom: input.validFrom } : {}),
+          ...(input.validTo !== undefined ? { validTo: input.validTo } : {}),
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        }),
+      );
+      return { status: 201, body };
+    },
+  });
+
+  /**
+   * End a grant. A POST rather than a DELETE because nothing is deleted — the grant
+   * stays, with an end date and a revoker, and that is the whole point of the table.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/admin/roles/:id/revoke",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const id = parse(UUID, ctx.params["id"]);
+      const input = parse(
+        z.object({ on: ISO_DATE.optional(), reason: z.string().max(500).nullish() }),
+        ctx.body ?? {},
+      );
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        revokeRole(tx, ctx.principal.tenantId, id, {
+          revokedBy: ctx.principal.repProfileId,
+          ...(input.on !== undefined ? { on: input.on } : {}),
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        }),
+      );
+      // A grant in another tenant is indistinguishable from a nonexistent one, which is
+      // the right answer: a grant id is not a probe into other tenants. The tenant is
+      // matched in SQL rather than left to RLS — see crm.revoke_rep_role.
+      if (body === null) throw notFound(`no role grant ${id}`);
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * The administrators a tenant currently has.
+   *
+   * Separate from the grant list because the operational question is "is this tenant
+   * still administrable", and the database refuses to let the answer reach zero.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/roles/administrators",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const on = onDate(ctx);
+      const data = await inTenant(deps, ctx.principal, (tx) => roleHolders(tx, "administrator", on));
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Set the disposal policy. COMPLIANCE, not administrator.
+   *
+   * These are the SOP parameters every rep is measured against — the grace period they
+   * get before an obligation goes overdue, and whether promotional material may be
+   * written off by a job at all. A changed grace period never rewrites a deadline that
+   * has already been communicated: 0020 copies it onto each obligation at discovery.
+   */
+  router.add({
+    method: "PUT",
+    pattern: "/v1/admin/samples/disposal-policy",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "compliance");
+      const input = parse(
+        z.object({
+          graceDays: z.number().int().min(0).max(365).optional(),
+          autoWriteoffPromo: z.boolean().optional(),
+        }),
+        ctx.body,
+      );
+      if (input.graceDays === undefined && input.autoWriteoffPromo === undefined) {
+        throw validationFailed("nothing to change", { _: "supply graceDays, autoWriteoffPromo, or both" });
+      }
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        setDisposalPolicy(tx, ctx.principal.tenantId, {
+          ...(input.graceDays !== undefined ? { graceDays: input.graceDays } : {}),
+          ...(input.autoWriteoffPromo !== undefined ? { autoWriteoffPromo: input.autoWriteoffPromo } : {}),
+        }),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * The tenant's webhook endpoints. Administrator only.
+   *
+   * No secret is ever in a request or a response: `secretEnv` names an environment
+   * variable and the database has only ever held the name (0021). The API therefore
+   * CANNOT tell an administrator whether their secret is actually present, because the
+   * sender runs in the scheduler process and reads a different environment — a check
+   * here would answer confidently about the wrong one. A missing secret surfaces where
+   * it is true: the delivery dead-letters rather than going out unsigned.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notification-endpoints",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const data = await inTenant(deps, ctx.principal, (tx) => listEndpoints(tx, ctx.principal.tenantId));
+      return { status: 200, body: { data } };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/admin/notification-endpoints",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const input = parse(
+        z.object({
+          url: z.string().max(2000),
+          secretEnv: z
+            .string()
+            .regex(/^[A-Z][A-Z0-9_]{2,63}$/, "must be an environment variable NAME, e.g. CRM_WEBHOOK_SECRET"),
+          minSeverity: z.enum(["info", "warning", "urgent"]).optional(),
+          kinds: z.array(z.string()).nullish(),
+          description: z.string().max(500).nullish(),
+          enabled: z.boolean().optional(),
+        }),
+        ctx.body,
+      );
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        createEndpoint(tx, ctx.principal.tenantId, {
+          url: input.url,
+          secretEnv: input.secretEnv,
+          ...(input.minSeverity !== undefined ? { minSeverity: input.minSeverity } : {}),
+          ...(input.kinds !== undefined ? { kinds: input.kinds } : {}),
+          ...(input.description !== undefined ? { description: input.description } : {}),
+          ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+        }),
+      );
+      return { status: 201, body };
+    },
+  });
+
+  /**
+   * Change an endpoint's thresholds, or switch it off.
+   *
+   * There is no DELETE, and that is not an omission. `crm.notification_delivery`
+   * references the endpoint ON DELETE CASCADE, so removing one would erase the record
+   * of everything ever sent to it — the audit trail of where a tenant's signals went.
+   * `enabled: false` is how an endpoint stops, and the history stays.
+   */
+  router.add({
+    method: "PATCH",
+    pattern: "/v1/admin/notification-endpoints/:id",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const id = parse(UUID, ctx.params["id"]);
+      const input = parse(
+        z.object({
+          minSeverity: z.enum(["info", "warning", "urgent"]).optional(),
+          kinds: z.array(z.string()).nullish(),
+          description: z.string().max(500).nullish(),
+          enabled: z.boolean().optional(),
+        }),
+        ctx.body,
+      );
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        if ((await getEndpoint(tx, id)) === null) throw notFound(`no notification endpoint ${id}`);
+        return await updateEndpoint(tx, id, {
+          ...(input.minSeverity !== undefined ? { minSeverity: input.minSeverity } : {}),
+          ...(Object.prototype.hasOwnProperty.call(input, "kinds") ? { kinds: input.kinds ?? null } : {}),
+          ...(Object.prototype.hasOwnProperty.call(input, "description")
+            ? { description: input.description ?? null }
+            : {}),
+          ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+        });
       });
       return { status: 200, body };
     },

@@ -23,6 +23,9 @@
       "path": "./packages/territory"
     },
     {
+      "path": "./packages/role"
+    },
+    {
       "path": "./packages/visit"
     },
     {

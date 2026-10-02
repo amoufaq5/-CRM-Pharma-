@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as callplan from "@crm/callplan";
+import * as notify from "@crm/notify";
+import * as role from "@crm/role";
 import * as sample from "@crm/sample";
 
 import { ApiError, PROBLEM_BASE, toProblem } from "./problems.js";
@@ -36,13 +38,17 @@ describe("toProblem covers every domain error", () => {
     return out;
   };
 
-  for (const [moduleName, mod] of [
-    ["@crm/sample", sample as unknown as Record<string, unknown>],
-    ["@crm/callplan", callplan as unknown as Record<string, unknown>],
+  // The minimum is per module and deliberately close to the real count: a module whose
+  // errors all vanish from the barrel would otherwise pass this test by exporting none.
+  for (const [moduleName, mod, atLeast] of [
+    ["@crm/sample", sample as unknown as Record<string, unknown>, 6],
+    ["@crm/callplan", callplan as unknown as Record<string, unknown>, 6],
+    ["@crm/role", role as unknown as Record<string, unknown>, 6],
+    ["@crm/notify", notify as unknown as Record<string, unknown>, 1],
   ] as const) {
     it(`maps every error exported by ${moduleName}`, () => {
       const classes = errorClasses(mod);
-      expect(classes.length).toBeGreaterThan(5);
+      expect(classes.length).toBeGreaterThanOrEqual(atLeast);
       for (const [name, instance] of classes) {
         const problem = toProblem(instance);
         expect(problem.kind, `${moduleName}.${name} falls through to a 500`).not.toBe("internal");
@@ -69,6 +75,14 @@ describe("toProblem covers every domain error", () => {
       `${PROBLEM_BASE}/insufficient-stock`,
     );
     expect(toProblem(new callplan.PlanFrozenError("are fixed")).body().type).toBe(`${PROBLEM_BASE}/plan-final`);
+  });
+
+  it("gives the lockout refusal its own type, because a client must act on it", () => {
+    expect(toProblem(new role.LastAdministratorError("refusing to revoke the last administrator")).body().type).toBe(
+      `${PROBLEM_BASE}/last-administrator`,
+    );
+    expect(toProblem(new role.SelfGrantError("cannot grant themselves")).status).toBe(403);
+    expect(toProblem(new role.RoleAlreadyHeldError("compliance", "2026-01-01")).status).toBe(409);
   });
 
   it("passes an ApiError through untouched", () => {

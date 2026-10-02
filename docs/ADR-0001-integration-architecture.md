@@ -334,6 +334,85 @@ Concretely, and these specifics are the decision, not commentary on it:
     independent scaling. `operate-server` must stay long-running (its schedulers are
     in-process); the CRM read path can scale horizontally on its own.
 
+13. **Administrative authority is a dated GRANT, not a column and not supervision.**
+    Decision item 10 put user-level authorisation in the CRM, and until now that meant
+    exactly two things: *is this your record* and *do you supervise this rep*. Both are
+    answers about a rep's own work. Neither can govern a **tenant-wide parameter**, and two
+    increments in a row proved it by declining to build an admin write route at all —
+    `crm.disposal_policy` (0020) and `crm.notification_endpoint` (0021) were settable only
+    at a psql prompt, which means settable by anyone holding the application password, with
+    no record of who changed what.
+
+    **Two roles, held by nobody implicitly:** `administrator` configures the tenant (where
+    its signals are pushed, and who holds roles); `compliance` owns the SOP parameters reps
+    are measured against (the disposal grace period, the promo auto-write-off switch). The
+    list is a CHECK constraint, not a lookup table — a role nothing checks is worse than no
+    role, so adding one should require a migration *and* the route that honours it.
+
+    **A grant, because the question an auditor asks is dated.** "Who was the compliance
+    officer when this obligation went overdue" cannot be answered by a column on
+    `rep_profile`; `crm.rep_role` is effective-dated like territory assignment (0010), with
+    `granted_by` / `granted_at` / `revoked_by` / `revoked_at` and reasons on both ends. The
+    row is the audit trail, so it is append-only: a grant may be *ended*, never edited or
+    deleted, and the one permitted UPDATE is a revocation from unrevoked to revoked.
+
+    **Supervision is deliberately not accepted in its place.** A district manager is the
+    most privileged principal the CRM had before this, and a tenant-wide SOP parameter is
+    precisely what they must not change — their own team is measured against it. The two
+    predicates (`crm.rep_can_supervise`, `crm.rep_has_role`) stay separate and no route
+    takes either for the other.
+
+    **Four eyes, and the lockout that follows from it.** Nobody grants themselves a role and
+    nobody revokes their own. That is the same rule as a call-plan approval (0015), and it
+    has a consequence worth stating plainly: a tenant with no administrator **cannot be
+    given one through the API**, because a grant cannot name its own holder as grantor. So
+    the last administrator leaving is a one-way door, and both ways through it are closed in
+    the database — revoking the last administrator is refused, and so is taking their
+    profile off `active`, since `crm.rep_has_role` requires an active profile and HR is
+    therefore the same door as security. A one-day gap is refused too: an
+    administrator-less day is a locked-out day, and the remedy is to date the successor's
+    grant from the same day rather than accept the gap.
+
+    **The first administrator of a tenant is inserted in SQL**, by whoever runs the
+    migrations. Not a gap — a closed system has to be started from outside it, and an API
+    that could mint its own first administrator would be a way in.
+
+    **Built** (`packages/role/`, migration 0023, `requireRole` in `@crm/api`). Five things
+    the implementation learned:
+
+    - **`valid_to = valid_from` must be allowed.** It is an *empty* half-open range: a grant
+      made and revoked the same day, which is the normal shape of correcting a mistake
+      within the hour. Refusing it would force the corrector to backdate the revocation or
+      delete the row, and deleting it is what the append-only trigger exists to prevent.
+      Because an empty `daterange` overlaps nothing, the exclusion constraint keeps ignoring
+      it, so the correction does not block a fresh grant the same day. Both halves were
+      verified live.
+    - **A revocation must be clamped INTO the grant's window, not written over it.** Written
+      the obvious way — `valid_to = GREATEST(on_date, valid_from)` — revoking a lapsed
+      interim appointment after its end date would hand it the extra months back.
+    - **Tenant scoping cannot be left to RLS here, and the test suite cannot catch that.**
+      The first `crm.revoke_rep_role` matched on the grant id alone. The API contract suite
+      connects as `postgres`, a superuser, which bypasses row-level security even under
+      `FORCE` — so the call succeeded and a rep of one tenant ended a grant in another. The
+      fix is the convention every other store already follows (`AND tenant_id = $n`), and
+      the policy is the backstop rather than the check. Confirmed afterwards against the
+      real `api` binary running as `crm_app`, where RLS *is* in force and the answer is 404.
+    - **The lockout guard answers before the four-eyes CHECK.** `BEFORE UPDATE` row triggers
+      run ahead of constraint evaluation, so an administrator who is the only one and tries
+      to revoke their own grant gets the 409 lockout refusal, not the 403 self-revoke one.
+      Both are correct; the order is pinned by a test, because a client that only ever saw
+      the 409 would report the wrong reason. Reaching the 409 *legitimately* over HTTP takes
+      a future-dated revocation that outlives the caller's own grant — an interim
+      administrator scheduling the permanent one's departure.
+    - **A `COALESCE` omitted from one date comparison emptied the whole listing.** With no
+      `asOf`, `r.valid_from <= $4::date` was NULL, the filter was NULL, and the live grant
+      list came back empty — indistinguishable from "nobody holds a role". Every function in
+      0023 defaults to `CURRENT_DATE`; the one query that did not, lied.
+
+    Roles are resolved **once per request, with the principal, as of today** — never as of a
+    `?on=` parameter, which several reads honour. A date on the path that authorises a write
+    is a date somebody eventually passes from a query string.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -585,11 +664,13 @@ reasoning behind each constrains what follows.
 | Controlled substances are flagged (`sample_lot.controlled`) and not otherwise handled. Unit-level serial custody is a stricter obligation than this schema discharges. | Compliance | _set a date_ |
 | Two outbox rows enqueued in ONE transaction have no deterministic order: `created_at` defaults to `now()`, which is the transaction timestamp, so both carry the same value to the microsecond. The relay copes — a transition that reaches the ERP before its create is classified `retry_ordering` and retried — so this is a latent inefficiency rather than a defect. A `BIGSERIAL` on `crm.outbox` would remove it. Found by a test that assumed a sequence the table does not provide. | Platform | _set a date_ |
 | No email or SMS sender. `ChannelSender` in `@crm/notify` is the seam and in-app plus webhook are the implementations; an SMTP or provider client was deliberately not written, because it could not be verified from here and the ERP's own stack shows where unverifiable senders end up. A webhook into Slack, Teams or PagerDuty covers the paging case today. | Product | _set a date_ |
-| `crm.notification_endpoint` has no write route, for the same reason `crm.disposal_policy` has none: configuring where a tenant's signals are pushed is an administrator's act and there is no role to restrict it to. Set in SQL. | Security | _set a date_ |
 | `crm.outbox_recipient` maps three producing tables to a rep (sample movements, visits, expense claims) and returns NULL for anything else. A new producer needs a branch added — deliberately a visible act in a diff rather than an inference — and until then its dead letters are unattributed: counted by the relay, listed with a null rep, and reachable only through SQL. | Platform | _set a date_ |
 | A dead letter keeps only its LATEST reason. `revive_count` says a row has died more than once but not why each time. A per-attempt history belongs in its own table if one is ever needed, not in more columns on `crm.outbox`. | Platform | _set a date_ |
-| Notification retention is unbounded. Nothing prunes `crm.notification`, so an inbox grows forever; the snapshot pruning job is the obvious place to extend. | Platform | _set a date_ |
-| `crm.disposal_policy` has no write route. The grace period and the promo auto-write-off flag are SOP parameters with a regulatory flavour, and every principal in the API is a rep profile — there is no compliance role to restrict a write to, and "supervises at least one rep" would let a first-line manager change a tenant-wide commitment. Set by an administrator in SQL until there is a role model. | Security | _set a date_ |
+| The API contract suite connects as `postgres`, a **superuser**, which bypasses row-level security even under `FORCE`. So no route's tenant scoping can be proved by that suite if it rests on RLS alone — and one did: the first `crm.revoke_rep_role` matched on the grant id only, and a rep of one tenant ended a grant in another, leaving a `revoked_by` pointing across the boundary. Fixed by matching the tenant in SQL (the convention every other store already follows), and verified live against the real binary running as `crm_app`. The suite should connect as `crm_app` too; that is a harness change wide enough to surface other leaks, which is the argument for doing it on purpose rather than inside this increment. | Platform | _set a date_ |
+| A role grant's `granted_by` / `revoked_by` are plain FKs to `crm.rep_profile (id)`, as every rep-profile reference in this schema is. Nothing but RLS and the explicit tenant match stops one naming a profile in another tenant. A composite `(tenant_id, id)` FK would close it structurally, and changing the convention for one table would be worse than leaving it stated here. | Platform | _set a date_ |
+| Roles cover the two administrative surfaces that exist (`crm.disposal_policy`, `crm.notification_endpoint`) and nothing else. `crm.cycle`, `crm.territory`, `crm.territory_assignment`, `crm.sample_lot` and `crm.expense_account_map` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |
+| Notification retention is still unbounded, and now has an obvious home: a per-tenant retention parameter behind the `administrator` role, pruned by the scheduler. The role model was the missing half; the parameter is the other. | Platform | _set a date_ |
+| There is no `GET /v1/admin/notification-endpoints/:id/test` — no way for an administrator to confirm that the environment variable their endpoint names actually holds a secret. The API cannot answer it: the sender runs in the **scheduler** process and reads a different environment, so a check in the API would report confidently about the wrong one. A test-send route would have to be driven by the scheduler, or the verdict recorded by it and read here. | Platform | _set a date_ |
 
 > The deadlines in the original table (8–26 September) all lapsed before the answers came
 > in. They are left blank above rather than back-dated.

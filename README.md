@@ -29,6 +29,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/credential/` | The ERP service credential: Ed25519 signing, the JWKS, the key lifecycle, per-tenant roles. |
 | `packages/callplan/` | Cycles, call plans and adherence. Four-eyed approval, frozen once approved. |
 | `packages/sample/` | Sample and promo-material custody: lots, expiry, balances, transfers, counts, the ERP mirror. |
+| `packages/role/` | The administrative roles: dated grants, four eyes, and the guard against locking a tenant out. |
 | `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints. See [`deploy/README.md`](deploy/README.md). |
 | `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres). |
 
@@ -100,9 +101,58 @@ authorisation on its own.
 | `GET /v1/erp-writes/failed` | writes the ERP refused permanently — theirs |
 | `GET /v1/team/erp-writes/failed` | the team's, for a manager |
 | `POST /v1/erp-writes/:id/retry` | queue the same payload again, once the cause is fixed |
+| `GET /v1/me/roles` | which administrative roles the caller holds, if any |
+| `GET /v1/admin/roles` | the grant log; `?role=`, `?includeEnded=true`, `?on=` |
+| `GET /v1/admin/roles/administrators` | who can configure this tenant — readable by every rep |
+| `POST /v1/admin/roles` | grant a role (**administrator**); never to oneself |
+| `POST /v1/admin/roles/:id/revoke` | end a grant (**administrator**); the grant stays, with an end date |
+| `PUT /v1/admin/samples/disposal-policy` | the grace period and the promo switch (**compliance**) |
+| `GET\|POST /v1/admin/notification-endpoints` | where signals are pushed (**administrator**) |
+| `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; there is no DELETE |
 
 Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
 emits two on the same API, and a client that handles only one misreads the other.
+
+## Roles
+
+Most routes are scoped to the caller, and the team routes to whoever they supervise. The
+handful of routes that configure a *tenant* need something else, because supervision is the
+wrong gate: a district manager reads their team's numbers and must not be able to change the
+SOP parameter those numbers are measured against.
+
+So there are two roles, held by nobody implicitly, each a **dated grant** on a rep profile:
+
+| | |
+|---|---|
+| `administrator` | configures the tenant: notification endpoints, and who holds roles |
+| `compliance` | the SOP parameters reps are held to: the disposal grace period, the promo auto-write-off switch |
+
+Four rules, all of them in the database (`db/migrations/0023_roles.sql`), so a route cannot
+forget one:
+
+- **Nobody grants themselves a role, and nobody revokes their own.** Together these mean a
+  tenant needs two administrators to stay administrable.
+- **One live grant of a role per rep**, enforced by an exclusion constraint over the date
+  range — so "when did they get this" always has one answer.
+- **A grant is history.** It can be ended; it cannot be edited or deleted. A revocation
+  records who and when, and the row stays in the log.
+- **A tenant can never be left with no administrator.** Revoking the last one is refused, and
+  so is suspending them — a suspended profile holds no role, so HR and security are the same
+  door. There is no API path back from an empty role set, which is why both are closed.
+
+The **first administrator of a tenant is inserted in SQL**, by whoever runs the migrations.
+That is not a gap: a grant cannot name its own holder as grantor, so a closed system has to
+be started from outside it.
+
+```sql
+INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+VALUES ('<tenant>', '<the administrator>', 'administrator', '<anyone else>', CURRENT_DATE,
+        'bootstrap');
+```
+
+A role is resolved once per request, with the principal, **as of today** — never as of a
+`?on=` parameter, which several reads honour. A revoked role is gone on the caller's next
+request.
 
 ## The background process
 

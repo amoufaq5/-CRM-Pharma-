@@ -1,4 +1,5 @@
 import { withTenantContext } from "@crm/db";
+import { rolesNow, type Role } from "@crm/role";
 import type { PoolClient } from "pg";
 import { forbidden, unauthenticated } from "./problems.js";
 import type { JwtClaims } from "./jwt.js";
@@ -10,6 +11,18 @@ export interface Principal {
   readonly displayName: string;
   /** The rep's own ERP Employee id, when the mapping has been reconciled. */
   readonly erpEmployeeId: string | null;
+  /**
+   * The administrative roles this rep holds RIGHT NOW (0023). Sorted; usually empty.
+   *
+   * Resolved once per request, with the principal, under the same tenant context — so
+   * an administrative route costs no extra round trip and cannot read a role from a
+   * connection whose tenant GUC was set by something else.
+   *
+   * As-of today, never as-of a query parameter. `?on=` scopes what a READ returns and
+   * several routes honour it; letting it reach an authorisation decision would let a
+   * caller pick the date on which they were an administrator.
+   */
+  readonly roles: readonly Role[];
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -42,7 +55,7 @@ export async function resolvePrincipal(
     );
   }
 
-  const row = await withTenantContext(client, tenantId, async (tx) => {
+  const resolved = await withTenantContext(client, tenantId, async (tx) => {
     const { rows } = await tx.query<{
       id: string;
       display_name: string;
@@ -53,15 +66,20 @@ export async function resolvePrincipal(
          FROM crm.rep_profile WHERE tenant_id = $1 AND subject = $2`,
       [tenantId, claims.sub],
     );
-    return rows[0] ?? null;
+    const found = rows[0];
+    if (found === undefined) return null;
+    // In the same tenant context as the profile lookup, deliberately: a role read on a
+    // connection whose GUC had drifted would be answered by RLS for another tenant.
+    return { row: found, roles: await rolesNow(tx, found.id) };
   });
 
-  if (row === null) {
+  if (resolved === null) {
     // Deliberately the same shape as a wrong tenant: distinguishing "no such rep
     // here" from "wrong tenant" would let a caller enumerate which tenants a
     // subject belongs to.
     throw forbidden("this identity is not a rep in that tenant");
   }
+  const { row, roles } = resolved;
   if (row.status !== "active") {
     throw forbidden(`this rep profile is ${row.status}`);
   }
@@ -72,5 +90,23 @@ export async function resolvePrincipal(
     subject: claims.sub,
     displayName: row.display_name,
     erpEmployeeId: row.erp_employee_id,
+    roles,
   };
+}
+
+/**
+ * Refuses a caller who does not hold the role an administrative route requires.
+ *
+ * 403, NOT the 404 the supervision helpers return. The two refusals protect different
+ * things: `requireSupervision` hides whether a rep exists, because the id itself is
+ * information a rep should not be able to probe for. An administrative route guards
+ * the tenant's OWN configuration, whose existence is no secret to a member of that
+ * tenant — several of these resources are already readable by every rep. A 404 there
+ * would only mislead an administrator who had lost their grant into hunting for a
+ * typo in the URL.
+ */
+export function requireRole(p: Principal, role: Role): void {
+  if (!p.roles.includes(role)) {
+    throw forbidden(`this action requires the ${role} role`);
+  }
 }

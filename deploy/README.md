@@ -233,7 +233,8 @@ The scheduler refuses to start with it when `NODE_ENV=production`; set
 
 ## Provisioning a tenant
 
-Three inserts, by hand for now — there is no admin surface yet.
+Four inserts, by hand. The fourth is permanent, not a stopgap: it bootstraps the role model,
+and bootstrapping it from outside the API is the point.
 
 ```sql
 -- 1. the CRM's own tenant registry. Not RLS-protected and holds no tenant data
@@ -265,6 +266,26 @@ VALUES ('<erp tenant uuid>', 'controller');
 from can hold something narrower — the role is per tenant precisely because each tenant's
 manifest declares its own.
 
+```sql
+-- 4. the tenant's FIRST administrator. This one cannot be done over the API, ever:
+--    a grant may not name its own holder as grantor (four eyes), so an empty role
+--    set has no way to fill itself. granted_by is any other rep profile in the
+--    tenant — it records who asked for it, and it must not be the holder.
+INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+VALUES ('<erp tenant uuid>', '<the administrator>', 'administrator', '<anyone else>',
+        CURRENT_DATE, 'bootstrap');
+```
+
+**Appoint a second administrator from the first one's session**, before anyone goes on leave.
+Nobody can revoke their own grant, so a tenant with one administrator cannot replace them
+through the API; the database refuses to revoke the last one or to suspend their profile, so
+the tenant stays usable — but fixing it then needs a psql prompt again. With two, the role
+is self-sustaining.
+
+Everything else an administrator needs is over HTTP: `POST /v1/admin/roles` to appoint the
+compliance officer, `PUT /v1/admin/samples/disposal-policy` for the SOP parameters, and
+`POST /v1/admin/notification-endpoints` for the webhooks below.
+
 Scheduled jobs need no provisioning: the scheduler creates missing rows at their
 default cadence on every tick, so a tenant added by hand — or a job added by a
 later release — starts running without a backfill.
@@ -275,6 +296,15 @@ Two channels. **In-app** needs no configuration: a notification is a row, writte
 whatever raised it, and `GET /v1/notifications` serves it. **Webhook** pushes an HMAC-signed
 POST at a URL — one of these into Slack, Teams or PagerDuty is how an overdue regulated
 disposal reaches someone who is not looking at the app.
+
+An administrator configures one over HTTP — the SQL below is the same thing by hand, for a
+tenant that has no administrator yet:
+
+```http
+POST /v1/admin/notification-endpoints
+{"url":"https://hooks.slack.com/services/…","secretEnv":"CRM_HOOK_OPS_SECRET",
+ "minSeverity":"warning","description":"ops channel"}
+```
 
 ```sql
 INSERT INTO crm.notification_endpoint
@@ -289,7 +319,16 @@ as the service signing key. Put the value in `deploy/.env`, give it to the **sch
 dead-letters the delivery rather than sending unsigned.
 
 `min_severity` defaults to `warning`, which keeps routine `info` events (a call plan
-approved) out of a paging channel. `kinds` is NULL for everything, or an allow-list.
+approved) out of a paging channel. `kinds` is NULL for everything, or an allow-list — and the
+API checks an allow-list against the real vocabulary, because `kinds` is a bare `text[]` with
+no CHECK and an endpoint filtered to a kind that does not exist receives nothing at all.
+
+An endpoint is retired with `PATCH /v1/admin/notification-endpoints/:id` and
+`{"enabled":false}`. **There is no delete**, by design: `crm.notification_delivery`
+references the endpoint `ON DELETE CASCADE`, so removing one would erase the record of
+everything ever sent to it. The URL and `secret_env` are not editable either — repointing an
+endpoint in place would carry its delivery history onto a different destination. Moving a
+destination is: disable the old one, create a new one.
 
 What a receiver must do: recompute `HMAC-SHA256(secret, "<x-crm-timestamp>.<raw body>")`,
 compare it with `x-crm-signature` in constant time, and reject anything whose timestamp is

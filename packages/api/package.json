@@ -26,6 +26,7 @@
     "@crm/db": "workspace:*",
     "@crm/notify": "workspace:*",
     "@crm/relay": "workspace:*",
+    "@crm/role": "workspace:*",
     "@crm/sample": "workspace:*",
     "@crm/territory": "workspace:*",
     "@crm/visit": "workspace:*",

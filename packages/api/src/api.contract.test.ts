@@ -65,6 +65,18 @@ describe("the API, end to end", () => {
   });
 
   beforeEach(async () => {
+    // Role grants come out FIRST, for both tenants, before any rep_profile is deleted.
+    // `revoked_by` is a plain FK to crm.rep_profile (the convention everywhere in this
+    // schema), so a grant in one tenant can reference a profile in another — which a
+    // cross-tenant leak, since fixed, actually produced here. Clearing per tenant inside
+    // the loop below would then fail on the first tenant's profiles.
+    for (const t of [TENANT, OTHER]) {
+      await withTenantContext(admin, t, async (tx) => {
+        await tx.query("ALTER TABLE crm.rep_role DISABLE TRIGGER USER");
+        await tx.query("DELETE FROM crm.rep_role WHERE tenant_id = $1", [t]);
+        await tx.query("ALTER TABLE crm.rep_role ENABLE TRIGGER USER");
+      });
+    }
     for (const t of [TENANT, OTHER]) {
       await withTenantContext(admin, t, async (tx) => {
         // Call plans and the sample ledger both refuse deletion by design (0016, 0018)
@@ -1650,6 +1662,300 @@ describe("the API, end to end", () => {
         await broken.close();
         await isolated.end();
       }
+    });
+  });
+  /**
+   * Administration (0023).
+   *
+   * The reason these routes exist at all: before the role model, `crm.disposal_policy`
+   * and `crm.notification_endpoint` were settable only at a psql prompt, which meant
+   * settable by anyone holding the application password with no record of who changed
+   * what. So the tests that matter here are the refusals — a rep with no grant, and a
+   * MANAGER with a full team, must both be turned away from a tenant-wide parameter.
+   */
+  describe("administration", () => {
+    const repToken = token({ sub: "idp|rep1" });
+    const mgrToken = token({ sub: "idp|mgr" });
+
+    /** Grants in SQL, as the first administrator of a tenant always must be (0023). */
+    const grant = async (
+      who: () => string,
+      role: "administrator" | "compliance",
+      by: () => string,
+      validTo: string | null = null,
+      validFrom: string | null = null,
+    ): Promise<string> => {
+      const { rows } = await withTenantContext(admin, TENANT, (tx) =>
+        tx.query<{ id: string }>(
+          `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, valid_to)
+           VALUES ($1,$2,$3,$4,COALESCE($6::date, CURRENT_DATE),$5::date) RETURNING id`,
+          [TENANT, who(), role, by(), validTo, validFrom],
+        ),
+      );
+      return rows[0]!.id;
+    };
+
+    it("tells the caller which roles they hold", async () => {
+      expect((await call("GET", "/v1/me/roles")).body.roles).toEqual([]);
+      await grant(() => rep, "compliance", () => manager);
+      expect((await call("GET", "/v1/me/roles")).body.roles).toEqual(["compliance"]);
+    });
+
+    describe("the disposal policy", () => {
+      it("is readable by every rep, because every rep is held to it", async () => {
+        const res = await call("GET", "/v1/samples/disposal-policy");
+        expect(res.status).toBe(200);
+        expect(res.body.grace_days).toBe(30);
+      });
+
+      it("refuses a write from a rep with no role — 403, not 404", async () => {
+        const res = await call("PUT", "/v1/admin/samples/disposal-policy", { body: { graceDays: 7 } });
+        expect(res.status).toBe(403);
+        expect(res.body.detail).toContain("compliance");
+        // 403 and not the 404 the supervision routes return: the resource is the
+        // tenant's own configuration, which every rep can already read, so hiding it
+        // would only send a lapsed officer hunting for a typo.
+        expect(res.body.type).toMatch(/\/forbidden$/);
+      });
+
+      /**
+       * The refusal this role model exists to make possible. A district manager with a
+       * full team is the most privileged principal the CRM had before 0023, and a
+       * tenant-wide SOP parameter is exactly what they must not be able to change —
+       * their own team is measured against it.
+       */
+      it("refuses a write from a manager who supervises a whole region", async () => {
+        const roster = await call("GET", "/v1/team", { auth: mgrToken });
+        expect(roster.body.data.length).toBeGreaterThan(0);
+        const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { graceDays: 7 },
+          auth: mgrToken,
+        });
+        expect(res.status).toBe(403);
+      });
+
+      it("accepts a write from the compliance officer", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { graceDays: 14, autoWriteoffPromo: true },
+          auth: repToken,
+        });
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ grace_days: 14, auto_writeoff_promo: true });
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.grace_days).toBe(14);
+      });
+
+      it("refuses a grace period outside the range the SOP allows", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        expect((await call("PUT", "/v1/admin/samples/disposal-policy", { body: { graceDays: 400 } })).status).toBe(422);
+      });
+
+      it("refuses an empty change rather than reporting a no-op as success", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        expect((await call("PUT", "/v1/admin/samples/disposal-policy", { body: {} })).status).toBe(422);
+      });
+
+      it("does not accept the administrator role in place of compliance", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        expect((await call("PUT", "/v1/admin/samples/disposal-policy", { body: { graceDays: 7 } })).status).toBe(403);
+      });
+    });
+
+    describe("notification endpoints", () => {
+      it("refuses to even list them without the administrator role", async () => {
+        expect((await call("GET", "/v1/admin/notification-endpoints")).status).toBe(403);
+      });
+
+      it("creates, lists and disables one", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const created = await call("POST", "/v1/admin/notification-endpoints", {
+          body: {
+            url: "https://hooks.example.test/crm",
+            secretEnv: "CRM_OPS_WEBHOOK_SECRET",
+            minSeverity: "urgent",
+            kinds: ["erp_write_failed"],
+            description: "ops channel",
+          },
+        });
+        expect(created.status).toBe(201);
+        expect(created.body.min_severity).toBe("urgent");
+        expect(created.body.secret_env).toBe("CRM_OPS_WEBHOOK_SECRET");
+
+        const listed = await call("GET", "/v1/admin/notification-endpoints");
+        expect(listed.body.data).toHaveLength(1);
+
+        const patched = await call("PATCH", `/v1/admin/notification-endpoints/${created.body.id}`, {
+          body: { enabled: false },
+        });
+        expect(patched.status).toBe(200);
+        expect(patched.body.enabled).toBe(false);
+        // There is no DELETE: crm.notification_delivery cascades from this row, so
+        // removing an endpoint would erase the record of everything sent to it.
+        expect((await call("DELETE", `/v1/admin/notification-endpoints/${created.body.id}`)).status).toBe(405);
+      });
+
+      it("refuses a plaintext destination", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("POST", "/v1/admin/notification-endpoints", {
+          body: { url: "http://hooks.example.test/crm", secretEnv: "CRM_OPS_WEBHOOK_SECRET" },
+        });
+        expect(res.status).toBeGreaterThanOrEqual(400);
+      });
+
+      it("refuses a secret VALUE where an environment variable NAME belongs", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("POST", "/v1/admin/notification-endpoints", {
+          body: { url: "https://hooks.example.test/crm", secretEnv: "hunter2-actual-secret" },
+        });
+        expect(res.status).toBe(422);
+        expect(JSON.stringify(res.body)).toContain("environment variable");
+      });
+
+      it("refuses a kind that does not exist, which would make the endpoint silently dead", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("POST", "/v1/admin/notification-endpoints", {
+          body: {
+            url: "https://hooks.example.test/crm",
+            secretEnv: "CRM_OPS_WEBHOOK_SECRET",
+            kinds: ["everything_please"],
+          },
+        });
+        expect(res.status).toBe(422);
+      });
+
+      it("404s a PATCH to an endpoint that is not there", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("PATCH", "/v1/admin/notification-endpoints/e8000000-0000-4000-8000-00000000000f", {
+          body: { enabled: false },
+        });
+        expect(res.status).toBe(404);
+      });
+    });
+
+    describe("granting and revoking over HTTP", () => {
+      it("lets any rep see who the administrators are", async () => {
+        await grant(() => manager, "administrator", () => rep);
+        const res = await call("GET", "/v1/admin/roles/administrators");
+        expect(res.status).toBe(200);
+        expect(res.body.data.map((h: { display_name: string }) => h.display_name)).toEqual(["The Manager"]);
+      });
+
+      it("refuses a grant from a rep who is not an administrator", async () => {
+        expect(
+          (await call("POST", "/v1/admin/roles", { body: { repProfileId: otherRep, role: "compliance" } })).status,
+        ).toBe(403);
+      });
+
+      it("grants, lists and revokes, keeping the ended grant", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const created = await call("POST", "/v1/admin/roles", {
+          body: { repProfileId: otherRep, role: "compliance", reason: "took over SOPs" },
+        });
+        expect(created.status).toBe(201);
+        expect(created.body.rep_display_name).toBe("Rep Two");
+        expect(created.body.granted_by_name).toBe("Rep One");
+
+        const live = await call("GET", "/v1/admin/roles?role=compliance");
+        expect(live.body.data).toHaveLength(1);
+
+        const revoked = await call("POST", `/v1/admin/roles/${created.body.id}/revoke`, {
+          body: { reason: "changed duties" },
+        });
+        expect(revoked.status).toBe(200);
+        expect(revoked.body.revoke_reason).toBe("changed duties");
+
+        expect((await call("GET", "/v1/admin/roles?role=compliance")).body.data).toHaveLength(0);
+        const all = await call("GET", "/v1/admin/roles?role=compliance&includeEnded=true");
+        expect(all.body.data).toHaveLength(1);
+        expect(all.body.data[0].in_force).toBe(false);
+      });
+
+      it("refuses a self-grant with a 403, from the database's own rule", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("POST", "/v1/admin/roles", {
+          body: { repProfileId: rep, role: "compliance" },
+        });
+        expect(res.status).toBe(403);
+        expect(res.body.detail).toContain("cannot grant themselves");
+      });
+
+      it("refuses an unknown role with a 422", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        expect(
+          (await call("POST", "/v1/admin/roles", { body: { repProfileId: otherRep, role: "root" } })).status,
+        ).toBe(422);
+      });
+
+      /**
+       * The lockout refusal, with its own problem type so a client can say "appoint a
+       * successor first" and offer the form rather than showing a bare 409.
+       *
+       * Reaching it over HTTP takes a FUTURE-DATED revocation, and that is not a
+       * contrivance: an administrator cannot revoke their own grant, and revoking
+       * somebody else's always leaves the caller, so the only way an administrator can
+       * empty the role is to end another one on a date their own grant no longer covers.
+       * An interim administrator scheduling the permanent one's departure past the end
+       * of their own term is exactly that, and the database refuses it.
+       */
+      it("refuses to revoke the last administrator, with an actionable problem type", async () => {
+        // The caller's own grant lapses on 1 November; the manager's does not lapse.
+        await grant(() => rep, "administrator", () => manager, "2026-11-01");
+        const theirs = await grant(() => manager, "administrator", () => rep);
+
+        // Ending it today is fine — the caller is still an administrator today.
+        const fine = await call("POST", `/v1/admin/roles/${theirs}/revoke`, { body: { on: "2026-10-20" } });
+        expect(fine.status).toBe(200);
+
+        // Ending it in December is not: by then the caller's grant has lapsed too and the
+        // tenant would have nobody who could appoint anyone.
+        // Re-appointed from the day after the first grant ended, so the two do not overlap.
+        const again = await grant(() => manager, "administrator", () => rep, null, "2026-10-20");
+        const res = await call("POST", `/v1/admin/roles/${again}/revoke`, { body: { on: "2026-12-01" } });
+        expect(res.status).toBe(409);
+        expect(res.body.type).toMatch(/\/last-administrator$/);
+        expect(res.body.detail).toContain("successor");
+      });
+
+      /**
+       * Needs a second administrator to reach the four-eyes rule at all: BEFORE UPDATE
+       * triggers run before CHECK constraints, so with only one administrator the
+       * lockout guard answers first and the refusal is a 409 rather than this 403. Both
+       * answers are correct; the order is worth pinning down, because a client that only
+       * ever saw the 409 would report the wrong reason.
+       */
+      it("refuses a self-revoke", async () => {
+        const mine = await grant(() => rep, "administrator", () => manager);
+        await grant(() => manager, "administrator", () => rep);
+        const res = await call("POST", `/v1/admin/roles/${mine}/revoke`);
+        expect(res.status).toBe(403);
+        expect(res.body.detail).toContain("cannot revoke their own");
+      });
+
+      /**
+       * The tenant is matched in SQL, not left to RLS — and this test is why. The API
+       * pool in this suite connects as `postgres`, a superuser, which BYPASSES row-level
+       * security even under FORCE. The first version of crm.revoke_rep_role scoped on the
+       * grant id alone, and this call succeeded: a rep of one tenant ended a grant in
+       * another, leaving a `revoked_by` pointing across the tenant boundary.
+       */
+      it("404s a grant id from another tenant", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const foreign = await withTenantContext(admin, OTHER, async (tx) => {
+          const reps = await tx.query<{ id: string }>(
+            `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name)
+             VALUES ($1,'idp|other-a','OA','Other A'), ($1,'idp|other-b','OB','Other B') RETURNING id`,
+            [OTHER],
+          );
+          const [a, b] = reps.rows.map((r) => r.id) as [string, string];
+          const g = await tx.query<{ id: string }>(
+            `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+             VALUES ($1,$2,'compliance',$3,CURRENT_DATE) RETURNING id`,
+            [OTHER, a, b],
+          );
+          return g.rows[0]!.id;
+        });
+        expect((await call("POST", `/v1/admin/roles/${foreign}/revoke`)).status).toBe(404);
+      });
     });
   });
 });

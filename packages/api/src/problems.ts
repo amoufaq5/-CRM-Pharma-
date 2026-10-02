@@ -21,6 +21,7 @@ export const PROBLEM_TYPES = {
   plan_final: "plan-final",
   lot_expired: "lot-expired",
   insufficient_stock: "insufficient-stock",
+  last_administrator: "last-administrator",
   method_not_allowed: "method-not-allowed",
   unsupported_media_type: "unsupported-media-type",
   payload_too_large: "payload-too-large",
@@ -43,6 +44,10 @@ const STATUS: Readonly<Record<ProblemKind, number>> = {
   // lot means bin it, a short balance means re-count the bag.
   lot_expired: 409,
   insufficient_stock: 409,
+  // Its own type because it is the one refusal an administrator must be able to act on
+  // without reading prose: a client can say "appoint a successor first" and offer the
+  // grant form, where a bare 409 would just look like a failed request.
+  last_administrator: 409,
   method_not_allowed: 405,
   unsupported_media_type: 415,
   payload_too_large: 413,
@@ -61,6 +66,7 @@ const TITLE: Readonly<Record<ProblemKind, string>> = {
   plan_final: "Call plan is final",
   lot_expired: "Lot is expired or withdrawn",
   insufficient_stock: "Not enough stock on hand",
+  last_administrator: "Last administrator",
   method_not_allowed: "Method not allowed",
   unsupported_media_type: "Unsupported media type",
   payload_too_large: "Payload too large",
@@ -173,6 +179,22 @@ export function toProblem(err: unknown): ApiError {
     case "DuplicateTargetError":
       return new ApiError("conflict", message);
     case "InvalidCycleError":
+      return new ApiError("validation_failed", message);
+
+    // Roles (0023). Four eyes and the lockout guard are the database's rules; they reach
+    // the client as refusals with their sentences intact, because every one of them tells
+    // an administrator what to do instead.
+    case "UnknownRoleError":
+      return new ApiError("validation_failed", message);
+    case "SelfGrantError":
+      return new ApiError("forbidden", message);
+    case "RoleAlreadyHeldError":
+    case "GrantAlreadyRevokedError":
+    case "GrantImmutableError":
+      return new ApiError("conflict", message);
+    case "LastAdministratorError":
+      return new ApiError("last_administrator", message);
+    case "InvalidEndpointError":
       return new ApiError("validation_failed", message);
 
     case "ErpError":

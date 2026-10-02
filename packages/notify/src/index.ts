@@ -41,3 +41,14 @@ export {
   type NotificationDispatcherOptions,
 } from "./dispatch.js";
 export { inbox, markAllRead, markRead, unreadCount, type InboxItem } from "./inbox.js";
+export {
+  InvalidEndpointError,
+  createEndpoint,
+  getEndpoint,
+  isSeverity,
+  listEndpoints,
+  updateEndpoint,
+  type CreateEndpointInput,
+  type EndpointRow,
+  type UpdateEndpointInput,
+} from "./endpoints.js";
