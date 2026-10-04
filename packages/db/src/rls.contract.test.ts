@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { testPool, TENANT_A, TENANT_B } from "./testing.js";
-import { withTenantContext } from "./tenant-context.js";
+import { PrivilegedConnectionError, withTenantContext } from "./tenant-context.js";
 
 /**
  * Contract tests against a REAL Postgres.
@@ -147,6 +147,38 @@ describe("row-level security contract", () => {
       expect(await countAs(null, TENANT_A)).toBe(3);
     } finally {
       await client.query("ALTER TABLE rls_fixture NO FORCE ROW LEVEL SECURITY");
+    }
+  });
+
+  /**
+   * The consequence of the two cases above, enforced rather than documented.
+   *
+   * Those tests prove that a superuser sees every tenant's rows. This one proves the
+   * application refuses to pretend otherwise: `withTenantContext` asks the server which
+   * role the statements will run under and will not proceed on one that is exempt from
+   * the policy. Until this existed, `PGUSER=postgres` in a compose file or a CI job
+   * turned every policy in the schema off and the only symptom was wider results.
+   *
+   * Run on the suite's own connection with no SET ROLE, which IS a superuser here — so
+   * this is the real refusal, not a simulation of it.
+   */
+  it("withTenantContext REFUSES a connection that bypasses RLS", async () => {
+    await expect(withTenantContext(client, TENANT_A, async () => "never"))
+      .rejects.toThrow(PrivilegedConnectionError);
+    // And it says which role, because the fix is to change it.
+    await expect(withTenantContext(client, TENANT_A, async () => "never"))
+      .rejects.toThrow(/postgres/);
+  });
+
+  it("admits the same connection once it has SET ROLE to an unprivileged role", async () => {
+    // The guard reads `current_user`, which follows SET ROLE — so the fixture pattern
+    // used throughout this repo (connect as admin, SET ROLE crm_app) still works, and
+    // works for the right reason rather than by being exempt.
+    await client.query("SET ROLE rls_reader");
+    try {
+      await expect(withTenantContext(client, TENANT_A, async () => "ok")).resolves.toBe("ok");
+    } finally {
+      await client.query("RESET ROLE");
     }
   });
 

@@ -48,6 +48,22 @@ the admin, every query would see every tenant's rows and every RLS policy in the
 schema would be decoration. A **superuser bypasses RLS even under `FORCE`**, so
 `crm_app` is explicitly `NOSUPERUSER NOBYPASSRLS`.
 
+**This is enforced at runtime, not just configured.** `withTenantContext` — the
+only sanctioned way to reach a `crm.*` table — asks the server which role its
+statements will run under and refuses a role that is `SUPERUSER` or `BYPASSRLS`.
+So a wrong `PGUSER` does not quietly widen every query:
+
+| | as `crm_app` | as the admin role |
+|---|---|---|
+| `GET /healthz` | `200 {"status":"ok"}` | `503 degraded`, naming the role and the fix |
+| any tenant request | served | `500`, with the reason in the structured log |
+| a `scheduler` tick | runs | `tick_error` per tenant, no work done |
+
+The 503 is the one that matters operationally: point the load balancer or the
+orchestrator at `/healthz` and a misconfigured deployment never takes traffic.
+The role name appears in `/healthz` and in the log — both read by the operator who
+can change it — and never in a request response, which a tenant can read.
+
 The migration runner enforces the same split internally: it connects as the
 admin, runs the two DBA files, then `SET ROLE crm_app` before the application
 migrations so the tables come out owned by the right role. That bug has happened

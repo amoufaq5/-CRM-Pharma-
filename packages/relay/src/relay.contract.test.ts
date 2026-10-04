@@ -8,18 +8,15 @@ import { inbox } from "@crm/notify";
 import { OutboxRelay, type RelayEvent } from "./relay.js";
 import { claimBatch, outboxLag, reclaimStale } from "./store.js";
 
-import { TENANT_RELAY as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_RELAY as TENANT } from "@crm/db/testing";
 
-function pool(): Pool {
-  return new Pool({
-    host: process.env["PGHOST"] ?? "/var/run/postgresql",
-    database: process.env["PGDATABASE"] ?? "crm_test",
-    user: process.env["PGUSER"] ?? "postgres",
-    ...(process.env["PGPASSWORD"] !== undefined ? { password: process.env["PGPASSWORD"] } : {}),
-    ...(process.env["PGPORT"] !== undefined ? { port: Number(process.env["PGPORT"]) } : {}),
-    max: 6,
-  });
-}
+/**
+ * `appPool()`, not `testPool()`: this pool is handed to code that opens its OWN
+ * connections, and those inherit the pool's role. The admin pool would run every one of
+ * them as a superuser, which bypasses row-level security even under `FORCE` — so a
+ * missing tenant predicate would be invisible to this whole suite. One was.
+ * See the comment on `appPool` in `@crm/db/testing`.
+ */
 
 /** An ERP whose every non-schema response is scripted by the test. */
 function fakeErp(handler: (url: string, method: string) => { status: number; body: unknown }): ErpClient {
@@ -42,7 +39,7 @@ describe("outbox relay against a real database", () => {
   let admin: PoolClient;
 
   beforeAll(async () => {
-    p = pool();
+    p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
   });
@@ -293,7 +290,7 @@ describe("concurrent workers and leases", () => {
   let admin: PoolClient;
 
   beforeAll(async () => {
-    p = pool();
+    p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
     await withTenantContext(admin, TENANT, async (tx) => {
@@ -386,7 +383,7 @@ describe("tenant isolation of the relay itself", () => {
   const OTHER = "22222222-2222-4222-8222-222222222222";
 
   beforeAll(async () => {
-    p = pool();
+    p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
     for (const t of [TENANT, OTHER]) {

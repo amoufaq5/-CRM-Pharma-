@@ -334,6 +334,7 @@ Concretely, and these specifics are the decision, not commentary on it:
     independent scaling. `operate-server` must stay long-running (its schedulers are
     in-process); the CRM read path can scale horizontally on its own.
 
+
 13. **Administrative authority is a dated GRANT, not a column and not supervision.**
     Decision item 10 put user-level authorisation in the CRM, and until now that meant
     exactly two things: *is this your record* and *do you supervise this rep*. Both are
@@ -412,6 +413,56 @@ Concretely, and these specifics are the decision, not commentary on it:
     Roles are resolved **once per request, with the principal, as of today** — never as of a
     `?on=` parameter, which several reads honour. A date on the path that authorises a write
     is a date somebody eventually passes from a query string.
+
+14. **The application role is enforced at runtime, not merely configured.** Decision item
+    2 made ownership and role separation the isolation guarantee, and `deploy/README.md`
+    has always said what happens if an application process connects as the admin: "every
+    query would see every tenant's rows and every RLS policy in the schema would be
+    decoration." That sentence was true, load-bearing, and checked by nothing.
+
+    `withTenantContext` — already the only sanctioned way to reach a `crm.*` table — now
+    asks the server which role its statements will actually run under and **refuses** a
+    role that is `SUPERUSER` or `BYPASSRLS`. It reads `current_user`, so it follows a
+    `SET ROLE` rather than reporting whatever the connection was opened with, and it
+    fails closed on a role the catalog has no row for. `GET /healthz` reports the same
+    condition as `503 degraded` naming the role, so an orchestrator never sends traffic
+    to a deployment that cannot serve a single tenant request.
+
+    **The cost is the design.** Asking the catalog for the role's attributes in the same
+    statement as `set_config` measured ~82 µs per transaction against a live cluster —
+    too much to pay on every request. Asking only for `current_user` is free. So the
+    attributes are looked up separately and cached **by role name**, once per distinct
+    name per process: keyed on the name rather than on the client, because a connection's
+    role changes under `SET ROLE` and a per-client cache would answer for whichever role
+    it saw first. Warm, the guard is free within measurement noise (median ~3 µs over
+    interleaved rounds of 2,000 transactions).
+
+    **What the contract suite was proving, and was not.** The API suite handed the ADMIN
+    pool to `startApi`, so every route in it ran as a superuser and row-level security was
+    switched off for the whole suite. Three more suites did the same for the scheduler,
+    the outbox relay, the snapshot refresher, the service-credential boot and the
+    per-tenant ERP role source. The worst case was `role-source.contract.test.ts`, whose
+    fixture inserted `crm.erp_service_principal` rows **with no tenant context at all** —
+    something only a privileged connection can do — and then asserted that each tenant
+    "never" sees the other's role. That assertion was about a `WHERE` clause on data
+    written outside any policy. All of these now connect as `crm_app` and seed through
+    `withTenantContext`, and `appPool()` in `@crm/db/testing` is the one place that choice
+    is made, with the reason attached.
+
+    **Verified** by deliberately putting the misconfiguration back: pointing the API
+    suite's pool at the admin role again fails 97 of its 113 tests immediately, so the
+    blind spot cannot return quietly. Then live, through the real binaries against a real
+    Postgres — as `crm_app`, `/healthz` 200 and `/v1/me` 200; as the admin role,
+    `/healthz` 503 naming the role and the remedy, `/v1/me` 500 with a generic body and
+    the full reason in the structured log, and the scheduler reporting `tick_error` per
+    tenant rather than doing the work with RLS off.
+
+    One thing worth recording about what this does NOT do: it would not have caught the
+    cross-tenant write in item 13. That defect relied on no tenant predicate at all, and
+    with RLS genuinely in force the policy stops it — which is the point. The guard makes
+    RLS *apply*; the explicit `AND tenant_id = $n` in every store is the second layer. The
+    suite now exercises both instead of neither.
+
 
 ## Alternatives considered
 
@@ -666,7 +717,8 @@ reasoning behind each constrains what follows.
 | No email or SMS sender. `ChannelSender` in `@crm/notify` is the seam and in-app plus webhook are the implementations; an SMTP or provider client was deliberately not written, because it could not be verified from here and the ERP's own stack shows where unverifiable senders end up. A webhook into Slack, Teams or PagerDuty covers the paging case today. | Product | _set a date_ |
 | `crm.outbox_recipient` maps three producing tables to a rep (sample movements, visits, expense claims) and returns NULL for anything else. A new producer needs a branch added — deliberately a visible act in a diff rather than an inference — and until then its dead letters are unattributed: counted by the relay, listed with a null rep, and reachable only through SQL. | Platform | _set a date_ |
 | A dead letter keeps only its LATEST reason. `revive_count` says a row has died more than once but not why each time. A per-attempt history belongs in its own table if one is ever needed, not in more columns on `crm.outbox`. | Platform | _set a date_ |
-| The API contract suite connects as `postgres`, a **superuser**, which bypasses row-level security even under `FORCE`. So no route's tenant scoping can be proved by that suite if it rests on RLS alone — and one did: the first `crm.revoke_rep_role` matched on the grant id only, and a rep of one tenant ended a grant in another, leaving a `revoked_by` pointing across the boundary. Fixed by matching the tenant in SQL (the convention every other store already follows), and verified live against the real binary running as `crm_app`. The suite should connect as `crm_app` too; that is a harness change wide enough to surface other leaks, which is the argument for doing it on purpose rather than inside this increment. | Platform | _set a date_ |
+| Nothing picks up `ALTER ROLE crm_app BYPASSRLS` on a running system. The privilege verdict is cached per role NAME for the life of the process, because asking the catalog costs ~82 µs and asking it on every transaction is the wrong trade. A restart notices; so does `/healthz` in a new process. Altering the role is a superuser action on a role the deployment creates `NOSUPERUSER NOBYPASSRLS`, so the exposure is an operator deliberately widening their own application role. | Platform | _set a date_ |
+| The guard answers "which role will these statements run under", not "does the policy actually confine this query". A `SECURITY DEFINER` function owned by a privileged role, or a query shaped so the policy does not apply, would still pass it. Nothing in the schema is `SECURITY DEFINER` today — the role model's functions are deliberately `SECURITY INVOKER` — and a test asserting that none ever becomes one would be cheap insurance. | Platform | _set a date_ |
 | A role grant's `granted_by` / `revoked_by` are plain FKs to `crm.rep_profile (id)`, as every rep-profile reference in this schema is. Nothing but RLS and the explicit tenant match stops one naming a profile in another tenant. A composite `(tenant_id, id)` FK would close it structurally, and changing the convention for one table would be worse than leaving it stated here. | Platform | _set a date_ |
 | Roles cover the two administrative surfaces that exist (`crm.disposal_policy`, `crm.notification_endpoint`) and nothing else. `crm.cycle`, `crm.territory`, `crm.territory_assignment`, `crm.sample_lot` and `crm.expense_account_map` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |
 | Notification retention is still unbounded, and now has an obvious home: a per-tenant retention parameter behind the `administrator` role, pruned by the scheduler. The role model was the missing half; the parameter is the other. | Platform | _set a date_ |

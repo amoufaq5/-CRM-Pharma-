@@ -334,6 +334,16 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
    * Liveness and readiness in one. The ERP has no health endpoint at all
    * (report R11), so this is ours to provide — and it checks the database,
    * because a process that is up but cannot reach Postgres is not ready.
+   *
+   * It also checks the ROLE, because a process connected as a privileged role is not
+   * ready either: `withTenantContext` refuses such a connection, so every tenant-scoped
+   * request would 500 while a `SELECT 1` kept answering. A green health check in front
+   * of a deployment that cannot serve one request is the same "appears to work" failure
+   * the guard exists to remove, moved one level up — so readiness reports it, and a
+   * rollout that would have gone live and then 500ed never goes live at all.
+   *
+   * Reported as a distinct `detail`, not folded into "database unreachable": the two
+   * have completely different remedies and an operator reads this string first.
    */
   router.add({
     method: "GET",
@@ -342,7 +352,24 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (): Promise<HandlerResult> => {
       const client = await deps.pool.connect();
       try {
-        await client.query("SELECT 1");
+        const { rows } = await client.query<{ role: string; bypasses_rls: boolean }>(
+          `SELECT current_user AS role,
+                  (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user)
+                    AS bypasses_rls`,
+        );
+        const role = rows[0];
+        if (role === undefined || role.bypasses_rls !== false) {
+          // The role name is safe here in a way it is not in a request error: /healthz is
+          // for the operator and carries no tenant data, and naming the role is the
+          // whole value of the signal.
+          return {
+            status: 503,
+            body: {
+              status: "degraded",
+              detail: `connected as ${role?.role ?? "an unknown role"}, which bypasses row-level security — connect as crm_app`,
+            },
+          };
+        }
         return { status: 200, body: { status: "ok" } };
       } catch {
         return { status: 503, body: { status: "degraded", detail: "database unreachable" } };

@@ -1,4 +1,6 @@
 export {
+  PrivilegedConnectionError,
+  ROLE_PRIVILEGE_SQL,
   SET_TENANT_CONTEXT_SQL,
   InvalidTenantIdError,
   withTenantContext,

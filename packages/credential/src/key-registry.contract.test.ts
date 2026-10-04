@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool } from "pg";
-import { testPool } from "@crm/db/testing";
+import { appPool } from "@crm/db/testing";
 
 import {
   DEFAULT_PROPAGATION_SECONDS,
@@ -23,6 +23,11 @@ import { MAX_TTL_SECONDS } from "./token.js";
  * to isolate on. This is the only test file that writes it, which is why it can
  * clear the table between cases.
  */
+/**
+ * `appPool()`: this pool is handed to production code that opens its own connections,
+ * which inherit its role. Under the admin pool they would run as a superuser, and RLS —
+ * including the per-tenant assertions below — would not apply at all.
+ */
 describe("the service key registry", () => {
   let pool: Pool;
   let clock = { t: new Date("2026-10-01T12:00:00.000Z") };
@@ -35,7 +40,7 @@ describe("the service key registry", () => {
   };
 
   beforeAll(() => {
-    pool = testPool();
+    pool = appPool();
   });
 
   afterAll(async () => {

@@ -7,18 +7,15 @@ import { withTenantContext } from "@crm/db";
 import { SnapshotRefresher } from "./refresh.js";
 import { evaluateStaleness, readFreshness } from "./snapshot-store.js";
 
-import { TENANT_SYNC as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_SYNC as TENANT } from "@crm/db/testing";
 
-function pool(): Pool {
-  return new Pool({
-    host: process.env["PGHOST"] ?? "/var/run/postgresql",
-    database: process.env["PGDATABASE"] ?? "crm_test",
-    user: process.env["PGUSER"] ?? "postgres",
-    ...(process.env["PGPASSWORD"] !== undefined ? { password: process.env["PGPASSWORD"] } : {}),
-    ...(process.env["PGPORT"] !== undefined ? { port: Number(process.env["PGPORT"]) } : {}),
-    max: 5,
-  });
-}
+/**
+ * `appPool()`, not `testPool()`: this pool is handed to code that opens its OWN
+ * connections, and those inherit the pool's role. The admin pool would run every one of
+ * them as a superuser, which bypasses row-level security even under `FORCE` — so a
+ * missing tenant predicate would be invisible to this whole suite. One was.
+ * See the comment on `appPool` in `@crm/db/testing`.
+ */
 
 /** An ERP serving a fixed set of Items, honouring ?updated_at[gte]= and the cursor. */
 function erpServing(items: Array<Record<string, unknown>>, pageSize = 100): ErpClient {
@@ -66,7 +63,7 @@ describe("snapshot refresh against a real database", () => {
   let admin: PoolClient;
 
   beforeAll(async () => {
-    p = pool();
+    p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
   });

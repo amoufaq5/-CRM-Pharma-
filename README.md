@@ -223,10 +223,19 @@ against a live Postgres 16.
 
 ## Rules that are not negotiable
 
-**1. `crm_app` owns nothing of the ERP's.** A table's owner bypasses row-level security —
-verified, not assumed (`packages/db/src/rls.contract.test.ts`). Ownership separation *is*
-the isolation guarantee for ERP data. A superuser bypasses RLS even under `FORCE`, so the
-application never connects as one. Both are asserted in CI.
+**1. `crm_app` owns nothing of the ERP's, and the application never connects as a
+privileged role.** A table's owner bypasses row-level security — verified, not assumed
+(`packages/db/src/rls.contract.test.ts`). Ownership separation *is* the isolation
+guarantee for ERP data. A superuser bypasses RLS even under `FORCE`, so connecting as one
+turns every policy in the schema into decoration.
+
+That second half used to be documentation. It is now enforced: `withTenantContext` asks
+the server which role its statements will run under and **refuses** a role that is
+`SUPERUSER` or `BYPASSRLS`, so a `PGUSER=postgres` fails loudly instead of silently
+serving every tenant's rows. `GET /healthz` reports the same thing as `503 degraded`,
+naming the role — a rollout that would have gone live and then 500ed never goes live.
+The contract tests connect as `crm_app` for the same reason, which is what makes their
+tenant-isolation assertions mean anything.
 
 **2. Never write an ERP table over SQL.** Writes go through the ERP's HTTP API via the
 outbox, so its RBAC, write-guards, period locks, sequences, audit and double-entry GL

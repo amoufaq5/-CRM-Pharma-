@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_NOTIFY as TENANT, testPool } from "@crm/db/testing";
+import { appPool, TENANT_NOTIFY as TENANT } from "@crm/db/testing";
 
 import { NotificationDispatcher, MAX_ATTEMPTS, nextDelayMs } from "./dispatch.js";
 import { inbox, markAllRead, markRead, unreadCount } from "./inbox.js";
@@ -17,6 +17,11 @@ import { WebhookSender, verifyWebhook, type FetchLike } from "./sender.js";
  * The delivery test stands up `node:http` and checks the signature on the bytes that
  * actually arrived. That is the difference between "the sender compiles" and "a receiver
  * can verify what we send", and it is the half the ERP's notification stack never got to.
+ */
+/**
+ * `appPool()`: this pool is handed to production code that opens its own connections,
+ * which inherit its role. Under the admin pool they would run as a superuser, and RLS —
+ * including the per-tenant assertions below — would not apply at all.
  */
 describe("notifications", () => {
   let pool: Pool;
@@ -34,7 +39,7 @@ describe("notifications", () => {
     withTenantContext(client, TENANT, fn);
 
   beforeAll(async () => {
-    pool = testPool();
+    pool = appPool();
     client = await pool.connect();
     await client.query("SET ROLE crm_app");
     await inTenant(async (tx) => {

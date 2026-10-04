@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createSign, generateKeyPairSync, randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_API as TENANT, TENANT_API_OTHER as OTHER } from "@crm/db/testing";
+import { appPool, testPool, TENANT_API as TENANT, TENANT_API_OTHER as OTHER } from "@crm/db/testing";
 
 import { startApi, type RunningApi } from "./server.js";
 import type { JwksKey } from "./jwt.js";
@@ -26,16 +26,13 @@ function token(claims: Record<string, unknown> = {}): string {
   return `${header}.${payload}.${sig.toString("base64url")}`;
 }
 
-function pool(): Pool {
-  return new Pool({
-    host: process.env["PGHOST"] ?? "/var/run/postgresql",
-    database: process.env["PGDATABASE"] ?? "crm_test",
-    user: process.env["PGUSER"] ?? "postgres",
-    ...(process.env["PGPASSWORD"] !== undefined ? { password: process.env["PGPASSWORD"] } : {}),
-    ...(process.env["PGPORT"] !== undefined ? { port: Number(process.env["PGPORT"]) } : {}),
-    max: 8,
-  });
-}
+/**
+ * `appPool()`, not `testPool()`: this pool is handed to code that opens its OWN
+ * connections, and those inherit the pool's role. The admin pool would run every one of
+ * them as a superuser, which bypasses row-level security even under `FORCE` — so a
+ * missing tenant predicate would be invisible to this whole suite. One was.
+ * See the comment on `appPool` in `@crm/db/testing`.
+ */
 
 describe("the API, end to end", () => {
   let p: Pool;
@@ -50,7 +47,7 @@ describe("the API, end to end", () => {
   let dxb = "";
 
   beforeAll(async () => {
-    p = pool();
+    p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
     api = await startApi({ pool: p, auth: { issuer: ISSUER, audience: AUDIENCE, jwks: KEYS } });
@@ -190,6 +187,35 @@ describe("the API, end to end", () => {
       const res = await call("GET", "/healthz", { auth: null, tenant: null });
       expect(res.status).toBe(200);
       expect(res.body.status).toBe("ok");
+    });
+
+    /**
+     * Readiness, not just liveness. A process connected as a privileged role answers
+     * `SELECT 1` perfectly and 500s every tenant-scoped request, because
+     * `withTenantContext` refuses that connection — so a health check that only pings
+     * the database would send a broken rollout live behind a green tick.
+     *
+     * Started on its own pool so the suite's own API is untouched.
+     */
+    it("reports NOT ready when connected as a role that bypasses RLS", async () => {
+      const privileged = testPool();
+      const misconfigured = await startApi({
+        pool: privileged,
+        auth: { issuer: ISSUER, audience: AUDIENCE, jwks: KEYS },
+        onError: () => undefined,
+      });
+      try {
+        const res = await fetch(`http://127.0.0.1:${misconfigured.port}/healthz`);
+        const body = (await res.json()) as { status: string; detail: string };
+        expect(res.status).toBe(503);
+        expect(body.status).toBe("degraded");
+        // Names the role, because /healthz is read by the operator who can change it.
+        expect(body.detail).toContain("postgres");
+        expect(body.detail).toContain("crm_app");
+      } finally {
+        await misconfigured.close();
+        await privileged.end();
+      }
     });
   });
 
@@ -1643,7 +1669,7 @@ describe("the API, end to end", () => {
     it("does not leak internals in a 500", async () => {
       // An internal message can carry a table name, a column, or SQL. The real
       // error goes to the log; the client gets a generic detail.
-      const isolated = pool();
+      const isolated = appPool();
       const broken = await startApi({
         pool: isolated,
         auth: { issuer: ISSUER, audience: AUDIENCE, jwks: KEYS },

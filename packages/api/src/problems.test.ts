@@ -4,6 +4,8 @@ import * as notify from "@crm/notify";
 import * as role from "@crm/role";
 import * as sample from "@crm/sample";
 
+import { PrivilegedConnectionError } from "@crm/db";
+
 import { ApiError, PROBLEM_BASE, toProblem } from "./problems.js";
 
 /**
@@ -83,6 +85,22 @@ describe("toProblem covers every domain error", () => {
     );
     expect(toProblem(new role.SelfGrantError("cannot grant themselves")).status).toBe(403);
     expect(toProblem(new role.RoleAlreadyHeldError("compliance", "2026-01-01")).status).toBe(409);
+  });
+
+  /**
+   * The one domain error that SHOULD fall through to a generic 500.
+   *
+   * A connection whose role bypasses RLS is an operator misconfiguration, not something
+   * a client did or can fix, and the error names a database role. Mapping it to a
+   * friendlier problem would publish that name to anyone who can make a request. The
+   * full message goes to the structured log, where the operator is.
+   */
+  it("keeps a privileged-connection refusal internal, and does not name the role", () => {
+    const problem = toProblem(new PrivilegedConnectionError("postgres"));
+    expect(problem.kind).toBe("internal");
+    expect(problem.status).toBe(500);
+    expect(JSON.stringify(problem.body("cid"))).not.toContain("postgres");
+    expect(JSON.stringify(problem.body("cid"))).not.toContain("row-level security");
   });
 
   it("passes an ApiError through untouched", () => {

@@ -16,18 +16,16 @@ import {
   TENANT_SCHEDULER_B as OTHER,
   TENANT_SCHEDULER_LOOP as LOOP_TENANT,
   TENANT_SCHEDULER_RESULT as RESULT_TENANT,
+  appPool,
 } from "@crm/db/testing";
 
-function pool(): Pool {
-  return new Pool({
-    host: process.env["PGHOST"] ?? "/var/run/postgresql",
-    database: process.env["PGDATABASE"] ?? "crm_test",
-    user: process.env["PGUSER"] ?? "postgres",
-    ...(process.env["PGPASSWORD"] !== undefined ? { password: process.env["PGPASSWORD"] } : {}),
-    ...(process.env["PGPORT"] !== undefined ? { port: Number(process.env["PGPORT"]) } : {}),
-    max: 8,
-  });
-}
+/**
+ * `appPool()`, not `testPool()`: this pool is handed to code that opens its OWN
+ * connections, and those inherit the pool's role. The admin pool would run every one of
+ * them as a superuser, which bypasses row-level security even under `FORCE` — so a
+ * missing tenant predicate would be invisible to this whole suite. One was.
+ * See the comment on `appPool` in `@crm/db/testing`.
+ */
 
 /** Stand-ins that record what they were asked to do. */
 function stubRelay(behaviour: (tenantId: string) => Promise<unknown> = async () => undefined) {
@@ -59,7 +57,7 @@ describe("scheduler against a real database", () => {
   let admin: PoolClient;
 
   beforeAll(async () => {
-    p = pool();
+    p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
   });
@@ -373,7 +371,7 @@ describe("the loop itself", () => {
   let admin: PoolClient;
 
   beforeAll(async () => {
-    p = pool();
+    p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
     await admin.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [LOOP_TENANT]);
@@ -493,7 +491,7 @@ describe("recordResult", () => {
   let admin: PoolClient;
 
   beforeAll(async () => {
-    p = pool();
+    p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
   });

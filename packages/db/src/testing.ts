@@ -1,21 +1,70 @@
 import { Pool } from "pg";
 
 /**
- * Connection for the contract tests. They need a REAL Postgres: the whole point
- * is that RLS, ownership and type coercion cannot be asserted against a fake —
- * every finding these tests encode was found by running SQL, not by reading it.
+ * The FIXTURE connection. Connects as the admin role.
  *
- * CI provides a service container; locally, point PG* at any throwaway cluster.
+ * Contract tests need a REAL Postgres: RLS, ownership and type coercion cannot be
+ * asserted against a fake, and every finding these tests encode was found by running
+ * SQL rather than by reading it. CI provides a service container; locally, point PG* at
+ * any throwaway cluster.
+ *
+ * A test takes ONE client from here and immediately `SET ROLE crm_app`, which is what
+ * makes RLS apply to it — a superuser bypasses the policy even under `FORCE`. Use this
+ * for setting up and tearing down rows, and for the few assertions that need to look at
+ * the catalog or prove the bypass itself.
+ *
+ * Do NOT hand this pool to code under test that connects its own clients: it would take
+ * fresh superuser connections with no `SET ROLE`, and nothing it does would be subject
+ * to a policy. Use `appPool()` for that. See the comment there — this distinction cost
+ * a real cross-tenant write before it was drawn.
  */
 export function testPool(): Pool {
+  return new Pool({ ...connection(), max: 4 });
+}
+
+/**
+ * The APPLICATION connection. Connects as `crm_app`, exactly as the deployed API and
+ * scheduler do (`deploy/README.md`, "Two database identities").
+ *
+ * This is the pool to hand to anything under test that connects clients of its own —
+ * `startApi`, `Scheduler`, `OutboxRelay`, `SnapshotRefresher`. Those open their own
+ * connections and set only the tenant GUC, so the ROLE they inherit from the pool is
+ * the one their queries run under.
+ *
+ * It exists because the API contract suite used to hand them the admin pool. Every
+ * route in it therefore ran as a superuser, so row-level security was switched off for
+ * the entire suite and no test could have caught a missing tenant predicate. One was
+ * missing: `crm.revoke_rep_role` matched on a grant id alone, and a rep of one tenant
+ * ended a grant in another. The suite passed. Connecting as `crm_app` is what makes a
+ * tenant-isolation assertion mean anything here.
+ *
+ * `PGAPPUSER` overrides the role for a cluster that names it differently; the password
+ * is whatever the migration runner set, supplied as `PGAPPPASSWORD`. Over a unix socket
+ * with local trust, neither is needed.
+ */
+export function appPool(): Pool {
   return new Pool({
+    ...connection(),
+    user: process.env["PGAPPUSER"] ?? "crm_app",
+    ...(process.env["PGAPPPASSWORD"] !== undefined ? { password: process.env["PGAPPPASSWORD"] } : {}),
+    max: 8,
+  });
+}
+
+function connection(): {
+  host: string;
+  database: string;
+  user: string;
+  password?: string;
+  port?: number;
+} {
+  return {
     host: process.env["PGHOST"] ?? "/var/run/postgresql",
     database: process.env["PGDATABASE"] ?? "crm_test",
     user: process.env["PGUSER"] ?? "postgres",
     ...(process.env["PGPASSWORD"] !== undefined ? { password: process.env["PGPASSWORD"] } : {}),
     ...(process.env["PGPORT"] !== undefined ? { port: Number(process.env["PGPORT"]) } : {}),
-    max: 4,
-  });
+  };
 }
 
 /**

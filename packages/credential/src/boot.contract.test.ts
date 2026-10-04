@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
-import type { Pool } from "pg";
-import { TENANT_CREDENTIAL_BOOT as TENANT, testPool } from "@crm/db/testing";
+import type { Pool, PoolClient } from "pg";
+import { appPool, TENANT_CREDENTIAL_BOOT as TENANT } from "@crm/db/testing";
+import { withTenantContext } from "@crm/db";
 
 import { buildServiceCredential } from "./boot.js";
 import { jwksResponse, type JwksDocument } from "./jwk.js";
@@ -17,8 +18,20 @@ import { decodeUnverified } from "./token.js";
  * failure it exists to catch is a token that is individually valid and references a
  * key the JWKS does not carry — which is only observable by doing both halves.
  */
+/**
+ * `appPool()`, because the pool is handed to `buildServiceCredential` and the key
+ * registry, which open their own connections and inherit its role. It used to be the
+ * admin pool, so every query here ran as a superuser with RLS switched off. The
+ * tenant-scoped table therefore needs its rows written through `withTenantContext`;
+ * `crm.service_key` is platform-wide and has no policy, so it does not.
+ */
 describe("the service credential, end to end", () => {
   let pool: Pool;
+  let fixture: PoolClient;
+
+  /** The one tenant-scoped table here, so the fixture goes through the RLS context. */
+  const principal = (sql: string): Promise<unknown> =>
+    withTenantContext(fixture, TENANT, (tx) => tx.query(sql, [TENANT]));
 
   const published = async (): Promise<{ kid: string; pem: string; x: string }> => {
     const g = generateServiceKeyPair();
@@ -38,27 +51,26 @@ describe("the service credential, end to end", () => {
     ERP_TOKEN_AUDIENCE: "crossengin-erp",
   });
 
-  beforeAll(() => {
-    pool = testPool();
+  beforeAll(async () => {
+    pool = appPool();
+    fixture = await pool.connect();
   });
 
   afterAll(async () => {
     await pool?.query("DELETE FROM crm.service_key");
-    await pool?.query("DELETE FROM crm.erp_service_principal WHERE tenant_id = $1", [TENANT]);
+    await principal("DELETE FROM crm.erp_service_principal WHERE tenant_id = $1");
+    fixture?.release();
     await pool?.end();
   });
 
   beforeEach(async () => {
     await pool.query("DELETE FROM crm.service_key");
-    await pool.query("DELETE FROM crm.erp_service_principal WHERE tenant_id = $1", [TENANT]);
+    await principal("DELETE FROM crm.erp_service_principal WHERE tenant_id = $1");
   });
 
   it("mints a token that verifies against the JWKS the API publishes", async () => {
     const key = await published();
-    await pool.query(
-      "INSERT INTO crm.erp_service_principal (tenant_id, erp_role) VALUES ($1, 'controller')",
-      [TENANT],
-    );
+    await principal("INSERT INTO crm.erp_service_principal (tenant_id, erp_role) VALUES ($1, 'controller')");
 
     const built = await buildServiceCredential({ pool, env: env(key.pem) });
     expect(built.kind).toBe("signing");
@@ -117,14 +129,11 @@ describe("the service credential, end to end", () => {
     // Revocation without deleting the record. Note what it does NOT do: a token
     // already issued stays valid at the ERP until it expires.
     const key = await published();
-    await pool.query(
-      "INSERT INTO crm.erp_service_principal (tenant_id, erp_role) VALUES ($1, 'controller')",
-      [TENANT],
-    );
+    await principal("INSERT INTO crm.erp_service_principal (tenant_id, erp_role) VALUES ($1, 'controller')");
     const built = await buildServiceCredential({ pool, env: env(key.pem) });
     await built.credential.token(TENANT);
 
-    await pool.query("UPDATE crm.erp_service_principal SET enabled = false WHERE tenant_id = $1", [TENANT]);
+    await principal("UPDATE crm.erp_service_principal SET enabled = false WHERE tenant_id = $1");
     const fresh = await buildServiceCredential({ pool, env: env(key.pem) });
     await expect(fresh.credential.token(TENANT)).rejects.toThrow(/disabled/);
   });

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { Pool } from "pg";
-import { TENANT_CREDENTIAL_A as TENANT_A, TENANT_CREDENTIAL_B as TENANT_B, testPool } from "@crm/db/testing";
-import { InvalidTenantIdError } from "@crm/db";
+import type { Pool, PoolClient } from "pg";
+import { appPool, TENANT_CREDENTIAL_A as TENANT_A, TENANT_CREDENTIAL_B as TENANT_B } from "@crm/db/testing";
+import { InvalidTenantIdError, withTenantContext } from "@crm/db";
 
 import { PostgresServiceRoleSource, ServiceRoleUnavailableError } from "./role-source.js";
 
@@ -10,35 +10,53 @@ import { PostgresServiceRoleSource, ServiceRoleUnavailableError } from "./role-s
  *
  * The CHECK constraints here are the interesting part: they encode what the ERP
  * would silently do with a bad value, and a fake connection cannot enforce a CHECK.
+ *
+ * `appPool()`, because this pool is handed to `PostgresServiceRoleSource`, which opens
+ * its own connections and inherits the pool's role. It used to be the admin pool, so
+ * every query in this suite ran as a superuser and row-level security did not apply —
+ * which made the assertion below that each tenant "never" sees the other's role a claim
+ * about a `WHERE` clause, not about isolation. The fixture writes through
+ * `withTenantContext` for the same reason: a seed that inserts with no tenant context is
+ * a seed only a privileged connection can perform.
  */
 describe("the per-tenant ERP service role", () => {
   let pool: Pool;
+  let fixture: PoolClient;
 
-  const seed = async (
+  const seed = (
     tenantId: string,
     role: string,
     opts: { subject?: string | null; enabled?: boolean } = {},
-  ): Promise<void> => {
-    await pool.query(
-      `INSERT INTO crm.erp_service_principal (tenant_id, erp_role, subject, enabled)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (tenant_id) DO UPDATE SET erp_role = $2, subject = $3, enabled = $4`,
-      [tenantId, role, opts.subject ?? null, opts.enabled ?? true],
+  ): Promise<unknown> =>
+    withTenantContext(fixture, tenantId, (tx) =>
+      tx.query(
+        `INSERT INTO crm.erp_service_principal (tenant_id, erp_role, subject, enabled)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (tenant_id) DO UPDATE SET erp_role = $2, subject = $3, enabled = $4`,
+        [tenantId, role, opts.subject ?? null, opts.enabled ?? true],
+      ),
     );
+
+  const clear = async (): Promise<void> => {
+    for (const t of [TENANT_A, TENANT_B]) {
+      await withTenantContext(fixture, t, (tx) =>
+        tx.query("DELETE FROM crm.erp_service_principal WHERE tenant_id = $1", [t]),
+      );
+    }
   };
 
-  beforeAll(() => {
-    pool = testPool();
+  beforeAll(async () => {
+    pool = appPool();
+    fixture = await pool.connect();
   });
 
   afterAll(async () => {
-    await pool?.query("DELETE FROM crm.erp_service_principal WHERE tenant_id = ANY($1)", [[TENANT_A, TENANT_B]]);
+    await clear();
+    fixture?.release();
     await pool?.end();
   });
 
-  beforeEach(async () => {
-    await pool.query("DELETE FROM crm.erp_service_principal WHERE tenant_id = ANY($1)", [[TENANT_A, TENANT_B]]);
-  });
+  beforeEach(clear);
 
   it("reads the role configured for a tenant", async () => {
     await seed(TENANT_A, "controller");
