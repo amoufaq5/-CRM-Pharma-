@@ -527,13 +527,50 @@ describe("notifications", () => {
       );
     });
 
-    it("dead-letters a channel with no registered sender instead of losing it quietly", async () => {
+    /**
+     * RETRIES a channel this process cannot send — it does not dead-letter it.
+     *
+     * It used to, and that destroyed every notification routed to a correctly configured
+     * endpoint whose sender the running binary happened not to register: `markDead` is
+     * terminal. A missing sender is a statement about the PROCESS, not the destination,
+     * and the notification is deliverable the moment a process that has the channel takes
+     * a tick. The retry ladder still gives up at MAX_ATTEMPTS, so a channel nobody ever
+     * registers dead-letters on its own rather than retrying forever — which the second
+     * half of this test proves, because "retry" must not mean "never resolves".
+     */
+    it("retries a channel with no registered sender, then gives up on its own", async () => {
       await inTenant(async (tx) => {
         await addEndpoint(tx, { url: "https://hooks.example.com/x", minSeverity: "info" });
         return raise(tx);
       });
-      const result = await new NotificationDispatcher({ pool, senders: [] }).drainTenant(TENANT);
-      expect(result).toMatchObject({ dead: 1 });
+      const d = new NotificationDispatcher({ pool, senders: [] });
+      expect(await d.drainTenant(TENANT)).toMatchObject({ dead: 0, retried: 1 });
+      await inTenant(async (tx) => {
+        const { rows } = await tx.query<{ state: string; last_error: string }>(
+          "SELECT state, last_error FROM crm.notification_delivery WHERE tenant_id = $1",
+          [TENANT],
+        );
+        expect(rows[0]!.state).toBe("pending");
+        // Names the channel AND what this process does register, so an operator reading a
+        // dead letter can tell "wrong binary" from "wrong endpoint".
+        expect(rows[0]!.last_error).toMatch(/no sender registered for channel webhook/);
+        expect(rows[0]!.last_error).toMatch(/it registers none/);
+      });
+
+      for (let i = 1; i < MAX_ATTEMPTS; i += 1) {
+        await inTenant((tx) =>
+          tx.query("UPDATE crm.notification_delivery SET next_attempt_at = now() WHERE tenant_id = $1", [TENANT]),
+        );
+        await d.drainTenant(TENANT);
+      }
+      await inTenant(async (tx) => {
+        const { rows } = await tx.query<{ state: string; attempts: number }>(
+          "SELECT state, attempts FROM crm.notification_delivery WHERE tenant_id = $1",
+          [TENANT],
+        );
+        expect(rows[0]!.state).toBe("dead");
+        expect(rows[0]!.attempts).toBe(MAX_ATTEMPTS);
+      });
     });
 
     it("does not claim a delivery before it is due", async () => {

@@ -59,6 +59,9 @@ describe("toProblem covers every domain error", () => {
     InvalidSmtpRelayError: "boot-time relay configuration; the scheduler must fail to start, not answer a request",
     SmtpProtocolError: "the relay spoke something that is not SMTP; becomes a dead SendOutcome",
     SmtpTimeoutError: "a relay stopped answering; becomes a retry SendOutcome",
+    ClientAlreadyInTenantContextError:
+      "a caller handed the expense sweep a client already inside withTenantContext — a " +
+      "programming error in the scheduler, not something a request can provoke or a client act on",
   };
 
   for (const [moduleName, mod, atLeast] of [

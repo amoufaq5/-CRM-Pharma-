@@ -3,16 +3,18 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { NotificationKind, Severity } from "./kinds.js";
 
 /**
- * The channel seam, and the one channel behind it that is real.
+ * The channel seam, and the webhook channel behind it.
  *
- * `ChannelSender` exists so email and SMS can be added without redesign. Neither is
- * built, and that is stated rather than implied: the ERP's notification package has a
- * `ChannelSender` seam, a retry ladder, suppression handling and eighteen declared
- * providers with an implementation for exactly one of them, and the gap sat in its ADRs
- * for releases. A seam with one working implementation is worth more than six stubs.
+ * `ChannelSender` exists so a channel can be added without redesign, and TWO are now
+ * built: this one and `smtp.ts`. Neither is a stub, which is the whole policy — the ERP's
+ * notification package declares eighteen providers across six channels and implements
+ * exactly one of them, and the gap sat in its ADRs for releases. A seam with working
+ * implementations behind it is worth more than a count of declared providers; SMS, push
+ * and voice are still unbuilt and still named as unbuilt rather than declared.
  *
- * The webhook sender is the one that works, and it is the one that matters operationally:
- * an incoming-webhook URL is how Slack, Teams and PagerDuty are actually fed.
+ * The webhook sender is the one that matters operationally: an incoming-webhook URL is how
+ * Slack, Teams and PagerDuty are actually fed. Email is for the recipient who has no
+ * such URL, which is most reps.
  */
 
 export interface WebhookPayload {

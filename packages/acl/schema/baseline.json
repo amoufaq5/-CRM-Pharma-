@@ -1,16 +1,2567 @@
 {
-  "generatedAt": "2026-09-30T00:00:00.000Z",
-  "roles": [
+  "entities": [
     {
-      "name": "erp_admin",
-      "label": "ERP Administrator"
+      "name": "AccountingBook",
+      "slug": "accounting-books",
+      "label": "Accounting Books",
+      "singular": "Accounting Book",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "accounting_standard",
+          "label": "Accounting Standard",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "ifrs",
+            "us_gaap",
+            "local_gaap",
+            "tax",
+            "management"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "functional_currency",
+          "label": "Functional Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "country",
+          "label": "Country",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "is_primary",
+          "label": "Is Primary",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "is_active",
+          "label": "Is Active",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "name"
+      ],
+      "sortableFields": [],
+      "filterableFields": [],
+      "searchableFields": [
+        "code",
+        "name",
+        "functional_currency"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "accountingBook.list",
+        "read": "accountingBook.read",
+        "create": "accountingBook.create",
+        "update": "accountingBook.update",
+        "delete": "accountingBook.delete"
+      },
+      "associations": []
     },
     {
-      "name": "sales_rep",
-      "label": "Sales Representative"
-    }
-  ],
-  "entities": [
+      "name": "Account",
+      "slug": "accounts",
+      "label": "Accounts",
+      "singular": "Account",
+      "module": "Sales & CRM",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_accountant",
+          "erp_viewer"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_accountant",
+          "erp_viewer"
+        ],
+        "create": [
+          "erp_admin",
+          "erp_accountant"
+        ],
+        "update": [
+          "erp_admin",
+          "erp_accountant"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "legal_name",
+          "label": "Legal Name",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "prospect",
+            "active",
+            "suspended",
+            "churned"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "industry",
+          "label": "Industry",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "website",
+          "label": "Website",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "billing_email",
+          "label": "Billing Email",
+          "input": "email",
+          "required": true
+        },
+        {
+          "name": "country",
+          "label": "Country",
+          "input": "text",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "name",
+        "status"
+      ],
+      "sortableFields": [
+        "name",
+        "status",
+        "industry",
+        "billing_email",
+        "country"
+      ],
+      "filterableFields": [
+        "name",
+        "status",
+        "industry",
+        "billing_email",
+        "country"
+      ],
+      "searchableFields": [
+        "name",
+        "industry",
+        "billing_email"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "account.list",
+        "read": "account.read",
+        "create": "account.create",
+        "update": "account.update",
+        "delete": "account.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "BillLine",
+      "slug": "bill-lines",
+      "label": "Bill Lines",
+      "singular": "Bill Line",
+      "module": "Finance",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "create": [
+          "erp_admin",
+          "ap_clerk"
+        ],
+        "update": [
+          "erp_admin",
+          "ap_clerk"
+        ],
+        "delete": [
+          "erp_admin",
+          "ap_clerk"
+        ]
+      },
+      "fields": [
+        {
+          "name": "bill_id",
+          "label": "Bill Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Bill"
+        },
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "quantity",
+          "label": "Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "unit_price",
+          "label": "Unit Price",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "amount",
+          "label": "Amount",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "tax_code_id",
+          "label": "Tax Code Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "TaxCode"
+        }
+      ],
+      "listColumns": [
+        "bill_id",
+        "item_id",
+        "amount",
+        "tax_code_id"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "bill_id",
+        "item_id",
+        "tax_code_id"
+      ],
+      "searchableFields": [
+        "description"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "billLine.list",
+        "read": "billLine.read",
+        "create": "billLine.create",
+        "update": "billLine.update",
+        "delete": "billLine.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "BillOfMaterials",
+      "slug": "bill-of-materialss",
+      "label": "Bill Of Materialss",
+      "singular": "Bill Of Materials",
+      "module": "Manufacturing",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "production_manager",
+          "inventory_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "production_manager",
+          "inventory_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "production_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "production_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "bom_code",
+          "label": "Bom Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "version",
+          "label": "Version",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "output_quantity",
+          "label": "Output Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "active",
+            "archived"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "notes",
+          "label": "Notes",
+          "input": "textarea",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "bom_code",
+        "item_id",
+        "status"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "item_id"
+      ],
+      "searchableFields": [
+        "bom_code",
+        "version",
+        "notes"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "billOfMaterials.list",
+        "read": "billOfMaterials.read",
+        "create": "billOfMaterials.create",
+        "update": "billOfMaterials.update",
+        "delete": "billOfMaterials.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Bill",
+      "slug": "bills",
+      "label": "Bills",
+      "singular": "Bill",
+      "module": "Finance",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "create": [
+          "erp_admin",
+          "ap_clerk"
+        ],
+        "update": [
+          "erp_admin",
+          "ap_clerk"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "bill_number",
+          "label": "Bill Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "vendor_id",
+          "label": "Vendor Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Vendor"
+        },
+        {
+          "name": "purchase_order_id",
+          "label": "Purchase Order Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "PurchaseOrder"
+        },
+        {
+          "name": "bill_date",
+          "label": "Bill Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "due_date",
+          "label": "Due Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "approved",
+            "paid",
+            "overdue",
+            "void"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "subtotal",
+          "label": "Subtotal",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "tax_total",
+          "label": "Tax Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "total",
+          "label": "Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "booking_rate",
+          "label": "Booking Rate",
+          "input": "number",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "bill_number",
+        "vendor_id",
+        "purchase_order_id",
+        "bill_date",
+        "due_date",
+        "state"
+      ],
+      "sortableFields": [
+        "bill_number",
+        "vendor_id",
+        "bill_date",
+        "due_date",
+        "state",
+        "total"
+      ],
+      "filterableFields": [
+        "bill_number",
+        "vendor_id",
+        "bill_date",
+        "due_date",
+        "state",
+        "total",
+        "purchase_order_id"
+      ],
+      "searchableFields": [
+        "bill_number"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "approve",
+          "label": "Approve",
+          "operationId": "bill.approve",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "approved",
+          "roles": [
+            "erp_admin",
+            "ap_clerk",
+            "controller"
+          ]
+        },
+        {
+          "name": "mark_overdue",
+          "label": "Mark Overdue",
+          "operationId": "bill.mark_overdue",
+          "stateField": "state",
+          "from": [
+            "approved"
+          ],
+          "to": "overdue",
+          "roles": [
+            "erp_admin"
+          ]
+        },
+        {
+          "name": "mark_paid",
+          "label": "Mark Paid",
+          "operationId": "bill.mark_paid",
+          "stateField": "state",
+          "from": [
+            "approved",
+            "overdue"
+          ],
+          "to": "paid",
+          "roles": [
+            "erp_admin",
+            "ap_clerk"
+          ]
+        },
+        {
+          "name": "void",
+          "label": "Void",
+          "operationId": "bill.void",
+          "stateField": "state",
+          "from": [
+            "draft",
+            "approved",
+            "overdue"
+          ],
+          "to": "void",
+          "roles": [
+            "erp_admin",
+            "controller"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "bill.list",
+        "read": "bill.read",
+        "create": "bill.create",
+        "update": "bill.update",
+        "delete": "bill.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "BomLine",
+      "slug": "bom-lines",
+      "label": "Bom Lines",
+      "singular": "Bom Line",
+      "module": "Manufacturing",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "production_manager",
+          "inventory_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "production_manager",
+          "inventory_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "production_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "production_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "bom_id",
+          "label": "Bom Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "BillOfMaterials"
+        },
+        {
+          "name": "component_item_id",
+          "label": "Component Item Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "quantity",
+          "label": "Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "scrap_pct",
+          "label": "Scrap Pct",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "bom_id",
+        "component_item_id"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "bom_id",
+        "component_item_id"
+      ],
+      "searchableFields": [],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "bomLine.list",
+        "read": "bomLine.read",
+        "create": "bomLine.create",
+        "update": "bomLine.update",
+        "delete": "bomLine.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Contact",
+      "slug": "contacts",
+      "label": "Contacts",
+      "singular": "Contact",
+      "module": "Sales & CRM",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_accountant",
+          "erp_viewer"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_accountant",
+          "erp_viewer"
+        ],
+        "create": [
+          "erp_admin",
+          "erp_accountant"
+        ],
+        "update": [
+          "erp_admin",
+          "erp_accountant"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "account_id",
+          "label": "Account Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Account"
+        },
+        {
+          "name": "given_name",
+          "label": "Given Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "family_name",
+          "label": "Family Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "title",
+          "label": "Title",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "email",
+          "label": "Email",
+          "input": "email",
+          "required": true
+        },
+        {
+          "name": "phone",
+          "label": "Phone",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "is_primary",
+          "label": "Is Primary",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "account_id",
+        "title",
+        "email"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "account_id"
+      ],
+      "searchableFields": [
+        "given_name",
+        "family_name",
+        "title",
+        "email",
+        "phone"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "contact.list",
+        "read": "contact.read",
+        "create": "contact.create",
+        "update": "contact.update",
+        "delete": "contact.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "CostCenter",
+      "slug": "cost-centers",
+      "label": "Cost Centers",
+      "singular": "Cost Center",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "parent_id",
+          "label": "Parent Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "CostCenter"
+        },
+        {
+          "name": "manager_id",
+          "label": "Manager Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "segment",
+          "label": "Segment",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "operating",
+            "geographic",
+            "product",
+            "service",
+            "other"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "is_active",
+          "label": "Is Active",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "name",
+        "parent_id",
+        "manager_id"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "parent_id",
+        "manager_id"
+      ],
+      "searchableFields": [
+        "code",
+        "name"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "costCenter.list",
+        "read": "costCenter.read",
+        "create": "costCenter.create",
+        "update": "costCenter.update",
+        "delete": "costCenter.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Currency",
+      "slug": "currencys",
+      "label": "Currencys",
+      "singular": "Currency",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "symbol",
+          "label": "Symbol",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "decimal_places",
+          "label": "Decimal Places",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "is_active",
+          "label": "Is Active",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "name"
+      ],
+      "sortableFields": [],
+      "filterableFields": [],
+      "searchableFields": [
+        "code",
+        "name",
+        "symbol"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "currency.list",
+        "read": "currency.read",
+        "create": "currency.create",
+        "update": "currency.update",
+        "delete": "currency.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Department",
+      "slug": "departments",
+      "label": "Departments",
+      "singular": "Department",
+      "module": "Human Resources",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "hr_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "hr_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "hr_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "hr_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "dept_code",
+          "label": "Dept Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "parent_department_id",
+          "label": "Parent Department Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Department"
+        },
+        {
+          "name": "manager_id",
+          "label": "Manager Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "cost_center",
+          "label": "Cost Center",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "active",
+            "inactive"
+          ],
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "dept_code",
+        "name",
+        "parent_department_id",
+        "manager_id",
+        "status"
+      ],
+      "sortableFields": [
+        "dept_code",
+        "name",
+        "cost_center",
+        "status"
+      ],
+      "filterableFields": [
+        "dept_code",
+        "name",
+        "cost_center",
+        "status",
+        "parent_department_id",
+        "manager_id"
+      ],
+      "searchableFields": [
+        "dept_code",
+        "name",
+        "cost_center"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "department.list",
+        "read": "department.read",
+        "create": "department.create",
+        "update": "department.update",
+        "delete": "department.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Employee",
+      "slug": "employees",
+      "label": "Employees",
+      "singular": "Employee",
+      "module": "Human Resources",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "hr_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "hr_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "hr_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "hr_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "employee_number",
+          "label": "Employee Number",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "given_name",
+          "label": "Given Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "family_name",
+          "label": "Family Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "work_email",
+          "label": "Work Email",
+          "input": "email",
+          "required": true,
+          "classification": "pii"
+        },
+        {
+          "name": "personal_email",
+          "label": "Personal Email",
+          "input": "email",
+          "required": false,
+          "classification": "pii"
+        },
+        {
+          "name": "phone",
+          "label": "Phone",
+          "input": "text",
+          "required": false,
+          "classification": "pii"
+        },
+        {
+          "name": "national_id",
+          "label": "National Id",
+          "input": "text",
+          "required": false,
+          "classification": "pii"
+        },
+        {
+          "name": "date_of_birth",
+          "label": "Date Of Birth",
+          "input": "date",
+          "required": false,
+          "classification": "pii"
+        },
+        {
+          "name": "department_id",
+          "label": "Department Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Department"
+        },
+        {
+          "name": "position_id",
+          "label": "Position Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Position"
+        },
+        {
+          "name": "manager_id",
+          "label": "Manager Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "hire_date",
+          "label": "Hire Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "employment_type",
+          "label": "Employment Type",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "full_time",
+            "part_time",
+            "contractor",
+            "intern",
+            "temporary"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "active",
+            "on_leave",
+            "suspended",
+            "terminated"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "annual_salary",
+          "label": "Annual Salary",
+          "input": "number",
+          "required": false,
+          "classification": "commercial_sensitive"
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "employee_number",
+        "national_id",
+        "department_id",
+        "position_id",
+        "manager_id",
+        "hire_date"
+      ],
+      "sortableFields": [
+        "employee_number",
+        "given_name",
+        "family_name",
+        "work_email",
+        "department_id",
+        "status"
+      ],
+      "filterableFields": [
+        "employee_number",
+        "given_name",
+        "family_name",
+        "work_email",
+        "department_id",
+        "status",
+        "position_id",
+        "manager_id"
+      ],
+      "searchableFields": [
+        "employee_number",
+        "given_name",
+        "family_name",
+        "work_email"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "employee.list",
+        "read": "employee.read",
+        "create": "employee.create",
+        "update": "employee.update",
+        "delete": "employee.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "ExchangeRate",
+      "slug": "exchange-rates",
+      "label": "Exchange Rates",
+      "singular": "Exchange Rate",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "from_currency_id",
+          "label": "From Currency Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Currency"
+        },
+        {
+          "name": "to_currency_id",
+          "label": "To Currency Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Currency"
+        },
+        {
+          "name": "rate_type",
+          "label": "Rate Type",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "spot",
+            "average",
+            "closing",
+            "historical"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "rate_date",
+          "label": "Rate Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "rate",
+          "label": "Rate",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "source",
+          "label": "Source",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "manual",
+            "ecb",
+            "central_bank",
+            "provider"
+          ],
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "from_currency_id",
+        "to_currency_id",
+        "rate_date"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "from_currency_id",
+        "to_currency_id"
+      ],
+      "searchableFields": [],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "exchangeRate.list",
+        "read": "exchangeRate.read",
+        "create": "exchangeRate.create",
+        "update": "exchangeRate.update",
+        "delete": "exchangeRate.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Expense",
+      "slug": "expenses",
+      "label": "Expenses",
+      "singular": "Expense",
+      "module": "Finance",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "erp_accountant",
+          "hr_manager",
+          "ap_clerk"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "erp_accountant",
+          "hr_manager",
+          "ap_clerk"
+        ],
+        "create": [
+          "erp_admin",
+          "erp_accountant",
+          "hr_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "erp_accountant",
+          "hr_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "expense_number",
+          "label": "Expense Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "employee_id",
+          "label": "Employee Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "category",
+          "label": "Category",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "travel",
+            "meals",
+            "lodging",
+            "supplies",
+            "software",
+            "training",
+            "other"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "amount",
+          "label": "Amount",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "submitted",
+            "approved",
+            "reimbursed",
+            "rejected"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "incurred_on",
+          "label": "Incurred On",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "input": "textarea",
+          "required": false
+        },
+        {
+          "name": "receipt",
+          "label": "Receipt",
+          "input": "text",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "expense_number",
+        "employee_id",
+        "amount",
+        "state"
+      ],
+      "sortableFields": [
+        "expense_number",
+        "employee_id",
+        "category",
+        "amount",
+        "state",
+        "incurred_on"
+      ],
+      "filterableFields": [
+        "expense_number",
+        "employee_id",
+        "category",
+        "amount",
+        "state",
+        "incurred_on"
+      ],
+      "searchableFields": [
+        "expense_number"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "submit",
+          "label": "Submit",
+          "operationId": "expense.submit",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "submitted",
+          "roles": [
+            "erp_admin",
+            "erp_accountant",
+            "hr_manager"
+          ]
+        },
+        {
+          "name": "approve",
+          "label": "Approve",
+          "operationId": "expense.approve",
+          "stateField": "state",
+          "from": [
+            "submitted"
+          ],
+          "to": "approved",
+          "roles": [
+            "erp_admin",
+            "hr_manager",
+            "controller"
+          ]
+        },
+        {
+          "name": "reimburse",
+          "label": "Reimburse",
+          "operationId": "expense.reimburse",
+          "stateField": "state",
+          "from": [
+            "approved"
+          ],
+          "to": "reimbursed",
+          "roles": [
+            "erp_admin",
+            "ap_clerk",
+            "erp_accountant"
+          ]
+        },
+        {
+          "name": "reject",
+          "label": "Reject",
+          "operationId": "expense.reject",
+          "stateField": "state",
+          "from": [
+            "submitted",
+            "approved"
+          ],
+          "to": "rejected",
+          "roles": [
+            "erp_admin",
+            "hr_manager",
+            "controller"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "expense.list",
+        "read": "expense.read",
+        "create": "expense.create",
+        "update": "expense.update",
+        "delete": "expense.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "FiscalPeriod",
+      "slug": "fiscal-periods",
+      "label": "Fiscal Periods",
+      "singular": "Fiscal Period",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "fiscal_year_id",
+          "label": "Fiscal Year Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "FiscalYear"
+        },
+        {
+          "name": "period_number",
+          "label": "Period Number",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "start_date",
+          "label": "Start Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "end_date",
+          "label": "End Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "open",
+            "closing",
+            "closed",
+            "locked"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "is_adjustment",
+          "label": "Is Adjustment",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "closed_at",
+          "label": "Closed At",
+          "input": "datetime",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "fiscal_year_id",
+        "period_number",
+        "name",
+        "start_date",
+        "end_date",
+        "status"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "fiscal_year_id"
+      ],
+      "searchableFields": [
+        "name"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "fiscalPeriod.list",
+        "read": "fiscalPeriod.read",
+        "create": "fiscalPeriod.create",
+        "update": "fiscalPeriod.update",
+        "delete": "fiscalPeriod.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "FiscalYear",
+      "slug": "fiscal-years",
+      "label": "Fiscal Years",
+      "singular": "Fiscal Year",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "start_date",
+          "label": "Start Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "end_date",
+          "label": "End Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "open",
+            "closed",
+            "permanently_closed"
+          ],
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "name",
+        "start_date",
+        "end_date",
+        "status"
+      ],
+      "sortableFields": [],
+      "filterableFields": [],
+      "searchableFields": [
+        "code",
+        "name"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "fiscalYear.list",
+        "read": "fiscalYear.read",
+        "create": "fiscalYear.create",
+        "update": "fiscalYear.update",
+        "delete": "fiscalYear.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "FixedAsset",
+      "slug": "fixed-assets",
+      "label": "Fixed Assets",
+      "singular": "Fixed Asset",
+      "module": "Assets & Maintenance",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "asset_manager",
+          "controller"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "asset_manager",
+          "controller"
+        ],
+        "create": [
+          "erp_admin",
+          "asset_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "asset_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "asset_tag",
+          "label": "Asset Tag",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "category",
+          "label": "Category",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "equipment",
+            "vehicle",
+            "building",
+            "furniture",
+            "it_hardware",
+            "software",
+            "other"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "ledger_account_id",
+          "label": "Ledger Account Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "LedgerAccount"
+        },
+        {
+          "name": "acquisition_date",
+          "label": "Acquisition Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "acquisition_cost",
+          "label": "Acquisition Cost",
+          "input": "number",
+          "required": true,
+          "classification": "commercial_sensitive"
+        },
+        {
+          "name": "depreciation_method",
+          "label": "Depreciation Method",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "straight_line",
+            "declining_balance",
+            "units_of_production",
+            "none"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "useful_life_months",
+          "label": "Useful Life Months",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "salvage_value",
+          "label": "Salvage Value",
+          "input": "number",
+          "required": false,
+          "classification": "commercial_sensitive"
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "in_service",
+            "under_maintenance",
+            "retired",
+            "disposed"
+          ],
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "name",
+        "ledger_account_id",
+        "acquisition_date",
+        "state"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "ledger_account_id"
+      ],
+      "searchableFields": [
+        "asset_tag",
+        "name"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "send_to_maintenance",
+          "label": "Send To Maintenance",
+          "operationId": "fixedAsset.send_to_maintenance",
+          "stateField": "state",
+          "from": [
+            "in_service"
+          ],
+          "to": "under_maintenance",
+          "roles": [
+            "erp_admin",
+            "asset_manager"
+          ]
+        },
+        {
+          "name": "return_to_service",
+          "label": "Return To Service",
+          "operationId": "fixedAsset.return_to_service",
+          "stateField": "state",
+          "from": [
+            "under_maintenance"
+          ],
+          "to": "in_service",
+          "roles": [
+            "erp_admin",
+            "asset_manager"
+          ]
+        },
+        {
+          "name": "retire",
+          "label": "Retire",
+          "operationId": "fixedAsset.retire",
+          "stateField": "state",
+          "from": [
+            "in_service",
+            "under_maintenance"
+          ],
+          "to": "retired",
+          "roles": [
+            "erp_admin",
+            "asset_manager"
+          ]
+        },
+        {
+          "name": "dispose",
+          "label": "Dispose",
+          "operationId": "fixedAsset.dispose",
+          "stateField": "state",
+          "from": [
+            "in_service",
+            "under_maintenance",
+            "retired"
+          ],
+          "to": "disposed",
+          "roles": [
+            "erp_admin",
+            "asset_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "fixedAsset.list",
+        "read": "fixedAsset.read",
+        "create": "fixedAsset.create",
+        "update": "fixedAsset.update",
+        "delete": "fixedAsset.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "GoodsReceipt",
+      "slug": "goods-receipts",
+      "label": "Goods Receipts",
+      "singular": "Goods Receipt",
+      "module": "Procurement",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "procurement_manager",
+          "ap_clerk",
+          "inventory_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "procurement_manager",
+          "ap_clerk",
+          "inventory_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "procurement_manager",
+          "warehouse_clerk"
+        ],
+        "update": [
+          "erp_admin",
+          "procurement_manager",
+          "warehouse_clerk"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "grn_number",
+          "label": "Grn Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "purchase_order_id",
+          "label": "Purchase Order Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "PurchaseOrder"
+        },
+        {
+          "name": "warehouse_id",
+          "label": "Warehouse Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Warehouse"
+        },
+        {
+          "name": "received_date",
+          "label": "Received Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "received_by",
+          "label": "Received By",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "posted",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "notes",
+          "label": "Notes",
+          "input": "textarea",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "grn_number",
+        "purchase_order_id",
+        "warehouse_id",
+        "received_date",
+        "status"
+      ],
+      "sortableFields": [
+        "grn_number",
+        "purchase_order_id",
+        "warehouse_id",
+        "received_date",
+        "status"
+      ],
+      "filterableFields": [
+        "grn_number",
+        "purchase_order_id",
+        "warehouse_id",
+        "received_date",
+        "status"
+      ],
+      "searchableFields": [
+        "grn_number"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "goodsReceipt.list",
+        "read": "goodsReceipt.read",
+        "create": "goodsReceipt.create",
+        "update": "goodsReceipt.update",
+        "delete": "goodsReceipt.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "InvoiceLine",
+      "slug": "invoice-lines",
+      "label": "Invoice Lines",
+      "singular": "Invoice Line",
+      "module": "Finance",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_accountant",
+          "erp_viewer"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_accountant",
+          "erp_viewer"
+        ],
+        "create": [
+          "erp_admin",
+          "erp_accountant"
+        ],
+        "update": [
+          "erp_admin",
+          "erp_accountant"
+        ],
+        "delete": [
+          "erp_admin",
+          "erp_accountant"
+        ]
+      },
+      "fields": [
+        {
+          "name": "invoice_id",
+          "label": "Invoice Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Invoice"
+        },
+        {
+          "name": "position",
+          "label": "Position",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "quantity",
+          "label": "Quantity",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "unit_price",
+          "label": "Unit Price",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "tax_rate_pct",
+          "label": "Tax Rate Pct",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "tax_code_id",
+          "label": "Tax Code Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "TaxCode"
+        },
+        {
+          "name": "line_total",
+          "label": "Line Total",
+          "input": "number",
+          "required": true
+        }
+      ],
+      "listColumns": [
+        "invoice_id",
+        "tax_code_id",
+        "line_total"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "invoice_id",
+        "tax_code_id"
+      ],
+      "searchableFields": [
+        "description"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "invoiceLine.list",
+        "read": "invoiceLine.read",
+        "create": "invoiceLine.create",
+        "update": "invoiceLine.update",
+        "delete": "invoiceLine.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Invoice",
+      "slug": "invoices",
+      "label": "Invoices",
+      "singular": "Invoice",
+      "module": "Finance",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_accountant",
+          "erp_viewer"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_accountant",
+          "erp_viewer"
+        ],
+        "create": [
+          "erp_admin",
+          "erp_accountant"
+        ],
+        "update": [
+          "erp_admin",
+          "erp_accountant"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "account_id",
+          "label": "Account Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Account"
+        },
+        {
+          "name": "invoice_number",
+          "label": "Invoice Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "sent",
+            "paid",
+            "overdue",
+            "void"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "document_type",
+          "label": "Document Type",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "invoice",
+            "credit_note"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "credit_note_of",
+          "label": "Credit Note Of",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Invoice"
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "booking_rate",
+          "label": "Booking Rate",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "subtotal",
+          "label": "Subtotal",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "tax_total",
+          "label": "Tax Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "total",
+          "label": "Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "withholding_total",
+          "label": "Withholding Total",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "issue_date",
+          "label": "Issue Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "due_date",
+          "label": "Due Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "sent_at",
+          "label": "Sent At",
+          "input": "datetime",
+          "required": false
+        },
+        {
+          "name": "paid_at",
+          "label": "Paid At",
+          "input": "datetime",
+          "required": false
+        },
+        {
+          "name": "credit_amount",
+          "label": "Credit Amount",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "notes",
+          "label": "Notes",
+          "input": "textarea",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "account_id",
+        "invoice_number",
+        "state",
+        "subtotal",
+        "tax_total",
+        "total"
+      ],
+      "sortableFields": [
+        "invoice_number",
+        "account_id",
+        "state",
+        "total",
+        "currency",
+        "due_date"
+      ],
+      "filterableFields": [
+        "invoice_number",
+        "account_id",
+        "state",
+        "total",
+        "currency",
+        "due_date",
+        "credit_note_of"
+      ],
+      "searchableFields": [
+        "invoice_number",
+        "currency"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "send",
+          "label": "Send",
+          "operationId": "invoice.send",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "sent",
+          "roles": [
+            "erp_admin",
+            "erp_accountant"
+          ]
+        },
+        {
+          "name": "mark_overdue",
+          "label": "Mark Overdue",
+          "operationId": "invoice.mark_overdue",
+          "stateField": "state",
+          "from": [
+            "sent"
+          ],
+          "to": "overdue",
+          "roles": [
+            "erp_admin",
+            "erp_accountant"
+          ]
+        },
+        {
+          "name": "mark_paid",
+          "label": "Mark Paid",
+          "operationId": "invoice.mark_paid",
+          "stateField": "state",
+          "from": [
+            "sent",
+            "overdue"
+          ],
+          "to": "paid",
+          "roles": [
+            "erp_admin",
+            "erp_accountant"
+          ]
+        },
+        {
+          "name": "void",
+          "label": "Void",
+          "operationId": "invoice.void",
+          "stateField": "state",
+          "from": [
+            "draft",
+            "sent",
+            "overdue"
+          ],
+          "to": "void",
+          "roles": [
+            "erp_admin"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "invoice.list",
+        "read": "invoice.read",
+        "create": "invoice.create",
+        "update": "invoice.update",
+        "delete": "invoice.delete"
+      },
+      "associations": []
+    },
     {
       "name": "Item",
       "slug": "items",
@@ -20,17 +2571,25 @@
       "access": {
         "list": [
           "erp_admin",
-          "sales_rep"
+          "erp_viewer",
+          "inventory_manager",
+          "warehouse_clerk",
+          "procurement_manager"
         ],
         "read": [
           "erp_admin",
-          "sales_rep"
+          "erp_viewer",
+          "inventory_manager",
+          "warehouse_clerk",
+          "procurement_manager"
         ],
         "create": [
-          "erp_admin"
+          "erp_admin",
+          "inventory_manager"
         ],
         "update": [
-          "erp_admin"
+          "erp_admin",
+          "inventory_manager"
         ],
         "delete": [
           "erp_admin"
@@ -51,22 +2610,68 @@
           "required": true
         },
         {
-          "name": "status",
-          "label": "Status",
+          "name": "description",
+          "label": "Description",
+          "input": "textarea",
+          "required": false
+        },
+        {
+          "name": "item_type",
+          "label": "Item Type",
           "input": "select",
           "required": true,
           "enumValues": [
-            "draft",
-            "active",
-            "discontinued"
+            "stock",
+            "service",
+            "kit",
+            "raw_material",
+            "finished_good",
+            "consumable"
           ],
           "defaulted": true
         },
         {
-          "name": "list_price",
-          "label": "List Price",
-          "input": "number",
+          "name": "unit_of_measure",
+          "label": "Unit Of Measure",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "each",
+            "kg",
+            "g",
+            "l",
+            "ml",
+            "m",
+            "cm",
+            "box",
+            "pallet",
+            "hour"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "category",
+          "label": "Category",
+          "input": "text",
           "required": false
+        },
+        {
+          "name": "barcode",
+          "label": "Barcode",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "tracking",
+          "label": "Tracking",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "none",
+            "lot",
+            "serial"
+          ],
+          "defaulted": true
         },
         {
           "name": "standard_cost",
@@ -76,10 +2681,46 @@
           "classification": "commercial_sensitive"
         },
         {
-          "name": "updated_at",
-          "label": "Updated At",
-          "input": "datetime",
+          "name": "list_price",
+          "label": "List Price",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
           "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "reorder_point",
+          "label": "Reorder Point",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "reorder_quantity",
+          "label": "Reorder Quantity",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "weight_kg",
+          "label": "Weight Kg",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "active",
+            "discontinued"
+          ],
           "defaulted": true
         }
       ],
@@ -91,22 +2732,1044 @@
       "sortableFields": [
         "sku",
         "name",
-        "status",
+        "item_type",
+        "category",
         "list_price",
-        "updated_at"
+        "status"
       ],
       "filterableFields": [
         "sku",
-        "status",
+        "name",
+        "item_type",
+        "category",
         "list_price",
-        "updated_at"
+        "status"
       ],
       "searchableFields": [
         "sku",
+        "name",
+        "category"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "item.list",
+        "read": "item.read",
+        "create": "item.create",
+        "update": "item.update",
+        "delete": "item.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "JournalEntry",
+      "slug": "journal-entrys",
+      "label": "Journal Entrys",
+      "singular": "Journal Entry",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "entry_number",
+          "label": "Entry Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "entry_date",
+          "label": "Entry Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "book_id",
+          "label": "Book Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "AccountingBook"
+        },
+        {
+          "name": "fiscal_period_id",
+          "label": "Fiscal Period Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "FiscalPeriod"
+        },
+        {
+          "name": "source",
+          "label": "Source",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "manual",
+            "invoice",
+            "bill",
+            "payment",
+            "payroll",
+            "fx_revaluation",
+            "depreciation",
+            "system"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "posted",
+            "reversed"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "memo",
+          "label": "Memo",
+          "input": "textarea",
+          "required": false
+        },
+        {
+          "name": "posted_at",
+          "label": "Posted At",
+          "input": "datetime",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "entry_number",
+        "entry_date",
+        "book_id",
+        "fiscal_period_id",
+        "state"
+      ],
+      "sortableFields": [
+        "entry_number",
+        "entry_date",
+        "source",
+        "state"
+      ],
+      "filterableFields": [
+        "entry_number",
+        "entry_date",
+        "source",
+        "state",
+        "book_id",
+        "fiscal_period_id"
+      ],
+      "searchableFields": [
+        "entry_number"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "post",
+          "label": "Post",
+          "operationId": "journalEntry.post",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "posted",
+          "roles": [
+            "erp_admin",
+            "controller"
+          ]
+        },
+        {
+          "name": "reverse",
+          "label": "Reverse",
+          "operationId": "journalEntry.reverse",
+          "stateField": "state",
+          "from": [
+            "posted"
+          ],
+          "to": "reversed",
+          "roles": [
+            "erp_admin",
+            "controller"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "journalEntry.list",
+        "read": "journalEntry.read",
+        "create": "journalEntry.create",
+        "update": "journalEntry.update",
+        "delete": "journalEntry.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "JournalLine",
+      "slug": "journal-lines",
+      "label": "Journal Lines",
+      "singular": "Journal Line",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin",
+          "controller"
+        ]
+      },
+      "fields": [
+        {
+          "name": "journal_entry_id",
+          "label": "Journal Entry Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "JournalEntry"
+        },
+        {
+          "name": "ledger_account_id",
+          "label": "Ledger Account Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "LedgerAccount"
+        },
+        {
+          "name": "cost_center_id",
+          "label": "Cost Center Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "CostCenter"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "debit",
+          "label": "Debit",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "credit",
+          "label": "Credit",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "fx_rate",
+          "label": "Fx Rate",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "functional_debit",
+          "label": "Functional Debit",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "functional_credit",
+          "label": "Functional Credit",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "journal_entry_id",
+        "ledger_account_id",
+        "cost_center_id"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "journal_entry_id",
+        "ledger_account_id",
+        "cost_center_id"
+      ],
+      "searchableFields": [
+        "description",
+        "currency"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "journalLine.list",
+        "read": "journalLine.read",
+        "create": "journalLine.create",
+        "update": "journalLine.update",
+        "delete": "journalLine.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Lead",
+      "slug": "leads",
+      "label": "Leads",
+      "singular": "Lead",
+      "module": "Sales & CRM",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "update": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "full_name",
+          "label": "Full Name",
+          "input": "text",
+          "required": true,
+          "classification": "pii"
+        },
+        {
+          "name": "company",
+          "label": "Company",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "email",
+          "label": "Email",
+          "input": "email",
+          "required": false,
+          "classification": "pii"
+        },
+        {
+          "name": "phone",
+          "label": "Phone",
+          "input": "text",
+          "required": false,
+          "classification": "pii"
+        },
+        {
+          "name": "source",
+          "label": "Source",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "web",
+            "referral",
+            "event",
+            "outbound",
+            "partner",
+            "other"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "new",
+            "working",
+            "qualified",
+            "converted",
+            "disqualified"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "owner_id",
+          "label": "Owner Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "estimated_value",
+          "label": "Estimated Value",
+          "input": "number",
+          "required": false,
+          "classification": "commercial_sensitive"
+        },
+        {
+          "name": "notes",
+          "label": "Notes",
+          "input": "textarea",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "email",
+        "state",
+        "owner_id"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "owner_id"
+      ],
+      "searchableFields": [
+        "full_name",
+        "company",
+        "email",
+        "phone",
+        "notes"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "start_working",
+          "label": "Start Working",
+          "operationId": "lead.start_working",
+          "stateField": "state",
+          "from": [
+            "new"
+          ],
+          "to": "working",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "qualify",
+          "label": "Qualify",
+          "operationId": "lead.qualify",
+          "stateField": "state",
+          "from": [
+            "working"
+          ],
+          "to": "qualified",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "convert",
+          "label": "Convert",
+          "operationId": "lead.convert",
+          "stateField": "state",
+          "from": [
+            "qualified"
+          ],
+          "to": "converted",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "disqualify",
+          "label": "Disqualify",
+          "operationId": "lead.disqualify",
+          "stateField": "state",
+          "from": [
+            "new",
+            "working",
+            "qualified"
+          ],
+          "to": "disqualified",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "lead.list",
+        "read": "lead.read",
+        "create": "lead.create",
+        "update": "lead.update",
+        "delete": "lead.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "LeaveRequest",
+      "slug": "leave-requests",
+      "label": "Leave Requests",
+      "singular": "Leave Request",
+      "module": "Human Resources",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "hr_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "hr_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "hr_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "hr_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "request_number",
+          "label": "Request Number",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "employee_id",
+          "label": "Employee Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "leave_type",
+          "label": "Leave Type",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "annual",
+            "sick",
+            "unpaid",
+            "parental",
+            "bereavement",
+            "study"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "start_date",
+          "label": "Start Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "end_date",
+          "label": "End Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "days",
+          "label": "Days",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "submitted",
+            "approved",
+            "rejected",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "reason",
+          "label": "Reason",
+          "input": "textarea",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "request_number",
+        "employee_id",
+        "start_date",
+        "end_date",
+        "state"
+      ],
+      "sortableFields": [
+        "request_number",
+        "employee_id",
+        "leave_type",
+        "start_date",
+        "end_date",
+        "state"
+      ],
+      "filterableFields": [
+        "request_number",
+        "employee_id",
+        "leave_type",
+        "start_date",
+        "end_date",
+        "state"
+      ],
+      "searchableFields": [
+        "request_number"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "submit",
+          "label": "Submit",
+          "operationId": "leaveRequest.submit",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "submitted",
+          "roles": [
+            "erp_admin",
+            "hr_manager"
+          ]
+        },
+        {
+          "name": "approve",
+          "label": "Approve",
+          "operationId": "leaveRequest.approve",
+          "stateField": "state",
+          "from": [
+            "submitted"
+          ],
+          "to": "approved",
+          "roles": [
+            "erp_admin",
+            "hr_manager"
+          ]
+        },
+        {
+          "name": "reject",
+          "label": "Reject",
+          "operationId": "leaveRequest.reject",
+          "stateField": "state",
+          "from": [
+            "submitted"
+          ],
+          "to": "rejected",
+          "roles": [
+            "erp_admin",
+            "hr_manager"
+          ]
+        },
+        {
+          "name": "cancel",
+          "label": "Cancel",
+          "operationId": "leaveRequest.cancel",
+          "stateField": "state",
+          "from": [
+            "draft",
+            "submitted"
+          ],
+          "to": "cancelled",
+          "roles": [
+            "erp_admin",
+            "hr_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "leaveRequest.list",
+        "read": "leaveRequest.read",
+        "create": "leaveRequest.create",
+        "update": "leaveRequest.update",
+        "delete": "leaveRequest.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "LedgerAccount",
+      "slug": "ledger-accounts",
+      "label": "Ledger Accounts",
+      "singular": "Ledger Account",
+      "module": "Accounting & GL",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "account_code",
+          "label": "Account Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "account_type",
+          "label": "Account Type",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "asset",
+            "liability",
+            "equity",
+            "revenue",
+            "expense"
+          ]
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "is_postable",
+          "label": "Is Postable",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "active",
+            "archived"
+          ],
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "account_code",
+        "name",
+        "status"
+      ],
+      "sortableFields": [
+        "account_code",
+        "name",
+        "account_type",
+        "status"
+      ],
+      "filterableFields": [
+        "account_code",
+        "name",
+        "account_type",
+        "status"
+      ],
+      "searchableFields": [
+        "account_code",
         "name"
       ],
       "stateField": null,
-      "transitions": []
+      "transitions": [],
+      "operationIds": {
+        "list": "ledgerAccount.list",
+        "read": "ledgerAccount.read",
+        "create": "ledgerAccount.create",
+        "update": "ledgerAccount.update",
+        "delete": "ledgerAccount.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "MaintenanceOrder",
+      "slug": "maintenance-orders",
+      "label": "Maintenance Orders",
+      "singular": "Maintenance Order",
+      "module": "Assets & Maintenance",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "asset_manager",
+          "controller"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "asset_manager",
+          "controller"
+        ],
+        "create": [
+          "erp_admin",
+          "asset_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "asset_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "mo_number",
+          "label": "Mo Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "fixed_asset_id",
+          "label": "Fixed Asset Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "FixedAsset"
+        },
+        {
+          "name": "assignee_id",
+          "label": "Assignee Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "kind",
+          "label": "Kind",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "preventive",
+            "corrective",
+            "inspection",
+            "calibration"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "requested",
+            "scheduled",
+            "in_progress",
+            "completed",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "scheduled_date",
+          "label": "Scheduled Date",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "completed_at",
+          "label": "Completed At",
+          "input": "datetime",
+          "required": false
+        },
+        {
+          "name": "cost",
+          "label": "Cost",
+          "input": "number",
+          "required": false,
+          "classification": "commercial_sensitive"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "input": "textarea",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "mo_number",
+        "fixed_asset_id",
+        "assignee_id",
+        "state",
+        "scheduled_date"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "fixed_asset_id",
+        "assignee_id"
+      ],
+      "searchableFields": [
+        "mo_number",
+        "description"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "schedule",
+          "label": "Schedule",
+          "operationId": "maintenanceOrder.schedule",
+          "stateField": "state",
+          "from": [
+            "requested"
+          ],
+          "to": "scheduled",
+          "roles": [
+            "erp_admin",
+            "asset_manager"
+          ]
+        },
+        {
+          "name": "start",
+          "label": "Start",
+          "operationId": "maintenanceOrder.start",
+          "stateField": "state",
+          "from": [
+            "scheduled"
+          ],
+          "to": "in_progress",
+          "roles": [
+            "erp_admin",
+            "asset_manager"
+          ]
+        },
+        {
+          "name": "complete",
+          "label": "Complete",
+          "operationId": "maintenanceOrder.complete",
+          "stateField": "state",
+          "from": [
+            "in_progress"
+          ],
+          "to": "completed",
+          "roles": [
+            "erp_admin",
+            "asset_manager"
+          ]
+        },
+        {
+          "name": "cancel",
+          "label": "Cancel",
+          "operationId": "maintenanceOrder.cancel",
+          "stateField": "state",
+          "from": [
+            "requested",
+            "scheduled",
+            "in_progress"
+          ],
+          "to": "cancelled",
+          "roles": [
+            "erp_admin",
+            "asset_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "maintenanceOrder.list",
+        "read": "maintenanceOrder.read",
+        "create": "maintenanceOrder.create",
+        "update": "maintenanceOrder.update",
+        "delete": "maintenanceOrder.delete"
+      },
+      "associations": []
     },
     {
       "name": "Opportunity",
@@ -117,16 +3780,26 @@
       "access": {
         "list": [
           "erp_admin",
-          "sales_rep"
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
         ],
         "read": [
           "erp_admin",
-          "sales_rep"
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
         ],
         "create": [
+          "erp_admin",
+          "sales_manager",
           "sales_rep"
         ],
         "update": [
+          "erp_admin",
+          "sales_manager",
           "sales_rep"
         ],
         "delete": [
@@ -142,17 +3815,39 @@
         },
         {
           "name": "account_id",
-          "label": "Account",
+          "label": "Account Id",
           "input": "reference",
           "required": true,
           "referenceTarget": "Account"
+        },
+        {
+          "name": "owner_id",
+          "label": "Owner Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Employee"
         },
         {
           "name": "amount",
           "label": "Amount",
           "input": "number",
           "required": true,
-          "classification": "commercial_sensitive"
+          "classification": "commercial_sensitive",
+          "defaulted": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "probability_pct",
+          "label": "Probability Pct",
+          "input": "number",
+          "required": true,
+          "defaulted": true
         },
         {
           "name": "stage",
@@ -170,35 +3865,84 @@
           "defaulted": true
         },
         {
-          "name": "updated_at",
-          "label": "Updated At",
-          "input": "datetime",
-          "required": true,
-          "defaulted": true
+          "name": "expected_close_date",
+          "label": "Expected Close Date",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "lost_reason",
+          "label": "Lost Reason",
+          "input": "text",
+          "required": false
         }
       ],
       "listColumns": [
         "name",
-        "stage",
-        "amount"
-      ],
-      "sortableFields": [
-        "name",
-        "stage",
+        "account_id",
+        "owner_id",
         "amount",
-        "updated_at"
+        "stage",
+        "expected_close_date"
       ],
+      "sortableFields": [],
       "filterableFields": [
         "stage",
         "account_id",
-        "amount",
-        "updated_at"
+        "owner_id"
       ],
       "searchableFields": [
-        "name"
+        "name",
+        "currency",
+        "lost_reason"
       ],
       "stateField": "stage",
       "transitions": [
+        {
+          "name": "advance_to_qualification",
+          "label": "Advance To Qualification",
+          "operationId": "opportunity.advance_to_qualification",
+          "stateField": "stage",
+          "from": [
+            "prospecting"
+          ],
+          "to": "qualification",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "advance_to_proposal",
+          "label": "Advance To Proposal",
+          "operationId": "opportunity.advance_to_proposal",
+          "stateField": "stage",
+          "from": [
+            "qualification"
+          ],
+          "to": "proposal",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "advance_to_negotiation",
+          "label": "Advance To Negotiation",
+          "operationId": "opportunity.advance_to_negotiation",
+          "stateField": "stage",
+          "from": [
+            "proposal"
+          ],
+          "to": "negotiation",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
         {
           "name": "win",
           "label": "Win",
@@ -209,6 +3953,8 @@
           ],
           "to": "won",
           "roles": [
+            "erp_admin",
+            "sales_manager",
             "sales_rep"
           ]
         },
@@ -225,10 +3971,3820 @@
           ],
           "to": "lost",
           "roles": [
+            "erp_admin",
+            "sales_manager",
             "sales_rep"
           ]
         }
-      ]
+      ],
+      "operationIds": {
+        "list": "opportunity.list",
+        "read": "opportunity.read",
+        "create": "opportunity.create",
+        "update": "opportunity.update",
+        "delete": "opportunity.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Payment",
+      "slug": "payments",
+      "label": "Payments",
+      "singular": "Payment",
+      "module": "Finance",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "erp_accountant",
+          "ap_clerk"
+        ],
+        "create": [
+          "erp_admin",
+          "ap_clerk",
+          "erp_accountant"
+        ],
+        "update": [
+          "erp_admin",
+          "ap_clerk",
+          "erp_accountant"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "payment_number",
+          "label": "Payment Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "direction",
+          "label": "Direction",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "inbound",
+            "outbound"
+          ]
+        },
+        {
+          "name": "method",
+          "label": "Method",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "bank_transfer",
+            "card",
+            "cash",
+            "cheque",
+            "ach",
+            "wire"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "account_id",
+          "label": "Account Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Account"
+        },
+        {
+          "name": "invoice_id",
+          "label": "Invoice Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Invoice"
+        },
+        {
+          "name": "bill_id",
+          "label": "Bill Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Bill"
+        },
+        {
+          "name": "amount",
+          "label": "Amount",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "cash_amount",
+          "label": "Cash Amount",
+          "input": "number",
+          "required": false
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "pending",
+            "completed",
+            "failed",
+            "refunded"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "paid_at",
+          "label": "Paid At",
+          "input": "datetime",
+          "required": false
+        },
+        {
+          "name": "reference",
+          "label": "Reference",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "bank_reference",
+          "label": "Bank Reference",
+          "input": "text",
+          "required": false,
+          "classification": "commercial_sensitive"
+        }
+      ],
+      "listColumns": [
+        "payment_number",
+        "account_id",
+        "invoice_id",
+        "bill_id",
+        "amount",
+        "cash_amount"
+      ],
+      "sortableFields": [
+        "payment_number",
+        "direction",
+        "method",
+        "amount",
+        "currency",
+        "state"
+      ],
+      "filterableFields": [
+        "payment_number",
+        "direction",
+        "method",
+        "amount",
+        "currency",
+        "state",
+        "account_id",
+        "invoice_id",
+        "bill_id"
+      ],
+      "searchableFields": [
+        "payment_number",
+        "currency"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "submit",
+          "label": "Submit",
+          "operationId": "payment.submit",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "pending",
+          "roles": [
+            "erp_admin",
+            "ap_clerk",
+            "erp_accountant"
+          ]
+        },
+        {
+          "name": "complete",
+          "label": "Complete",
+          "operationId": "payment.complete",
+          "stateField": "state",
+          "from": [
+            "pending"
+          ],
+          "to": "completed",
+          "roles": [
+            "erp_admin",
+            "ap_clerk",
+            "erp_accountant"
+          ]
+        },
+        {
+          "name": "fail",
+          "label": "Fail",
+          "operationId": "payment.fail",
+          "stateField": "state",
+          "from": [
+            "pending"
+          ],
+          "to": "failed",
+          "roles": [
+            "erp_admin"
+          ]
+        },
+        {
+          "name": "refund",
+          "label": "Refund",
+          "operationId": "payment.refund",
+          "stateField": "state",
+          "from": [
+            "completed"
+          ],
+          "to": "refunded",
+          "roles": [
+            "erp_admin",
+            "ap_clerk",
+            "controller"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "payment.list",
+        "read": "payment.read",
+        "create": "payment.create",
+        "update": "payment.update",
+        "delete": "payment.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Position",
+      "slug": "positions",
+      "label": "Positions",
+      "singular": "Position",
+      "module": "Human Resources",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "hr_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "hr_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "hr_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "hr_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "title",
+          "label": "Title",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "department_id",
+          "label": "Department Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Department"
+        },
+        {
+          "name": "job_grade",
+          "label": "Job Grade",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "intern",
+            "junior",
+            "mid",
+            "senior",
+            "lead",
+            "manager",
+            "director",
+            "executive"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "headcount",
+          "label": "Headcount",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "open",
+            "filled",
+            "frozen",
+            "closed"
+          ],
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "title",
+        "department_id",
+        "status"
+      ],
+      "sortableFields": [
+        "code",
+        "title",
+        "department_id",
+        "job_grade",
+        "status"
+      ],
+      "filterableFields": [
+        "code",
+        "title",
+        "department_id",
+        "job_grade",
+        "status"
+      ],
+      "searchableFields": [
+        "code",
+        "title"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "position.list",
+        "read": "position.read",
+        "create": "position.create",
+        "update": "position.update",
+        "delete": "position.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "PriceListItem",
+      "slug": "price-list-items",
+      "label": "Price List Items",
+      "singular": "Price List Item",
+      "module": "Pricing & Tax",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "sales_manager",
+          "procurement_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "sales_manager",
+          "procurement_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "price_list_id",
+          "label": "Price List Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "PriceList"
+        },
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "unit_price",
+          "label": "Unit Price",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "min_quantity",
+          "label": "Min Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "price_list_id",
+        "item_id"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "price_list_id",
+        "item_id"
+      ],
+      "searchableFields": [],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "priceListItem.list",
+        "read": "priceListItem.read",
+        "create": "priceListItem.create",
+        "update": "priceListItem.update",
+        "delete": "priceListItem.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "PriceList",
+      "slug": "price-lists",
+      "label": "Price Lists",
+      "singular": "Price List",
+      "module": "Pricing & Tax",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "sales_manager",
+          "procurement_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "sales_manager",
+          "procurement_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "valid_from",
+          "label": "Valid From",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "valid_to",
+          "label": "Valid To",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "is_active",
+          "label": "Is Active",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "name"
+      ],
+      "sortableFields": [],
+      "filterableFields": [],
+      "searchableFields": [
+        "code",
+        "name",
+        "currency"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "priceList.list",
+        "read": "priceList.read",
+        "create": "priceList.create",
+        "update": "priceList.update",
+        "delete": "priceList.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "ProjectTask",
+      "slug": "project-tasks",
+      "label": "Project Tasks",
+      "singular": "Project Task",
+      "module": "Projects & Services",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "project_manager",
+          "hr_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "project_manager",
+          "hr_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "project_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "project_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "project_id",
+          "label": "Project Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Project"
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "assignee_id",
+          "label": "Assignee Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "todo",
+            "in_progress",
+            "review",
+            "done",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "priority",
+          "label": "Priority",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "low",
+            "medium",
+            "high",
+            "urgent"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "due_date",
+          "label": "Due Date",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "estimated_hours",
+          "label": "Estimated Hours",
+          "input": "number",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "project_id",
+        "name",
+        "assignee_id",
+        "state",
+        "due_date"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "project_id",
+        "assignee_id"
+      ],
+      "searchableFields": [
+        "name"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "start",
+          "label": "Start",
+          "operationId": "projectTask.start",
+          "stateField": "state",
+          "from": [
+            "todo"
+          ],
+          "to": "in_progress",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "submit_review",
+          "label": "Submit Review",
+          "operationId": "projectTask.submit_review",
+          "stateField": "state",
+          "from": [
+            "in_progress"
+          ],
+          "to": "review",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "complete",
+          "label": "Complete",
+          "operationId": "projectTask.complete",
+          "stateField": "state",
+          "from": [
+            "review"
+          ],
+          "to": "done",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "cancel",
+          "label": "Cancel",
+          "operationId": "projectTask.cancel",
+          "stateField": "state",
+          "from": [
+            "todo",
+            "in_progress",
+            "review"
+          ],
+          "to": "cancelled",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "projectTask.list",
+        "read": "projectTask.read",
+        "create": "projectTask.create",
+        "update": "projectTask.update",
+        "delete": "projectTask.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Project",
+      "slug": "projects",
+      "label": "Projects",
+      "singular": "Project",
+      "module": "Projects & Services",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "project_manager",
+          "hr_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "project_manager",
+          "hr_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "project_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "project_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "project_code",
+          "label": "Project Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "account_id",
+          "label": "Account Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Account"
+        },
+        {
+          "name": "manager_id",
+          "label": "Manager Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "planning",
+            "active",
+            "on_hold",
+            "completed",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "start_date",
+          "label": "Start Date",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "end_date",
+          "label": "End Date",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "budget",
+          "label": "Budget",
+          "input": "number",
+          "required": false,
+          "classification": "commercial_sensitive"
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "project_code",
+        "name",
+        "account_id",
+        "manager_id",
+        "state",
+        "start_date"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "account_id",
+        "manager_id"
+      ],
+      "searchableFields": [
+        "project_code",
+        "name",
+        "currency"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "activate",
+          "label": "Activate",
+          "operationId": "project.activate",
+          "stateField": "state",
+          "from": [
+            "planning"
+          ],
+          "to": "active",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "hold",
+          "label": "Hold",
+          "operationId": "project.hold",
+          "stateField": "state",
+          "from": [
+            "active"
+          ],
+          "to": "on_hold",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "resume",
+          "label": "Resume",
+          "operationId": "project.resume",
+          "stateField": "state",
+          "from": [
+            "on_hold"
+          ],
+          "to": "active",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "complete",
+          "label": "Complete",
+          "operationId": "project.complete",
+          "stateField": "state",
+          "from": [
+            "active"
+          ],
+          "to": "completed",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "cancel",
+          "label": "Cancel",
+          "operationId": "project.cancel",
+          "stateField": "state",
+          "from": [
+            "planning",
+            "active",
+            "on_hold"
+          ],
+          "to": "cancelled",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "project.list",
+        "read": "project.read",
+        "create": "project.create",
+        "update": "project.update",
+        "delete": "project.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "PurchaseOrderLine",
+      "slug": "purchase-order-lines",
+      "label": "Purchase Order Lines",
+      "singular": "Purchase Order Line",
+      "module": "Procurement",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "procurement_manager",
+          "ap_clerk",
+          "inventory_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "procurement_manager",
+          "ap_clerk",
+          "inventory_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "procurement_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "procurement_manager"
+        ],
+        "delete": [
+          "erp_admin",
+          "procurement_manager"
+        ]
+      },
+      "fields": [
+        {
+          "name": "purchase_order_id",
+          "label": "Purchase Order Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "PurchaseOrder"
+        },
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "quantity",
+          "label": "Quantity",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "unit_price",
+          "label": "Unit Price",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "received_quantity",
+          "label": "Received Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "line_total",
+          "label": "Line Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "purchase_order_id",
+        "item_id",
+        "line_total"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "purchase_order_id",
+        "item_id"
+      ],
+      "searchableFields": [
+        "description"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "purchaseOrderLine.list",
+        "read": "purchaseOrderLine.read",
+        "create": "purchaseOrderLine.create",
+        "update": "purchaseOrderLine.update",
+        "delete": "purchaseOrderLine.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "PurchaseOrder",
+      "slug": "purchase-orders",
+      "label": "Purchase Orders",
+      "singular": "Purchase Order",
+      "module": "Procurement",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "procurement_manager",
+          "ap_clerk",
+          "inventory_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "procurement_manager",
+          "ap_clerk",
+          "inventory_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "procurement_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "procurement_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "po_number",
+          "label": "Po Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "vendor_id",
+          "label": "Vendor Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Vendor"
+        },
+        {
+          "name": "warehouse_id",
+          "label": "Warehouse Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Warehouse"
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "submitted",
+            "approved",
+            "received",
+            "closed",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "order_date",
+          "label": "Order Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "expected_date",
+          "label": "Expected Date",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "subtotal",
+          "label": "Subtotal",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "tax_total",
+          "label": "Tax Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "total",
+          "label": "Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "notes",
+          "label": "Notes",
+          "input": "textarea",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "po_number",
+        "vendor_id",
+        "warehouse_id",
+        "state",
+        "order_date",
+        "expected_date"
+      ],
+      "sortableFields": [
+        "po_number",
+        "vendor_id",
+        "state",
+        "order_date",
+        "total",
+        "currency"
+      ],
+      "filterableFields": [
+        "po_number",
+        "vendor_id",
+        "state",
+        "order_date",
+        "total",
+        "currency",
+        "warehouse_id"
+      ],
+      "searchableFields": [
+        "po_number",
+        "currency"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "submit",
+          "label": "Submit",
+          "operationId": "purchaseOrder.submit",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "submitted",
+          "roles": [
+            "erp_admin",
+            "procurement_manager"
+          ]
+        },
+        {
+          "name": "approve",
+          "label": "Approve",
+          "operationId": "purchaseOrder.approve",
+          "stateField": "state",
+          "from": [
+            "submitted"
+          ],
+          "to": "approved",
+          "roles": [
+            "erp_admin",
+            "procurement_manager"
+          ]
+        },
+        {
+          "name": "receive",
+          "label": "Receive",
+          "operationId": "purchaseOrder.receive",
+          "stateField": "state",
+          "from": [
+            "approved"
+          ],
+          "to": "received",
+          "roles": [
+            "erp_admin",
+            "procurement_manager",
+            "warehouse_clerk"
+          ]
+        },
+        {
+          "name": "close",
+          "label": "Close",
+          "operationId": "purchaseOrder.close",
+          "stateField": "state",
+          "from": [
+            "received"
+          ],
+          "to": "closed",
+          "roles": [
+            "erp_admin",
+            "procurement_manager"
+          ]
+        },
+        {
+          "name": "cancel",
+          "label": "Cancel",
+          "operationId": "purchaseOrder.cancel",
+          "stateField": "state",
+          "from": [
+            "draft",
+            "submitted",
+            "approved"
+          ],
+          "to": "cancelled",
+          "roles": [
+            "erp_admin",
+            "procurement_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "purchaseOrder.list",
+        "read": "purchaseOrder.read",
+        "create": "purchaseOrder.create",
+        "update": "purchaseOrder.update",
+        "delete": "purchaseOrder.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "QuoteLine",
+      "slug": "quote-lines",
+      "label": "Quote Lines",
+      "singular": "Quote Line",
+      "module": "Sales & CRM",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "update": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "quote_id",
+          "label": "Quote Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Quote"
+        },
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "quantity",
+          "label": "Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "unit_price",
+          "label": "Unit Price",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "discount_pct",
+          "label": "Discount Pct",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "line_total",
+          "label": "Line Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "quote_id",
+        "item_id",
+        "line_total"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "quote_id",
+        "item_id"
+      ],
+      "searchableFields": [
+        "description"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "quoteLine.list",
+        "read": "quoteLine.read",
+        "create": "quoteLine.create",
+        "update": "quoteLine.update",
+        "delete": "quoteLine.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Quote",
+      "slug": "quotes",
+      "label": "Quotes",
+      "singular": "Quote",
+      "module": "Sales & CRM",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "update": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "quote_number",
+          "label": "Quote Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "account_id",
+          "label": "Account Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Account"
+        },
+        {
+          "name": "opportunity_id",
+          "label": "Opportunity Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Opportunity"
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "sent",
+            "accepted",
+            "rejected",
+            "expired"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "valid_until",
+          "label": "Valid Until",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "subtotal",
+          "label": "Subtotal",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "tax_total",
+          "label": "Tax Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "total",
+          "label": "Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "quote_number",
+        "account_id",
+        "opportunity_id",
+        "state",
+        "subtotal",
+        "tax_total"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "account_id",
+        "opportunity_id"
+      ],
+      "searchableFields": [
+        "quote_number",
+        "currency"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "send",
+          "label": "Send",
+          "operationId": "quote.send",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "sent",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "accept",
+          "label": "Accept",
+          "operationId": "quote.accept",
+          "stateField": "state",
+          "from": [
+            "sent"
+          ],
+          "to": "accepted",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "reject",
+          "label": "Reject",
+          "operationId": "quote.reject",
+          "stateField": "state",
+          "from": [
+            "sent"
+          ],
+          "to": "rejected",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "expire",
+          "label": "Expire",
+          "operationId": "quote.expire",
+          "stateField": "state",
+          "from": [
+            "sent"
+          ],
+          "to": "expired",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "quote.list",
+        "read": "quote.read",
+        "create": "quote.create",
+        "update": "quote.update",
+        "delete": "quote.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "SalesOrderLine",
+      "slug": "sales-order-lines",
+      "label": "Sales Order Lines",
+      "singular": "Sales Order Line",
+      "module": "Sales & CRM",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "update": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "sales_order_id",
+          "label": "Sales Order Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "SalesOrder"
+        },
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "quantity",
+          "label": "Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "fulfilled_quantity",
+          "label": "Fulfilled Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "unit_price",
+          "label": "Unit Price",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "line_total",
+          "label": "Line Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "sales_order_id",
+        "item_id",
+        "line_total"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "sales_order_id",
+        "item_id"
+      ],
+      "searchableFields": [
+        "description"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "salesOrderLine.list",
+        "read": "salesOrderLine.read",
+        "create": "salesOrderLine.create",
+        "update": "salesOrderLine.update",
+        "delete": "salesOrderLine.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "SalesOrder",
+      "slug": "sales-orders",
+      "label": "Sales Orders",
+      "singular": "Sales Order",
+      "module": "Sales & CRM",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "update": [
+          "erp_admin",
+          "sales_manager",
+          "sales_rep"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "so_number",
+          "label": "So Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "account_id",
+          "label": "Account Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Account"
+        },
+        {
+          "name": "quote_id",
+          "label": "Quote Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Quote"
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "confirmed",
+            "fulfilled",
+            "invoiced",
+            "closed",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "order_date",
+          "label": "Order Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "requested_delivery_date",
+          "label": "Requested Delivery Date",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "subtotal",
+          "label": "Subtotal",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "tax_total",
+          "label": "Tax Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "total",
+          "label": "Total",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "so_number",
+        "account_id",
+        "quote_id",
+        "state",
+        "order_date",
+        "requested_delivery_date"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "account_id",
+        "quote_id"
+      ],
+      "searchableFields": [
+        "so_number",
+        "currency"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "confirm",
+          "label": "Confirm",
+          "operationId": "salesOrder.confirm",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "confirmed",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "fulfill",
+          "label": "Fulfill",
+          "operationId": "salesOrder.fulfill",
+          "stateField": "state",
+          "from": [
+            "confirmed"
+          ],
+          "to": "fulfilled",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "invoice",
+          "label": "Invoice",
+          "operationId": "salesOrder.invoice",
+          "stateField": "state",
+          "from": [
+            "fulfilled"
+          ],
+          "to": "invoiced",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "close",
+          "label": "Close",
+          "operationId": "salesOrder.close",
+          "stateField": "state",
+          "from": [
+            "invoiced"
+          ],
+          "to": "closed",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        },
+        {
+          "name": "cancel",
+          "label": "Cancel",
+          "operationId": "salesOrder.cancel",
+          "stateField": "state",
+          "from": [
+            "draft",
+            "confirmed"
+          ],
+          "to": "cancelled",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "sales_rep"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "salesOrder.list",
+        "read": "salesOrder.read",
+        "create": "salesOrder.create",
+        "update": "salesOrder.update",
+        "delete": "salesOrder.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Shipment",
+      "slug": "shipments",
+      "label": "Shipments",
+      "singular": "Shipment",
+      "module": "Sales & CRM",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant",
+          "warehouse_clerk",
+          "inventory_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "sales_manager",
+          "sales_rep",
+          "erp_accountant",
+          "warehouse_clerk",
+          "inventory_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "sales_manager",
+          "warehouse_clerk"
+        ],
+        "update": [
+          "erp_admin",
+          "sales_manager",
+          "warehouse_clerk"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "shipment_number",
+          "label": "Shipment Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "sales_order_id",
+          "label": "Sales Order Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "SalesOrder"
+        },
+        {
+          "name": "warehouse_id",
+          "label": "Warehouse Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Warehouse"
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "pending",
+            "picked",
+            "packed",
+            "shipped",
+            "delivered",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "carrier",
+          "label": "Carrier",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "tracking_number",
+          "label": "Tracking Number",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "shipped_at",
+          "label": "Shipped At",
+          "input": "datetime",
+          "required": false
+        },
+        {
+          "name": "delivered_at",
+          "label": "Delivered At",
+          "input": "datetime",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "shipment_number",
+        "sales_order_id",
+        "warehouse_id",
+        "state",
+        "tracking_number"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "sales_order_id",
+        "warehouse_id"
+      ],
+      "searchableFields": [
+        "shipment_number",
+        "carrier",
+        "tracking_number"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "pick",
+          "label": "Pick",
+          "operationId": "shipment.pick",
+          "stateField": "state",
+          "from": [
+            "pending"
+          ],
+          "to": "picked",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "warehouse_clerk"
+          ]
+        },
+        {
+          "name": "pack",
+          "label": "Pack",
+          "operationId": "shipment.pack",
+          "stateField": "state",
+          "from": [
+            "picked"
+          ],
+          "to": "packed",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "warehouse_clerk"
+          ]
+        },
+        {
+          "name": "ship",
+          "label": "Ship",
+          "operationId": "shipment.ship",
+          "stateField": "state",
+          "from": [
+            "packed"
+          ],
+          "to": "shipped",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "warehouse_clerk"
+          ]
+        },
+        {
+          "name": "deliver",
+          "label": "Deliver",
+          "operationId": "shipment.deliver",
+          "stateField": "state",
+          "from": [
+            "shipped"
+          ],
+          "to": "delivered",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "warehouse_clerk"
+          ]
+        },
+        {
+          "name": "cancel",
+          "label": "Cancel",
+          "operationId": "shipment.cancel",
+          "stateField": "state",
+          "from": [
+            "pending",
+            "picked",
+            "packed"
+          ],
+          "to": "cancelled",
+          "roles": [
+            "erp_admin",
+            "sales_manager",
+            "warehouse_clerk"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "shipment.list",
+        "read": "shipment.read",
+        "create": "shipment.create",
+        "update": "shipment.update",
+        "delete": "shipment.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "StockLevel",
+      "slug": "stock-levels",
+      "label": "Stock Levels",
+      "singular": "Stock Level",
+      "module": "Supply Chain & Inventory",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "inventory_manager",
+          "warehouse_clerk",
+          "procurement_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "inventory_manager",
+          "warehouse_clerk",
+          "procurement_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "inventory_manager",
+          "warehouse_clerk"
+        ],
+        "update": [
+          "erp_admin",
+          "inventory_manager",
+          "warehouse_clerk"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "warehouse_id",
+          "label": "Warehouse Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Warehouse"
+        },
+        {
+          "name": "quantity_on_hand",
+          "label": "Quantity On Hand",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "quantity_reserved",
+          "label": "Quantity Reserved",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "quantity_incoming",
+          "label": "Quantity Incoming",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "bin_location",
+          "label": "Bin Location",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "last_counted_at",
+          "label": "Last Counted At",
+          "input": "datetime",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "item_id",
+        "warehouse_id"
+      ],
+      "sortableFields": [
+        "item_id",
+        "warehouse_id",
+        "quantity_on_hand",
+        "quantity_reserved",
+        "quantity_incoming",
+        "bin_location"
+      ],
+      "filterableFields": [
+        "item_id",
+        "warehouse_id",
+        "quantity_on_hand",
+        "quantity_reserved",
+        "quantity_incoming",
+        "bin_location"
+      ],
+      "searchableFields": [
+        "bin_location"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "stockLevel.list",
+        "read": "stockLevel.read",
+        "create": "stockLevel.create",
+        "update": "stockLevel.update",
+        "delete": "stockLevel.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "StockMovement",
+      "slug": "stock-movements",
+      "label": "Stock Movements",
+      "singular": "Stock Movement",
+      "module": "Supply Chain & Inventory",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "inventory_manager",
+          "warehouse_clerk",
+          "procurement_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "inventory_manager",
+          "warehouse_clerk",
+          "procurement_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "inventory_manager",
+          "warehouse_clerk"
+        ],
+        "update": [
+          "erp_admin",
+          "inventory_manager",
+          "warehouse_clerk"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "warehouse_id",
+          "label": "Warehouse Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Warehouse"
+        },
+        {
+          "name": "movement_type",
+          "label": "Movement Type",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "receipt",
+            "issue",
+            "transfer_in",
+            "transfer_out",
+            "adjustment",
+            "return"
+          ]
+        },
+        {
+          "name": "quantity",
+          "label": "Quantity",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "reference",
+          "label": "Reference",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "reason",
+          "label": "Reason",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "occurred_at",
+          "label": "Occurred At",
+          "input": "datetime",
+          "required": true
+        }
+      ],
+      "listColumns": [
+        "item_id",
+        "warehouse_id"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "item_id",
+        "warehouse_id"
+      ],
+      "searchableFields": [
+        "reference",
+        "reason"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "stockMovement.list",
+        "read": "stockMovement.read",
+        "create": "stockMovement.create",
+        "update": "stockMovement.update",
+        "delete": "stockMovement.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "TaxCode",
+      "slug": "tax-codes",
+      "label": "Tax Codes",
+      "singular": "Tax Code",
+      "module": "Pricing & Tax",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "sales_manager",
+          "procurement_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "sales_manager",
+          "procurement_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "controller"
+        ],
+        "update": [
+          "erp_admin",
+          "controller"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "rate_pct",
+          "label": "Rate Pct",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "kind",
+          "label": "Kind",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "sales",
+            "purchase",
+            "vat",
+            "gst",
+            "withholding",
+            "exempt"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "jurisdiction",
+          "label": "Jurisdiction",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "gl_account_code",
+          "label": "Gl Account Code",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "is_active",
+          "label": "Is Active",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "name",
+        "gl_account_code"
+      ],
+      "sortableFields": [],
+      "filterableFields": [],
+      "searchableFields": [
+        "code",
+        "name",
+        "jurisdiction",
+        "gl_account_code"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "taxCode.list",
+        "read": "taxCode.read",
+        "create": "taxCode.create",
+        "update": "taxCode.update",
+        "delete": "taxCode.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "TaxJurisdiction",
+      "slug": "tax-jurisdictions",
+      "label": "Tax Jurisdictions",
+      "singular": "Tax Jurisdiction",
+      "module": "Pricing & Tax",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "tax_manager",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "tax_manager",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller",
+          "tax_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "controller",
+          "tax_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "country",
+          "label": "Country",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "region",
+          "label": "Region",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "tax_regime",
+          "label": "Tax Regime",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "vat",
+            "gst",
+            "sales_tax",
+            "consumption_tax",
+            "none"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "registration_number",
+          "label": "Registration Number",
+          "input": "text",
+          "required": false,
+          "classification": "commercial_sensitive"
+        },
+        {
+          "name": "filing_currency",
+          "label": "Filing Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "is_active",
+          "label": "Is Active",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "name",
+        "registration_number"
+      ],
+      "sortableFields": [],
+      "filterableFields": [],
+      "searchableFields": [
+        "code",
+        "name",
+        "region",
+        "registration_number",
+        "filing_currency"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "taxJurisdiction.list",
+        "read": "taxJurisdiction.read",
+        "create": "taxJurisdiction.create",
+        "update": "taxJurisdiction.update",
+        "delete": "taxJurisdiction.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "TaxReturn",
+      "slug": "tax-returns",
+      "label": "Tax Returns",
+      "singular": "Tax Return",
+      "module": "Pricing & Tax",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "tax_manager",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "tax_manager",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller",
+          "tax_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "controller",
+          "tax_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "return_number",
+          "label": "Return Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "jurisdiction_id",
+          "label": "Jurisdiction Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "TaxJurisdiction"
+        },
+        {
+          "name": "fiscal_period_id",
+          "label": "Fiscal Period Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "FiscalPeriod"
+        },
+        {
+          "name": "return_type",
+          "label": "Return Type",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "vat",
+            "gst",
+            "sales_tax",
+            "withholding",
+            "consumption_tax"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "period_start",
+          "label": "Period Start",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "period_end",
+          "label": "Period End",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "output_tax",
+          "label": "Output Tax",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "input_tax",
+          "label": "Input Tax",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "net_payable",
+          "label": "Net Payable",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "ready",
+            "filed",
+            "paid",
+            "amended"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "filed_at",
+          "label": "Filed At",
+          "input": "datetime",
+          "required": false
+        },
+        {
+          "name": "filing_reference",
+          "label": "Filing Reference",
+          "input": "text",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "return_number",
+        "jurisdiction_id",
+        "fiscal_period_id",
+        "state"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "jurisdiction_id",
+        "fiscal_period_id"
+      ],
+      "searchableFields": [
+        "return_number",
+        "currency",
+        "filing_reference"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "mark_ready",
+          "label": "Mark Ready",
+          "operationId": "taxReturn.mark_ready",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "ready",
+          "roles": [
+            "erp_admin",
+            "controller",
+            "tax_manager"
+          ]
+        },
+        {
+          "name": "file",
+          "label": "File",
+          "operationId": "taxReturn.file",
+          "stateField": "state",
+          "from": [
+            "ready"
+          ],
+          "to": "filed",
+          "roles": [
+            "erp_admin",
+            "controller",
+            "tax_manager"
+          ]
+        },
+        {
+          "name": "mark_paid",
+          "label": "Mark Paid",
+          "operationId": "taxReturn.mark_paid",
+          "stateField": "state",
+          "from": [
+            "filed"
+          ],
+          "to": "paid",
+          "roles": [
+            "erp_admin",
+            "controller",
+            "tax_manager"
+          ]
+        },
+        {
+          "name": "amend",
+          "label": "Amend",
+          "operationId": "taxReturn.amend",
+          "stateField": "state",
+          "from": [
+            "filed"
+          ],
+          "to": "amended",
+          "roles": [
+            "erp_admin",
+            "controller",
+            "tax_manager"
+          ]
+        },
+        {
+          "name": "refile",
+          "label": "Refile",
+          "operationId": "taxReturn.refile",
+          "stateField": "state",
+          "from": [
+            "amended"
+          ],
+          "to": "filed",
+          "roles": [
+            "erp_admin",
+            "controller",
+            "tax_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "taxReturn.list",
+        "read": "taxReturn.read",
+        "create": "taxReturn.create",
+        "update": "taxReturn.update",
+        "delete": "taxReturn.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "TaxRule",
+      "slug": "tax-rules",
+      "label": "Tax Rules",
+      "singular": "Tax Rule",
+      "module": "Pricing & Tax",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "tax_manager",
+          "erp_accountant"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "controller",
+          "tax_manager",
+          "erp_accountant"
+        ],
+        "create": [
+          "erp_admin",
+          "controller",
+          "tax_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "controller",
+          "tax_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "jurisdiction_id",
+          "label": "Jurisdiction Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "TaxJurisdiction"
+        },
+        {
+          "name": "tax_code_id",
+          "label": "Tax Code Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "TaxCode"
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "applies_to",
+          "label": "Applies To",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "sales",
+            "purchase",
+            "both"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "rate_category",
+          "label": "Rate Category",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "standard",
+            "reduced",
+            "super_reduced",
+            "zero",
+            "exempt"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "rate_pct",
+          "label": "Rate Pct",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "is_compound",
+          "label": "Is Compound",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "reverse_charge",
+          "label": "Reverse Charge",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "priority",
+          "label": "Priority",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "effective_from",
+          "label": "Effective From",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "effective_to",
+          "label": "Effective To",
+          "input": "date",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "jurisdiction_id",
+        "tax_code_id",
+        "name"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "jurisdiction_id",
+        "tax_code_id"
+      ],
+      "searchableFields": [
+        "name"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "taxRule.list",
+        "read": "taxRule.read",
+        "create": "taxRule.create",
+        "update": "taxRule.update",
+        "delete": "taxRule.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Timesheet",
+      "slug": "timesheets",
+      "label": "Timesheets",
+      "singular": "Timesheet",
+      "module": "Projects & Services",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "project_manager",
+          "hr_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "project_manager",
+          "hr_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "project_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "project_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "employee_id",
+          "label": "Employee Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Employee"
+        },
+        {
+          "name": "project_id",
+          "label": "Project Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Project"
+        },
+        {
+          "name": "project_task_id",
+          "label": "Project Task Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "ProjectTask"
+        },
+        {
+          "name": "work_date",
+          "label": "Work Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "hours",
+          "label": "Hours",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "billable",
+          "label": "Billable",
+          "input": "boolean",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "submitted",
+            "approved",
+            "rejected"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "notes",
+          "label": "Notes",
+          "input": "textarea",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "employee_id",
+        "project_id",
+        "project_task_id",
+        "work_date",
+        "state"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "employee_id",
+        "project_id",
+        "project_task_id"
+      ],
+      "searchableFields": [
+        "notes"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "submit",
+          "label": "Submit",
+          "operationId": "timesheet.submit",
+          "stateField": "state",
+          "from": [
+            "draft"
+          ],
+          "to": "submitted",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "approve",
+          "label": "Approve",
+          "operationId": "timesheet.approve",
+          "stateField": "state",
+          "from": [
+            "submitted"
+          ],
+          "to": "approved",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        },
+        {
+          "name": "reject",
+          "label": "Reject",
+          "operationId": "timesheet.reject",
+          "stateField": "state",
+          "from": [
+            "submitted"
+          ],
+          "to": "rejected",
+          "roles": [
+            "erp_admin",
+            "project_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "timesheet.list",
+        "read": "timesheet.read",
+        "create": "timesheet.create",
+        "update": "timesheet.update",
+        "delete": "timesheet.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Vendor",
+      "slug": "vendors",
+      "label": "Vendors",
+      "singular": "Vendor",
+      "module": "Procurement",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "procurement_manager",
+          "ap_clerk",
+          "inventory_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "procurement_manager",
+          "ap_clerk",
+          "inventory_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "procurement_manager",
+          "ap_clerk"
+        ],
+        "update": [
+          "erp_admin",
+          "procurement_manager",
+          "ap_clerk"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "vendor_code",
+          "label": "Vendor Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "legal_name",
+          "label": "Legal Name",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "tax_id",
+          "label": "Tax Id",
+          "input": "text",
+          "required": false,
+          "classification": "commercial_sensitive"
+        },
+        {
+          "name": "contact_email",
+          "label": "Contact Email",
+          "input": "email",
+          "required": false,
+          "classification": "pii"
+        },
+        {
+          "name": "contact_phone",
+          "label": "Contact Phone",
+          "input": "text",
+          "required": false,
+          "classification": "pii"
+        },
+        {
+          "name": "country",
+          "label": "Country",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "payment_terms",
+          "label": "Payment Terms",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "net_15",
+            "net_30",
+            "net_45",
+            "net_60",
+            "due_on_receipt",
+            "prepaid"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "prospect",
+            "active",
+            "on_hold",
+            "blacklisted",
+            "inactive"
+          ],
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "vendor_code",
+        "name",
+        "tax_id",
+        "status"
+      ],
+      "sortableFields": [
+        "vendor_code",
+        "name",
+        "status",
+        "payment_terms",
+        "country"
+      ],
+      "filterableFields": [
+        "vendor_code",
+        "name",
+        "status",
+        "payment_terms",
+        "country"
+      ],
+      "searchableFields": [
+        "vendor_code",
+        "name"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "vendor.list",
+        "read": "vendor.read",
+        "create": "vendor.create",
+        "update": "vendor.update",
+        "delete": "vendor.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "Warehouse",
+      "slug": "warehouses",
+      "label": "Warehouses",
+      "singular": "Warehouse",
+      "module": "Supply Chain & Inventory",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "inventory_manager",
+          "warehouse_clerk",
+          "procurement_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "inventory_manager",
+          "warehouse_clerk",
+          "procurement_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "inventory_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "inventory_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "code",
+          "label": "Code",
+          "input": "text",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "input": "text",
+          "required": true
+        },
+        {
+          "name": "warehouse_type",
+          "label": "Warehouse Type",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "distribution",
+            "retail",
+            "transit",
+            "manufacturing",
+            "virtual"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "address_line1",
+          "label": "Address Line1",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "city",
+          "label": "City",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "country",
+          "label": "Country",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "status",
+          "label": "Status",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "active",
+            "inactive",
+            "closed"
+          ],
+          "defaulted": true
+        }
+      ],
+      "listColumns": [
+        "code",
+        "name",
+        "status"
+      ],
+      "sortableFields": [
+        "code",
+        "name",
+        "warehouse_type",
+        "city",
+        "country",
+        "status"
+      ],
+      "filterableFields": [
+        "code",
+        "name",
+        "warehouse_type",
+        "city",
+        "country",
+        "status"
+      ],
+      "searchableFields": [
+        "code",
+        "name",
+        "city"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "warehouse.list",
+        "read": "warehouse.read",
+        "create": "warehouse.create",
+        "update": "warehouse.update",
+        "delete": "warehouse.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "WhtCertificate",
+      "slug": "wht-certificates",
+      "label": "Wht Certificates",
+      "singular": "Wht Certificate",
+      "module": "Finance",
+      "access": {
+        "list": [],
+        "read": [],
+        "create": [],
+        "update": [],
+        "delete": []
+      },
+      "fields": [
+        {
+          "name": "certificate_number",
+          "label": "Certificate Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "invoice_id",
+          "label": "Invoice Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Invoice"
+        },
+        {
+          "name": "account_id",
+          "label": "Account Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Account"
+        },
+        {
+          "name": "certificate_ref",
+          "label": "Certificate Ref",
+          "input": "text",
+          "required": false
+        },
+        {
+          "name": "amount",
+          "label": "Amount",
+          "input": "number",
+          "required": true
+        },
+        {
+          "name": "currency",
+          "label": "Currency",
+          "input": "text",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "issue_date",
+          "label": "Issue Date",
+          "input": "date",
+          "required": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "draft",
+            "confirmed",
+            "void"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "confirmed_at",
+          "label": "Confirmed At",
+          "input": "datetime",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "certificate_number",
+        "invoice_id",
+        "account_id",
+        "amount",
+        "issue_date",
+        "state"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "invoice_id",
+        "account_id"
+      ],
+      "searchableFields": [
+        "certificate_number",
+        "certificate_ref",
+        "currency"
+      ],
+      "stateField": null,
+      "transitions": [],
+      "operationIds": {
+        "list": "whtCertificate.list",
+        "read": "whtCertificate.read",
+        "create": "whtCertificate.create",
+        "update": "whtCertificate.update",
+        "delete": "whtCertificate.delete"
+      },
+      "associations": []
+    },
+    {
+      "name": "WorkOrder",
+      "slug": "work-orders",
+      "label": "Work Orders",
+      "singular": "Work Order",
+      "module": "Manufacturing",
+      "access": {
+        "list": [
+          "erp_admin",
+          "erp_viewer",
+          "production_manager",
+          "inventory_manager"
+        ],
+        "read": [
+          "erp_admin",
+          "erp_viewer",
+          "production_manager",
+          "inventory_manager"
+        ],
+        "create": [
+          "erp_admin",
+          "production_manager"
+        ],
+        "update": [
+          "erp_admin",
+          "production_manager"
+        ],
+        "delete": [
+          "erp_admin"
+        ]
+      },
+      "fields": [
+        {
+          "name": "wo_number",
+          "label": "Wo Number",
+          "input": "text",
+          "required": true,
+          "unique": true,
+          "readOnly": true,
+          "defaulted": true
+        },
+        {
+          "name": "item_id",
+          "label": "Item Id",
+          "input": "reference",
+          "required": true,
+          "referenceTarget": "Item"
+        },
+        {
+          "name": "bom_id",
+          "label": "Bom Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "BillOfMaterials"
+        },
+        {
+          "name": "warehouse_id",
+          "label": "Warehouse Id",
+          "input": "reference",
+          "required": false,
+          "referenceTarget": "Warehouse"
+        },
+        {
+          "name": "quantity",
+          "label": "Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "completed_quantity",
+          "label": "Completed Quantity",
+          "input": "number",
+          "required": true,
+          "defaulted": true
+        },
+        {
+          "name": "state",
+          "label": "State",
+          "input": "select",
+          "required": true,
+          "enumValues": [
+            "planned",
+            "released",
+            "in_progress",
+            "completed",
+            "cancelled"
+          ],
+          "defaulted": true
+        },
+        {
+          "name": "planned_start",
+          "label": "Planned Start",
+          "input": "date",
+          "required": false
+        },
+        {
+          "name": "planned_end",
+          "label": "Planned End",
+          "input": "date",
+          "required": false
+        }
+      ],
+      "listColumns": [
+        "wo_number",
+        "item_id",
+        "bom_id",
+        "warehouse_id",
+        "state"
+      ],
+      "sortableFields": [],
+      "filterableFields": [
+        "state",
+        "item_id",
+        "bom_id",
+        "warehouse_id"
+      ],
+      "searchableFields": [
+        "wo_number"
+      ],
+      "stateField": "state",
+      "transitions": [
+        {
+          "name": "release",
+          "label": "Release",
+          "operationId": "workOrder.release",
+          "stateField": "state",
+          "from": [
+            "planned"
+          ],
+          "to": "released",
+          "roles": [
+            "erp_admin",
+            "production_manager"
+          ]
+        },
+        {
+          "name": "start",
+          "label": "Start",
+          "operationId": "workOrder.start",
+          "stateField": "state",
+          "from": [
+            "released"
+          ],
+          "to": "in_progress",
+          "roles": [
+            "erp_admin",
+            "production_manager"
+          ]
+        },
+        {
+          "name": "complete",
+          "label": "Complete",
+          "operationId": "workOrder.complete",
+          "stateField": "state",
+          "from": [
+            "in_progress"
+          ],
+          "to": "completed",
+          "roles": [
+            "erp_admin",
+            "production_manager"
+          ]
+        },
+        {
+          "name": "cancel",
+          "label": "Cancel",
+          "operationId": "workOrder.cancel",
+          "stateField": "state",
+          "from": [
+            "planned",
+            "released",
+            "in_progress"
+          ],
+          "to": "cancelled",
+          "roles": [
+            "erp_admin",
+            "production_manager"
+          ]
+        }
+      ],
+      "operationIds": {
+        "list": "workOrder.list",
+        "read": "workOrder.read",
+        "create": "workOrder.create",
+        "update": "workOrder.update",
+        "delete": "workOrder.delete"
+      },
+      "associations": []
     }
-  ]
+  ],
+  "roles": [
+    {
+      "name": "erp_accountant",
+      "label": "Accountant",
+      "description": "Creates and sends invoices, marks them paid, reads accounts and contacts."
+    },
+    {
+      "name": "ap_clerk",
+      "label": "Accounts Payable Clerk",
+      "description": "Manages vendor bills and outbound payments."
+    },
+    {
+      "name": "asset_manager",
+      "label": "Asset Manager",
+      "description": "Manages fixed assets and maintenance orders."
+    },
+    {
+      "name": "erp_admin",
+      "label": "ERP Administrator",
+      "description": "Full CRUD across every ERP domain — CRM, inventory, procurement, finance, and HR."
+    },
+    {
+      "name": "controller",
+      "label": "Financial Controller",
+      "description": "Owns the general ledger — ledger accounts, journal entries, and posting."
+    },
+    {
+      "name": "hr_manager",
+      "label": "HR Manager",
+      "description": "Manages departments, positions, employees, and leave requests (incl. PII)."
+    },
+    {
+      "name": "inventory_manager",
+      "label": "Inventory Manager",
+      "description": "Manages items, warehouses, stock levels, and stock movements."
+    },
+    {
+      "name": "procurement_manager",
+      "label": "Procurement Manager",
+      "description": "Manages vendors and purchase orders, approves procurement, posts goods receipts."
+    },
+    {
+      "name": "production_manager",
+      "label": "Production Manager",
+      "description": "Manages bills of materials and work orders on the shop floor."
+    },
+    {
+      "name": "project_manager",
+      "label": "Project Manager",
+      "description": "Manages projects, tasks, and timesheets for services delivery."
+    },
+    {
+      "name": "erp_viewer",
+      "label": "Read-only viewer",
+      "description": "Read-only access for auditors and observers."
+    },
+    {
+      "name": "sales_manager",
+      "label": "Sales Manager",
+      "description": "Owns the sales pipeline — leads, opportunities, quotes, sales orders, and shipments."
+    },
+    {
+      "name": "sales_rep",
+      "label": "Sales Representative",
+      "description": "Works leads, opportunities, and quotes; reads accounts and price lists."
+    },
+    {
+      "name": "tax_manager",
+      "label": "Tax Manager",
+      "description": "Owns indirect-tax configuration and compliance — jurisdictions, country tax rules, and periodic VAT/GST/withholding returns."
+    },
+    {
+      "name": "warehouse_clerk",
+      "label": "Warehouse Clerk",
+      "description": "Records stock movements and goods receipts; reads items and warehouses."
+    }
+  ],
+  "generatedAt": "2026-10-05T02:54:36.877Z",
+  "viewer": {
+    "primaryRole": "erp_admin",
+    "roles": [
+      "erp_admin"
+    ]
+  },
+  "formatting": {}
 }

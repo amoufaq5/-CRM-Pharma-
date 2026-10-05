@@ -40,9 +40,19 @@ export interface AccountMappingInput {
 const MAPPING_COLUMNS =
   "crm_category, erp_ledger_account_code, erp_cost_center_code, is_active, updated_at";
 
-/** The ERP's own limit on both code fields — see `InvalidAccountCodeError`. */
-const CODE_MAX = 32;
-const CATEGORY_MAX = 120;
+/**
+ * The ERP's own limit on both code fields — see `InvalidAccountCodeError`. Measured, not
+ * assumed: `LedgerAccount.account_code` and `CostCenter.code` are both `maxLength: 32` in
+ * the captured schema (`packages/acl/schema/baseline.json`).
+ *
+ * Exported because the API route validated these at 64 and 100 while the store refused
+ * anything over 32 and 120 — both ended in a 422, so nothing was corrupted, but the route
+ * advertised a contract the layer behind it rejected. One number, named once.
+ */
+export const ACCOUNT_CODE_MAX = 32;
+export const EXPENSE_CATEGORY_MAX = 120;
+const CODE_MAX = ACCOUNT_CODE_MAX;
+const CATEGORY_MAX = EXPENSE_CATEGORY_MAX;
 
 function checkedCode(field: string, value: string): string {
   if (value.length === 0 || value.length > CODE_MAX || value.trim() !== value) {

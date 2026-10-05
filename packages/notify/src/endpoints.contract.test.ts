@@ -4,6 +4,7 @@ import { withTenantContext } from "@crm/db";
 import { TENANT_ENDPOINTS as TENANT, testPool } from "@crm/db/testing";
 
 import {
+  ENDPOINT_CHANNELS,
   InvalidEndpointError,
   createEndpoint,
   getEndpoint,
@@ -51,6 +52,7 @@ describe("notification endpoints", () => {
 
   const create = (tx: PoolClient, over: Partial<Parameters<typeof createEndpoint>[2]> = {}) =>
     createEndpoint(tx, TENANT, {
+      channel: "webhook",
       url: "https://hooks.example.test/crm",
       secretEnv: "CRM_TEST_WEBHOOK_SECRET",
       ...over,
@@ -88,10 +90,80 @@ describe("notification endpoints", () => {
     });
   });
 
+  /**
+   * The CHECK still decides; what changed is what the caller is told.
+   *
+   * These two used to assert the raw constraint name, which was honest about what happened
+   * and meant an administrator configuring an endpoint got a 500 with a Postgres string
+   * in it. The refusal is now an `InvalidEndpointError` — a 422 — and the assertion is on
+   * the sentence, because the sentence is the thing that has to be right.
+   */
   it("refuses a plaintext URL that is not loopback", async () => {
     await inTenant(async (tx) => {
       const err = await refuses(tx, () => create(tx, { url: "http://hooks.example.test/crm" }));
-      expect(err.message).toMatch(/notification_endpoint_url_check|check constraint/);
+      expect(err).toBeInstanceOf(InvalidEndpointError);
+      expect(err.message).toMatch(/does not travel in the clear/);
+    });
+  });
+
+  it("refuses an https url on an email endpoint, and a mailbox on a webhook", async () => {
+    // The url rule is per-channel (0029), not a flat disjunction: a webhook pointed at a
+    // mailbox and an email endpoint pointed at an HTTPS host are both configurations with
+    // no sender and no error, which is what the paired CHECK exists to prevent.
+    await inTenant(async (tx) => {
+      const asEmail = await refuses(tx, () =>
+        create(tx, { channel: "email", url: "https://hooks.example.test/crm" }),
+      );
+      expect(asEmail).toBeInstanceOf(InvalidEndpointError);
+      expect(asEmail.message).toMatch(/single mailto: mailbox/);
+
+      const asWebhook = await refuses(tx, () => create(tx, { url: "mailto:ops@example.test" }));
+      expect(asWebhook).toBeInstanceOf(InvalidEndpointError);
+      expect(asWebhook.message).toMatch(/must be https:\/\//);
+    });
+  });
+
+  it("stores an email endpoint, which nothing above SQL could name before", async () => {
+    await inTenant(async (tx) => {
+      const ep = await create(tx, {
+        channel: "email",
+        url: "mailto:ops@example.test",
+        secretEnv: "CRM_SMTP_PASSWORD",
+      });
+      expect(ep.channel).toBe("email");
+      expect(ep.url).toBe("mailto:ops@example.test");
+    });
+  });
+
+  it("refuses a channel the CHECK does not admit, before the INSERT", async () => {
+    // In TypeScript as well as in SQL, and the TypeScript answer first, so the refusal
+    // names the legal values instead of surfacing a constraint violation from the bottom
+    // of the stack. `ENDPOINT_CHANNELS` is compared to the CHECK below.
+    await inTenant(async (tx) => {
+      const err = await refuses(tx, () =>
+        create(tx, { channel: "carrier_pigeon" as (typeof ENDPOINT_CHANNELS)[number] }),
+      );
+      expect(err).toBeInstanceOf(InvalidEndpointError);
+      expect(err.message).toMatch(/webhook, email/);
+    });
+  });
+
+  /**
+   * The TypeScript list and the CHECK, compared against `pg_constraint`.
+   *
+   * `ENDPOINT_CHANNELS` is a copy of 0029's `notification_endpoint_channel_check`, and a
+   * copy that can drift is worse than no copy: the route would advertise a channel the
+   * database refuses, or refuse one it accepts.
+   */
+  it("keeps ENDPOINT_CHANNELS and the CHECK in agreement", async () => {
+    await inTenant(async (tx) => {
+      const { rows } = await tx.query<{ def: string }>(
+        `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+          WHERE conname = 'notification_endpoint_channel_check'`,
+      );
+      const def = rows[0]!.def;
+      const inCheck = [...def.matchAll(/'([a-z_]+)'::text/g)].map((m) => m[1]!).sort();
+      expect(inCheck).toEqual([...ENDPOINT_CHANNELS].sort());
     });
   });
 
@@ -105,7 +177,8 @@ describe("notification endpoints", () => {
   it("refuses a secret_env that is not an environment variable name", async () => {
     await inTenant(async (tx) => {
       const err = await refuses(tx, () => create(tx, { secretEnv: "s3cr3t-value" }));
-      expect(err.message).toMatch(/notification_endpoint_secret_env_check|check constraint/);
+      expect(err).toBeInstanceOf(InvalidEndpointError);
+      expect(err.message).toMatch(/NAME of an environment variable/);
     });
   });
 

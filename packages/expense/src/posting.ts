@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg";
+import type { Expense } from "@crm/acl";
 import { enqueueOutbox } from "@crm/relay";
 
 /**
@@ -12,14 +13,16 @@ import { enqueueOutbox } from "@crm/relay";
  * and `ErpClient` resolves the slug from the tenant's own `/v1/meta/schema` at dispatch
  * (README rule 3).
  *
- * FIELD NAMES come from `pack-erp-core/src/entities-finance.ts` (`EXPENSE_ENTITY`) in the
- * ERP repo, cross-read against `docs/ERP_INTEGRATION_REPORT.md` "Expense claims". They
- * are NOT in `packages/acl/schema/baseline.json`, which captured only `Item` and
- * `Opportunity`, so `packages/acl/src/generated/erp.ts` has no `Expense` interface to
- * type this against — see the report accompanying this package. The same is true of
- * `StockMovement` in `packages/sample/src/erp-mirror.ts`, which is the precedent this
- * follows: an entity the baseline does not cover is named, never pathed, and a tenant
- * whose served manifest lacks it fails closed when `slugFor` cannot answer.
+ * FIELD NAMES are the GENERATED ones. `packages/acl/schema/baseline.json` is now a
+ * capture of a real `operate-server` serving `pack-erp-core` — all 51 entities, not the
+ * two the first hand-written fixture had — so `packages/acl/src/generated/erp.ts` carries
+ * an `Expense` interface and the create payload below is typed against it. A field this
+ * file misspells, or a `category` outside the seven the ERP admits, is now a compile
+ * error rather than a dead letter three weeks later.
+ *
+ * The entity NAME is still all the outbox carries, and nothing here hand-writes a path: a
+ * tenant whose served manifest lacks `Expense` fails closed when `slugFor` cannot answer.
+ * `StockMovement` in `packages/sample/src/erp-mirror.ts` follows the same rule.
  *
  * ────────────────────────────────────────────────────────────────────────────────
  * WHY THERE IS NO JOURNAL ENTRY HERE.
@@ -34,9 +37,22 @@ import { enqueueOutbox } from "@crm/relay";
  *     record-id churn a JSONB-store reload causes). Item 11 says the code is "resolved at
  *     posting time via resolveAccountId", but `resolveAccountId` is a private function
  *     inside the ERP's own `write-effects.ts`, used by its invoice/bill postings; it is
- *     not reachable over the HTTP API. The CRM has no `crm.ledger_account_snapshot` to
- *     resolve against either — `packages/sync` projects `Item`, `Employee` and `Account`
- *     and nothing else. So there is no code → id path at all today.
+ *     not reachable over the HTTP API.
+ *
+ *     CORRECTION, from the captured schema: there IS a code → id path for the DEBIT.
+ *     `LedgerAccount.account_code` is both filterable and sortable, so
+ *     `GET /v1/ledger-accounts?account_code[eq]=6200` resolves it over the ordinary API —
+ *     an earlier version of this comment said no path existed at all, and that was wrong.
+ *     What is still true is that the CRM has nothing to resolve against OFFLINE:
+ *     `packages/sync` projects `Item`, `Employee` and `Account` and no ledger accounts, so
+ *     the resolution would be a synchronous ERP read on the posting path.
+ *
+ *     The COST CENTRE has no path, and that is the sharper problem. `CostCenter`'s only
+ *     filterable fields are `parent_id` and `manager_id` — `code` is NOT among them — and
+ *     the ERP DROPS a filter it does not recognise rather than refusing it, so
+ *     `?code[eq]=CC-SM` returns the first cost centre in the tenant and looks like a hit.
+ *     A journal entry attributed to a silently wrong cost centre is exactly the class of
+ *     error this file refuses to risk.
  *
  *  2. There is no credit account anywhere to name. `FinanceSettings` has
  *     `apAccountCode` (the supplier AP control) and `cashAccountCode`, and no
@@ -115,11 +131,21 @@ export interface PostableClaim {
   readonly erp_cost_center_code: string | null;
 }
 
+/**
+ * The create payload, typed against the ERP's own `Expense`.
+ *
+ * `id` and `expense_number` are omitted because both are server-allocated — the latter is
+ * an `EXP-{YYYY}-{SEQ:5}` sequence reset yearly, and supplying one would collide with the
+ * ERP's. `receipt` is omitted because the CRM's `receipt_url` is a CRM-side URL, not an
+ * ERP file handle.
+ */
+export type ErpExpenseCreatePayload = Omit<Expense, "id" | "expense_number" | "receipt">;
+
 export interface ErpExpenseCreate {
   readonly entity: typeof ERP_EXPENSE_ENTITY;
   readonly operation: "create";
   readonly targetRecordId: string;
-  readonly payload: Readonly<Record<string, unknown>>;
+  readonly payload: ErpExpenseCreatePayload;
 }
 
 export interface ErpExpenseTransition {
@@ -165,14 +191,15 @@ export function expenseDescription(claim: PostableClaim): string {
  * claim, which is theatre, not provenance. `approved_by` and `approved_at` on
  * `crm.expense_claim`, under a four-eyes CHECK, are the provenance.
  *
- * And the two transitions could not be relied on anyway. An invalid transition answers
- * **409** (`operate-runtime/src/handlers.ts`: `invalid_transition`), which
- * `classify` maps through `kind === "conflict"` to `already_delivered` — i.e. SUCCESS.
- * So an `approve` row delivered before its `submit` row would be marked delivered and
- * never retried, leaving the ERP record stuck in `submitted` with nothing to say so.
- * Three rows enqueued in one transaction share a `created_at` (Postgres `now()` is
- * transaction-start), so `claimBatch`'s `ORDER BY next_attempt_at, created_at` does not
- * order them. One row cannot be out of order with itself.
+ * And the two transitions would need the relay to order them, which is a guarantee this
+ * design does not have to ask for. Both of the reasons it originally could not have been
+ * asked for are now fixed at their source — `classify` reads the ERP's
+ * `invalid_transition` code and answers `retry_ordering` instead of mapping every 409 to
+ * `already_delivered`, and `claimBatch` orders by the `seq` 0027 added rather than by a
+ * `created_at` that three rows written in one transaction share. So ordering is no longer
+ * the objection. The objection that remains is simpler and does not expire: one row cannot
+ * be out of order with itself, and a design that needs no ordering guarantee cannot be
+ * broken by one regressing.
  *
  * `expense_number` is NOT sent: it is a server-allocated sequence
  * (`EXP-{YYYY}-{SEQ:5}`, reset yearly) and supplying one would collide with the ERP's own.

@@ -6,6 +6,7 @@ import { TENANT_EXPENSE_STORE as TENANT, appPool } from "@crm/db/testing";
 import { upsertAccountMapping } from "./accounts.js";
 import {
   FourEyesViolationError,
+  RejectionFourEyesViolationError,
   InvalidAmountError,
   InvalidCategoryError,
   InvalidCurrencyError,
@@ -143,6 +144,8 @@ describe("expense claims", () => {
           submitted_at: null,
           approved_at: null,
           approved_by: null,
+          rejected_at: null,
+          rejected_by: null,
           posted_at: null,
         });
       });
@@ -447,30 +450,116 @@ describe("expense claims", () => {
   });
 
   describe("rejecting", () => {
+    /** A mapped, submitted claim — the only state a rejection is reachable from. */
+    const submitted = async (tx: PoolClient, rep = REP): Promise<ExpenseClaim> => {
+      await map(tx);
+      const claim = await draft(tx, rep);
+      return submitClaim(tx, TENANT, claim.id, new Date("2026-09-02T09:00:00Z"));
+    };
+
     it("rejects a submitted claim without an approval timestamp", async () => {
       await inTenant(async (tx) => {
-        await map(tx);
-        const claim = await draft(tx);
-        await submitClaim(tx, TENANT, claim.id, new Date());
-        const out = await rejectClaim(tx, TENANT, claim.id);
+        const claim = await submitted(tx);
+        const out = await rejectClaim(tx, TENANT, claim.id, MGR, new Date());
         expect(out.state).toBe("rejected");
         expect(out.approved_at).toBeNull();
       });
     });
 
+    /**
+     * The gap 0030 closed. Before it, a rejection recorded a state and no actor — and in
+     * a lifecycle where four-eyes is enforced here or nowhere, "a manager rejected this"
+     * with no manager named is not a record of a decision.
+     */
+    it("records who rejected it, and when, in columns of their own", async () => {
+      await inTenant(async (tx) => {
+        const claim = await submitted(tx);
+        const out = await rejectClaim(
+          tx, TENANT, claim.id, MGR, new Date("2026-09-04T11:30:00Z"),
+        );
+        expect(out.rejected_by).toBe(MGR);
+        expect(out.rejected_at?.toISOString()).toBe("2026-09-04T11:30:00.000Z");
+        // And NOT in the approval columns, which is the whole point of adding two.
+        expect(out.approved_by).toBeNull();
+        expect(out.approved_at).toBeNull();
+      });
+    });
+
+    /** Four eyes applies to the refusal exactly as it does to the approval. */
+    it("refuses a rejection by the claimant", async () => {
+      await inTenant(async (tx) => {
+        const claim = await submitted(tx);
+        await expect(
+          rejectClaim(tx, TENANT, claim.id, REP, new Date()),
+        ).rejects.toBeInstanceOf(RejectionFourEyesViolationError);
+      });
+    });
+
+    /**
+     * Distinct classes, because a rejection reported as a failed approval sends the
+     * reader looking for an approval nobody attempted.
+     */
+    it("tells a rejecter four-eyes violation apart from an approver one", async () => {
+      await inTenant(async (tx) => {
+        const claim = await submitted(tx);
+        await expect(
+          approveClaim(tx, TENANT, claim.id, REP, new Date()),
+        ).rejects.toBeInstanceOf(FourEyesViolationError);
+      });
+      await inTenant(async (tx) => {
+        const claim = await submitted(tx);
+        let err: unknown;
+        try {
+          await rejectClaim(tx, TENANT, claim.id, REP, new Date());
+        } catch (caught) {
+          err = caught;
+        }
+        expect(err).toBeInstanceOf(RejectionFourEyesViolationError);
+        expect(err).not.toBeInstanceOf(FourEyesViolationError);
+        expect((err as Error).message).toMatch(/cannot be rejected by the rep who submitted it/);
+      });
+    });
+
+    /**
+     * `expense_claim_rejected_fields` and `expense_claim_approved_fields` are over
+     * disjoint state sets, so at most one timestamp is ever required — asserted against
+     * the live constraints rather than reasoned about, since a contradiction between the
+     * two would show up as a row nothing can write.
+     */
+    it("leaves the approval pairing intact, and cannot contradict it", async () => {
+      await inTenant(async (tx) => {
+        const claim = await submitted(tx);
+        const rejected = await rejectClaim(tx, TENANT, claim.id, MGR, new Date());
+        expect(rejected.rejected_at).not.toBeNull();
+        expect(rejected.approved_at).toBeNull();
+
+        // A rejected claim carrying an approval timestamp is refused by 0006's half.
+        await expect(
+          tx.query("UPDATE crm.expense_claim SET approved_at = now() WHERE id = $1", [claim.id]),
+        ).rejects.toThrow(/expense_claim_approved_fields/);
+      });
+      await inTenant(async (tx) => {
+        const claim = await submitted(tx);
+        // …and a submitted one carrying a rejection timestamp by 0030's.
+        await expect(
+          tx.query("UPDATE crm.expense_claim SET rejected_at = now() WHERE id = $1", [claim.id]),
+        ).rejects.toThrow(/expense_claim_rejected_fields/);
+      });
+    });
+
     it("keeps the snapshot, which the snapshot CHECK requires outside draft", async () => {
       await inTenant(async (tx) => {
-        await map(tx);
-        const claim = await draft(tx);
-        await submitClaim(tx, TENANT, claim.id, new Date());
-        expect((await rejectClaim(tx, TENANT, claim.id)).erp_ledger_account_code).toBe("6200");
+        const claim = await submitted(tx);
+        expect(
+          (await rejectClaim(tx, TENANT, claim.id, MGR, new Date())).erp_ledger_account_code,
+        ).toBe("6200");
       });
     });
 
     it("cannot reject an approved claim — the posting is already handed over", async () => {
       const id = await approved();
       await inTenant(async (tx) => {
-        await expect(rejectClaim(tx, TENANT, id)).rejects.toBeInstanceOf(
+        await expect(rejectClaim(tx, TENANT, id, MGR, new Date())).rejects.toBeInstanceOf(
           InvalidExpenseClaimTransitionError,
         );
       });
@@ -478,10 +567,8 @@ describe("expense claims", () => {
 
     it("is terminal", async () => {
       await inTenant(async (tx) => {
-        await map(tx);
-        const claim = await draft(tx);
-        await submitClaim(tx, TENANT, claim.id, new Date());
-        await rejectClaim(tx, TENANT, claim.id);
+        const claim = await submitted(tx);
+        await rejectClaim(tx, TENANT, claim.id, MGR, new Date());
         await expect(approveClaim(tx, TENANT, claim.id, MGR, new Date())).rejects.toBeInstanceOf(
           InvalidExpenseClaimTransitionError,
         );

@@ -11,6 +11,8 @@ import {
   InvalidDateError,
   MissingAccountSnapshotError,
   MissingErpExpenseIdError,
+  RejectionFieldsError,
+  RejectionFourEyesViolationError,
   RepNotMappedToEmployeeError,
   UnmappedCategoryError,
   translateExpenseClaimError,
@@ -76,6 +78,29 @@ describe("translateExpenseClaimError", () => {
   it("turns expense_claim_approved_fields into ApprovalFieldsError", () => {
     const err = translateExpenseClaimError(pgError("expense_claim_approved_fields"));
     expect(err).toBeInstanceOf(ApprovalFieldsError);
+  });
+
+  it("turns expense_claim_reject_four_eyes into RejectionFourEyesViolationError", () => {
+    const err = translateExpenseClaimError(pgError("expense_claim_reject_four_eyes"));
+    expect(err).toBeInstanceOf(RejectionFourEyesViolationError);
+    expect(err.message).toContain("cannot be rejected by the rep who submitted it");
+  });
+
+  /**
+   * The two four-eyes constraints differ by one infix and the approve branch matches on a
+   * substring, so this is the test that catches a reject refusal being reported as a
+   * failed approval — the mistake 0030 refused to make in the schema.
+   */
+  it("does not report a rejecter four-eyes violation as an approval one", () => {
+    const err = translateExpenseClaimError(pgError("expense_claim_reject_four_eyes"));
+    expect(err).not.toBeInstanceOf(FourEyesViolationError);
+    expect(err.message).not.toContain("cannot be approved");
+  });
+
+  it("turns expense_claim_rejected_fields into RejectionFieldsError", () => {
+    const err = translateExpenseClaimError(pgError("expense_claim_rejected_fields"));
+    expect(err).toBeInstanceOf(RejectionFieldsError);
+    expect(err).not.toBeInstanceOf(ApprovalFieldsError);
   });
 
   it("recognises a constraint named only in the message text", () => {
@@ -169,6 +194,8 @@ describe("the posting preconditions", () => {
       new FourEyesViolationError("m"),
       new MissingAccountSnapshotError("m"),
       new ApprovalFieldsError("m"),
+      new RejectionFieldsError("m"),
+      new RejectionFourEyesViolationError("m"),
       new InvalidAmountError("v"),
       new InvalidCurrencyError("v"),
       new InvalidDateError("f", "v"),

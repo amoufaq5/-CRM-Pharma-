@@ -11,6 +11,7 @@ import {
   chooseAuthMechanism,
   chooseEncoding,
   classifySmtpReply,
+  composeBody,
   dotStuff,
   encodeHeaderValue,
   isLoopbackHost,
@@ -268,6 +269,43 @@ describe("chooseEncoding", () => {
   it("falls back to base64 for a line over the 998-octet limit, even in ASCII", () => {
     expect(chooseEncoding("x".repeat(999), { eightBitMime: true })).toBe("base64");
     expect(chooseEncoding(`short\n${"x".repeat(1200)}`, { eightBitMime: true })).toBe("base64");
+  });
+
+  /**
+   * It must be asked about the COMPOSED body, not `payload.body`.
+   *
+   * The footer carries `recipient.displayName`, which is a person's name. An Arabic rep
+   * receiving an English notification therefore produced a body with high bytes in it while
+   * `chooseEncoding(payload.body, …)` answered `7bit` — so the message declared
+   * `Content-Transfer-Encoding: 7bit` and then sent raw 8-bit octets, which is both an RFC
+   * violation and the exact mojibake this function exists to prevent.
+   *
+   * Asserted on `composeBody` rather than on the sender, because the bug was a
+   * DISAGREEMENT between two functions about what was being sent: the only fix that holds
+   * is for one of them to produce what the other measures.
+   */
+  it("is answerable about the whole composed body, name in the footer included", () => {
+    const arabicName: WebhookPayload = {
+      ...PAYLOAD,
+      body: "Lot LOT-A was due for disposal",
+      recipient: { ...PAYLOAD.recipient, displayName: "أحمد الموفق" },
+    };
+    expect(/[^\x00-\x7f]/.test(arabicName.body)).toBe(false);
+    const composed = composeBody(arabicName);
+    expect(composed).toContain("أحمد الموفق");
+    expect(chooseEncoding(composed, { eightBitMime: true })).toBe("8bit");
+    expect(chooseEncoding(composed, { eightBitMime: false })).toBe("base64");
+    // And this is what the old call site measured — the reason it answered 7bit.
+    expect(chooseEncoding(arabicName.body, { eightBitMime: true })).toBe("7bit");
+  });
+
+  it("notices a long subjectRef too, not only the name", () => {
+    // Every footer line is composed text: the signal kind, the subject table and id, the
+    // created-at. None of them can carry high bytes today, but all of them are measured
+    // now, so adding one that can does not reopen the hole.
+    const composed = composeBody({ ...PAYLOAD, body: "a" });
+    expect(composed).toContain("Record:    crm.disposal_obligation");
+    expect(chooseEncoding(composed, { eightBitMime: true })).toBe("7bit");
   });
 });
 

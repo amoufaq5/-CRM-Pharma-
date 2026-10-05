@@ -47,6 +47,15 @@ export const EXPENSE_CLAIM_TRANSITIONS: Readonly<
 export const APPROVED_STATES: readonly ExpenseClaimState[] = ["approved", "posted", "reimbursed"];
 
 /**
+ * The states 0030's `expense_claim_rejected_fields` CHECK requires `rejected_at` for.
+ *
+ * One state, and a list anyway, so the two pairings read as the same kind of rule and a
+ * caller can see that they are disjoint — which is why they cannot contradict each other.
+ * `rejected` is terminal, so nothing will be added here.
+ */
+export const REJECTED_STATES: readonly ExpenseClaimState[] = ["rejected"];
+
+/**
  * States that must carry a snapshotted S&M account code.
  *
  * 0006 phrases its CHECK as `state = 'draft' OR erp_ledger_account_code IS NOT NULL`,
@@ -96,6 +105,11 @@ export function isFinalExpenseClaimState(state: ExpenseClaimState): boolean {
 /** Whether `expense_claim_approved_fields` requires `approved_at` in this state. */
 export function requiresApproval(state: ExpenseClaimState): boolean {
   return APPROVED_STATES.includes(state);
+}
+
+/** Whether `expense_claim_rejected_fields` requires `rejected_at` in this state. */
+export function requiresRejection(state: ExpenseClaimState): boolean {
+  return REJECTED_STATES.includes(state);
 }
 
 /** Whether `expense_claim_snapshot_before_submit` requires an account code in this state. */

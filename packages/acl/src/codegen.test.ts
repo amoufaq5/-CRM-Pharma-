@@ -36,16 +36,31 @@ describe("generateTypes", () => {
   });
 
   it("records numeric fields explicitly, so a caller can see what is unsafe to range-filter", () => {
-    expect(result.source).toMatch(/Item: \{[\s\S]*?numericFields: \["list_price", "standard_cost"\]/);
+    // The real `Item` has five numeric fields, not the two the hand-written fixture
+    // claimed. Every one of them is unsafe to range-filter on the deployed store.
+    expect(result.source).toMatch(
+      /Item: \{[\s\S]*?numericFields: \["standard_cost", "list_price", "reorder_point", "reorder_quantity", "weight_kg"\]/,
+    );
   });
 
   it("records each entity's filterable, sortable and transition sets", () => {
-    expect(result.source).toContain('filterable: ["sku", "status", "list_price", "updated_at"]');
-    expect(result.source).toContain('transitions: ["win", "lose"]');
+    // As served: `name` IS filterable and `updated_at` is served on no entity at all.
+    expect(result.source).toContain(
+      'filterable: ["sku", "name", "item_type", "category", "list_price", "status"]',
+    );
+    expect(result.source).toContain(
+      'transitions: ["advance_to_qualification", "advance_to_proposal", ' +
+        '"advance_to_negotiation", "win", "lose"]',
+    );
   });
 
   it("emits a transition union only for entities that have one", () => {
-    expect(result.source).toContain('readonly Opportunity: "win" | "lose";');
+    // Five transitions, not the two the hand-written fixture claimed — the three
+    // `advance_to_*` stages were missing from it entirely.
+    expect(result.source).toContain(
+      'readonly Opportunity: "advance_to_qualification" | "advance_to_proposal" | ' +
+        '"advance_to_negotiation" | "win" | "lose";',
+    );
     expect(result.source).not.toMatch(/readonly Item: .*;\n\};/);
   });
 

@@ -59,15 +59,30 @@ async function main(): Promise<number> {
       console.log(`erp codegen: up to date (${result.entityCount} entities, ${result.schemaSha256.slice(0, 12)}…)`);
       return 0;
     }
+    if (existing === null) {
+      console.error(`erp codegen: ${OUT} is missing — run \`pnpm erp:codegen\``);
+      return 1;
+    }
+    const committed = /SCHEMA_SHA256 = "([0-9a-f]+)"/.exec(existing)?.[1] ?? null;
+    if (committed === result.schemaSha256) {
+      // Same input, different output. That is the GENERATOR having changed, not the ERP —
+      // a different thing to be told, and the old message printed two identical hashes
+      // under the heading "the served schema no longer matches", which sent a reader
+      // looking for a schema change that had not happened.
+      console.error(
+        `erp codegen: STALE. The schema is unchanged (${result.schemaSha256.slice(0, 12)}…) but the\n` +
+          `committed file is not what this generator now emits. The generator changed; run\n` +
+          `\`pnpm erp:codegen:baseline\` and commit the regenerated file.`,
+      );
+      return 1;
+    }
     console.error(
-      existing === null
-        ? `erp codegen: ${OUT} is missing — run \`pnpm erp:codegen\``
-        : `erp codegen: DRIFT. The served schema no longer matches the committed types.\n` +
-            `  committed: ${/SCHEMA_SHA256 = "([0-9a-f]+)"/.exec(existing)?.[1]?.slice(0, 12) ?? "unknown"}…\n` +
-            `  served:    ${result.schemaSha256.slice(0, 12)}…\n` +
-            `Run \`pnpm erp:codegen\` and review the diff — a field that stopped being\n` +
-            `filterable is the dangerous case: the ERP ignores such a filter silently,\n` +
-            `so every query relying on it starts returning MORE rows than asked for.`,
+      `erp codegen: DRIFT. The served schema no longer matches the committed types.\n` +
+        `  committed: ${committed?.slice(0, 12) ?? "unknown"}…\n` +
+        `  served:    ${result.schemaSha256.slice(0, 12)}…\n` +
+        `Run \`pnpm erp:codegen\` and review the diff — a field that stopped being\n` +
+        `filterable is the dangerous case: the ERP ignores such a filter silently,\n` +
+        `so every query relying on it starts returning MORE rows than asked for.`,
     );
     return 1;
   }

@@ -32,6 +32,15 @@ export const NOTIFICATION_KINDS = [
    * their app said so, and the half they cannot see never landed.
    */
   "erp_write_failed",
+  /**
+   * An approved claim could not be handed to the ERP, and a human has to unblock it.
+   *
+   * Raised by the `expense_post` sweep (0031), which is the one scheduled job that acts on
+   * money. It fires for the two refusals the sweep cannot resolve on its own — the rep has
+   * no `erp_employee_id`, or the claim's category snapshot names no ledger account — and
+   * not for a transport failure, which the outbox retries without anyone's help.
+   */
+  "expense_post_blocked",
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 

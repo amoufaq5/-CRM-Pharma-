@@ -46,6 +46,25 @@ export const DEFAULT_PRUNE_GUARD_FLOOR_ROWS = 100;
 /** The longest window the CHECK in 0026 will accept, restated so a caller can say why. */
 export const MAX_PRUNE_OVERRIDE_HOURS = 168;
 
+/**
+ * The ceiling on the FLOOR (0032).
+ *
+ * The floor short-circuits the share ceiling, so an unbounded one is a permanent,
+ * unattributed, non-expiring override — the shape 0026 argues against and then shipped.
+ * 1000 is ten times the default and bounds what a misconfigured floor can cost.
+ */
+export const MAX_PRUNE_GUARD_FLOOR_ROWS = 1000;
+
+/**
+ * `notification_policy_prune_override_named`'s character limit on the grantor (0026).
+ *
+ * Exported so the caller that BUILDS the attribution can fit it. `rep_profile.display_name`
+ * and `subject` are unbounded `text`, so a long name or a long OIDC subject overflowed the
+ * CHECK and surfaced as "a prune guard override must name who granted it" — the wrong
+ * diagnosis for "the name is too long", and unactionable.
+ */
+export const MAX_PRUNE_OVERRIDE_BY_CHARS = 200;
+
 const DEFAULT_GUARD: PruneGuard = {
   prune_max_share_percent: DEFAULT_PRUNE_MAX_SHARE_PERCENT,
   prune_guard_floor_rows: DEFAULT_PRUNE_GUARD_FLOOR_ROWS,
@@ -225,7 +244,9 @@ export async function revokePruneGuardOverride(tx: PoolClient, tenantId: string)
 const GUARD_CONSTRAINT_MESSAGES: Readonly<Record<string, string>> = {
   notification_policy_prune_max_share:
     "a prune ceiling must be between 1 and 99 percent of the inbox — a ceiling of 100 is not a ceiling",
-  notification_policy_prune_guard_floor: "a prune guard floor must be between 0 and 1000000 rows",
+  notification_policy_prune_guard_floor:
+    "a prune guard floor must be between 0 and 1000 rows — above that it is not a floor but a " +
+    "permanent bypass of the ceiling; raise the ceiling, or grant a prune guard override",
   notification_policy_prune_override_bounded: `a prune guard override must last between 1 and ${MAX_PRUNE_OVERRIDE_HOURS} hours`,
   notification_policy_prune_override_named: "a prune guard override must name who granted it",
   notification_policy_prune_override_whole: "a prune guard override must name who granted it",
@@ -337,6 +358,15 @@ export interface PruneResult {
   readonly sharePercent: number;
   /** The guard tripped and a live override let the pass through regardless. */
   readonly overridden: boolean;
+  /**
+   * The pass was over the ceiling and the row FLOOR let it through — not the override.
+   *
+   * `overridden` cannot say this, because the floor stops the guard tripping at all, so a
+   * floor-waived pass used to log identically to one that was within its ceiling. Null
+   * reason when false, for the same reason `refusalReason` is.
+   */
+  readonly floorWaived: boolean;
+  readonly floorWaivedReason: string | null;
 }
 
 /**
@@ -351,6 +381,22 @@ export interface PruneResult {
  * also what the guard reads, which is the other reason they come first: the share has to
  * be known while the rows still exist.
  */
+/**
+ * `prunableTotal / inboxTotal` as a percentage, rounded to two places AND rounded UP.
+ *
+ * Two places because one made the sentence contradict itself: the decision is the exact
+ * integer comparison `prunable * 100 > ceiling * total`, so at 2501 of 10000 against a 25%
+ * ceiling the guard trips and `round(25.01)` to one place reported "would take 25% ... over
+ * its 25% ceiling" — while 2500, which does not trip, reported the same 25%. Up rather than
+ * nearest for the same reason, one step further: a share that tripped the guard must never
+ * print as a number at or below the ceiling, whatever the decimals do, because the sentence
+ * is the only thing the operator reads.
+ */
+function sharePercentOf(prunableTotal: number, inboxTotal: number): number {
+  if (inboxTotal === 0) return 0;
+  return Math.ceil((prunableTotal / inboxTotal) * 10_000) / 100;
+}
+
 /** One wording, so the preview and the refusal cannot describe the same number differently. */
 function refusalSentence(
   prunableTotal: number,
@@ -365,12 +411,31 @@ function refusalSentence(
   );
 }
 
+/**
+ * The pass is over the ceiling and the FLOOR let it through anyway.
+ *
+ * Reported because a floor-waived pass used to be indistinguishable from a pass that was
+ * within its ceiling: `overridden` is only ever true when the guard itself tripped, and the
+ * floor stops it tripping. 0032 caps the floor at 1000 rows so the amount a waiver can cost
+ * is bounded; this is how it stops being silent as well.
+ */
+function floorWaivedSentence(prunableTotal: number, sharePercent: number, guard: PruneGuard): string {
+  return (
+    `${prunableTotal} notification(s) is ${sharePercent}% of the inbox, over the ` +
+    `${guard.prune_max_share_percent}% ceiling, but at or under the ${guard.prune_guard_floor_rows}-row ` +
+    `floor below which the share is not consulted — the pass ran`
+  );
+}
+
 export interface PrunePreview {
   readonly guard: PruneGuard;
   /** Whether tonight's pass would be refused for taking too much of the inbox. */
   readonly wouldRefuse: boolean;
   readonly refusalReason: string | null;
   readonly overrideLive: boolean;
+  /** Over the ceiling, under the floor — so it will run, and the guard will not say so. */
+  readonly floorWaived: boolean;
+  readonly floorWaivedReason: string | null;
   readonly prunableTotal: number;
   readonly inboxTotal: number;
   readonly sharePercent: number;
@@ -379,11 +444,17 @@ export interface PrunePreview {
 /**
  * Would tonight's prune be refused, and on what numbers?
  *
- * READ-ONLY, which is the whole reason it exists separately. The dry-run route has to
- * answer this, and the obvious shortcut — calling `pruneNotifications` with a row cap of
+ * DELETES NOTHING, which is the whole reason it exists separately. The dry-run route has
+ * to answer this, and the obvious shortcut — calling `pruneNotifications` with a row cap of
  * zero — makes a GET invoke the deleter. It happens to delete nothing today; it would stop
  * happening to the moment anyone changed what a zero cap means, and the failure would be
  * silent and irreversible. A reader does not call the writer.
+ *
+ * Not "read-only", which is what this said and was wrong about: `policyRow` upserts the
+ * tenant's default policy row, so a first preview writes one. That write is deliberate and
+ * idempotent — every reader of the policy needs a row to read and the defaults are the
+ * answer when there is none — but a doc comment that says read-only when a statement is an
+ * INSERT is the kind of claim someone later builds on.
  *
  * It asks the same `crm.notification_prune_guard_trips` the pass asks, so the preview and
  * the verdict cannot drift apart.
@@ -401,13 +472,18 @@ export async function prunePreview(
     prunable: string;
     inbox_total: string;
     guard_trips: boolean;
+    ceiling_exceeded: boolean;
   }>(
     `SELECT count(*) FILTER (WHERE NOT c.subject_open AND NOT c.delivery_unsettled) AS prunable,
             (SELECT count(*) FROM crm.notification n WHERE n.tenant_id = $1)        AS inbox_total,
             crm.notification_prune_guard_trips(
               count(*) FILTER (WHERE NOT c.subject_open AND NOT c.delivery_unsettled),
               (SELECT count(*) FROM crm.notification n WHERE n.tenant_id = $1),
-              $5::int, $6::int)                                                     AS guard_trips
+              $5::int, $6::int)                                                     AS guard_trips,
+            crm.notification_prune_ceiling_exceeded(
+              count(*) FILTER (WHERE NOT c.subject_open AND NOT c.delivery_unsettled),
+              (SELECT count(*) FROM crm.notification n WHERE n.tenant_id = $1),
+              $5::int)                                                              AS ceiling_exceeded
        FROM crm.notification_prune_candidates c
       WHERE c.tenant_id = $1 AND ${PAST_HORIZON}`,
     [
@@ -422,17 +498,21 @@ export async function prunePreview(
   const summary = rows[0]!;
   const prunableTotal = Number(summary.prunable);
   const inboxTotal = Number(summary.inbox_total);
-  const sharePercent = inboxTotal === 0 ? 0 : Math.round((prunableTotal / inboxTotal) * 1000) / 10;
+  const sharePercent = sharePercentOf(prunableTotal, inboxTotal);
   const overrideLive =
     guard.prune_guard_override_until !== null &&
     guard.prune_guard_override_until.getTime() > asOf.getTime();
   const wouldRefuse = summary.guard_trips && !overrideLive;
+  // Over the ceiling but the guard did not trip: the floor is the only other operand.
+  const floorWaived = summary.ceiling_exceeded && !summary.guard_trips;
 
   return {
     guard,
     wouldRefuse,
     refusalReason: wouldRefuse ? refusalSentence(prunableTotal, sharePercent, inboxTotal, guard) : null,
     overrideLive,
+    floorWaived,
+    floorWaivedReason: floorWaived ? floorWaivedSentence(prunableTotal, sharePercent, guard) : null,
     prunableTotal,
     inboxTotal,
     sharePercent,
@@ -464,6 +544,7 @@ export async function pruneNotifications(
     prunable: string;
     inbox_total: string;
     guard_trips: boolean;
+    ceiling_exceeded: boolean;
   }>(
     `SELECT count(*) FILTER (WHERE c.subject_open)                                AS kept_subject_open,
             count(*) FILTER (WHERE NOT c.subject_open AND c.delivery_unsettled)   AS kept_delivery_unsettled,
@@ -474,7 +555,11 @@ export async function pruneNotifications(
             crm.notification_prune_guard_trips(
               count(*) FILTER (WHERE NOT c.subject_open AND NOT c.delivery_unsettled),
               (SELECT count(*) FROM crm.notification n WHERE n.tenant_id = $1),
-              $5::int, $6::int)                                                   AS guard_trips
+              $5::int, $6::int)                                                   AS guard_trips,
+            crm.notification_prune_ceiling_exceeded(
+              count(*) FILTER (WHERE NOT c.subject_open AND NOT c.delivery_unsettled),
+              (SELECT count(*) FROM crm.notification n WHERE n.tenant_id = $1),
+              $5::int)                                                            AS ceiling_exceeded
        FROM crm.notification_prune_candidates c
       WHERE c.tenant_id = $1 AND ${PAST_HORIZON}`,
     [...horizon, guard.prune_max_share_percent, guard.prune_guard_floor_rows],
@@ -482,7 +567,7 @@ export async function pruneNotifications(
   const summary = counts[0]!;
   const prunableTotal = Number(summary.prunable);
   const inboxTotal = Number(summary.inbox_total);
-  const sharePercent = inboxTotal === 0 ? 0 : Math.round((prunableTotal / inboxTotal) * 1000) / 10;
+  const sharePercent = sharePercentOf(prunableTotal, inboxTotal);
   const kept = {
     keptSubjectOpen: Number(summary.kept_subject_open),
     keptDeliveryUnsettled: Number(summary.kept_delivery_unsettled),
@@ -496,6 +581,8 @@ export async function pruneNotifications(
   const overrideLive =
     guard.prune_guard_override_until !== null &&
     guard.prune_guard_override_until.getTime() > asOf.getTime();
+
+  const floorWaived = summary.ceiling_exceeded && !summary.guard_trips;
 
   if (summary.guard_trips && !overrideLive) {
     // Nothing, rather than a trimmed something. A prune cannot be undone, so a pass that
@@ -515,6 +602,9 @@ export async function pruneNotifications(
       prunableTotal,
       sharePercent,
       overridden: false,
+      // The guard tripped, so the floor did not waive anything.
+      floorWaived: false,
+      floorWaivedReason: null,
     };
   }
 
@@ -546,5 +636,7 @@ export async function pruneNotifications(
     // True only where the guard actually tripped; a live window over a pass that was
     // within its ceiling anyway overrode nothing.
     overridden: summary.guard_trips,
+    floorWaived,
+    floorWaivedReason: floorWaived ? floorWaivedSentence(prunableTotal, sharePercent, guard) : null,
   };
 }

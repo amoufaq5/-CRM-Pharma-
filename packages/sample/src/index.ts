@@ -55,9 +55,11 @@ export {
 } from "./store.js";
 export {
   DEFAULT_GRACE_DAYS,
+  disposalHistory,
   disposalPolicy,
   setDisposalPolicy,
   sweepExpiredStock,
+  type DisposalObligationHistoryEntry,
   type DisposalPolicy,
   type ExpirySweepOptions,
   type ExpirySweepResult,

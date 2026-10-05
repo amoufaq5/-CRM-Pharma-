@@ -9,6 +9,18 @@
 import type { PoolClient } from "pg";
 import { NOTIFICATION_KINDS, SEVERITIES, type NotificationKind, type Severity } from "./kinds.js";
 
+/**
+ * The channels an endpoint row may name — 0029's
+ * `notification_endpoint_channel_check`, in TypeScript.
+ *
+ * Duplicated from the CHECK on purpose, and `endpoints.contract.test.ts` compares the two
+ * against `pg_constraint` so the copy cannot drift. The point is where the refusal lands:
+ * a channel this process cannot send is a 422 naming the legal values, not a constraint
+ * violation surfacing as a 500 from the bottom of the stack.
+ */
+export const ENDPOINT_CHANNELS = ["webhook", "email"] as const;
+export type EndpointChannel = (typeof ENDPOINT_CHANNELS)[number];
+
 export class InvalidEndpointError extends Error {
   constructor(message: string) {
     super(message);
@@ -30,6 +42,16 @@ export interface EndpointRow {
 }
 
 export interface CreateEndpointInput {
+  /**
+   * Required, with no default.
+   *
+   * It was a literal `'webhook'` in the INSERT until now, which is why 0029 could add the
+   * email channel to the CHECK and leave it unreachable: nothing above SQL could name it.
+   * A default would have the same effect for the next channel, so there is none — and the
+   * url shape is channel-dependent (0029), so a caller that does not know which channel
+   * it means does not know whether its url is valid either.
+   */
+  readonly channel: EndpointChannel;
   readonly url: string;
   readonly secretEnv: string;
   readonly minSeverity?: Severity;
@@ -83,22 +105,34 @@ export async function createEndpoint(
   input: CreateEndpointInput,
 ): Promise<EndpointRow> {
   const kinds = normaliseKinds(input.kinds);
-  const { rows } = await tx.query<{ id: string }>(
-    `INSERT INTO crm.notification_endpoint
-       (tenant_id, channel, url, secret_env, min_severity, kinds, description, enabled)
-     VALUES ($1, 'webhook', $2, $3, COALESCE($4, 'warning'), $5::text[], $6, COALESCE($7, true))
-     RETURNING id`,
-    [
-      tenantId,
-      input.url,
-      input.secretEnv,
-      input.minSeverity ?? null,
-      kinds,
-      input.description ?? null,
-      input.enabled ?? null,
-    ],
-  );
-  return (await getEndpoint(tx, rows[0]!.id))!;
+  if (!(ENDPOINT_CHANNELS as readonly string[]).includes(input.channel)) {
+    throw new InvalidEndpointError(
+      `channel must be one of ${ENDPOINT_CHANNELS.join(", ")}, not ${JSON.stringify(input.channel)}`,
+    );
+  }
+  let id: string;
+  try {
+    const { rows } = await tx.query<{ id: string }>(
+      `INSERT INTO crm.notification_endpoint
+         (tenant_id, channel, url, secret_env, min_severity, kinds, description, enabled)
+       VALUES ($1, $8, $2, $3, COALESCE($4, 'warning'), $5::text[], $6, COALESCE($7, true))
+       RETURNING id`,
+      [
+        tenantId,
+        input.url,
+        input.secretEnv,
+        input.minSeverity ?? null,
+        kinds,
+        input.description ?? null,
+        input.enabled ?? null,
+        input.channel,
+      ],
+    );
+    id = rows[0]!.id;
+  } catch (err) {
+    throw translateEndpointError(err, input.channel);
+  }
+  return (await getEndpoint(tx, id))!;
 }
 
 /**
@@ -160,6 +194,42 @@ function normaliseKinds(kinds: readonly string[] | null | undefined): string[] |
     );
   }
   return [...new Set(kinds)].sort();
+}
+
+/**
+ * The table's CHECKs, as the sentences a 422 can carry.
+ *
+ * Without this an endpoint refused by the database reached the client as a 500 "an
+ * unexpected error occurred" — including the plaintext-url refusal, which is one of the
+ * most deliberate rules in the schema (0021: a notification carries a rep's name and an
+ * account id, so it does not travel in the clear). The url rule is CHANNEL-DEPENDENT since
+ * 0029, so the message names the channel the caller actually asked for; a flat "that url
+ * is invalid" would be unactionable for exactly the mismatch 0029 exists to catch.
+ */
+function translateEndpointError(err: unknown, channel: string): Error {
+  const constraint = (err as { constraint?: string }).constraint;
+  if (constraint === "notification_endpoint_url_check") {
+    return new InvalidEndpointError(
+      channel === "email"
+        ? "an email endpoint's url must be a single mailto: mailbox — one delivery has one outcome, " +
+          "so one endpoint is one destination"
+        : "a webhook endpoint's url must be https:// (or http:// to loopback, for a local sink) — " +
+          "a notification carries a rep's name and an account id and does not travel in the clear",
+    );
+  }
+  if (constraint === "notification_endpoint_channel_check") {
+    return new InvalidEndpointError(`channel must be one of ${ENDPOINT_CHANNELS.join(", ")}, not ${channel}`);
+  }
+  if (constraint === "notification_endpoint_secret_env_check") {
+    return new InvalidEndpointError("secretEnv must be the NAME of an environment variable, not a secret value");
+  }
+  if (constraint === "notification_endpoint_min_severity_check") {
+    return new InvalidEndpointError(`minSeverity must be one of ${SEVERITIES.join(", ")}`);
+  }
+  if (constraint === "notification_endpoint_kinds_not_empty") {
+    return new InvalidEndpointError("kinds must be a non-empty array, or null for every kind");
+  }
+  return err instanceof Error ? err : new Error(String(err));
 }
 
 export function isSeverity(value: string): value is Severity {

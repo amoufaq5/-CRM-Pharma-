@@ -146,6 +146,24 @@ export function translateSampleError(err: unknown): Error {
   if (message.includes("already been accepted") || message.includes("already been recalled")) {
     return new TransferAlreadySettledError(message);
   }
+  /**
+   * "transfer X already has a Y recorded against it" — 0025's ELSE branch, for a terminal
+   * event of a kind the trigger does not recognise.
+   *
+   * It was matched below as a `TransferMismatchError` (409 conflict), which is the wrong
+   * verdict: the sentence says the transfer is SETTLED, by something, and that is
+   * `TransferAlreadySettledError`. Matched here instead, above the mismatch group, because
+   * the group's `already has a` substring would otherwise claim it first.
+   *
+   * 0029's `sample_tx_transfer_of_only_settles` makes the branch unreachable in practice —
+   * it forbids any kind but `transfer_in`/`transfer_recall` from carrying a `transfer_of`,
+   * and it was added VALIDATED, so no pre-existing row can reach it either. The branch and
+   * this arm stay anyway: the trigger must not assume a CHECK beside it is still there, and
+   * a refusal that fires after someone drops the CHECK should name the right thing.
+   */
+  if (message.includes("already has a") && message.includes("recorded against it")) {
+    return new TransferAlreadySettledError(message);
+  }
   if (message.includes("only the sender can take material back")) {
     return new TransferNotSenderError(message);
   }
@@ -160,8 +178,7 @@ export function translateSampleError(err: unknown): Error {
     message.includes("must take back exactly what was sent") ||
     message.includes("cannot accept it from") ||
     message.includes("must name the rep it was sent to") ||
-    message.includes("already has a") ||
-    message.includes("is a ") && message.includes("not a transfer_out") ||
+    (message.includes("is a ") && message.includes("not a transfer_out")) ||
     message.includes("transfer_of")
   ) {
     return new TransferMismatchError(message);

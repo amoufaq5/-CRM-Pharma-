@@ -1,7 +1,27 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "outDir": "./dist", "rootDir": "./src" },
-  "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"],
-  "references": [{ "path": "../db" }, { "path": "../relay" }]
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "src/**/*.test.ts"
+  ],
+  "references": [
+    {
+      "path": "../acl"
+    },
+    {
+      "path": "../db"
+    },
+    {
+      "path": "../notify"
+    },
+    {
+      "path": "../relay"
+    }
+  ]
 }

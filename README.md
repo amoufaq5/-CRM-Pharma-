@@ -217,12 +217,22 @@ leaves nobody able to tell whether the number in front of them is the whole mist
 share rather than a row cap on purpose: the failure being defended against is a horizon
 wrong by an order of magnitude, and that looks the same at 800 rows and at two million,
 where any absolute cap protects one size and fails the other. `prune_guard_floor_rows`
-(100) is the count below which the ratio is noise and the guard stays quiet.
+(100) is the count below which the ratio is noise and the guard stays quiet — **capped at
+1,000**, because the floor is the left operand of the guard's `AND` and therefore
+short-circuits the ceiling entirely. It shipped capped at a million, which made one
+unattributed `PUT` a permanent, non-expiring bypass that was not even reported as an
+override. A pass the floor lets through now says so in its own words:
 
-Past it only by a **window**: `POST /v1/admin/notifications/prune-guard/override` takes
-`hours` with no default, names who opened it, is capped at seven days, and expires on its
-own. A boolean would be set once for one night's reason and outlive it silently, leaving
-the next horizon typo unguarded.
+```
+notify_prune  … share=71.43%/25% prunable=150 inbox=210
+              FLOOR-WAIVED: 150 notification(s) is 71.43% of the inbox, over the 25%
+              ceiling, but at or under the 200-row floor … — the pass ran
+```
+
+Past the ceiling only by a **window**: `POST /v1/admin/notifications/prune-guard/override`
+takes `hours` with no default, names who opened it, is capped at seven days, and expires on
+its own. A boolean would be set once for one night's reason and outlive it silently,
+leaving the next horizon typo unguarded.
 
 Each pass is also capped at 50,000 rows and reports `more`, so a tenant turning retention
 on after a year of growth drains over a few nights rather than in one long transaction.
@@ -237,6 +247,20 @@ anything is deleted.
 A rep files a claim; their manager approves it; it is handed to the ERP. The approval graph
 is the CRM's (ADR-0001 item 11) because the ERP's own `Expense` workflow is a flat role
 check that never reads `Employee.manager_id` — so four-eyes is enforced here or nowhere.
+
+**Four eyes covers all four decisions — approve, reject, post and reimburse.** It did not,
+and the way it failed is worth keeping: `crm.rep_can_supervise` answers *yes* for the
+caller themselves, which is correct for a read (a rep may always see their own work, and it
+is why one helper serves "mine" and "my team's"), and every write transition gated on
+supervision alone. `expense_claim_four_eyes` caught the approve in the database and
+`expense_claim_reject_four_eyes` the reject — but `post` and `reimburse` record no actor,
+so no constraint could ever have caught those. A rep could hand their own claim to the
+ledger and mark it paid. The rule is now in the route, once, for all four, as a 403 that
+names which rule was broken rather than a constraint violation with no explanation.
+
+**A rejection names who made it.** `rejected_by` and `rejected_at`, under their own
+four-eyes CHECK — it was the one decision in the lifecycle that left no record of its
+author.
 
 **Submitting is refused while Finance has not mapped the category.** That is the designed
 behaviour, not a gap: `crm.expense_account_map` names the Sales & Marketing
@@ -269,6 +293,26 @@ The classification is the part worth knowing: **4xx retries, 5xx dead-letters**,
 positive reply at the wrong stage dead-letters because the conversation has lost step.
 Backwards, that is either a bounced address retried forever or a greylist — a 4xx, and
 extremely common — thrown away.
+
+**The channel is reachable end to end, and that is newer than the sender.** For a while it
+was not: `createEndpoint` wrote `'webhook'` as a literal, so migration 0029 could widen the
+CHECK to admit `email` and nothing above SQL could name it — and nothing constructed
+`SmtpSender` outside the tests. Both halves are closed. `POST
+/v1/admin/notification-endpoints` takes a required `channel` with **no default** (the url
+shape is channel-dependent, so a caller that does not know which channel it means does not
+know whether its url is valid either), and the scheduler builds the sender at boot when
+`SMTP_HOST` is set — which is what makes the TLS refusal above a real gate rather than an
+unreachable constructor. With `SMTP_HOST` unset an `email` endpoint **retries** with a
+readable reason naming the channels this process does register; it used to dead-letter,
+which destroyed every notification routed to a correctly configured endpoint whose sender
+the running binary happened not to have.
+
+The encoding is chosen from the **composed** message, not from the notification text. The
+footer carries the recipient's own name, so an Arabic rep receiving an English notification
+produced a body with high bytes in it while the message declared `7bit` — an RFC violation
+and exactly the mojibake the check exists to prevent. Verified against a real SMTP
+conversation: an ASCII body for `أحمد الموفق` goes out as `8bit` with the name intact, and
+`base64` to a relay that does not offer 8BITMIME.
 
 It has **never spoken to a real mail server**: it is verified end to end against a sink
 written alongside it, which is faithful to RFC 5321/3207/4616 as far as it goes and is not
@@ -517,11 +561,19 @@ alongside the sender so the receiving end has a reference rather than a reimplem
 and the tests verify against it — so both halves are known to agree. A missing secret
 dead-letters the delivery rather than sending unsigned.
 
-**29. Two channels, both real; email and SMS are a seam and nothing more.** The ERP's
-notification package declares 6 channels and 18 providers and has a working implementation
-for one of them, a gap that sat in its ADRs for releases. One working channel is worth more
-than six stubs, so this ships in-app and webhook — verified against a real HTTP server that
-checks the signature — and says plainly that nothing else is built.
+**29. Three channels, all real; SMS, push and voice are a seam and nothing more.** The
+ERP's notification package declares 6 channels and 18 providers and has a working
+implementation for one of them, a gap that sat in its ADRs for releases. Working channels
+are worth more than declared ones, so this ships in-app, webhook — verified against a real
+HTTP server that checks the signature — and email, verified against a real SMTP
+conversation, and says plainly that nothing else is built.
+
+**A channel is not shipped until it is reachable from a route and constructed by a
+process.** That is the second half of this rule and it was learned the hard way: email had
+~1,400 lines, a migration widening the CHECK to admit it, a README paragraph and an ADR
+item, and for one commit it could be configured only in psql and sent by nobody — a
+shipped, documented channel that did not exist. "Both senders are real" was true of the
+code and false of the system.
 
 **30. A write the ERP refuses permanently is not allowed to fail quietly.** The rep's app
 already showed it as recorded — because in the CRM it is — so the only half that failed is

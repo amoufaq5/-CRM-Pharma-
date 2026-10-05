@@ -351,6 +351,49 @@ describe("the SMTP channel, against a real server", () => {
       expect(live.transcript).toContain("MAIL FROM:<crm@crm.example>");
     });
 
+    /**
+     * The recipient's own NAME, over a real socket.
+     *
+     * The notification text here is pure ASCII; only the footer's `Recipient:` line is
+     * not. `chooseEncoding` was asked about `payload.body`, so it answered `7bit`, and the
+     * message went out declaring `7bit` while carrying raw 8-bit octets — an RFC violation
+     * and precisely the mojibake the function exists to prevent. Asserted against bytes
+     * that crossed a socket, because the two assertions that matter are what the HEADER
+     * says and what the relay actually received.
+     */
+    it("picks the encoding from the composed body, so an Arabic rep NAME is carried intact", async () => {
+      const live = await open({ advertise8BitMime: true });
+      const outcome = await sendTo(live, {
+        payload: {
+          subject: "OVERDUE: expired stock",
+          body: "Lot LOT-A was due for disposal",
+          recipient: { repProfileId: PAYLOAD.recipient.repProfileId, displayName: "أحمد الموفق" },
+        },
+      });
+      expect(outcome.kind).toBe("delivered");
+
+      const message = live.messages[0]!;
+      expect(message.headers["content-transfer-encoding"]).toBe("8bit");
+      expect(message.body).toContain("Recipient: أحمد الموفق");
+      expect(live.transcript).toContain("MAIL FROM:<crm@crm.example> BODY=8BITMIME");
+    });
+
+    it("base64s the same name for a 7-bit relay, rather than declaring 7bit and lying", async () => {
+      const live = await open({ advertise8BitMime: false });
+      const outcome = await sendTo(live, {
+        payload: {
+          body: "Lot LOT-A was due for disposal",
+          recipient: { repProfileId: PAYLOAD.recipient.repProfileId, displayName: "أحمد الموفق" },
+        },
+      });
+      expect(outcome.kind).toBe("delivered");
+      const message = live.messages[0]!;
+      expect(message.headers["content-transfer-encoding"]).toBe("base64");
+      expect(Buffer.from(message.body.split("\r\n").join(""), "base64").toString("utf8")).toContain(
+        "Recipient: أحمد الموفق",
+      );
+    });
+
     it("keeps a subject that contains a CRLF from becoming a header of its own", async () => {
       const live = await open();
       const outcome = await sendTo(live, {
@@ -429,6 +472,73 @@ describe("the SMTP channel, against a real server", () => {
         expect(outcome.kind).toBe("retry");
         expect(outcome.error).toMatch(/certificate/i);
         expect(live.messages).toHaveLength(0);
+      });
+    });
+
+    /**
+     * The socket is destroyed when the connect times out.
+     *
+     * `open()` created the socket, raced a timer against `connect`, and on a timeout
+     * rejected without closing it: the socket was a local that was never returned, so
+     * `conversation` stayed null and `send`'s `finally { conversation?.destroy() }`
+     * destroyed nothing. The handle kept the event loop alive — a process could not exit —
+     * and in a scheduler that retries a down relay every tick it leaked one descriptor per
+     * attempt, each able to complete its connect later and sit against the relay with no
+     * reader and no QUIT.
+     *
+     * Asserted on `process._getActiveHandles()` because the leak is not observable from the
+     * outcome: a leaking `open()` and a clean one return the same `retry`.
+     */
+    describe("a connect that never completes", () => {
+      /**
+       * Sockets the event loop is still holding open.
+       *
+       * `destroyed` and not presence: a destroyed socket stays in `_getActiveHandles()`
+       * until its close is processed, and it does NOT keep the loop alive — verified by
+       * running the same five attempts in a plain node process, which exits 0 with the fix
+       * and hangs without it. So the question "was it torn down" is `destroyed`, and the
+       * question "does it leak" is whether this count GROWS.
+       */
+      const liveSockets = (): number =>
+        (
+          process as unknown as {
+            _getActiveHandles: () => readonly { constructor: { name: string }; destroyed?: boolean }[];
+          }
+        )
+          ._getActiveHandles()
+          .filter((h) => /Socket$/.test(h.constructor.name) && h.destroyed !== true).length;
+
+      /**
+       * 10.255.255.1 is routable-looking and unreachable, so the connect HANGS rather than
+       * being refused. That distinction is the test: a refused connect closes its own
+       * socket and would prove nothing.
+       */
+      const unreachable = (timeoutMs: number): SmtpSender =>
+        new SmtpSender({
+          relay: { host: "10.255.255.1", port: 25, from: "crm@crm.example", transport: "starttls" },
+          env: {},
+          timeoutMs,
+        });
+
+      it("retries AND tears the socket down", async () => {
+        const before = liveSockets();
+        const outcome = await unreachable(300).send(PAYLOAD, MAILBOX);
+        expect(outcome.kind).toBe("retry");
+        expect(outcome.error).toMatch(/could not connect to 10\.255\.255\.1:25 within 300ms/);
+        expect(liveSockets()).toBe(before);
+      });
+
+      it("does not leak one per attempt, which is what a scheduler would do", async () => {
+        // The measured shape of the bug: a relay down for an hour with a per-minute tick
+        // leaked a descriptor a minute, each still able to complete its connect later and
+        // sit against the relay with no reader and no QUIT. Before the fix this counted
+        // 1, 2, 3, 4, 5.
+        const sender = unreachable(200);
+        const before = liveSockets();
+        for (let i = 0; i < 5; i += 1) {
+          expect((await sender.send(PAYLOAD, MAILBOX)).kind, `attempt ${String(i + 1)}`).toBe("retry");
+          expect(liveSockets(), `attempt ${String(i + 1)}`).toBe(before);
+        }
       });
     });
   });

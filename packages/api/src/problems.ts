@@ -233,6 +233,11 @@ export function toProblem(err: unknown): ApiError {
     // Four eyes, refused by a CHECK in 0006. Forbidden rather than conflict: the state is
     // fine, the actor is not.
     case "FourEyesViolationError":
+    // The same rule for the other decision, refused by its own CHECK in 0030. Mapped as
+    // its own case rather than folded into the one above, because the two errors say
+    // different things and a rejection reported as "cannot be approved by the rep who
+    // submitted it" sends the reader looking for an approval nobody attempted.
+    case "RejectionFourEyesViolationError":
       return new ApiError("forbidden", message);
     case "InvalidExpenseClaimTransitionError":
       return new ApiError("conflict", message);
@@ -242,6 +247,7 @@ export function toProblem(err: unknown): ApiError {
     case "RepNotMappedToEmployeeError":
     case "MissingAccountSnapshotError":
     case "ApprovalFieldsError":
+    case "RejectionFieldsError":
     case "MissingErpExpenseIdError":
       return new ApiError("conflict", message);
     case "InvalidAmountError":

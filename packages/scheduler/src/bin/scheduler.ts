@@ -2,7 +2,15 @@
 import { Pool } from "pg";
 import { ErpClient, type FetchLike } from "@crm/acl";
 import { buildServiceCredential } from "@crm/credential";
-import { NotificationDispatcher, WebhookSender, type FetchLike as NotifyFetch } from "@crm/notify";
+import {
+  NotificationDispatcher,
+  SmtpSender,
+  WebhookSender,
+  type ChannelSender,
+  type FetchLike as NotifyFetch,
+  type SmtpRelayConfig,
+  type SmtpTransport,
+} from "@crm/notify";
 import { OutboxRelay } from "@crm/relay";
 import { SnapshotRefresher } from "@crm/sync";
 
@@ -21,6 +29,47 @@ function env(name: string, fallback?: string): string {
   const v = process.env[name] ?? fallback;
   if (v === undefined) throw new Error(`missing required environment variable ${name}`);
   return v;
+}
+
+const SMTP_TRANSPORTS: readonly SmtpTransport[] = ["starttls", "implicit_tls", "plaintext"];
+
+/**
+ * The email sender, when one is configured.
+ *
+ * `SMTP_HOST` is the switch: absent means this process sends webhooks only, and an `email`
+ * endpoint row dead-letters with a readable reason. Present means the sender is built HERE,
+ * at boot, so its constructor refusals — a From that is not a mailbox, a port that is not a
+ * port, plaintext to anywhere but loopback — stop the process instead of being discovered
+ * one dead notification at a time. That refusal was unreachable until this function
+ * existed: nothing outside the tests had ever called the constructor.
+ *
+ * The password is NOT read here. It is read per delivery, from the variable each endpoint
+ * row names in `secret_env`, so two tenants relaying through the same host with different
+ * credentials need no second process.
+ */
+function buildMailSender(): SmtpSender | null {
+  const host = process.env["SMTP_HOST"];
+  if (host === undefined || host === "") return null;
+
+  const transport = process.env["SMTP_TRANSPORT"];
+  if (transport !== undefined && !SMTP_TRANSPORTS.includes(transport as SmtpTransport)) {
+    throw new Error(`SMTP_TRANSPORT must be one of ${SMTP_TRANSPORTS.join(", ")}, not ${JSON.stringify(transport)}`);
+  }
+  const port = Number(process.env["SMTP_PORT"] ?? (transport === "implicit_tls" ? "465" : "587"));
+  const relay: SmtpRelayConfig = {
+    host,
+    port,
+    from: env("SMTP_FROM"),
+    ...(transport !== undefined ? { transport: transport as SmtpTransport } : {}),
+    // Absent means no AUTH is attempted at all, which is the only sane reading of "no
+    // username": attempting AUTH with an empty one would fail every send identically.
+    ...(process.env["SMTP_USERNAME"] !== undefined ? { username: process.env["SMTP_USERNAME"] } : {}),
+    ...(process.env["SMTP_CLIENT_NAME"] !== undefined ? { clientName: process.env["SMTP_CLIENT_NAME"] } : {}),
+  };
+  return new SmtpSender({
+    relay,
+    ...(process.env["SMTP_TIMEOUT_MS"] !== undefined ? { timeoutMs: Number(process.env["SMTP_TIMEOUT_MS"]) } : {}),
+  });
 }
 
 function log(event: SchedulerEvent): void {
@@ -86,18 +135,24 @@ async function main(): Promise<void> {
     fetch: globalThis.fetch as unknown as FetchLike,
   });
 
+  const mail = buildMailSender();
+  const senders: readonly ChannelSender[] = [
+    new WebhookSender({ fetch: globalThis.fetch as unknown as NotifyFetch }),
+    ...(mail === null ? [] : [mail]),
+  ];
+  console.log(
+    JSON.stringify({ ts: new Date().toISOString(), type: "senders", channels: senders.map((x) => x.channel) }),
+  );
+
   const workerId = `${process.env["HOSTNAME"] ?? "local"}-${process.pid}`;
   const scheduler = new Scheduler({
     pool,
     relay: new OutboxRelay({ pool, client, workerId }),
     refresher: new SnapshotRefresher({ pool, client }),
-    // The webhook sender reads each endpoint's secret from the environment by name, so
-    // nothing secret is in the database and the process needs no configuration beyond the
+    // Both senders read each endpoint's secret from the environment by name, so nothing
+    // secret is in the database and the process needs no configuration beyond the
     // variables those endpoints point at.
-    notifications: new NotificationDispatcher({
-      pool,
-      senders: [new WebhookSender({ fetch: globalThis.fetch as unknown as NotifyFetch })],
-    }),
+    notifications: new NotificationDispatcher({ pool, senders }),
     ...(process.env["TICK_INTERVAL_MS"] !== undefined
       ? { tickIntervalMs: Number(process.env["TICK_INTERVAL_MS"]) }
       : {}),

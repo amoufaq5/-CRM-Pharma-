@@ -6,6 +6,7 @@ export const JOB_NAMES = [
   "expiry_sweep",
   "notify_dispatch",
   "notify_prune",
+  "expense_post",
 ] as const;
 export type JobName = (typeof JOB_NAMES)[number];
 
@@ -32,6 +33,13 @@ export type JobName = (typeof JOB_NAMES)[number];
  *   could notice — and the pass is capped at 50,000 rows, so a tenant turning retention
  *   on after a year of growth drains over a few nights rather than in one long
  *   transaction. Daily is what makes that cap a schedule rather than a cliff.
+ * - **expense_post (5 min).** The one job that acts on money, and the interval is a
+ *   deliberate compromise rather than a cadence. It is not 30 seconds, because a sweep
+ *   that posts an approved claim within half a minute makes approval and payment feel like
+ *   one act and leaves no window in which an approver who has just realised their mistake
+ *   can do anything about it. It is not daily, because a rep who is owed money should not
+ *   wait for a night to pass. Five minutes matches the snapshot: long enough to be a
+ *   separate act, short enough that nobody plans around it.
  */
 export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   relay_drain: 30_000,
@@ -40,6 +48,7 @@ export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   expiry_sweep: 24 * 60 * 60_000,
   notify_dispatch: 30_000,
   notify_prune: 24 * 60 * 60_000,
+  expense_post: 5 * 60_000,
 };
 
 /**

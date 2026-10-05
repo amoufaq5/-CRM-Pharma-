@@ -2,6 +2,7 @@ import { withTenantContext } from "@crm/db";
 import type { OutboxRelay } from "@crm/relay";
 import { pruneNotifications, type NotificationDispatcher } from "@crm/notify";
 import { sweepExpiredStock } from "@crm/sample";
+import { summariseExpensePostSweep, sweepApprovedExpenseClaims } from "@crm/expense";
 import type { SnapshotRefresher } from "@crm/sync";
 import type { Pool, PoolClient } from "pg";
 
@@ -231,8 +232,26 @@ export class Scheduler {
             `share=${r.sharePercent}%/${r.guard.prune_max_share_percent}% ` +
             `prunable=${r.prunableTotal} inbox=${r.inboxTotal}` +
             (r.overridden ? " overridden=true" : "") +
+            // A pass the FLOOR let through over the ceiling used to read like a pass that
+            // was within it — `overridden` is only ever true when the guard tripped, and
+            // the floor stops it tripping. Named here so the log says which knob did it.
+            (r.floorWaived ? ` FLOOR-WAIVED: ${r.floorWaivedReason ?? "under the row floor"}` : "") +
             // A refusal deleted NOTHING, so it must not read like a quiet zero.
             (r.refused ? ` REFUSED: ${r.refusalReason ?? "over the ceiling"}` : "")
+          );
+        } finally {
+          client.release();
+        }
+      }
+      case "expense_post": {
+        // A PLAIN pool client, deliberately not wrapped: the sweep opens one transaction
+        // per claim, so one claim that cannot post must not roll back the ones that
+        // already did. It refuses a client that is already in a tenant context rather than
+        // nesting a BEGIN inside one, which is why the wrapper is its job and not ours.
+        const client = await this.options.pool.connect();
+        try {
+          return summariseExpensePostSweep(
+            await sweepApprovedExpenseClaims(client, tenantId, { asOf: this.now() }),
           );
         } finally {
           client.release();

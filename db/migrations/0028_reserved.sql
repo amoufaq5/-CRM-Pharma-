@@ -1,0 +1,13 @@
+-- 0028_reserved.sql
+--
+-- DELIBERATELY EMPTY. This number is a permanent gap and this file is the record of it.
+--
+-- 0028 was claimed for an increment that was then folded into 0029, and the number was
+-- never reused. The repo's convention for a reserved-and-never-written number is to say
+-- so where a reader will look (ADR-0001 does the same for its own reserved numbers), and
+-- the only place a reader looks for a missing migration is the directory listing — so the
+-- note goes in a file rather than in a document beside it. A gap with no explanation reads
+-- as a lost file, which is a worse thing to find in a schema's history than a no-op.
+--
+-- The migration runner applies this once and records its hash like any other, so the
+-- number is accounted for in `crm._migrations` too, not just on disk. Nothing below.

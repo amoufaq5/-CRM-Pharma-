@@ -16,6 +16,8 @@ export {
   ApprovalFieldsError,
   ExpenseClaimNotFoundError,
   FourEyesViolationError,
+  RejectionFieldsError,
+  RejectionFourEyesViolationError,
   InvalidAccountCodeError,
   InvalidAmountError,
   InvalidCategoryError,
@@ -28,6 +30,8 @@ export {
   translateExpenseClaimError,
 } from "./errors.js";
 export {
+  ACCOUNT_CODE_MAX,
+  EXPENSE_CATEGORY_MAX,
   activeAccountMapping,
   deactivateAccountMapping,
   listAccountMappings,
@@ -53,6 +57,17 @@ export {
   type ErpExpenseTransition,
   type PostableClaim,
 } from "./posting.js";
+export {
+  ClientAlreadyInTenantContextError,
+  DEFAULT_SWEEP_LIMIT,
+  EXPENSE_POST_BLOCKED_KIND,
+  summariseExpensePostSweep,
+  sweepApprovedExpenseClaims,
+  type ExpensePostOutcome,
+  type ExpensePostStatus,
+  type ExpensePostSweepOptions,
+  type ExpensePostSweepResult,
+} from "./sweeper.js";
 export {
   approveClaim,
   claimPostingStatus,

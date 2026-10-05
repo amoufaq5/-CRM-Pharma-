@@ -18,13 +18,25 @@ export interface PollingChangeSourceOptions {
  * `WebhookChangeSource` replaces this behind the same interface and no caller
  * changes.
  *
- * Why this works at all: every entity carries `updated_at` from the `auditable`
- * trait, and `?updated_at[gte]=` is accepted because reference and lifecycle
- * fields are filterable by default. Crucially, `updated_at` is a DATETIME, so the
- * ERP's text comparison is CORRECT for it — ISO-8601 sorts lexicographically in
- * chronological order. That accident is the only reason incremental polling is
- * sound on the deployed store; the same query against a numeric field would be
- * silently wrong (report R19).
+ * WHETHER IT CAN POLL INCREMENTALLY AT ALL IS A PROPERTY OF THE SERVED SCHEMA, and this
+ * comment used to assert it always could: "every entity carries `updated_at` from the
+ * `auditable` trait, and `?updated_at[gte]=` is accepted because reference and lifecycle
+ * fields are filterable by default". Checked against a real `operate-server` serving
+ * `pack-erp-core`, both halves are false — 0 of 51 entities declare `updated_at` and 0
+ * have it filterable, because `buildUiSchema` reads the manifest's `fields` and not
+ * `resolvedFields`, so a trait's columns never appear. See `change-source.ts`.
+ *
+ * So the filter is applied only where the schema says it will be honoured. Where it will
+ * not, this reads everything it can page through and returns `mode: "full_sweep"`. The
+ * filter is never sent speculatively: the ERP ignores an unknown filter rather than
+ * refusing it, so a speculative one would produce an unbounded result set that looked
+ * bounded — and `ErpClient.assertFilterable` would refuse it anyway, which is the guard
+ * working as intended.
+ *
+ * Where it IS honoured, `updated_at` is a DATETIME and the ERP's text comparison is
+ * correct for it: ISO-8601 sorts lexicographically in chronological order. That accident
+ * is the only reason incremental polling is sound on the deployed store; the same query
+ * against a numeric field would be silently wrong (report R19).
  */
 export class PollingChangeSource implements ChangeSource {
   private readonly pageSize: number;
@@ -33,19 +45,40 @@ export class PollingChangeSource implements ChangeSource {
     this.pageSize = Math.min(options.pageSize ?? 200, 500);
   }
 
+  /**
+   * Can `since` be honoured for this entity?
+   *
+   * Asked of the served schema, not assumed. Both the filter AND the sort have to be
+   * supported: a filtered-but-unsorted page would still be correct, but the cursor would
+   * walk the view's default order while the watermark advanced by `updated_at`, and the
+   * two can disagree about what has been seen.
+   */
+  async supportsIncremental(tenantId: string, entity: string): Promise<boolean> {
+    const schema = await this.options.client.schema(tenantId);
+    const ent = schema.entity(entity);
+    return (
+      ent.filterableFields.includes("updated_at") && ent.sortableFields.includes("updated_at")
+    );
+  }
+
   async changesSince(
     tenantId: string,
     entity: string,
     since: string,
     cursor?: string,
   ): Promise<ChangeBatch> {
+    const incremental = await this.supportsIncremental(tenantId, entity);
     const page = await this.options.client.list(tenantId, entity, {
       // INCLUSIVE (gte, not gt). Two records can share an `updated_at` to the
       // millisecond, and re-reading one is free while skipping one is a silent
       // hole in the snapshot. Callers tolerate redelivery because every write is
       // keyed on a deterministic id.
-      filters: [{ field: "updated_at", op: "gte", value: since }],
-      sort: { field: "updated_at", direction: "asc" },
+      ...(incremental
+        ? {
+            filters: [{ field: "updated_at", op: "gte", value: since }],
+            sort: { field: "updated_at", direction: "asc" as const },
+          }
+        : {}),
       limit: this.pageSize,
       ...(cursor !== undefined ? { cursor } : {}),
     });
@@ -69,6 +102,9 @@ export class PollingChangeSource implements ChangeSource {
       // Only advance the mark once the page is drained. Advancing mid-page would
       // skip the rest of it if the process died before the next call.
       highWaterMark: page.nextCursor === null ? high : null,
+      // Carried so a caller cannot mistake one for the other. In `full_sweep` the records
+      // are still correct; what is untrue of them is that `since` bounded the read.
+      mode: incremental ? "incremental" : "full_sweep",
     };
   }
 }

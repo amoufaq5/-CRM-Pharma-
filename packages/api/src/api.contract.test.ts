@@ -113,6 +113,10 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.visit_product WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.visit WHERE tenant_id = $1", [t]);
         await tx.query("ALTER TABLE crm.visit ENABLE TRIGGER visit_reject_delete_when_final");
+        // Before rep_profile: `crm.expense_claim` references it (and `approved_by` /
+        // `rejected_by` reference it too), all ON DELETE RESTRICT.
+        await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.expense_account_map WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.account_assignment WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.territory_assignment WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1", [t]);
@@ -1703,6 +1707,195 @@ describe("the API, end to end", () => {
    * what. So the tests that matter here are the refusals — a rep with no grant, and a
    * MANAGER with a full team, must both be turned away from a tenant-wide parameter.
    */
+  /**
+   * The expense claim lifecycle over HTTP, and the four-eyes rule on all four decisions.
+   *
+   * These routes had no coverage here at all, which is how the hole below shipped:
+   * `rep_can_supervise` answers YES for the caller themselves — correct for a read, where a
+   * rep may always see their own work — and all four write transitions gated on supervision
+   * alone. `expense_claim_four_eyes` caught the approve in the database; `post` and
+   * `reimburse` record no actor, so nothing downstream could catch those. A rep could hand
+   * their own claim to the ledger and mark it paid.
+   */
+  describe("expense claims", () => {
+    const mapCategory = async (): Promise<void> => {
+      await withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.expense_account_map
+             (tenant_id, crm_category, erp_ledger_account_code, is_active)
+           VALUES ($1, 'client_meal', '6100', true)`,
+          [TENANT],
+        ),
+      );
+    };
+
+    const mgrToken = (): string => token({ sub: "idp|mgr" });
+
+    /** A claim filed by `rep` and submitted, which is where every decision starts. */
+    const submitted = async (): Promise<string> => {
+      await mapCategory();
+      const created = await call("POST", "/v1/expenses", {
+        body: { crmCategory: "client_meal", amount: "120.50", currency: "AED", incurredOn: "2026-09-01" },
+      });
+      expect(created.status).toBe(201);
+      const id = created.body.id as string;
+      expect((await call("POST", `/v1/expenses/${id}/submit`)).status).toBe(200);
+      return id;
+    };
+
+    it("files, submits, approves, posts and reimburses — with two different people", async () => {
+      const id = await submitted();
+      // The manager supervises `rep` through the region, and is not the claimant.
+      const approved = await call("POST", `/v1/expenses/${id}/approve`, { auth: mgrToken() });
+      expect(approved.status).toBe(200);
+      expect(approved.body.state).toBe("approved");
+      expect(approved.body.approved_by).toBe(manager);
+
+      const posted = await call("POST", `/v1/expenses/${id}/post`, { auth: mgrToken() });
+      expect(posted.status).toBe(200);
+      expect(posted.body.claim.state).toBe("posted");
+
+      const paid = await call("POST", `/v1/expenses/${id}/reimburse`, { auth: mgrToken() });
+      expect(paid.status).toBe(200);
+      expect(paid.body.claim.state).toBe("reimbursed");
+    });
+
+    /**
+     * The hole, on each of the four decisions.
+     *
+     * 403 and not the 404 every other scoped record gets: the caller IS the claimant, so
+     * pretending the claim does not exist tells them something they know to be false, and
+     * there is nothing left to conceal from the person whose money it is.
+     */
+    it("refuses the claimant their own approve and reject, in the route", async () => {
+      const id = await submitted();
+      for (const verb of ["approve", "reject"] as const) {
+        const res = await call("POST", `/v1/expenses/${id}/${verb}`);
+        expect(res.status, verb).toBe(403);
+        // The 403 was already there for these two — `expense_claim_four_eyes` and 0030's
+        // `expense_claim_reject_four_eyes` produce one — but with no explanation, because
+        // a constraint violation does not know what the caller was trying to do. The route
+        // is where a refusal can say which rule was broken.
+        expect(JSON.stringify(res.body), verb).toMatch(/by the rep who filed it/);
+      }
+    });
+
+    /**
+     * The half nothing downstream could catch, and the reason the rule belongs in the route.
+     *
+     * `post` and `reimburse` record no actor — there is no `posted_by` column for a CHECK
+     * to compare — so until this check existed a rep who had been legitimately approved
+     * could hand their own claim to the ledger and mark it paid, alone. These two asserted
+     * 200 before the fix.
+     */
+    it("refuses the claimant their own post and reimburse, which no CHECK can", async () => {
+      const id = await submitted();
+      expect((await call("POST", `/v1/expenses/${id}/approve`, { auth: mgrToken() })).status).toBe(200);
+      for (const verb of ["post", "reimburse"] as const) {
+        const res = await call("POST", `/v1/expenses/${id}/${verb}`);
+        expect(res.status, verb).toBe(403);
+        expect(JSON.stringify(res.body), verb).toMatch(/by the rep who filed it/);
+      }
+      // And the claim did not move — nothing was enqueued to the ERP either.
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const { rows } = await tx.query<{ state: string }>(
+          "SELECT state FROM crm.expense_claim WHERE id = $1",
+          [id],
+        );
+        expect(rows[0]!.state).toBe("approved");
+        const { rows: out } = await tx.query<{ n: string }>(
+          "SELECT count(*) AS n FROM crm.outbox WHERE tenant_id = $1 AND source_id = $2",
+          [TENANT, id],
+        );
+        expect(Number(out[0]!.n)).toBe(0);
+      });
+    });
+
+    it("records who rejected a claim, and when", async () => {
+      const id = await submitted();
+      const rejected = await call("POST", `/v1/expenses/${id}/reject`, { auth: mgrToken() });
+      expect(rejected.status).toBe(200);
+      expect(rejected.body.state).toBe("rejected");
+      // 0030. Before it, a rejection was a state with no actor and no timestamp — the one
+      // decision in the lifecycle that left no record of who made it.
+      expect(rejected.body.rejected_by).toBe(manager);
+      expect(rejected.body.rejected_at).not.toBeNull();
+      expect(rejected.body.approved_at).toBeNull();
+    });
+
+    it("still refuses a decision from someone outside the claimant's line", async () => {
+      // Four eyes is not the only rule: `otherRep` is neither the claimant nor a
+      // supervisor, and gets the 404 that every other cross-rep read gets, because whether
+      // another rep's claim exists is information about their spending.
+      const id = await submitted();
+      const res = await call("POST", `/v1/expenses/${id}/approve`, { auth: token({ sub: "idp|rep2" }) });
+      expect(res.status).toBe(404);
+    });
+
+    it("refuses to submit while Finance has mapped no account for the category", async () => {
+      const created = await call("POST", "/v1/expenses", {
+        body: { crmCategory: "unmapped_thing", amount: "10.00", currency: "AED", incurredOn: "2026-09-01" },
+      });
+      expect(created.status).toBe(201);
+      const res = await call("POST", `/v1/expenses/${created.body.id}/submit`);
+      // The designed refusal, and the behaviour the whole design turns on — not a 500.
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
+    });
+
+    it("refuses an amount of zero on the characters, not on a float", async () => {
+      for (const amount of ["0", "0.00", "00.0"]) {
+        const res = await call("POST", "/v1/expenses", {
+          body: { crmCategory: "client_meal", amount, currency: "AED", incurredOn: "2026-09-01" },
+        });
+        expect(res.status, amount).toBe(422);
+      }
+      // And the smallest real amount is accepted, which is what the test above would also
+      // pass if the check were simply "refuse everything".
+      await mapCategory();
+      const ok = await call("POST", "/v1/expenses", {
+        body: { crmCategory: "client_meal", amount: "0.01", currency: "AED", incurredOn: "2026-09-01" },
+      });
+      expect(ok.status).toBe(201);
+    });
+
+    it("reports the claim's ERP writes in the order they were enqueued", async () => {
+      const id = await submitted();
+      expect((await call("POST", `/v1/expenses/${id}/approve`, { auth: mgrToken() })).status).toBe(200);
+      expect((await call("POST", `/v1/expenses/${id}/post`, { auth: mgrToken() })).status).toBe(200);
+      expect((await call("POST", `/v1/expenses/${id}/reimburse`, { auth: mgrToken() })).status).toBe(200);
+      const erp = await call("GET", `/v1/expenses/${id}/erp`);
+      expect(erp.status).toBe(200);
+      // `create` before `reimburse`, by `seq` — 0027's sequence, not a `created_at` that
+      // two rows written in one transaction share to the microsecond.
+      expect(erp.body.data.map((r: { operation: string }) => r.operation)).toEqual([
+        "create",
+        "transition:reimburse",
+      ]);
+    });
+
+    it("advertises the ERP's own code length, not a longer one", async () => {
+      // The route validated these at 64 while the store refused anything over 32, which is
+      // the ERP's real `maxLength` on LedgerAccount.account_code and CostCenter.code. Both
+      // ended in a 422; the route just promised a contract the layer behind it rejected.
+      await withTenantContext(admin, TENANT, (tx) =>
+        tx.query("DELETE FROM crm.rep_role WHERE tenant_id = $1", [TENANT]),
+      );
+      const id = await withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+           VALUES ($1,$2,'administrator',$3,CURRENT_DATE) RETURNING id`,
+          [TENANT, rep, manager],
+        ),
+      );
+      expect(id.rows).toHaveLength(1);
+      const res = await call("PUT", "/v1/admin/expense-accounts/client_meal", {
+        body: { erpLedgerAccountCode: "6".repeat(33) },
+      });
+      expect(res.status).toBe(422);
+    });
+  });
+
   describe("administration", () => {
     const repToken = token({ sub: "idp|rep1" });
     const mgrToken = token({ sub: "idp|mgr" });
@@ -1800,6 +1993,7 @@ describe("the API, end to end", () => {
         await grant(() => rep, "administrator", () => manager);
         const created = await call("POST", "/v1/admin/notification-endpoints", {
           body: {
+            channel: "webhook",
             url: "https://hooks.example.test/crm",
             secretEnv: "CRM_OPS_WEBHOOK_SECRET",
             minSeverity: "urgent",
@@ -1824,18 +2018,22 @@ describe("the API, end to end", () => {
         expect((await call("DELETE", `/v1/admin/notification-endpoints/${created.body.id}`)).status).toBe(405);
       });
 
-      it("refuses a plaintext destination", async () => {
+      it("refuses a plaintext destination, as a 422 that says why", async () => {
         await grant(() => rep, "administrator", () => manager);
         const res = await call("POST", "/v1/admin/notification-endpoints", {
-          body: { url: "http://hooks.example.test/crm", secretEnv: "CRM_OPS_WEBHOOK_SECRET" },
+          body: { channel: "webhook", url: "http://hooks.example.test/crm", secretEnv: "CRM_OPS_WEBHOOK_SECRET" },
         });
-        expect(res.status).toBeGreaterThanOrEqual(400);
+        // 422 and not 500. This assertion was `>= 400` and the refusal was in fact an
+        // untranslated CHECK violation surfacing as "an unexpected error occurred" — which
+        // turned one of the schema's most deliberate rules into a bug report.
+        expect(res.status).toBe(422);
+        expect(JSON.stringify(res.body)).toContain("does not travel in the clear");
       });
 
       it("refuses a secret VALUE where an environment variable NAME belongs", async () => {
         await grant(() => rep, "administrator", () => manager);
         const res = await call("POST", "/v1/admin/notification-endpoints", {
-          body: { url: "https://hooks.example.test/crm", secretEnv: "hunter2-actual-secret" },
+          body: { channel: "webhook", url: "https://hooks.example.test/crm", secretEnv: "hunter2-actual-secret" },
         });
         expect(res.status).toBe(422);
         expect(JSON.stringify(res.body)).toContain("environment variable");
@@ -1845,10 +2043,68 @@ describe("the API, end to end", () => {
         await grant(() => rep, "administrator", () => manager);
         const res = await call("POST", "/v1/admin/notification-endpoints", {
           body: {
+            channel: "webhook",
             url: "https://hooks.example.test/crm",
             secretEnv: "CRM_OPS_WEBHOOK_SECRET",
             kinds: ["everything_please"],
           },
+        });
+        expect(res.status).toBe(422);
+      });
+
+      /**
+       * The email channel, reachable from the route it was always supposed to be reachable
+       * from.
+       *
+       * `createEndpoint` wrote `'webhook'` as a LITERAL, so 0029 could widen the CHECK to
+       * admit `email` and the only way to use it was psql — a shipped, documented channel
+       * with ~1,400 lines behind it that nothing above SQL could name.
+       */
+      it("creates an email endpoint, and holds it to the mailto: shape", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const created = await call("POST", "/v1/admin/notification-endpoints", {
+          body: {
+            channel: "email",
+            url: "mailto:ops@example.test",
+            secretEnv: "CRM_SMTP_PASSWORD",
+            minSeverity: "urgent",
+          },
+        });
+        expect(created.status).toBe(201);
+        expect(created.body.channel).toBe("email");
+        expect(created.body.url).toBe("mailto:ops@example.test");
+
+        // Per-channel, not a flat disjunction: an https url is valid for a webhook and
+        // invalid for email, and 0029 checks the PAIR precisely so neither mismatch can be
+        // stored with no sender and no error.
+        const wrongUrl = await call("POST", "/v1/admin/notification-endpoints", {
+          body: { channel: "email", url: "https://hooks.example.test/crm", secretEnv: "CRM_SMTP_PASSWORD" },
+        });
+        expect(wrongUrl.status).toBeGreaterThanOrEqual(400);
+        expect(wrongUrl.status).toBeLessThan(500);
+
+        const mailboxAsWebhook = await call("POST", "/v1/admin/notification-endpoints", {
+          body: { channel: "webhook", url: "mailto:ops@example.test", secretEnv: "CRM_OPS_WEBHOOK_SECRET" },
+        });
+        expect(mailboxAsWebhook.status).toBeGreaterThanOrEqual(400);
+        expect(mailboxAsWebhook.status).toBeLessThan(500);
+      });
+
+      it("refuses a channel nothing sends, naming the ones it does", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("POST", "/v1/admin/notification-endpoints", {
+          body: { channel: "carrier_pigeon", url: "https://hooks.example.test/crm", secretEnv: "CRM_OPS_WEBHOOK_SECRET" },
+        });
+        expect(res.status).toBe(422);
+      });
+
+      it("has no default channel: an omitted one is a 422, not a webhook", async () => {
+        // A default would leave the next channel as unreachable as email was, and the url
+        // shape is channel-dependent, so a caller that does not know which channel it
+        // means does not know whether its url is valid either.
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("POST", "/v1/admin/notification-endpoints", {
+          body: { url: "https://hooks.example.test/crm", secretEnv: "CRM_OPS_WEBHOOK_SECRET" },
         });
         expect(res.status).toBe(422);
       });
@@ -1916,6 +2172,33 @@ describe("the API, end to end", () => {
         const res = await call("GET", "/v1/admin/notifications/prune-candidates");
         expect(res.status).toBe(200);
         expect(res.body.data).toEqual([]);
+      });
+
+      /**
+       * The override's attribution is built from two unbounded `text` columns and the
+       * column it lands in is capped at 200 characters.
+       *
+       * A long display name or a long OIDC subject therefore failed the CHECK and the
+       * operator was told the override "must name who granted it" — true of the empty
+       * string, not of theirs, and nothing they could act on. The subject survives whole
+       * because it is the half that identifies the grantor; the name gives way, with an
+       * ellipsis so a reader can see something was dropped.
+       */
+      it("fits a long display name into the override's attribution instead of failing", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const long = "Ä".repeat(400);
+        await withTenantContext(admin, TENANT, (tx) =>
+          tx.query("UPDATE crm.rep_profile SET display_name = $2 WHERE id = $1", [rep, long]),
+        );
+        const res = await call("POST", "/v1/admin/notifications/prune-guard/override", {
+          body: { hours: 2 },
+        });
+        expect(res.status).toBe(200);
+        const by = res.body.prune_guard_override_by as string;
+        expect(by.length).toBeLessThanOrEqual(200);
+        // The subject is intact and the name is what was shortened.
+        expect(by).toContain("<idp|rep1>");
+        expect(by).toContain("…");
       });
     });
 

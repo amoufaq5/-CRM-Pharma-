@@ -52,6 +52,25 @@ export class FourEyesViolationError extends Error {
 }
 
 /**
+ * The rejecter is the rep whose claim it is. 0030's `expense_claim_reject_four_eyes`.
+ *
+ * Its own class rather than a reused `FourEyesViolationError`, for the same reason 0030
+ * added two columns instead of overloading `approved_by`: a rejection reported as "cannot
+ * be approved by the rep who submitted it" sends the reader looking for an approval that
+ * was never attempted.
+ */
+export class RejectionFourEyesViolationError extends Error {
+  constructor(message: string) {
+    super(
+      `an expense claim cannot be rejected by the rep who submitted it (four-eyes). ` +
+        `Separation of duties applies to the refusal exactly as it does to the approval — a ` +
+        `claimant who can reject their own claim decides both outcomes: ${message}`,
+    );
+    this.name = "RejectionFourEyesViolationError";
+  }
+}
+
+/**
  * The claim has no snapshotted account code but is leaving `draft`.
  *
  * Reachable only by a writer that bypassed `submitClaim`; the store's own path snapshots
@@ -73,6 +92,20 @@ export class ApprovalFieldsError extends Error {
   constructor(message: string) {
     super(`approval state and approval timestamp disagree: ${message}`);
     this.name = "ApprovalFieldsError";
+  }
+}
+
+/**
+ * A rejected claim with no rejection timestamp, or an unrejected one carrying one.
+ *
+ * The counterpart to `ApprovalFieldsError`, over 0030's `expense_claim_rejected_fields`.
+ * The two constraints cannot both be violated by one row: `state` is a single value and
+ * the state sets are disjoint, so at most one of the timestamps is ever required.
+ */
+export class RejectionFieldsError extends Error {
+  constructor(message: string) {
+    super(`rejection state and rejection timestamp disagree: ${message}`);
+    this.name = "RejectionFieldsError";
   }
 }
 
@@ -194,12 +227,28 @@ interface PgErrorShape {
   readonly message?: string;
 }
 
-/** Recognises 0006's refusals. Anything unrecognised passes through unchanged. */
+/** Recognises 0006's and 0030's refusals. Anything unrecognised passes through unchanged. */
 export function translateExpenseClaimError(err: unknown): Error {
   const e = err as PgErrorShape;
   const message = e?.message ?? "";
   const constraint = e?.constraint ?? "";
 
+  // The two reject constraints are matched BEFORE their approve counterparts. Neither
+  // name is a substring of the other today, but they differ by one infix and the
+  // approve branches match on substrings — so a future rename is one letter away from
+  // reporting a rejection as a failed approval.
+  if (
+    constraint === "expense_claim_reject_four_eyes" ||
+    message.includes("expense_claim_reject_four_eyes")
+  ) {
+    return new RejectionFourEyesViolationError(message);
+  }
+  if (
+    constraint === "expense_claim_rejected_fields" ||
+    message.includes("expense_claim_rejected_fields")
+  ) {
+    return new RejectionFieldsError(message);
+  }
   if (constraint === "expense_claim_four_eyes" || message.includes("expense_claim_four_eyes")) {
     return new FourEyesViolationError(message);
   }

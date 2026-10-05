@@ -18,7 +18,9 @@ import { translateSampleError } from "./errors.js";
  * What it does instead is the thing nobody was doing: notice, date, chase, and attribute.
  *
  *   1. close obligations whose stock has actually gone, recording WHICH movement did it;
- *   2. open an obligation for every expired holding that has none;
+ *   2. open an obligation for every expired holding that has none — CONTINUING the
+ *      (rep, lot)'s earlier deadline where there was one, rather than granting a fresh
+ *      grace period to material that left custody and came back (0030);
  *   3. write off expired PROMO MATERIAL, if the tenant opted in — a leaflet past its
  *      campaign date carries no custody obligation;
  *   4. mark anything past its deadline overdue.
@@ -41,6 +43,12 @@ export interface DisposalPolicy {
 export interface ExpirySweepResult {
   readonly expiredHoldings: number;
   readonly opened: number;
+  /**
+   * How many of `opened` inherited an earlier deadline instead of being granted a fresh
+   * one — material that left this rep's custody and came back. A subset of `opened`, not
+   * a separate total, because a continuation IS an obligation now live that was not.
+   */
+  readonly continued: number;
   readonly resolved: number;
   readonly markedOverdue: number;
   readonly autoWrittenOff: number;
@@ -182,46 +190,92 @@ export async function sweepExpiredStock(
     );
 
     let opened = 0;
+    let continued = 0;
     let notified = 0;
-    const dueBy = isoDate(new Date(asOf.getTime() + policy.grace_days * 86_400_000));
+    const freshDueBy = isoDate(new Date(asOf.getTime() + policy.grace_days * 86_400_000));
     for (const holding of expired) {
-      const { rowCount } = await tx.query(
-        `INSERT INTO crm.disposal_obligation
-           (tenant_id, rep_profile_id, lot_id, quantity_at_discovery, expired_on, discovered_on, due_by)
-         VALUES ($1, $2, $3, $4, $5::date, $6::date, $7::date)
+      const { rows: raised } = await tx.query<{
+        id: string;
+        discovered_on: string;
+        due_by: string;
+        continues_obligation_id: string | null;
+      }>(
+        // The dates are decided in SQL for the reason `crm.open_disposal_obligations`
+        // is: `crm.disposal_carry_forward` is the one definition of "the deadline this
+        // rep already has for this lot", and a second one here would eventually disagree
+        // with it. In the same statement as the ON CONFLICT rather than before it, so a
+        // night that has nothing to insert computes no deadline at all — the conflicting
+        // case must not be able to produce a date that something later reads.
+        `WITH carried AS (SELECT * FROM crm.disposal_carry_forward($2, $3))
+         INSERT INTO crm.disposal_obligation
+           (tenant_id, rep_profile_id, lot_id, quantity_at_discovery, expired_on,
+            discovered_on, due_by, continues_obligation_id)
+         SELECT $1, $2, $3, $4, $5::date,
+                COALESCE(c.discovered_on, $6::date),
+                COALESCE(c.due_by, $7::date),
+                c.continues_obligation_id
+           FROM carried c
          -- Inferred against uq_disposal_obligation_live: one live obligation per
          -- (rep, lot). The sweep runs nightly and must not raise a row per night for
          -- the same carton, which would reset the deadline every time — the opposite of
          -- chasing it.
          ON CONFLICT (rep_profile_id, lot_id) WHERE status IN ('open', 'overdue')
-         DO NOTHING`,
+         DO NOTHING
+         RETURNING id, discovered_on::text AS discovered_on, due_by::text AS due_by,
+                   continues_obligation_id`,
         [tenantId, holding.rep_profile_id, holding.lot_id, holding.quantity_on_hand,
-         holding.expiry_date, today, dueBy],
+         holding.expiry_date, today, freshDueBy],
       );
-      if ((rowCount ?? 0) === 0) continue;
+      const obligation = raised[0];
+      if (obligation === undefined) continue;
       opened += 1;
+
+      const isContinuation = obligation.continues_obligation_id !== null;
+      if (isContinuation) continued += 1;
 
       // Told in the SAME transaction as the obligation. Previously this was the whole gap:
       // the sweep raised an obligation at 3am and the rep found out whenever they next
       // happened to open the app.
+      //
+      // A continuation is told separately and says so. It has to: the first notification
+      // is still in the inbox under the `:raised` key, so reusing that key would dedup
+      // against it and the rep would never learn that the material is back — and the fact
+      // they most need is the one a fresh grace period would have hidden, that the
+      // original deadline still stands.
       await raiseNotification(tx, tenantId, {
         recipientRepProfileId: holding.rep_profile_id,
         kind: "disposal_obligation_raised",
         severity: "warning",
-        subject: `Expired stock to dispose of: lot ${holding.lot_number}`,
-        body:
-          `${holding.quantity_on_hand} unit(s) of lot ${holding.lot_number} expired on ` +
-          `${holding.expiry_date}. Record a destruction or return it to a warehouse by ${dueBy}.`,
+        subject: isContinuation
+          ? `Expired stock back in your custody: lot ${holding.lot_number}`
+          : `Expired stock to dispose of: lot ${holding.lot_number}`,
+        body: isContinuation
+          ? `${holding.quantity_on_hand} unit(s) of lot ${holding.lot_number} are back on your ` +
+            `balance. This is the same disposal you were told about on ` +
+            `${obligation.discovered_on} and the deadline has not moved: record a destruction ` +
+            `or return it to a warehouse by ${obligation.due_by}.`
+          : `${holding.quantity_on_hand} unit(s) of lot ${holding.lot_number} expired on ` +
+            `${holding.expiry_date}. Record a destruction or return it to a warehouse by ` +
+            `${obligation.due_by}.`,
         // Scoped to the lot and the event, with no date in it: the key is what makes a
-        // nightly sweep tell them once rather than every night.
-        dedupKey: `disposal:${holding.lot_id}:raised`,
+        // nightly sweep tell them once rather than every night. A continuation is keyed
+        // to its own obligation instead, so each return is news exactly once.
+        dedupKey: isContinuation
+          ? `disposal:${holding.lot_id}:resumed:${obligation.id}`
+          : `disposal:${holding.lot_id}:raised`,
         subjectTable: "crm.disposal_obligation",
+        // Named so retention can tell that this notification is about something
+        // unfinished. `crm.notification_subject_open` matches on the id, so without it a
+        // notice about a live regulated disposal prunes at the ordinary horizon — which
+        // for the one deadline this file exists to preserve is the wrong way round.
+        subjectId: obligation.id,
         payload: {
           lotNumber: holding.lot_number,
           materialKind: holding.material_kind,
           expiredOn: holding.expiry_date,
-          dueBy,
+          dueBy: obligation.due_by,
           quantity: holding.quantity_on_hand,
+          continuesObligationId: obligation.continues_obligation_id,
         },
       });
       notified += 1;
@@ -324,6 +378,7 @@ export async function sweepExpiredStock(
     return {
       expiredHoldings: expired.length,
       opened,
+      continued,
       resolved,
       markedOverdue,
       autoWrittenOff,
@@ -334,4 +389,52 @@ export async function sweepExpiredStock(
   } catch (err) {
     throw translateSampleError(err);
   }
+}
+
+/**
+ * One (rep, lot)'s disposal history, oldest first.
+ *
+ * The read that makes carrying a deadline forward auditable rather than merely correct.
+ * A resolved obligation and the continuation that inherited its deadline are two rows,
+ * and this is where the pair reads as what happened: discovered on a date, due on a date,
+ * discharged by a named movement of a named KIND, then continued — so an auditor can see
+ * that the stock was transferred away and came back, which is a different fact from an
+ * obligation that simply exists.
+ *
+ * Separate from `openObligations` on purpose: that one answers "what must this rep
+ * clear", which is a live list and has no business carrying resolved rows.
+ */
+export interface DisposalObligationHistoryEntry {
+  readonly id: string;
+  readonly sequence_number: number;
+  readonly continues_obligation_id: string | null;
+  readonly quantity_at_discovery: string;
+  readonly expired_on: string;
+  readonly discovered_on: string;
+  readonly due_by: string;
+  readonly status: "open" | "overdue" | "resolved";
+  readonly resolved_on: string | null;
+  readonly resolution: string | null;
+  readonly resolving_transaction_id: string | null;
+  /** The custody ledger's own word for the movement — `transfer_out`, not `transferred`. */
+  readonly resolving_transaction_kind: string | null;
+  readonly created_at: Date;
+}
+
+export async function disposalHistory(
+  tx: PoolClient,
+  repProfileId: string,
+  lotId: string,
+): Promise<readonly DisposalObligationHistoryEntry[]> {
+  const { rows } = await tx.query<DisposalObligationHistoryEntry>(
+    `SELECT id, sequence_number, continues_obligation_id,
+            quantity_at_discovery::text AS quantity_at_discovery,
+            expired_on::text AS expired_on, discovered_on::text AS discovered_on,
+            due_by::text AS due_by, status,
+            resolved_on::text AS resolved_on, resolution,
+            resolving_transaction_id, resolving_transaction_kind, created_at
+       FROM crm.disposal_obligation_chain($1, $2)`,
+    [repProfileId, lotId],
+  );
+  return rows;
 }

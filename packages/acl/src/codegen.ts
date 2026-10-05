@@ -100,11 +100,19 @@ export function generateTypes(schema: UiSchema, opts: { source?: string } = {}):
   );
   const schemaSha256 = createHash("sha256").update(canonical, "utf8").digest("hex");
 
+  // The provenance line deliberately does NOT name where the schema came from.
+  //
+  // It used to interpolate `opts.source`, which is a live URL on `erp:codegen` and
+  // `schema/baseline.json` on `erp:codegen:baseline` — so a live refresh and the drift
+  // gate produced different BYTES for an identical schema, and `--check` reported DRIFT
+  // while printing two identical SCHEMA_SHA256 values. The input's identity is the hash,
+  // which is already here; which machine last ran the generator is not a fact about the
+  // types and belongs in the commit, not in the file.
   const header = [
     "// GENERATED FILE — DO NOT EDIT.",
     "//",
-    `// Produced by @crm/acl codegen from GET /v1/meta/schema${opts.source !== undefined ? ` (${opts.source})` : ""}.`,
-    "// Regenerate with: pnpm erp:codegen",
+    "// Produced by @crm/acl codegen from GET /v1/meta/schema.",
+    "// Regenerate with: pnpm erp:codegen && pnpm erp:codegen:baseline",
     "//",
     "// Hand-writing any of this is a bug waiting to happen. The ERP's pluraliser is",
     "// naive (Opportunity -> /v1/opportunitys), an unknown filter param is silently",

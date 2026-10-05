@@ -1,6 +1,6 @@
 import type { PoolClient } from "pg";
 
-import { requireAccountMapping } from "./accounts.js";
+import { EXPENSE_CATEGORY_MAX as CATEGORY_MAX, requireAccountMapping } from "./accounts.js";
 import {
   ExpenseClaimNotFoundError,
   InvalidAmountError,
@@ -51,6 +51,8 @@ export interface ExpenseClaim {
   readonly submitted_at: Date | null;
   readonly approved_at: Date | null;
   readonly approved_by: string | null;
+  readonly rejected_at: Date | null;
+  readonly rejected_by: string | null;
   readonly posted_at: Date | null;
   readonly created_at: Date;
   readonly updated_at: Date;
@@ -91,6 +93,8 @@ const CLAIM_FIELDS = [
   "submitted_at",
   "approved_at",
   "approved_by",
+  "rejected_at",
+  "rejected_by",
   "posted_at",
   "created_at",
   "updated_at",
@@ -105,7 +109,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const CURRENCY_RE = /^[A-Z]{3}$/;
 /** Up to 12 integer digits and 2 decimals — the headroom `NUMERIC(14,2)` actually has. */
 const AMOUNT_RE = /^\d{1,12}(\.\d{1,2})?$/;
-const CATEGORY_MAX = 120;
+
 
 /**
  * Three shape checks that the database cannot make, verified against the live cluster:
@@ -122,7 +126,13 @@ function checkedInput(input: CreateClaimInput): CreateClaimInput {
   if (input.crmCategory.trim().length === 0 || input.crmCategory.length > CATEGORY_MAX) {
     throw new InvalidCategoryError(input.crmCategory);
   }
-  if (!AMOUNT_RE.test(input.amount) || Number(input.amount) <= 0) {
+  // `/[1-9]/` and not `Number(input.amount) <= 0`. The float test was harmless given the
+  // regex — the smallest positive value it admits is 0.01 — but it is the exact construct
+  // README rule 4 forbids, in the one module whose own error class exists to explain why,
+  // and it would quietly become wrong the moment the regex widened. Having passed
+  // AMOUNT_RE the string is digits and at most one dot, so "contains a non-zero digit" is
+  // "greater than zero", decided on the characters themselves.
+  if (!AMOUNT_RE.test(input.amount) || !/[1-9]/.test(input.amount)) {
     throw new InvalidAmountError(input.amount);
   }
   if (!CURRENCY_RE.test(input.currency)) throw new InvalidCurrencyError(input.currency);
@@ -285,29 +295,35 @@ export async function approveClaim(
 }
 
 /**
- * Rejects a submitted claim.
+ * Rejects a submitted claim, recording WHO rejected it and when (0030).
  *
  * `approved_at` stays null, which `expense_claim_approved_fields` requires for every
- * state outside approved/posted/reimbursed. The consequence worth knowing: 0006 has no
- * `rejected_by` or `rejected_at`, so WHO rejected a claim is not recorded. Writing it to
- * `approved_by` was considered and rejected — a rejecter stored in a column named
- * `approved_by` reads as an approval to every query that does not know better, including
- * the four-eyes CHECK's own wording.
+ * state outside approved/posted/reimbursed; `rejected_at` is set, which
+ * `expense_claim_rejected_fields` requires for this one. The actor goes in its own
+ * column: writing it to `approved_by` was considered and refused, because a rejecter
+ * stored in a column named `approved_by` reads as an approval to every query that does
+ * not know better, including the four-eyes CHECK's own wording.
+ *
+ * Four eyes is not re-checked here, exactly as in `approveClaim` and for the same
+ * reason — `expense_claim_reject_four_eyes` is a CHECK, so it holds for a psql prompt
+ * too, and the refusal is translated rather than duplicated.
  */
 export async function rejectClaim(
   tx: PoolClient,
   tenantId: string,
   claimId: string,
+  rejectedBy: string,
+  now: Date,
 ): Promise<ExpenseClaim> {
   const claim = await requireClaim(tx, tenantId, claimId);
   assertExpenseClaimTransition(claim.state, "rejected");
   try {
     const { rows } = await tx.query<ExpenseClaim>(
       `UPDATE crm.expense_claim
-          SET state = 'rejected', updated_at = now()
+          SET state = 'rejected', rejected_at = $4, rejected_by = $3, updated_at = now()
         WHERE tenant_id = $1 AND id = $2 AND state = 'submitted'
         RETURNING ${CLAIM_COLUMNS}`,
-      [tenantId, claimId],
+      [tenantId, claimId, rejectedBy, now],
     );
     if (rows[0] === undefined) throw await staleTransition(tx, tenantId, claimId, "rejected");
     return rows[0];
@@ -372,10 +388,15 @@ export async function postClaim(
 /**
  * Marks a posted claim reimbursed and drives the ERP's `reimburse` transition.
  *
- * Enqueued as its own row at its own moment, never alongside the create: an invalid
- * transition answers 409, which `classify` reads as `already_delivered`, so a transition
- * delivered ahead of the create it depends on would be recorded as a success that never
- * happened. Enqueueing one row per CRM state change is what keeps that impossible.
+ * Enqueued as its own row at its own moment, never alongside the create — one outbox row
+ * per CRM state change, so a transition can never be in flight ahead of the record it acts
+ * on. That used to be load-bearing twice over: an invalid transition answers 409, and
+ * `classify` read every 409 as `already_delivered`, so a transition delivered early was
+ * recorded as a success that never happened. The relay no longer does that (it reads the
+ * ERP's `invalid_transition` code and answers `retry_ordering`), and the rows now order by
+ * `seq` rather than a shared `created_at` — so both of the original hazards are closed at
+ * their source. The rule stays because it is still the right shape: one row cannot be out
+ * of order with itself, and that holds without depending on either fix.
  */
 export async function reimburseClaim(
   tx: PoolClient,
@@ -448,11 +469,16 @@ export async function claimPostingStatus(
   tenantId: string,
   claimId: string,
 ): Promise<readonly ErpWriteStatus[]> {
+  // ORDER BY seq, not created_at. 0027 added the sequence precisely because now() is the
+  // transaction timestamp: two outbox rows written in one transaction share created_at to
+  // the microsecond and nothing orders them. A claim's create and reimburse happen in
+  // different transactions today, so this query was right by accident; seq makes it right
+  // by construction, and it is what the relay claims in.
   const { rows } = await tx.query<ErpWriteStatus>(
     `SELECT entity, operation, state, attempts, dead_reason, delivered_at
        FROM crm.outbox
       WHERE tenant_id = $1 AND source_table = $2 AND source_id = $3
-      ORDER BY created_at, operation`,
+      ORDER BY seq`,
     [tenantId, EXPENSE_SOURCE_TABLE, claimId],
   );
   return rows;

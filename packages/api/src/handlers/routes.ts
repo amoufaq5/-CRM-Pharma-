@@ -21,6 +21,9 @@ import {
 } from "@crm/callplan";
 import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
 import {
+  ENDPOINT_CHANNELS,
+  MAX_PRUNE_GUARD_FLOOR_ROWS,
+  MAX_PRUNE_OVERRIDE_BY_CHARS,
   createEndpoint,
   getEndpoint,
   grantPruneGuardOverride,
@@ -49,6 +52,8 @@ import {
 import { deadLetter, deadLetters, reviveDeadLetter, teamDeadLetters } from "@crm/relay";
 import { withTenantContext } from "@crm/db";
 import {
+  ACCOUNT_CODE_MAX,
+  EXPENSE_CATEGORY_MAX,
   EXPENSE_CLAIM_STATES,
   approveClaim,
   claimPostingStatus,
@@ -329,6 +334,32 @@ async function requireSupervision(tx: PoolClient, p: Principal, repProfileId: st
   }
 }
 
+/**
+ * Supervision AND four-eyes, for a privileged act on somebody else's expense claim.
+ *
+ * `canSupervise` answers yes for the caller themselves. That is right for a read — a rep
+ * may always see their own work, which is why one helper covers "mine" and "my team's" —
+ * and wrong for a privileged write: supervision alone let a rep approve, reject, post and
+ * reimburse their own claim. Two of the four were caught downstream by
+ * `expense_claim_four_eyes` and (0030) `expense_claim_reject_four_eyes`, as a 403 with no
+ * explanation; `post` and `reimburse` record no actor at all, so no constraint could ever
+ * have caught those. The rule belongs here, once, for all four.
+ *
+ * A 403 and not the 404 every other scoped record gets: the caller is the claimant, so
+ * claiming the claim does not exist tells them something they know to be false, and there
+ * is nothing left to conceal from the person whose money it is.
+ */
+async function requireExpenseApprover(
+  tx: PoolClient,
+  p: Principal,
+  claim: { readonly rep_profile_id: string },
+  verb: string,
+): Promise<void> {
+  if (claim.rep_profile_id === p.repProfileId) {
+    throw forbidden(`a claim may not be ${verb} by the rep who filed it`);
+  }
+  await requireSupervision(tx, p, claim.rep_profile_id);
+}
 
 /**
  * Refuses a count the caller may neither own nor supervise.
@@ -347,6 +378,29 @@ async function requireOwnOrSupervisedCount(
     throw notFound(`no sample count ${countId}`);
   }
   return count;
+}
+
+/**
+ * Who granted something, as `display name <subject>` and guaranteed to fit
+ * `MAX_PRUNE_OVERRIDE_BY_CHARS`.
+ *
+ * Both halves come from unbounded `text` columns, so the obvious template overflowed the
+ * CHECK on a long display name or a long OIDC subject and the operator was told the
+ * override "must name who granted it" — true of the empty string, not of theirs.
+ *
+ * The subject survives whole where it can: it is the half that identifies the grantor
+ * uniquely, and a truncated one names nobody. The display name gives way first, with an
+ * ellipsis rather than a silent cut, so a reader can see something was dropped.
+ */
+function attributionOf(p: Principal): string {
+  const subject = `<${p.subject}>`;
+  if (subject.length >= MAX_PRUNE_OVERRIDE_BY_CHARS) {
+    return `${subject.slice(0, MAX_PRUNE_OVERRIDE_BY_CHARS - 1)}\u2026`;
+  }
+  const room = MAX_PRUNE_OVERRIDE_BY_CHARS - subject.length - 1;
+  const name =
+    p.displayName.length <= room ? p.displayName : `${p.displayName.slice(0, Math.max(0, room - 1))}\u2026`;
+  return name.length === 0 ? subject : `${name} ${subject}`;
 }
 
 const EXPENSE_STATE = z.enum(EXPENSE_CLAIM_STATES);
@@ -1904,7 +1958,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
   });
 
   /**
-   * The tenant's webhook endpoints. Administrator only.
+   * The tenant's notification endpoints. Administrator only.
    *
    * No secret is ever in a request or a response: `secretEnv` names an environment
    * variable and the database has only ever held the name (0021). The API therefore
@@ -1930,6 +1984,10 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       requireRole(ctx.principal, "administrator");
       const input = parse(
         z.object({
+          // No default. An `https://` url and a `mailto:` are both valid endpoints and
+          // each is invalid for the other channel (0029 checks the pair, not either
+          // alone), so guessing would mean guessing which refusal the operator gets.
+          channel: z.enum(ENDPOINT_CHANNELS),
           url: z.string().max(2000),
           secretEnv: z
             .string()
@@ -1943,6 +2001,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       );
       const body = await inTenant(deps, ctx.principal, (tx) =>
         createEndpoint(tx, ctx.principal.tenantId, {
+          channel: input.channel,
           url: input.url,
           secretEnv: input.secretEnv,
           ...(input.minSeverity !== undefined ? { minSeverity: input.minSeverity } : {}),
@@ -2090,7 +2149,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       const input = parse(
         z.object({
           maxSharePercent: z.number().int().min(1).max(99).optional(),
-          guardFloorRows: z.number().int().min(0).max(1_000_000).optional(),
+          guardFloorRows: z.number().int().min(0).max(MAX_PRUNE_GUARD_FLOOR_ROWS).optional(),
         }),
         ctx.body,
       );
@@ -2129,7 +2188,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         grantPruneGuardOverride(tx, ctx.principal.tenantId, {
           // Attributed to the caller, not to a string they supply: an override that could
           // name anyone would be an override that names nobody.
-          grantedBy: `${ctx.principal.displayName} <${ctx.principal.subject}>`,
+          grantedBy: attributionOf(ctx.principal),
           hours: input.hours,
         }),
       );
@@ -2188,7 +2247,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       const input = parse(
         z.object({
-          crmCategory: z.string().min(1).max(100),
+          crmCategory: z.string().min(1).max(EXPENSE_CATEGORY_MAX),
           amount: z.string().regex(/^\d{1,12}(\.\d{1,2})?$/, "an amount is a decimal string"),
           currency: z.string().length(3),
           incurredOn: ISO_DATE,
@@ -2235,12 +2294,16 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
   });
 
   /**
-   * Approve or reject. The approver must supervise the claimant AND must not be them —
-   * the second half is a CHECK in the database, so this route cannot forget it.
+   * Approve or reject. The approver must supervise the claimant AND must not be them.
+   *
+   * Both halves are re-asserted by a CHECK once the decision is written — `approved_by`
+   * and `rejected_by` each carry a four-eyes constraint — but the route is where the
+   * refusal can say which rule was broken, and the two acts below it record no actor for
+   * a constraint to read.
    */
-  for (const [verb, run] of [
-    ["approve", true],
-    ["reject", false],
+  for (const [verb, past] of [
+    ["approve", "approved"],
+    ["reject", "rejected"],
   ] as const) {
     router.add({
       method: "POST",
@@ -2249,10 +2312,10 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         const id = parse(UUID, ctx.params["id"]);
         const body = await inTenant(deps, ctx.principal, async (tx) => {
           const claim = await requireClaim(tx, ctx.principal.tenantId, id);
-          await requireSupervision(tx, ctx.principal, claim.rep_profile_id);
-          return run
+          await requireExpenseApprover(tx, ctx.principal, claim, past);
+          return past === "approved"
             ? approveClaim(tx, ctx.principal.tenantId, id, ctx.principal.repProfileId, now())
-            : rejectClaim(tx, ctx.principal.tenantId, id);
+            : rejectClaim(tx, ctx.principal.tenantId, id, ctx.principal.repProfileId, now());
         });
         return { status: 200, body };
       },
@@ -2266,9 +2329,9 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
    * `idx_expense_claim_unsent` ("approved, not yet handed over") is for. Both enqueue an
    * outbox row; neither writes the ERP directly.
    */
-  for (const [verb, run] of [
-    ["post", true],
-    ["reimburse", false],
+  for (const [verb, past] of [
+    ["post", "posted"],
+    ["reimburse", "reimbursed"],
   ] as const) {
     router.add({
       method: "POST",
@@ -2277,8 +2340,11 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         const id = parse(UUID, ctx.params["id"]);
         const body = await inTenant(deps, ctx.principal, async (tx) => {
           const claim = await requireClaim(tx, ctx.principal.tenantId, id);
-          await requireSupervision(tx, ctx.principal, claim.rep_profile_id);
-          return run
+          // Neither act records who performed it, so this is the only four-eyes check
+          // there is: a rep who reached `approved` with a colleague's blessing could
+          // otherwise hand their own claim to the ledger and mark it paid alone.
+          await requireExpenseApprover(tx, ctx.principal, claim, past);
+          return past === "posted"
             ? postClaim(tx, ctx.principal.tenantId, id, now())
             : reimburseClaim(tx, ctx.principal.tenantId, id);
         });
@@ -2329,11 +2395,13 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     pattern: "/v1/admin/expense-accounts/:category",
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       requireRole(ctx.principal, "administrator");
-      const category = parse(z.string().min(1).max(100), ctx.params["category"]);
+      const category = parse(z.string().min(1).max(EXPENSE_CATEGORY_MAX), ctx.params["category"]);
       const input = parse(
         z.object({
-          erpLedgerAccountCode: z.string().min(1).max(64),
-          erpCostCenterCode: z.string().min(1).max(64).nullish(),
+          // The ERP's own `maxLength` on both code fields, via the store's constant, so
+          // the route cannot advertise a longer one than the layer behind it accepts.
+          erpLedgerAccountCode: z.string().min(1).max(ACCOUNT_CODE_MAX),
+          erpCostCenterCode: z.string().min(1).max(ACCOUNT_CODE_MAX).nullish(),
         }),
         ctx.body,
       );
@@ -2353,7 +2421,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     pattern: "/v1/admin/expense-accounts/:category",
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       requireRole(ctx.principal, "administrator");
-      const category = parse(z.string().min(1).max(100), ctx.params["category"]);
+      const category = parse(z.string().min(1).max(EXPENSE_CATEGORY_MAX), ctx.params["category"]);
       // Deactivated, not deleted: a claim already submitted carries its own snapshot, and
       // the row is the record of what the mapping used to be.
       const body = await inTenant(deps, ctx.principal, (tx) =>

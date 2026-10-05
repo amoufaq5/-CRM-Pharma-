@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   APPROVED_STATES,
+  REJECTED_STATES,
   EXPENSE_CLAIM_STATES,
   EXPENSE_CLAIM_TRANSITIONS,
   InvalidExpenseClaimTransitionError,
@@ -12,6 +13,7 @@ import {
   isFinalExpenseClaimState,
   requiresAccountSnapshot,
   requiresApproval,
+  requiresRejection,
   type ExpenseClaimState,
 } from "./states.js";
 
@@ -200,5 +202,35 @@ describe("the CHECK constraints this map has to agree with", () => {
     // draft -> submitted is the only exit, and a submitted claim has not been approved,
     // so no single transition can need both the snapshot and an approval timestamp.
     for (const to of EXPENSE_CLAIM_TRANSITIONS.draft) expect(requiresApproval(to)).toBe(false);
+  });
+
+  it("requires rejected_at in exactly rejected (0030)", () => {
+    expect([...REJECTED_STATES]).toEqual(["rejected"]);
+    for (const state of EXPENSE_CLAIM_STATES) {
+      expect(requiresRejection(state)).toBe(REJECTED_STATES.includes(state));
+    }
+  });
+
+  /**
+   * The property that makes the two pairings safe to hold at once: the state sets are
+   * disjoint, so no state demands both timestamps and neither CHECK can refuse a row the
+   * other requires. Asserted over the whole enum rather than argued about, because the
+   * two constraints were written in different migrations.
+   */
+  it("never requires both approved_at and rejected_at in one state", () => {
+    for (const state of EXPENSE_CLAIM_STATES) {
+      expect(requiresApproval(state) && requiresRejection(state)).toBe(false);
+    }
+  });
+
+  it("reaches rejected only from a state that needs neither timestamp", () => {
+    const from = EXPENSE_CLAIM_STATES.filter((s) =>
+      EXPENSE_CLAIM_TRANSITIONS[s].includes("rejected"),
+    );
+    expect(from).toEqual(["submitted"]);
+    for (const s of from) {
+      expect(requiresApproval(s)).toBe(false);
+      expect(requiresRejection(s)).toBe(false);
+    }
   });
 });

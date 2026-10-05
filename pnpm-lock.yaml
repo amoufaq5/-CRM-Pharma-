@@ -108,9 +108,15 @@ importers:
 
   packages/expense:
     dependencies:
+      '@crm/acl':
+        specifier: workspace:*
+        version: link:../acl
       '@crm/db':
         specifier: workspace:*
         version: link:../db
+      '@crm/notify':
+        specifier: workspace:*
+        version: link:../notify
       '@crm/relay':
         specifier: workspace:*
         version: link:../relay
@@ -177,6 +183,9 @@ importers:
       '@crm/db':
         specifier: workspace:*
         version: link:../db
+      '@crm/expense':
+        specifier: workspace:*
+        version: link:../expense
       '@crm/notify':
         specifier: workspace:*
         version: link:../notify

@@ -6,10 +6,12 @@ import { withTenantContext } from "@crm/db";
 import {
   grantPruneGuardOverride,
   InvalidRetentionError,
+  MAX_PRUNE_GUARD_FLOOR_ROWS,
   notificationPolicy,
   notificationPruneGuard,
   prunableNotifications,
   pruneNotifications,
+  prunePreview,
   revokePruneGuardOverride,
   setNotificationPolicy,
   setNotificationPruneGuard,
@@ -722,8 +724,40 @@ describe("the prune guard", () => {
         inT((c) => setNotificationPruneGuard(c, T, { guardFloorRows: -1 })),
       ).rejects.toBeInstanceOf(InvalidRetentionError);
       await expect(
-        inT((c) => setNotificationPruneGuard(c, T, { guardFloorRows: 1_000_001 })),
+        inT((c) => setNotificationPruneGuard(c, T, { guardFloorRows: MAX_PRUNE_GUARD_FLOOR_ROWS + 1 })),
       ).rejects.toBeInstanceOf(InvalidRetentionError);
+    });
+
+    /**
+     * The floor is capped at 1000 — 0032 — because it is the LEFT operand of the guard's
+     * AND and therefore short-circuits the ceiling entirely.
+     *
+     * It was capped at a million by 0026, so one `PUT` with `guardFloorRows: 1000000` was
+     * a permanent, unattributed, non-expiring bypass that was not even reported as an
+     * override: exactly the shape 0026's own header spends four paragraphs arguing against
+     * before shipping it. The ceiling is capped at 99 because "a ceiling that permits 100%
+     * is not a ceiling"; a floor above the inbox is not a floor.
+     */
+    it("caps the floor low enough that it cannot stand in for the ceiling", async () => {
+      expect(MAX_PRUNE_GUARD_FLOOR_ROWS).toBe(1000);
+      const err = await inT((c) =>
+        setNotificationPruneGuard(c, T, { guardFloorRows: 1_000_000 }).then(
+          () => null,
+          (e: unknown) => e as Error,
+        ),
+      );
+      expect(err).toBeInstanceOf(InvalidRetentionError);
+      // The 422 has to say what to do instead, or the operator just picks 1000.
+      expect(err?.message).toMatch(/permanent bypass/);
+      expect(err?.message).toMatch(/raise the ceiling, or grant a prune guard override/);
+      // And the bypass it enabled is gone: a 90%-of-a-million pass now trips the guard.
+      const { rows } = await inT((c) =>
+        c.query<{ trips: boolean }>(
+          "SELECT crm.notification_prune_guard_trips(900000, 1000000, 25, $1) AS trips",
+          [MAX_PRUNE_GUARD_FLOOR_ROWS],
+        ),
+      );
+      expect(rows[0]!.trips).toBe(true);
     });
   });
 
@@ -736,9 +770,14 @@ describe("the prune guard", () => {
       expect(r.deletedUnread).toBe(0);
       expect(r.prunableTotal).toBe(150);
       expect(r.inboxTotal).toBe(210);
-      expect(r.sharePercent).toBe(71.4);
+      // 150/210 is 71.428…%, reported to TWO places and rounded UP. One place made the
+      // sentence contradict itself at a boundary: the decision is the exact integer
+      // comparison, so 2501 of 10000 against a 25% ceiling tripped the guard and printed
+      // "would take 25% ... over its 25% ceiling", while 2500, which does not trip,
+      // printed the same 25%.
+      expect(r.sharePercent).toBe(71.43);
       expect(r.guard.prune_max_share_percent).toBe(25);
-      expect(r.refusalReason).toMatch(/71\.4% of this tenant's inbox of 210, over its 25% ceiling/);
+      expect(r.refusalReason).toMatch(/71\.43% of this tenant's inbox of 210, over its 25% ceiling/);
       // The whole point: the rows are still there to look at.
       expect(await remaining()).toBe(210);
       // And the operator is told there is work outstanding, not that there was none.
@@ -782,6 +821,70 @@ describe("the prune guard", () => {
       // ran — a refusal that blanked them would hide the shape of the backlog.
       expect(r.keptSubjectOpen).toBe(1);
       expect(r.prunableTotal).toBe(150);
+    });
+  });
+
+  describe("a pass the FLOOR lets through", () => {
+    /**
+     * Over the ceiling, under the floor — and the log has to say so.
+     *
+     * `overridden` cannot say it, because it is only ever true when the guard tripped and
+     * the floor is what stops it tripping. So a floor-waived pass read exactly like a pass
+     * that was within its ceiling: `share=71%/25%` with no REFUSED and no overridden flag.
+     * With the floor capped at 1000 (0032) the amount a waiver can cost is bounded; this is
+     * how it stops being silent as well.
+     */
+    it("runs, and names the floor as the reason rather than looking ordinary", async () => {
+      await inT(async (c) => {
+        await setNotificationPruneGuard(c, T, { guardFloorRows: 200 });
+        await seed(c, { count: 150, createdDaysAgo: 400 });
+        await seed(c, { count: 60, createdDaysAgo: 2 });
+      });
+      const r = await prune();
+      // 150 of 210 is 71.43%, far over the 25% ceiling — and 150 is under the 200-row
+      // floor, so the guard does not trip and the pass runs.
+      expect(r.refused).toBe(false);
+      expect(r.overridden).toBe(false);
+      expect(r.deletedRead).toBe(150);
+      expect(r.floorWaived).toBe(true);
+      expect(r.floorWaivedReason).toMatch(/over the 25% ceiling/);
+      expect(r.floorWaivedReason).toMatch(/200-row floor/);
+      expect(await remaining()).toBe(60);
+    });
+
+    it("says nothing about the floor when the pass was within the ceiling anyway", async () => {
+      await inT(async (c) => {
+        await setNotificationPruneGuard(c, T, { guardFloorRows: 200 });
+        await seed(c, { count: 20, createdDaysAgo: 400 });
+        await seed(c, { count: 980, createdDaysAgo: 2 });
+      });
+      const r = await prune();
+      // 2% — the floor waived nothing, so claiming it did would be noise in every line.
+      expect(r.floorWaived).toBe(false);
+      expect(r.floorWaivedReason).toBeNull();
+      expect(r.deletedRead).toBe(20);
+    });
+
+    it("says nothing about the floor on a refusal either — the guard tripped", async () => {
+      await seedOverCeiling();
+      const r = await prune();
+      expect(r.refused).toBe(true);
+      expect(r.floorWaived).toBe(false);
+      expect(r.floorWaivedReason).toBeNull();
+    });
+
+    it("answers the same question in the preview, before anything is deleted", async () => {
+      await inT(async (c) => {
+        await setNotificationPruneGuard(c, T, { guardFloorRows: 200 });
+        await seed(c, { count: 150, createdDaysAgo: 400 });
+        await seed(c, { count: 60, createdDaysAgo: 2 });
+      });
+      const p = await inT((c) => prunePreview(c, T, { asOf: NOW }));
+      expect(p.wouldRefuse).toBe(false);
+      expect(p.floorWaived).toBe(true);
+      expect(p.floorWaivedReason).toMatch(/200-row floor/);
+      // And nothing was deleted to find that out.
+      expect(await remaining()).toBe(210);
     });
   });
 

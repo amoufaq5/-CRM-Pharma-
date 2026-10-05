@@ -104,10 +104,28 @@ services:
       CRM_TOKEN_ISSUER: ${CRM_TOKEN_ISSUER:-}
       ERP_TOKEN_AUDIENCE: ${ERP_TOKEN_AUDIENCE:-}
       ERP_TOKEN_TTL_SECONDS: ${ERP_TOKEN_TTL_SECONDS:-}
-      # One variable per webhook endpoint, named by its crm.notification_endpoint
-      # row's secret_env. The scheduler is the only process that sends, so it is
-      # the only one that needs them.
+      # One variable per endpoint, named by its crm.notification_endpoint row's
+      # secret_env. The scheduler is the only process that sends, so it is the only
+      # one that needs them. This holds for BOTH channels: the webhook sender reads
+      # the HMAC secret by that name, and the SMTP sender reads the relay password by
+      # that name — so two tenants relaying through one host with different
+      # credentials need no second process.
       CRM_HOOK_OPS_SECRET: ${CRM_HOOK_OPS_SECRET:-}
+      CRM_SMTP_PASSWORD: ${CRM_SMTP_PASSWORD:-}
+      # The email channel. SMTP_HOST is the switch: unset means this process sends
+      # webhooks only, and an `email` endpoint row retries with a readable reason
+      # rather than dead-lettering. Set, and the sender is constructed AT BOOT — so a
+      # relay configured without TLS, or with a From that is not a mailbox, stops the
+      # process instead of being discovered one dead notification at a time.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      # starttls (default) | implicit_tls | plaintext. plaintext is refused to anything
+      # but a loopback relay: a notification carries a rep's name and an account id.
+      SMTP_TRANSPORT: ${SMTP_TRANSPORT:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_CLIENT_NAME: ${SMTP_CLIENT_NAME:-}
+      SMTP_TIMEOUT_MS: ${SMTP_TIMEOUT_MS:-}
       # Development-only, and ignored when a signing key is set. The process
       # REFUSES to start with it under NODE_ENV=production.
       ERP_TOKEN: ${ERP_TOKEN:-}

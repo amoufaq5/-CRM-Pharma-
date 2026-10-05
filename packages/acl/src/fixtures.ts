@@ -1,113 +1,61 @@
-import type { UiSchema } from "./ui-schema.js";
+import { createRequire } from "node:module";
+
+import { UiSchemaSchema, type UiSchema } from "./ui-schema.js";
 
 /**
- * A stand-in for `GET /v1/meta/schema` shaped exactly like `pack-erp-core`'s,
- * including the quirks that matter: the naive plural (`Opportunity` ->
- * `opportunitys`), numeric fields that cannot be range-filtered on the deployed
- * store, and a lifecycle with real transitions.
+ * The served schema, for tests — SLICED FROM THE COMMITTED BASELINE rather than written
+ * by hand.
+ *
+ * WHY IT IS NOT HAND-WRITTEN ANY MORE. It was, and it drifted, and the drift hid a real
+ * defect for the life of the project. The hand-written version declared `updated_at` as a
+ * field on `Item` and `Opportunity` and listed it in both `filterableFields` and
+ * `sortableFields`. A real `operate-server` serving `pack-erp-core` declares it on **none
+ * of its 51 entities** and makes it filterable on none of them, because `buildUiSchema`
+ * reads the manifest's own `fields` rather than `resolvedFields`, so the `auditable`
+ * trait's columns are never published.
+ *
+ * The consequence was not that a test was slightly wrong. `PollingChangeSource` is built
+ * entirely on `?updated_at[gte]=`, and its six tests passed — against this fixture —
+ * while the same code throws `UnsupportedFilterError` for every entity against the real
+ * server. The suite was asserting against the stand-in, and the stand-in was the thing
+ * that was wrong. The old fixture's `generatedAt` was a round `2026-09-30T00:00:00.000Z`,
+ * which is the tell: it was never a capture.
+ *
+ * So the fixture is now derived from `schema/baseline.json`, which `pnpm
+ * erp:codegen:check` already gates against the live ERP. A fixture that cannot encode a
+ * schema the ERP has never served cannot hide this class of bug again — and it costs
+ * nothing, because the baseline is a real capture of the same two entities plus 49 more.
+ *
+ * Parsed through `UiSchemaSchema` on the way out, so a malformed baseline fails here
+ * rather than somewhere downstream with a confusing message.
  */
+const require_ = createRequire(import.meta.url);
+
+/** The whole captured schema: 51 entities, as the ERP really serves them. */
+export const ERP_SCHEMA_FULL: UiSchema = UiSchemaSchema.parse(
+  require_("../schema/baseline.json"),
+);
+
+/**
+ * The two entities the tests were written around, kept as a narrow fixture so a failure
+ * names a small schema rather than a 7,000-line one.
+ *
+ * Three entities, each carrying a quirk the tests need and none of them invented:
+ *
+ * - **`Item`** — `list_price` is numeric AND filterable, which is the live example of the
+ *   range-operator refusal (report R19). Its filterable and sortable sets are identical.
+ * - **`Opportunity`** — the naive plural (`opportunitys`), five lifecycle transitions
+ *   (the hand-written fixture claimed two), and `sortableFields: []`, which is true of 34
+ *   of the ERP's 51 entities and was invisible before.
+ * - **`Expense`** — the only one of the three with a FILTERABLE DATE (`incurred_on`), so
+ *   the "ISO-8601 range filters are safe as text" exemption has a real subject. It had
+ *   none before: the old fixture used `updated_at`, which the ERP does not serve.
+ */
+export const FIXTURE_ENTITIES = ["Item", "Opportunity", "Expense"] as const;
+
 export const ERP_SCHEMA_FIXTURE: UiSchema = {
-  generatedAt: "2026-09-30T00:00:00.000Z",
-  roles: [
-    { name: "erp_admin", label: "ERP Administrator" },
-    { name: "sales_rep", label: "Sales Representative" },
-  ],
-  entities: [
-    {
-      name: "Item",
-      slug: "items",
-      label: "Items",
-      singular: "Item",
-      module: "Supply Chain & Inventory",
-      access: {
-        list: ["erp_admin", "sales_rep"],
-        read: ["erp_admin", "sales_rep"],
-        create: ["erp_admin"],
-        update: ["erp_admin"],
-        delete: ["erp_admin"],
-      },
-      fields: [
-        { name: "sku", label: "Sku", input: "text", required: true, unique: true },
-        { name: "name", label: "Name", input: "text", required: true },
-        {
-          name: "status",
-          label: "Status",
-          input: "select",
-          required: true,
-          enumValues: ["draft", "active", "discontinued"],
-          defaulted: true,
-        },
-        { name: "list_price", label: "List Price", input: "number", required: false },
-        {
-          name: "standard_cost",
-          label: "Standard Cost",
-          input: "number",
-          required: false,
-          classification: "commercial_sensitive",
-        },
-        { name: "updated_at", label: "Updated At", input: "datetime", required: true, defaulted: true },
-      ],
-      listColumns: ["sku", "name", "status"],
-      sortableFields: ["sku", "name", "status", "list_price", "updated_at"],
-      filterableFields: ["sku", "status", "list_price", "updated_at"],
-      searchableFields: ["sku", "name"],
-      stateField: null,
-      transitions: [],
-    },
-    {
-      // The naive pluraliser's most visible casualty. Hand-writing `/v1/opportunities`
-      // here would 404, which is exactly why slugs are read from the server.
-      name: "Opportunity",
-      slug: "opportunitys",
-      label: "Opportunitys",
-      singular: "Opportunity",
-      module: "Sales & CRM",
-      access: {
-        list: ["erp_admin", "sales_rep"],
-        read: ["erp_admin", "sales_rep"],
-        create: ["sales_rep"],
-        update: ["sales_rep"],
-        delete: ["erp_admin"],
-      },
-      fields: [
-        { name: "name", label: "Name", input: "text", required: true },
-        { name: "account_id", label: "Account", input: "reference", required: true, referenceTarget: "Account" },
-        { name: "amount", label: "Amount", input: "number", required: true, classification: "commercial_sensitive" },
-        {
-          name: "stage",
-          label: "Stage",
-          input: "select",
-          required: true,
-          enumValues: ["prospecting", "qualification", "proposal", "negotiation", "won", "lost"],
-          defaulted: true,
-        },
-        { name: "updated_at", label: "Updated At", input: "datetime", required: true, defaulted: true },
-      ],
-      listColumns: ["name", "stage", "amount"],
-      sortableFields: ["name", "stage", "amount", "updated_at"],
-      filterableFields: ["stage", "account_id", "amount", "updated_at"],
-      searchableFields: ["name"],
-      stateField: "stage",
-      transitions: [
-        {
-          name: "win",
-          label: "Win",
-          operationId: "opportunity.win",
-          stateField: "stage",
-          from: ["negotiation"],
-          to: "won",
-          roles: ["sales_rep"],
-        },
-        {
-          name: "lose",
-          label: "Lose",
-          operationId: "opportunity.lose",
-          stateField: "stage",
-          from: ["prospecting", "qualification", "proposal", "negotiation"],
-          to: "lost",
-          roles: ["sales_rep"],
-        },
-      ],
-    },
-  ],
+  ...ERP_SCHEMA_FULL,
+  entities: ERP_SCHEMA_FULL.entities.filter((e) =>
+    (FIXTURE_ENTITIES as readonly string[]).includes(e.name),
+  ),
 };

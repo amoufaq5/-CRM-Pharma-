@@ -7,7 +7,7 @@ export {
   toErpError,
 } from "./problems.js";
 export { entityCamel, operationId, resourceSlug } from "./slugs.js";
-export type { ChangeBatch, ChangedRecord, ChangeSource } from "./change-source.js";
+export type { ChangeBatch, ChangeMode, ChangedRecord, ChangeSource } from "./change-source.js";
 export {
   TenantSchema,
   UiEntitySchemaSchema,
@@ -33,3 +33,10 @@ export {
 } from "./client.js";
 export { PollingChangeSource, type PollingChangeSourceOptions } from "./polling-change-source.js";
 export { generateTypes, type CodegenResult } from "./codegen.js";
+
+/**
+ * The generated ERP types. Captured from a live `operate-server` serving `pack-erp-core`
+ * (51 entities) — re-exported because they were unreachable from this package until now,
+ * which is why `@crm/expense` and `@crm/sample` still type their ERP payloads by hand.
+ */
+export * from "./generated/erp.js";

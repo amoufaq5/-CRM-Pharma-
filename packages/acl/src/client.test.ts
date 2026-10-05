@@ -128,8 +128,11 @@ describe("filter validation — refusing what the ERP would mishandle", () => {
     // wider than asked for. Sending and hoping is the bug.
     const { client, calls } = harness();
     const before = calls.length;
+    // `description` is a real `Item` field and is NOT in its filterableFields. It used to
+    // be `name` here, which the hand-written fixture wrongly made unfilterable — the real
+    // schema does allow filtering on `name`, so that assertion was testing nothing.
     await expect(
-      client.list(TENANT, "Item", { filters: [{ field: "name", value: "x" }] }),
+      client.list(TENANT, "Item", { filters: [{ field: "description", value: "x" }] }),
     ).rejects.toThrow(UnsupportedFilterError);
     // Only the schema fetch happened; the list request was never made.
     expect(calls.filter((c) => c.url.includes("/v1/items"))).toHaveLength(0);
@@ -149,13 +152,17 @@ describe("filter validation — refusing what the ERP would mishandle", () => {
     expect(queryOf(calls.at(-1)!.url).get("list_price")).toBe("10");
   });
 
-  it("allows a range filter on a DATETIME — ISO-8601 sorts chronologically as text", async () => {
-    // The accident that makes incremental polling sound on the deployed store.
+  it("allows a range filter on a DATE — ISO-8601 sorts chronologically as text", async () => {
+    // The accident that makes a date range sound on the deployed store, where every
+    // comparison is textual. `Expense.incurred_on` is the subject because it is one of
+    // the nine filterable date fields the ERP actually serves; this test used
+    // `Item.updated_at`, which the ERP serves on no entity at all — so for the life of
+    // the project it proved the exemption against a field that does not exist.
     const { client, calls } = harness();
-    await client.list(TENANT, "Item", {
-      filters: [{ field: "updated_at", op: "gte", value: "2026-09-01T00:00:00Z" }],
+    await client.list(TENANT, "Expense", {
+      filters: [{ field: "incurred_on", op: "gte", value: "2026-09-01" }],
     });
-    expect(queryOf(calls.at(-1)!.url).get("updated_at[gte]")).toBe("2026-09-01T00:00:00Z");
+    expect(queryOf(calls.at(-1)!.url).get("incurred_on[gte]")).toBe("2026-09-01");
   });
 
   it("refuses sorting by a numeric field", async () => {
@@ -176,19 +183,23 @@ describe("filter validation — refusing what the ERP would mishandle", () => {
 describe("query building", () => {
   it("renders operators, in-lists, search, projection and limit", async () => {
     const { client, calls } = harness();
-    await client.list(TENANT, "Opportunity", {
-      filters: [{ field: "stage", op: "in", value: ["won", "lost"] }],
-      sort: { field: "updated_at", direction: "desc" },
+    // Sorted by `incurred_on` on `Expense` rather than `updated_at` on `Opportunity`:
+    // `Opportunity.sortableFields` is EMPTY in the real schema (true of 34 of the ERP's
+    // 51 entities), so there is nothing legal to sort it by, and `updated_at` is served
+    // on nothing.
+    await client.list(TENANT, "Expense", {
+      filters: [{ field: "state", op: "in", value: ["approved", "reimbursed"] }],
+      sort: { field: "incurred_on", direction: "desc" },
       search: "  acme  ",
-      fields: ["id", "name"],
+      fields: ["id", "category"],
       limit: 25,
     });
     const q = queryOf(calls.at(-1)!.url);
-    expect(q.get("stage[in]")).toBe("won,lost");
-    expect(q.get("sort")).toBe("updated_at");
+    expect(q.get("state[in]")).toBe("approved,reimbursed");
+    expect(q.get("sort")).toBe("incurred_on");
     expect(q.get("order")).toBe("desc");
     expect(q.get("q")).toBe("acme");
-    expect(q.get("fields")).toBe("id,name");
+    expect(q.get("fields")).toBe("id,category");
     expect(q.get("limit")).toBe("25");
   });
 

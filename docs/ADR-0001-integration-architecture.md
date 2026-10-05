@@ -321,10 +321,19 @@ Concretely, and these specifics are the decision, not commentary on it:
       when `lockedDocumentGuard` refuses a closed `FiscalPeriod` — a late claim
       against a closed month is routine, not an error.
     - **The approval graph is the CRM's**, and four-eyes is enforced in the CRM
-      schema (`expense_claim_four_eyes`) because nothing downstream will: the
-      ERP's `Expense` workflow is a flat role check that never reads
-      `Employee.manager_id`, has no amount bands and no separation of duties, so
-      the same principal can submit and approve (report R7).
+      schema (`expense_claim_four_eyes`, and `expense_claim_reject_four_eyes`
+      since 0030) because nothing downstream will: the ERP's `Expense` workflow
+      is a flat role check that never reads `Employee.manager_id`, has no amount
+      bands and no separation of duties, so the same principal can submit and
+      approve (report R7).
+    - **"In the schema" is not enough on its own, and finding out why cost a
+      shipped hole.** A CHECK can only compare columns the table has, so it
+      covers `approve` and `reject` — which record an actor — and cannot cover
+      `post` or `reimburse`, which do not. Those two gated on supervision alone,
+      and `crm.rep_can_supervise` answers yes for the caller themselves, so a rep
+      could hand their own claim to the ledger and mark it paid. The rule now
+      lives in the route for all four, which is also where a refusal can say
+      which rule was broken; the CHECKs stay as the backstop under it.
     - Posting needs the `controller` role, so the tenant's ERP service
       credential must hold it. That widens the credential; it is the price of GL
       attribution and should be reviewed as such rather than waved through.
@@ -656,6 +665,27 @@ Concretely, and these specifics are the decision, not commentary on it:
     pointed at a mailbox and an email endpoint pointed at an HTTPS host, two
     configurations with no sender and no error.
 
+    **Correction (2026-10-05): 0029 was necessary and not sufficient, and this item said
+    otherwise.** It claimed the channel could now be configured. It could not.
+    `createEndpoint` wrote `'webhook'` as a LITERAL in its INSERT, so no route could name
+    the channel 0029 had just legalised, and nothing outside the tests ever called
+    `new SmtpSender` — so the boot-time TLS refusal this item makes a point of was
+    unreachable, and a row inserted by hand produced permanently dead deliveries. Three
+    independent gaps, each of which had to close for the channel to exist:
+    `createEndpoint` now takes a required `channel` with no default; the scheduler builds
+    the sender at boot when `SMTP_HOST` is set, and reports the channels it registered on
+    its first log line; and a delivery for a channel this process has no sender for
+    RETRIES with a readable reason instead of dead-lettering, because a missing sender is a
+    fact about the binary and not about the destination.
+
+    One more thing this item got wrong by implication. The encoding was chosen from
+    `payload.body` while the message was built from a composed body that also carries the
+    recipient's `displayName` — so the Arabic case it makes a point of handling was the
+    case it got wrong: an English notification to a rep named in Arabic went out declaring
+    `7bit` over raw 8-bit octets. Verified now against a real SMTP conversation driven by
+    the real scheduler binary: `8bit` with the name intact where 8BITMIME is offered,
+    `base64` where it is not.
+
 21. **Expense claims are built end to end, and the Finance dependency is now a single
     row.** `crm.expense_account_map` and `crm.expense_claim` had existed since migration
     0006 with not one line of TypeScript. `packages/expense` is the lifecycle
@@ -905,6 +935,52 @@ blocked. Order matters for the reasons given, not for missing inputs.
 - Transitions are `POST /v1/<resource>/{id}/<transition>` and are role-gated only.
 - `GET /v1/meta/aging` gives AR/AP buckets for rep credit checks (finance roles only).
 
+**Rules that came out of an adversarial review of what had already shipped** (2026-10-05).
+Each one is here because the code and the prose beside it disagreed, which is the failure
+mode this repo is most exposed to — documentation is load-bearing here, so a comment that
+has gone stale is a defect, not untidiness.
+
+- **A reflexive predicate is right for reads and wrong for privileged writes.**
+  `crm.rep_can_supervise(x, x)` is true, deliberately: it is what lets one helper serve
+  "my record" and "my team's record", and a manager who could not read their own work
+  would be absurd. It also meant every expense write transition — approve, reject, post,
+  reimburse — admitted the claimant. Two were caught downstream by a four-eyes CHECK; the
+  other two record no actor, so no constraint could ever have caught them. The lesson is
+  not "add a check": it is that a predicate's correctness depends on the question being
+  asked of it, and a helper named for one question must not be reused for the other.
+- **A refusal computed from one value must be applied to the value actually sent.** The
+  SMTP encoding was chosen from `payload.body` and the message was built from a composed
+  body that also carries the recipient's name — so an Arabic rep receiving an English
+  notification got `Content-Transfer-Encoding: 7bit` over raw 8-bit octets. The fix is not
+  a wider check but one function producing what the other measures.
+- **A channel is not shipped until a route can configure it and a process constructs it.**
+  Email had the sender, the migration widening the CHECK, the README paragraph and the ADR
+  item, and for one commit it was reachable only from psql and sent by nobody.
+  `createEndpoint` wrote `'webhook'` as a literal and nothing outside the tests called
+  `new SmtpSender`. "Both senders are real" was true of the code and false of the system.
+- **A knob that short-circuits a guard is that guard's override, whatever it is called.**
+  `prune_guard_floor_rows` is the left operand of the guard's `AND`, capped at a million,
+  settable by the same role that opens the override window — but naming nobody, expiring
+  never, and not reported as an override. 0026's own header spends four paragraphs
+  explaining why an override must be a window, and then shipped one that was not.
+- **A socket is a resource even when the function that created it never returns it.**
+  `open()` raced a timer against `connect` and, on timeout, rejected without destroying
+  the socket — which the caller's `finally` could not reach, because there was no
+  conversation to wrap it in. One leaked descriptor per retry in a long-running scheduler,
+  each able to complete its connect later and sit against the relay with no reader.
+- **A test that needs an interleaving must produce it, not race for it.** The sweeper's
+  concurrency test ran two sweeps with `Promise.all` and asserted the loser reported a
+  skip; it failed about one run in five, correctly, because whether the loser SEES the
+  claim depends on commit order. The deterministic version uses the database as the
+  synchronisation point — a one-shot trigger on `crm.outbox` moves the second claim at the
+  moment the first claim's row is written — and the real race is asserted only on what is
+  genuinely invariant under it.
+- **A generated file must not record where it was generated from.** The codegen header
+  interpolated its source, which is a live URL on `erp:codegen` and a file path on
+  `erp:codegen:baseline`, so the drift gate reported DRIFT while printing two identical
+  schema hashes. The input's identity is the hash; which machine ran the generator is a
+  fact about the commit, not about the types.
+
 **Explicitly out of scope for the ERP, owned by the CRM:** identity and session,
 territory and assignment, row-level authorisation, offline outbox and conflict resolution,
 attachments and object storage, e-signature capture, lot/expiry/custody for samples,
@@ -939,7 +1015,7 @@ reasoning behind each constrains what follows.
 | Question | Owner | Deadline |
 |---|---|---|
 | **Which `LedgerAccount.account_code` is the S&M expense account per tenant?** Unchanged as a question and now the ONLY thing standing between a rep and a filed claim: `packages/expense` is built, and submitting a claim whose category has no active `crm.expense_account_map` row is refused with a 409 naming the category, the table and what Finance must supply. One row per category is the whole unblock. | Finance | _set a date_ |
-| **The JournalEntry still cannot be posted, for three reasons beyond the account code.** (a) `JournalLine.ledger_account_id` is a record REFERENCE and the CRM holds a code; ADR item 11 says it is "resolved at posting time via `resolveAccountId`", but that is a private function inside the ERP's `write-effects.ts` and is not on the HTTP API, and `packages/sync` projects no `LedgerAccount`, so no code→id path exists today. That is a hole in item 11's reasoning, not an omission in the code. (b) There is no employee-reimbursements-payable account anywhere in either system: `FinanceSettings` has `apAccountCode` (supplier AP control) and `cashAccountCode`, and crediting either mis-states something — AP would carry an employee liability with no `Bill` behind it, cash would assert money moved before it did. (c) One ERP scope cannot do both halves: `Expense.create` excludes `controller` while GL writes require it, so a tenant wanting both must grant `erp_admin`, which is wider than item 11's security note contemplated. The `Expense` record posts today and carries the account and cost centre in its description so the manual journal entry is readable off it. | Finance + Security | _set a date_ |
+| **The JournalEntry still cannot be posted, for three reasons beyond the account code.** (a) `JournalLine.ledger_account_id` is a record REFERENCE and the CRM holds a code. ADR item 11 says it is "resolved at posting time via `resolveAccountId`", which is a private function inside the ERP's `write-effects.ts` and is not on the HTTP API — a hole in item 11's reasoning. **Corrected 2026-10-05 from the captured schema:** `LedgerAccount.account_code` IS filterable, so the DEBIT account can be resolved over the ordinary API; an earlier version of this row said no code→id path existed at all and that was wrong. What remains true is that `packages/sync` projects no `LedgerAccount`, so the resolution would be a synchronous ERP read on the posting path. The COST CENTRE is the harder half and the reason this stays closed: `CostCenter`'s only filterable fields are `parent_id` and `manager_id` — `code` is not among them — and the ERP drops an unrecognised filter silently, so `?code[eq]=CC-SM` returns the tenant's first cost centre and looks like a hit. (b) There is no employee-reimbursements-payable account anywhere in either system: `FinanceSettings` has `apAccountCode` (supplier AP control) and `cashAccountCode`, and crediting either mis-states something — AP would carry an employee liability with no `Bill` behind it, cash would assert money moved before it did. (c) One ERP scope cannot do both halves: `Expense.create` excludes `controller` while GL writes require it, so a tenant wanting both must grant `erp_admin`, which is wider than item 11's security note contemplated. The `Expense` record posts today and carries the account and cost centre in its description so the manual journal entry is readable off it. | Finance + Security | _set a date_ |
 | Which `CostCenter.code` (if any) to hook per category. Optional by design — NULL posts to the account with no dimension. `CostCenter.segment` has no `functional` value (`operating\|geographic\|product\|service\|other`), so S&M would sit under `operating`. | Finance | _set a date_ |
 | Does the CRM need more than one S&M account (e.g. splitting congresses from detailing samples), or does one account with cost-centre and CRM-side category reporting suffice? The map is per-category already, so several accounts cost nothing structurally. | Finance | _set a date_ |
 | Which OIDC IdP for human login (Q8 tier 1), and does the CRM service credential holding `controller` (needed for the GL posting in item 11) pass security review? The credential itself is built; the question is whether `controller` per tenant is the right grant, and it is per-tenant configuration (`crm.erp_service_principal`) so narrowing it costs nothing structurally. | Security | _set a date_ |
@@ -954,14 +1030,16 @@ reasoning behind each constrains what follows.
 | A dead letter keeps only its LATEST reason. `revive_count` says a row has died more than once but not why each time. A per-attempt history belongs in its own table if one is ever needed, not in more columns on `crm.outbox`. | Platform | _set a date_ |
 | Nothing picks up `ALTER ROLE crm_app BYPASSRLS` on a running system. The privilege verdict is cached per role NAME for the life of the process, because asking the catalog costs ~82 µs and asking it on every transaction is the wrong trade. A restart notices; so does `/healthz` in a new process. Altering the role is a superuser action on a role the deployment creates `NOSUPERUSER NOBYPASSRLS`, so the exposure is an operator deliberately widening their own application role. | Platform | _set a date_ |
 | Deleting a notification takes its `crm.notification_delivery` rows with it, by the `ON DELETE CASCADE` migration 0021 wrote. So the retention period for a notification is also the retention period for the record of where that signal was pushed — which is coherent (the policy says the tenant no longer keeps this) but means delivery history cannot be retained longer than the notification it describes. Separating them needs the delivery rows to stop depending on the notification row. | Platform | _set a date_ |
-| A recall can reset a disposal deadline, and now one party can do it alone. If a rep's expired stock reaches zero by `transfer_out`, the sweep resolves the obligation as `transferred`; a recall puts the stock back and the next sweep raises a NEW obligation with a fresh `discovered_on` and `due_by`. Two reps could already achieve this by bouncing a transfer between them — the recall makes it unilateral. The fix is in 0020's territory: re-open the resolved obligation rather than raise a new one, or key the deadline to the lot's expiry rather than to discovery. | Compliance | _set a date_ |
 | The SMTP sender has never spoken to a real mail server. It is verified end to end against a sink written alongside it — reply classification at every stage, dot-stuffing, RFC 2047 subjects, STARTTLS with certificate verification, AUTH PLAIN and LOGIN — and the sink is faithful to RFC 5321/3207/4616 as far as it goes, but it is not Postfix, Exchange or SES. Untested in the wild: PIPELINING, a relay that enforces SIZE rather than advertising it, reply codes outside the ranges covered, and whether a given provider accepts `8bit`. It also does no DKIM signing, which is not claimed anywhere. | Platform | _set a date_ |
-| No route and no scheduler job calls `postClaim`; a human does, through `POST /v1/expenses/{id}/post`. Deliberate — `idx_expense_claim_unsent` ("approved, not yet handed over") only means anything if posting is a separate act — but it means an approved claim sits until somebody presses the button. A sweeper over `unpostedApprovedClaims` would want a new `scheduled_job` kind. | Product | _set a date_ |
-| `crm.expense_claim` has no `rejected_by` / `rejected_at`, so WHO rejected a claim is not recorded. Overloading `approved_by` was rejected as a fix: a rejecter stored in a column named `approved_by` reads as an approval to every query that does not know better, the four-eyes CHECK's own wording included. It wants two columns and a migration. | Compliance | _set a date_ |
-| `packages/acl/schema/baseline.json` holds TWO entities — `Item` and `Opportunity`. `Expense`, `JournalEntry`, `JournalLine`, `LedgerAccount` and `CostCenter` are all absent, so the expense payloads are typed by hand against the ERP's manifest rather than against generated code, and `posting.test.ts` names every field so a typo fails a test rather than a request. The same is already true of `StockMovement` in the sample mirror. Re-capturing the baseline against a server serving the full `pack-erp-core` would close it; rule 3 is not violated, because that rule is about paths and filters and this write resolves its slug from the tenant's live `/v1/meta/schema`. | Platform | _set a date_ |
-| `crm.notification_subject_open` has a branch per producing table and nothing enforces that the set of branches matches the set of producers. A new producer that sets `subject_table` without adding a branch prunes at the normal horizon; the job's `unknownSubjects` count is the only signal, and only after the fact. The same shape as `crm.outbox_recipient` (0022) and open for the same reason — a test that derives the producer list from the code would have to parse it. | Platform | _set a date_ |
 | A role grant's `granted_by` / `revoked_by` are plain FKs to `crm.rep_profile (id)`, as every rep-profile reference in this schema is. Nothing but RLS and the explicit tenant match stops one naming a profile in another tenant. A composite `(tenant_id, id)` FK would close it structurally, and changing the convention for one table would be worse than leaving it stated here. | Platform | _set a date_ |
 | Roles cover the two administrative surfaces that exist (`crm.disposal_policy`, `crm.notification_endpoint`) and nothing else. `crm.cycle`, `crm.territory`, `crm.territory_assignment`, `crm.sample_lot` and `crm.expense_account_map` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |
+| **The disposal deadline is carried per (rep, lot), so a FIRST hand-off between two cooperating reps can still move the material's effective deadline.** Closed as of 0030 for the unilateral recall path and for any pair that has each held the lot once: the sweep now asks `crm.disposal_carry_forward` and inserts a CONTINUATION obligation inheriting `discovered_on` and `due_by` verbatim, naming the row it continues. What is left open is deliberate and pinned by a test — a genuine hand-over to a rep who has never held the lot starts that rep's own grace period, because holding someone to a deadline they were never given is the mirror image of the bug. Closing it means deciding that an obligation attaches to the MATERIAL rather than to a person, which changes what the table means. | Compliance | _set a date_ |
+| **The disposal chain is readable in SQL and not over HTTP.** `crm.disposal_obligation_chain` walks the continuation links and returns each row's resolution plus the ledger's own word for the discharging movement (`transfer_out`, not just `transferred`), exposed as `disposalHistory()` — but no route reads it, so the audit trail an inspector would ask for is reachable only by someone with a psql prompt. A `GET /v1/samples/obligations/:lotId/history` would close it. | Compliance | _set a date_ |
+| **`crm.outbox.created_at` is the transaction clock, and only the outbox has a `seq` to fall back on.** 0027 added one there after proving the tie; `crm.disposal_obligation` has nothing equivalent, so two obligations written in one transaction — which a catch-up sweep does — cannot be ordered at all. `disposal_obligation_chain` sidesteps it by walking `continues_obligation_id` recursively from the root rather than ordering by time, bounded at 10,000 so a hand-edited cycle fails short instead of hanging. `crm.open_disposal_obligations` would have the same problem if it ever needed a stable order. | Platform | _set a date_ |
+| **The prune guard's floor is capped at 1,000 rows (0032), which is a judgement and not a derivation.** The floor short-circuits the share ceiling, so an uncapped one is a permanent unattributed bypass — it shipped capped at a million. 1,000 is ten times the default and bounds what a misconfigured floor can cost to a number an operator can read and recover from, and a pass the floor lets through is now reported as `FLOOR-WAIVED` rather than reading like an ordinary pass. What nobody has decided is whether the right number for a two-million-row inbox is the same as for an eight-hundred-row one; the honest answer may be that the floor should be a share too. | Product | _set a date_ |
+| **No incremental polling is possible against `pack-erp-core` at all.** Measured from the captured baseline: 0 of 51 entities declare `updated_at` and 0 expose it as filterable. `PollingChangeSource` asks the schema and returns `mode: "full_sweep"` rather than sending a filter the ERP would silently drop, so every snapshot refresh is a full read of every entity. That is correct and expensive, and it is the strongest argument for Q9's `meta.webhook_deliveries` that exists — the alternative is the platform adding `updated_at` to the pack's filterable sets. | Platform | _set a date_ |
+| **34 of 51 entities expose no sortable fields**, so a `sort` on them silently falls back to the view's default order. Keyset pagination over an unordered view can revisit and skip rows, which means a paged full sweep of those entities is not provably complete. Nothing in the CRM pages them today; the snapshot refresher reads the entities that do sort. Worth knowing before anything new pages one. | Platform | _set a date_ |
+| **A channel with no sender in the running process now RETRIES rather than dead-letters**, which is right (a missing sender is a fact about the binary, not the destination, and the notification is deliverable the moment a process that has the channel takes a tick) and bounded (`markRetry` gives up at `MAX_ATTEMPTS`). But it means a channel nobody ever registers burns five attempts per delivery before dead-lettering, and nothing warns an operator that their endpoint's channel is unsendable until the first delivery is already late. A boot-time check against the distinct channels in `crm.notification_endpoint` would say it once, at the right moment. | Platform | _set a date_ |
 | There is no `GET /v1/admin/notification-endpoints/:id/test` — no way for an administrator to confirm that the environment variable their endpoint names actually holds a secret. The API cannot answer it: the sender runs in the **scheduler** process and reads a different environment, so a check in the API would report confidently about the wrong one. A test-send route would have to be driven by the scheduler, or the verdict recorded by it and read here. | Platform | _set a date_ |
 
 > The deadlines in the original table (8–26 September) all lapsed before the answers came

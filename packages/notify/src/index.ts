@@ -42,6 +42,7 @@ export {
 } from "./dispatch.js";
 export { inbox, markAllRead, markRead, unreadCount, type InboxItem } from "./inbox.js";
 export {
+  ENDPOINT_CHANNELS,
   InvalidEndpointError,
   createEndpoint,
   getEndpoint,
@@ -49,6 +50,7 @@ export {
   listEndpoints,
   updateEndpoint,
   type CreateEndpointInput,
+  type EndpointChannel,
   type EndpointRow,
   type UpdateEndpointInput,
 } from "./endpoints.js";
@@ -58,6 +60,8 @@ export {
   DEFAULT_RETAIN_READ_DAYS,
   DEFAULT_RETAIN_UNREAD_DAYS,
   InvalidRetentionError,
+  MAX_PRUNE_GUARD_FLOOR_ROWS,
+  MAX_PRUNE_OVERRIDE_BY_CHARS,
   MAX_PRUNE_OVERRIDE_HOURS,
   MAX_PRUNE_ROWS,
   grantPruneGuardOverride,

@@ -201,7 +201,19 @@ export class NotificationDispatcher {
         const sender = this.senders.get(delivery.channel);
         const outcome: SendOutcome =
           sender === undefined
-            ? { kind: "dead", error: `no sender registered for channel ${delivery.channel}` }
+            ? // RETRY, not dead. A missing sender is a statement about THIS PROCESS, not
+              // about the destination: the endpoint row is legal (0029 admits `email`) and
+              // the notification is deliverable the moment a process that registers the
+              // channel takes a tick. Dead-lettering it destroyed every notification routed
+              // to a correctly configured endpoint whose sender the running binary happened
+              // not to have. `markRetry` still gives up at MAX_ATTEMPTS, so a channel nobody
+              // ever registers dead-letters on its own rather than retrying forever.
+              {
+                kind: "retry",
+                error:
+                  `no sender registered for channel ${delivery.channel} in this process — ` +
+                  `it registers ${[...this.senders.keys()].join(", ") || "none"}`,
+              }
             : await sender.send(delivery.payload, {
                 id: delivery.endpoint_id,
                 url: delivery.url,

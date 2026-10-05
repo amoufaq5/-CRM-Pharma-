@@ -383,15 +383,21 @@ function wrapBase64(text: string): string {
 }
 
 /**
- * The message, headers and all.
+ * Everything below the headers, as it will be sent.
+ *
+ * Separate from `buildMessage` for one reason: `chooseEncoding` must see **this** text
+ * and not `payload.body`. The footer carries `recipient.displayName`, which is a person's
+ * name — so an Arabic rep receiving an English notification composed a body with high
+ * bytes in it and got `7bit` chosen for it, which is the mojibake `chooseEncoding` exists
+ * to prevent. Composing twice is free; disagreeing about what was composed is not.
  *
  * `payload.payload` — the structured facts a webhook receiver parses — is deliberately
  * left out. A human reads this one, and the lot number or account id that matters is
  * already in the notification body; a JSON blob under it is noise that also widens what
  * leaves the system by email.
  */
-export function buildMessage(payload: WebhookPayload, opts: MessageOptions): string {
-  const body = toCrlf(
+export function composeBody(payload: WebhookPayload): string {
+  return toCrlf(
     [
       payload.body,
       "",
@@ -407,6 +413,11 @@ export function buildMessage(payload: WebhookPayload, opts: MessageOptions): str
       "Sent by the CRM. Replies are not read.",
     ].join("\n"),
   );
+}
+
+/** The message, headers and all. */
+export function buildMessage(payload: WebhookPayload, opts: MessageOptions): string {
+  const body = composeBody(payload);
 
   const headers: readonly (readonly [string, string])[] = [
     ["From", `<${opts.from}>`],
@@ -559,20 +570,29 @@ class SmtpConversation {
     plain.removeAllListeners("close");
 
     const secure = tlsConnect({ ...tlsOptions, socket: plain, host });
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new SmtpTimeoutError(`the TLS handshake did not complete within ${this.perWaitMs}ms`)),
-        Math.max(1, Math.min(this.perWaitMs, this.deadlineAt - Date.now())),
-      );
-      secure.once("secureConnect", () => {
-        clearTimeout(timer);
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new SmtpTimeoutError(`the TLS handshake did not complete within ${this.perWaitMs}ms`)),
+          Math.max(1, Math.min(this.perWaitMs, this.deadlineAt - Date.now())),
+        );
+        secure.once("secureConnect", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        secure.once("error", (err: Error) => {
+          clearTimeout(timer);
+          reject(err);
+        });
       });
-      secure.once("error", (err: Error) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-    });
+    } catch (err) {
+      // `this.socket` is still `plain` here, so the caller's `destroy()` would tear the
+      // connection down — but not this TLSSocket, which holds its own handle and its own
+      // pending `secureConnect`. Destroying the wrapper takes the plaintext socket with
+      // it, which is what we want on a handshake that failed.
+      secure.destroy();
+      throw err;
+    }
 
     this.socket = secure;
     this.decoder = new StringDecoder("utf8");
@@ -705,20 +725,32 @@ export class SmtpSender implements ChannelSender {
         ? tlsConnect({ ...tlsOptions, host, port })
         : netConnect({ host, port });
 
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new SmtpTimeoutError(`could not connect to ${host}:${String(port)} within ${perWait}ms`)),
-        Math.max(1, Math.min(perWait, deadlineAt - Date.now())),
-      );
-      const settle = (err?: Error): void => {
-        clearTimeout(timer);
-        socket.removeListener("error", settle);
-        if (err === undefined) resolve();
-        else reject(err);
-      };
-      socket.once(this.transport === "implicit_tls" ? "secureConnect" : "connect", () => settle());
-      socket.once("error", settle);
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new SmtpTimeoutError(`could not connect to ${host}:${String(port)} within ${perWait}ms`)),
+          Math.max(1, Math.min(perWait, deadlineAt - Date.now())),
+        );
+        const settle = (err?: Error): void => {
+          clearTimeout(timer);
+          socket.removeListener("error", settle);
+          if (err === undefined) resolve();
+          else reject(err);
+        };
+        socket.once(this.transport === "implicit_tls" ? "secureConnect" : "connect", () => settle());
+        socket.once("error", settle);
+      });
+    } catch (err) {
+      // The socket exists whether or not it connected, and until this `catch` nothing
+      // closed it: `send`'s `finally { conversation?.destroy() }` can only reach a
+      // conversation, and on a connect timeout there is no conversation to wrap it in. The
+      // handle therefore stayed open, kept the event loop alive, and — in a scheduler that
+      // retries a down relay every tick — leaked one descriptor per attempt while the
+      // connect it abandoned could still complete later and sit against the relay with no
+      // reader and no QUIT. `destroy()` is safe on a socket that never connected.
+      socket.destroy();
+      throw err;
+    }
 
     return new SmtpConversation(socket, perWait, deadlineAt);
   }
@@ -796,7 +828,10 @@ export class SmtpSender implements ChannelSender {
       if (authed !== null) return authed;
     }
 
-    const encoding = chooseEncoding(payload.body, caps);
+    // The composed body, not `payload.body`: the footer appends the recipient's own
+    // name, so the text that actually goes down the wire can be non-ASCII when the
+    // notification text is not.
+    const encoding = chooseEncoding(composeBody(payload), caps);
     const message = buildMessage(payload, {
       from: this.relay.from,
       to: ctx.to,
