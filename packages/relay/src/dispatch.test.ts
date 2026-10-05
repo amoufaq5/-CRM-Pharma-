@@ -22,6 +22,7 @@ const row = (over: Partial<OutboxRow> = {}): OutboxRow => ({
   source_table: "crm.expense_claim",
   source_id: "0d1c1e2f-0000-4000-8000-000000000002",
   attempts: 0,
+  revive_count: 0,
   ...over,
 });
 
@@ -41,13 +42,29 @@ describe("parseOperation", () => {
 });
 
 describe("idempotencyKeyFor", () => {
-  it("is stable per row, so a retry reuses it", () => {
+  it("is stable within an episode, so a retry of the same attempt reuses it", () => {
     expect(idempotencyKeyFor(row())).toBe(idempotencyKeyFor(row()));
+    // `attempts` moves inside one episode and must NOT move the key: a worker that died
+    // after sending and before settling has to be deduped by the gateway.
+    expect(idempotencyKeyFor(row({ attempts: 4 }))).toBe(idempotencyKeyFor(row({ attempts: 1 })));
   });
 
   it("differs between rows, so distinct writes never collide", () => {
     expect(idempotencyKeyFor(row())).not.toBe(
       idempotencyKeyFor(row({ id: "0d1c1e2f-0000-4000-8000-000000000009" })),
+    );
+  });
+
+  /**
+   * The live gate caught this one. Under a reused key the ERP replays its earlier answer,
+   * whose body it does not keep — so a revived row's second refusal came back bodiless and
+   * was recorded as `rejected: unrecognised_error_shape` instead of the ERP's own sentence.
+   * A revive asks what the ERP says NOW; it has to ask in its own name.
+   */
+  it("CHANGES across a revive, so the ERP answers again instead of replaying", () => {
+    expect(idempotencyKeyFor(row({ revive_count: 1 }))).not.toBe(idempotencyKeyFor(row()));
+    expect(idempotencyKeyFor(row({ revive_count: 2 }))).not.toBe(
+      idempotencyKeyFor(row({ revive_count: 1 })),
     );
   });
 });

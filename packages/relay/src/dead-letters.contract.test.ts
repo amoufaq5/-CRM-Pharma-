@@ -5,7 +5,14 @@ import { withTenantContext } from "@crm/db";
 import { TENANT_DEAD_LETTERS as TENANT, testPool } from "@crm/db/testing";
 import { inbox } from "@crm/notify";
 
-import { deadLetter, deadLetters, raiseDeadLetterAlarm, reviveDeadLetter, teamDeadLetters } from "./dead-letters.js";
+import {
+  deadLetter,
+  deadLetters,
+  outboxLetterOwner,
+  raiseDeadLetterAlarm,
+  reviveDeadLetter,
+  teamDeadLetters,
+} from "./dead-letters.js";
 import { enqueueOutbox, markDead } from "./store.js";
 
 /**
@@ -25,6 +32,8 @@ describe("dead letters", () => {
   const REGION = "d1400000-0000-4000-8000-000000000004";
   const TERRITORY = "d1500000-0000-4000-8000-000000000005";
   const ELSEWHERE = "d1600000-0000-4000-8000-000000000006";
+  /** A tenant this suite never writes as — only reads from, to prove RLS is the predicate. */
+  const FOREIGN_TENANT = "d1000000-0000-4000-8000-0000000000b9";
 
   const inTenant = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> =>
     withTenantContext(client, TENANT, fn);
@@ -383,6 +392,74 @@ describe("dead letters", () => {
           [outboxId],
         );
         expect(rows[0]!.revive_count).toBe(3);
+      });
+    });
+  });
+
+  /**
+   * `deadLetter` carries `state = 'dead'`; this does not, and the difference is the whole
+   * point. A route that authorises reading a death HISTORY cannot use the dead-only lookup,
+   * because the history becomes unreadable the moment a revive succeeds — which is the
+   * moment "why did this take four attempts" is worth asking.
+   */
+  describe("attributing a queue row in any state", () => {
+    it("answers for a row that is pending, dead, revived and delivered alike", async () => {
+      await inTenant(async (tx) => {
+        const { outboxId } = await aFailedWrite(tx);
+
+        expect(await outboxLetterOwner(tx, outboxId)).toMatchObject({
+          id: outboxId,
+          state: "pending",
+          rep_profile_id: REP,
+          revive_count: 0,
+        });
+        // Dead-only lookup says nothing yet.
+        expect(await deadLetter(tx, outboxId)).toBeNull();
+
+        await markDead(tx, outboxId, new Date(), "ERP refused");
+        expect(await outboxLetterOwner(tx, outboxId)).toMatchObject({ state: "dead", rep_profile_id: REP });
+        expect(await deadLetter(tx, outboxId)).not.toBeNull();
+
+        expect(await reviveDeadLetter(tx, outboxId, MANAGER)).toBe(true);
+        expect(await outboxLetterOwner(tx, outboxId)).toMatchObject({
+          state: "pending",
+          rep_profile_id: REP,
+          revive_count: 1,
+        });
+        // And here is the divergence that matters.
+        expect(await deadLetter(tx, outboxId)).toBeNull();
+
+        await tx.query("UPDATE crm.outbox SET state = 'delivered' WHERE id = $1", [outboxId]);
+        expect(await outboxLetterOwner(tx, outboxId)).toMatchObject({ state: "delivered", rep_profile_id: REP });
+      });
+    });
+
+    it("reports no rep for a producing table nothing maps", async () => {
+      await inTenant(async (tx) => {
+        const { outboxId } = await aFailedWrite(tx, { sourceTable: "crm.not_a_producer" });
+        expect(await outboxLetterOwner(tx, outboxId)).toMatchObject({ rep_profile_id: null });
+      });
+    });
+
+    it("is null for an id that does not exist", async () => {
+      await inTenant(async (tx) => {
+        expect(await outboxLetterOwner(tx, randomUUID())).toBeNull();
+      });
+    });
+
+    /**
+     * The query has no tenant predicate of its own, exactly as `deadLetter` has none: RLS
+     * is the predicate. Pinned here because this function is an AUTHORISATION gate — a
+     * route uses its answer to decide whether a caller may read a history — so "another
+     * tenant's id is indistinguishable from a missing one" has to be a property, not a
+     * coincidence of how the test happens to connect.
+     */
+    it("cannot attribute another tenant's row", async () => {
+      // Committed before the foreign read, so an absence means the policy hid it rather
+      // than that it was not there yet.
+      const outboxId = await inTenant(async (tx) => (await aFailedWrite(tx)).outboxId);
+      await withTenantContext(client, FOREIGN_TENANT, async (other) => {
+        expect(await outboxLetterOwner(other, outboxId)).toBeNull();
       });
     });
   });

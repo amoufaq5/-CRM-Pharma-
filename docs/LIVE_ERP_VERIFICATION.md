@@ -311,8 +311,9 @@ design change rather than a defect fix. Both belong in ADR-0001's open table.
 
 ### The same-process retry takes a different path again
 
-A retry of the same outbox row sends the same `Idempotency-Key` (`crm-<row id>`),
-and within one ERP process lifetime that hits the gateway's in-memory idempotency
+A retry of the same outbox row sends the same `Idempotency-Key` — today
+`crm-<row id>-r<revive count>`, and at the time of this run `crm-<row id>` — and
+within one ERP process lifetime that hits the gateway's in-memory idempotency
 store, which answers **201 with an empty body**. `ErpClient.request` returns
 `null` for it without throwing, so the relay marks the row delivered — correct,
 but via a third mechanism, and `erp_response` is `null` rather than the record.
@@ -381,6 +382,64 @@ and live, after:
 ```
 ok: and the dead reason names the FIELD the ERP rejected, so it can be fixed
     — "validation_failed: request_number is required"
+```
+
+## The second defect found and fixed: a retry that told the operator less
+
+Added in §6i, which reads the death HISTORY the trigger writes rather than the
+queue row — and found that the gateway's in-memory idempotency store, already
+known to answer a replay **with the status and without the body**, was corrupting
+the one record that exists to answer "is pressing retry worth anything".
+
+The run that found it, verbatim:
+
+```
+FAIL: the second death is reported as a REPEAT of the first — the ERP said the
+      same thing twice
+      — got entries=2 repeat=false
+        first="validation_failed: request_number is required"
+        second="rejected: unrecognised_error_shape"
+```
+
+Same outbox row, same payload, same server, two deaths — and the second one does
+not say what the first said. `idempotencyKeyFor` was `crm-<row id>`, fixed for the
+life of the row, so a **revived** write re-asked under the key the gateway had
+already answered. The replay came back 422 with no body, failed both error parses,
+and the history recorded the CRM's failure to read an answer in place of the ERP's
+sentence. Two consequences, and the second is worse than the first:
+
+- the operator who pressed retry was told **less** than before they pressed it;
+- `is_repeat_of_previous` called an identical cause a new one, which is the exact
+  question `crm.outbox_dead_letter` was built to answer, answered backwards. A
+  history that says "different cause each time" is a history that says "keep
+  retrying".
+
+The fix is one line of key derivation and a paragraph saying why:
+`crm-<row id>-r<revive count>`. Stable **within** an episode, so a worker that
+died after sending and before settling is still deduped by the gateway; distinct
+**across** episodes, because a revive is a request for the ERP's answer *now*, on
+the premise that the cause was fixed, and replaying the old answer makes that
+unanswerable. Nothing is risked: if the earlier attempt actually landed, the
+collision is on the record id the CRM minted itself and settles as
+`already_delivered` — which §6h proves against this same server with the driver
+message stripped out. The key only ever saved a round trip.
+
+**Why no offline test could have caught it.** The fake ERP answers every request
+it is given; it has no idempotency store, so it cannot replay. The behaviour only
+exists where a real gateway remembers a key across two requests, which is the same
+property §6's three-way replay table is about. This is the fourth time in this
+repo that "the fixture was kinder than reality" has been the defect class, and the
+first time it was the ERP's *memory* rather than its schema or its words.
+
+After the fix, on the same server:
+
+```
+ok: the second death carries the ERP's OWN sentence again, not the CRM's failure
+    to read a replayed answer
+    — first="validation_failed: request_number is required"
+      second="validation_failed: request_number is required"
+ok: so the summary reads as the button being pressed instead of the cause being
+    fixed — always=true never=false distinct=1
 ```
 
 ## What is left open

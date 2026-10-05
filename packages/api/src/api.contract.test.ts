@@ -86,6 +86,11 @@ describe("the API, end to end", () => {
         // Notifications reference rep_profile with ON DELETE RESTRICT, and obligations
         // reference the lot the same way, so both go before their targets.
         await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [t]);
+        // `crm.outbox_dead_letter` carries NO foreign key to `crm.outbox` on purpose
+        // (0036): a death history has to survive its queue row's deletion. So deleting the
+        // queue leaves the history behind, and a fixture that cleared only the queue would
+        // carry every previous test's deaths into the tenant-wide listing.
+        await tx.query("DELETE FROM crm.outbox_dead_letter WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [t]);
@@ -1597,6 +1602,7 @@ describe("the API, end to end", () => {
     const cleanup = async (): Promise<void> => {
       await withTenantContext(admin, TENANT, async (tx) => {
         await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [TENANT]);
+        await tx.query("DELETE FROM crm.outbox_dead_letter WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1", [TENANT]);
       });
     };
@@ -1703,6 +1709,229 @@ describe("the API, end to end", () => {
       });
       try {
         expect((await call("POST", `/v1/erp-writes/${id}/retry`, { auth: mgr(), body: {} })).status).toBe(404);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    /**
+     * A death HISTORY needs a real death, and `aDeadWrite` above does not produce one.
+     *
+     * `trg_outbox_dead_letter` fires `AFTER UPDATE OF state`, so a row INSERTed already
+     * `dead` writes no history at all — which is correct for the list and retry tests
+     * (they only read `crm.outbox`) and would have made every assertion below pass
+     * vacuously against an empty table. The row therefore arrives `pending` and is killed
+     * by an UPDATE, which is also how the relay does it.
+     */
+    const aRealDeath = async (
+      repId: string,
+      reason: string,
+    ): Promise<{ outboxId: string; kill: (why: string) => Promise<void> }> => {
+      let outboxId = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const claim = await tx.query<{ id: string }>(
+          `INSERT INTO crm.expense_claim (tenant_id, rep_profile_id, crm_category, amount, currency, incurred_on)
+           VALUES ($1,$2,'detailing',40.00,'AED','2026-10-05') RETURNING id`,
+          [TENANT, repId],
+        );
+        const row = await tx.query<{ id: string }>(
+          `INSERT INTO crm.outbox
+             (tenant_id, entity, operation, payload, target_record_id, source_table, source_id, state)
+           VALUES ($1,'Expense','create','{}'::jsonb,$2,'crm.expense_claim',$3,'pending')
+           RETURNING id`,
+          [TENANT, `crm_hist_${Math.random().toString(36).slice(2, 10)}`, claim.rows[0]!.id],
+        );
+        outboxId = row.rows[0]!.id;
+      });
+      const kill = async (why: string): Promise<void> => {
+        await withTenantContext(admin, TENANT, async (tx) => {
+          await tx.query(
+            "UPDATE crm.outbox SET state = 'dead', dead_at = now(), dead_reason = $2 WHERE id = $1",
+            [outboxId, why],
+          );
+        });
+      };
+      await kill(reason);
+      return { outboxId, kill };
+    };
+
+    it("tells progress from the same wall, over a row's whole history", async () => {
+      const { outboxId, kill } = await aRealDeath(rep, "ledger account 6200 does not exist");
+      try {
+        // Revived through the route, so the revive bookkeeping is the real one.
+        expect((await call("POST", `/v1/erp-writes/${outboxId}/retry`, { body: {} })).status).toBe(200);
+        await kill("period 2026-10 is locked");
+
+        const res = await call("GET", `/v1/erp-writes/${outboxId}/history`);
+        expect(res.status).toBe(200);
+        expect(res.body.id).toBe(outboxId);
+        expect(res.body.state).toBe("dead");
+        expect(res.body.data).toHaveLength(2);
+        // Oldest first, and each death carries the count as it stood.
+        expect(res.body.data[0]).toMatchObject({ attempt: 1, revive_count_at_death: 0 });
+        expect(res.body.data[1]).toMatchObject({ attempt: 2, revive_count_at_death: 1 });
+        expect(res.body.data[0].reason).toMatch(/ledger account 6200/);
+        expect(res.body.data[1].reason).toMatch(/period 2026-10 is locked/);
+        // The first episode closed; the second is open.
+        expect(res.body.data[0].revived_at).not.toBeNull();
+        expect(res.body.data[0].revived_by).toBe(rep);
+        expect(res.body.data[1].revived_at).toBeNull();
+        // Two different causes: the retry is working and a third attempt is worth having.
+        expect(res.body.summary).toMatchObject({
+          deaths: 2,
+          deathsEverRecorded: 2,
+          episodesMissing: 0,
+          revives: 1,
+          distinctReasons: 2,
+          repeatedReasons: [],
+          unexplained: 0,
+          alwaysTheSameReason: false,
+          neverTheSameReason: true,
+          unaccountedRevivals: 0,
+          impossibleRevivals: 0,
+        });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it("names the button-pressed shape when the reason never changes", async () => {
+      const { outboxId, kill } = await aRealDeath(rep, "ledger account 6200 does not exist");
+      try {
+        expect((await call("POST", `/v1/erp-writes/${outboxId}/retry`, { body: {} })).status).toBe(200);
+        await kill("ledger account 6200 does not exist");
+
+        const res = await call("GET", `/v1/erp-writes/${outboxId}/history`);
+        expect(res.status).toBe(200);
+        expect(res.body.data[1].is_repeat_of_previous).toBe(true);
+        expect(res.body.summary).toMatchObject({
+          alwaysTheSameReason: true,
+          neverTheSameReason: false,
+          distinctReasons: 1,
+          repeatedReasons: ["ledger account 6200 does not exist"],
+        });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    /**
+     * THE REASON THIS ROUTE DOES NOT GO THROUGH `deadLetter`.
+     *
+     * That lookup carries `state = 'dead'`, which is right for a retry and would make the
+     * history unreadable at the exact moment it became worth reading: the write finally
+     * landed, and "why did this take four attempts" is the question an operator then asks.
+     */
+    it("stays readable after the write finally lands", async () => {
+      const { outboxId } = await aRealDeath(rep, "ledger account 6200 does not exist");
+      try {
+        expect((await call("POST", `/v1/erp-writes/${outboxId}/retry`, { body: {} })).status).toBe(200);
+        await withTenantContext(admin, TENANT, async (tx) => {
+          await tx.query("UPDATE crm.outbox SET state = 'delivered' WHERE id = $1", [outboxId]);
+        });
+        // Gone from both dead-letter listings, by construction.
+        expect((await call("GET", "/v1/erp-writes/failed")).body.data).toEqual([]);
+
+        const res = await call("GET", `/v1/erp-writes/${outboxId}/history`);
+        expect(res.status).toBe(200);
+        expect(res.body.state).toBe("delivered");
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.summary.deaths).toBe(1);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    /**
+     * An empty history is a 200, not a 404. "This write has never died" is a true and
+     * useful answer, and it is not the same answer as "there is no such write" — the state
+     * in the body is what separates them.
+     */
+    it("answers for a write that has never died", async () => {
+      let outboxId = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const claim = await tx.query<{ id: string }>(
+          `INSERT INTO crm.expense_claim (tenant_id, rep_profile_id, crm_category, amount, currency, incurred_on)
+           VALUES ($1,$2,'detailing',12.00,'AED','2026-10-05') RETURNING id`,
+          [TENANT, rep],
+        );
+        const row = await tx.query<{ id: string }>(
+          `INSERT INTO crm.outbox
+             (tenant_id, entity, operation, payload, target_record_id, source_table, source_id, state)
+           VALUES ($1,'Expense','create','{}'::jsonb,$2,'crm.expense_claim',$3,'pending')
+           RETURNING id`,
+          [TENANT, `crm_alive_${Math.random().toString(36).slice(2, 10)}`, claim.rows[0]!.id],
+        );
+        outboxId = row.rows[0]!.id;
+      });
+      try {
+        const res = await call("GET", `/v1/erp-writes/${outboxId}/history`);
+        expect(res.status).toBe(200);
+        expect(res.body.state).toBe("pending");
+        expect(res.body.data).toEqual([]);
+        expect(res.body.summary).toMatchObject({ deaths: 0, deathsEverRecorded: 0, episodesMissing: 0 });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it("shows a manager a supervised rep's history and a peer rep a 404", async () => {
+      const { outboxId } = await aRealDeath(rep, "ERP refused");
+      try {
+        expect((await call("GET", `/v1/erp-writes/${outboxId}/history`, { auth: mgr() })).status).toBe(200);
+        const peer = await call("GET", `/v1/erp-writes/${outboxId}/history`, {
+          auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        });
+        expect(peer.status).toBe(404);
+        // The refusal names the write, never its owner: a 404 that said whose write it was
+        // would hand a caller who guessed an id the rep id they were missing.
+        expect(peer.body.detail).toContain(outboxId);
+        expect(peer.body.detail).not.toContain(rep);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    /**
+     * The tenant-wide listing, and the one case the per-row route cannot serve.
+     *
+     * `crm.outbox_dead_letter` has no foreign key to `crm.outbox` (0036), so a history
+     * outlives its queue row — and once the queue row is gone nothing attributes the
+     * history to a rep, which is why the per-row route 404s on it and this one does not.
+     */
+    it("lists the tenant's recent deaths, orphans included, for an administrator only", async () => {
+      const { outboxId: mine } = await aRealDeath(rep, "ledger account 6200 does not exist");
+      const { outboxId: orphan } = await aRealDeath(otherRep, "period 2026-10 is locked");
+      try {
+        await withTenantContext(admin, TENANT, async (tx) => {
+          await tx.query("DELETE FROM crm.outbox WHERE id = $1", [orphan]);
+          // The administrator is rep2, NOT the caller `call` defaults to: with the role on
+          // rep1 the two 403s below would be asserting against an administrator and would
+          // pass for the wrong reason.
+          await tx.query(
+            `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+             VALUES ($1,$2,'administrator',$3,CURRENT_DATE)`,
+            [TENANT, otherRep, manager],
+          );
+        });
+        const adminToken = (): string => token({ sub: "idp|rep2", tenant: TENANT });
+
+        const res = await call("GET", "/v1/admin/erp-writes/deaths", { auth: adminToken() });
+        expect(res.status).toBe(200);
+        const ids = (res.body.data as { outbox_id: string }[]).map((d) => d.outbox_id);
+        expect(ids).toContain(mine);
+        expect(ids).toContain(orphan);
+
+        // The orphan is unreachable per row, by design.
+        expect((await call("GET", `/v1/erp-writes/${orphan}/history`, { auth: mgr() })).status).toBe(404);
+
+        // Tenant-wide, so supervision is the wrong gate: a manager is refused.
+        expect((await call("GET", "/v1/admin/erp-writes/deaths", { auth: mgr() })).status).toBe(403);
+        expect((await call("GET", "/v1/admin/erp-writes/deaths")).status).toBe(403);
+
+        // And the page size is bounded rather than trusted.
+        expect((await call("GET", "/v1/admin/erp-writes/deaths?limit=501", { auth: adminToken() })).status).toBe(422);
+        expect((await call("GET", "/v1/admin/erp-writes/deaths?limit=1", { auth: adminToken() })).body.data).toHaveLength(1);
       } finally {
         await cleanup();
       }

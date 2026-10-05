@@ -165,6 +165,49 @@ export async function teamDeadLetters(
   return rows;
 }
 
+/**
+ * Who a queue row belongs to, WHATEVER STATE IT IS IN.
+ *
+ * `deadLetter` carries `state = 'dead'` in its WHERE clause, which is right for a retry —
+ * there is nothing to revive otherwise — and wrong for reading a death history. A history
+ * exists precisely because a row died, and the interesting histories are the ones whose
+ * row then got revived and delivered: predicating the lookup on `dead` would make the
+ * record unreadable at the exact moment it became worth reading.
+ *
+ * So this answers the authorisation question on its own, with no state predicate, and the
+ * route decides what to do with the state rather than being silently denied by it.
+ *
+ * Returns null when there is no such row in this tenant — which, under RLS, also covers
+ * another tenant's id. Note that `crm.outbox_dead_letter` deliberately carries no foreign
+ * key to `crm.outbox` (0036), so a history can outlive its queue row; when it has, this
+ * returns null and the per-row history is unreachable for a rep. That is the fail-closed
+ * reading and it is deliberate: an orphaned history cannot be attributed to anybody, so
+ * nobody but an administrator has a claim on it, and the tenant-wide listing is how they
+ * reach it.
+ */
+export interface OutboxLetterOwner {
+  readonly id: string;
+  readonly state: string;
+  /** Null when the producing table is not mapped to a rep — see `crm.outbox_recipient`. */
+  readonly rep_profile_id: string | null;
+  readonly revive_count: number;
+}
+
+export async function outboxLetterOwner(
+  tx: PoolClient,
+  id: string,
+): Promise<OutboxLetterOwner | null> {
+  const { rows } = await tx.query<OutboxLetterOwner>(
+    `SELECT o.id, o.state,
+            crm.outbox_recipient(o.source_table, o.source_id) AS rep_profile_id,
+            o.revive_count
+       FROM crm.outbox o
+      WHERE o.id = $1`,
+    [id],
+  );
+  return rows[0] ?? null;
+}
+
 export class DeadLetterNotFoundError extends Error {
   constructor(id: string) {
     super(`no dead outbox letter ${id}`);

@@ -52,7 +52,16 @@ import {
   roleHolders,
   type Role,
 } from "@crm/role";
-import { deadLetter, deadLetters, reviveDeadLetter, teamDeadLetters } from "@crm/relay";
+import {
+  attemptHistory,
+  deadLetter,
+  deadLetters,
+  outboxLetterOwner,
+  recentDeaths,
+  reviveDeadLetter,
+  summariseAttemptHistory,
+  teamDeadLetters,
+} from "@crm/relay";
 import { withTenantContext } from "@crm/db";
 import {
   ACCOUNT_CODE_MAX,
@@ -1867,6 +1876,52 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     },
   });
 
+  /**
+   * Why a write kept failing — one row's whole death history, oldest first.
+   *
+   * `revive_count` says a retry has already been pressed; it does not say whether pressing
+   * it again is worth anything. These two answers are different conversations and the
+   * number cannot tell them apart: "died because the ledger account was missing, somebody
+   * created it, died again because the period was locked" is progress, and "died twice
+   * because the ledger account is still missing" is the button being pressed instead of the
+   * cause being fixed. The summary names which shape this is.
+   *
+   * Authorised like the retry — the caller's own writes and a supervised rep's — but NOT
+   * through `deadLetter`, whose `state = 'dead'` predicate would make the history
+   * unreadable the moment a revive succeeded, which is the one moment it is most worth
+   * reading. `outboxLetterOwner` answers without a state predicate; the state is reported
+   * rather than used as a gate.
+   *
+   * A 404 when the queue row is gone. `crm.outbox_dead_letter` outlives it on purpose
+   * (0036), so the history may well still be there — but nothing attributes it to a rep any
+   * more, and guessing is not attribution. Those rows are reached through the tenant-wide
+   * listing below.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/erp-writes/:id/history",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const p = ctx.principal;
+      const body = await inTenant(deps, p, async (tx) => {
+        const owner = await outboxLetterOwner(tx, id);
+        if (
+          owner === null ||
+          owner.rep_profile_id === null ||
+          !(await canSupervise(tx, p.repProfileId, owner.rep_profile_id))
+        ) {
+          throw notFound(`no failed ERP write ${id}`);
+        }
+        const data = await attemptHistory(tx, id);
+        // An empty history for a row that exists is not a 404: it means this write has
+        // never died, which is a true and useful answer and is not the same as "no such
+        // write". The state is what distinguishes them, so it is in the body.
+        return { id, state: owner.state, summary: summariseAttemptHistory(data), data };
+      });
+      return { status: 200, body };
+    },
+  });
+
   // ---- administration -----------------------------------------------------
   //
   // Everything below requires a ROLE (0023), not supervision. A first-line manager
@@ -1986,6 +2041,31 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       const on = onDate(ctx);
       const data = await inTenant(deps, ctx.principal, (tx) => roleHolders(tx, "administrator", on));
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Every recent death in the tenant, latest first — including the orphans.
+   *
+   * `GET /v1/erp-writes/failed` and its team sibling answer "what is dead right now" by
+   * joining `crm.outbox`, so a row that died, was revived and then delivered has left them,
+   * and so has one whose queue row was deleted. This reads the history table alone, so
+   * neither disappears — which makes it the only way to reach a history that nothing
+   * attributes to a rep, and the reason the per-row route can afford to 404 on one.
+   *
+   * ADMINISTRATOR, not supervision. The gate is not "is this your rep's write": the listing
+   * is tenant-wide by construction and contains writes from every rep and from producing
+   * tables that map to no rep at all. A first-line manager reads their team's failures
+   * through the team route; this is the operator's view of the queue itself.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/erp-writes/deaths",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const limit = parse(z.coerce.number().int().min(1).max(500), ctx.query.get("limit") ?? "100");
+      const data = await inTenant(deps, ctx.principal, (tx) => recentDeaths(tx, { limit }));
       return { status: 200, body: { data } };
     },
   });

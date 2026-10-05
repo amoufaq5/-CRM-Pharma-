@@ -59,16 +59,33 @@ export function parseOperation(operation: string): ParsedOperation {
 }
 
 /**
- * The `Idempotency-Key` for a row.
+ * The `Idempotency-Key` for one DISPATCH EPISODE of a row.
  *
- * Derived from the row's own identity so a retry of the SAME row reuses it while
- * a different row never collides. Belt and braces only: the real dedup is the
- * ERP's `(tenant_id, entity, record_id)` unique constraint, because the
- * deployed gateway's idempotency store is in-memory, dies on restart and does
- * not span instances (report R6).
+ * Derived from the row's identity so a retry within an episode reuses it, and from
+ * `revive_count` so a REVIVE does not. Belt and braces either way: the real dedup is the
+ * ERP's `(tenant_id, entity, record_id)` unique constraint over an id the CRM minted
+ * itself, because the deployed gateway's idempotency store is in-memory, dies on restart
+ * and does not span instances (report R6).
+ *
+ * THE REVIVE COUNT IS NOT COSMETIC, and the live gate is why it is here. The key used to
+ * be `crm-<row id>` for the life of the row, so a revived row re-sent its write under the
+ * key the ERP had already answered — and the gateway replayed its stored answer, which it
+ * keeps the STATUS of and not the body (section 4's measured fact, the same one that makes
+ * a replayed 201 arrive empty). So a second death's reason was not the ERP's reason at all:
+ * a 422 came back bodiless, failed both error parses, and the history recorded
+ * `rejected: unrecognised_error_shape` where the first episode had recorded
+ * `validation_failed: request_number is required`. The operator who pressed retry was told
+ * LESS than before they pressed it, and `is_repeat_of_previous` called an identical cause a
+ * new one — the exact question `crm.outbox_dead_letter` exists to answer, answered wrongly.
+ *
+ * A revive is a request for the ERP's answer NOW, on the premise that the cause was fixed.
+ * Replaying the old answer makes that unanswerable, so each episode asks in its own name.
+ * Nothing is risked by it: if the earlier attempt actually landed, the collision is on the
+ * record id and `classify` settles it `already_delivered` — proved against the live server
+ * with the driver message removed (6h). The key only ever saved a round trip.
  */
 export function idempotencyKeyFor(row: OutboxRow): string {
-  return `crm-${row.id}`;
+  return `crm-${row.id}-r${row.revive_count}`;
 }
 
 /**

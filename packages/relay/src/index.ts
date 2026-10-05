@@ -31,11 +31,13 @@ export {
   DeadLetterNotFoundError,
   deadLetter,
   deadLetters,
+  outboxLetterOwner,
   raiseDeadLetterAlarm,
   reviveDeadLetter,
   teamDeadLetters,
   type DeadLetter,
   type DeadLetterAlarm,
+  type OutboxLetterOwner,
 } from "./dead-letters.js";
 export {
   attemptHistory,

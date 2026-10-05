@@ -13,10 +13,20 @@ export interface OutboxRow {
   readonly source_table: string;
   readonly source_id: string;
   readonly attempts: number;
+  /**
+   * How many times this row has been put back in the queue after dying.
+   *
+   * Carried on the dispatch row, not merely on the dead-letter record, because the
+   * `Idempotency-Key` is derived from it: see `idempotencyKeyFor`. A revive is a request
+   * for the ERP's CURRENT answer, and re-sending under the previous episode's key gets the
+   * previous episode's answer replayed instead.
+   */
+  readonly revive_count: number;
 }
 
 const ROW_COLUMNS =
-  "id, tenant_id, entity, operation, payload, target_record_id, source_table, source_id, attempts";
+  "id, tenant_id, entity, operation, payload, target_record_id, source_table, source_id, attempts, " +
+  "revive_count";
 
 /**
  * Claims up to `limit` due rows for this worker, oldest due first and in

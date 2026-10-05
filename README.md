@@ -105,6 +105,8 @@ authorisation on its own.
 | `GET /v1/erp-writes/failed` | writes the ERP refused permanently — theirs |
 | `GET /v1/team/erp-writes/failed` | the team's, for a manager |
 | `POST /v1/erp-writes/:id/retry` | queue the same payload again, once the cause is fixed |
+| `GET /v1/erp-writes/:id/history` | why it died EACH time, with the shape named: a different cause each attempt, or the same wall twice |
+| `GET /v1/admin/erp-writes/deaths` | every recent death in the tenant, orphans included (**administrator**); `?limit=` 1..500 |
 | `GET /v1/me/roles` | which administrative roles the caller holds, if any |
 | `GET /v1/admin/roles` | the grant log; `?role=`, `?includeEnded=true`, `?on=` |
 | `GET /v1/admin/roles/administrators` | who can configure this tenant — readable by every rep |

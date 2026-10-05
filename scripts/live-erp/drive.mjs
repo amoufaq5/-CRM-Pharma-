@@ -30,7 +30,16 @@ import {
   mintServiceToken,
 } from "../../packages/credential/dist/index.js";
 import { withTenantContext } from "../../packages/db/dist/index.js";
-import { OutboxRelay, classify, enqueueOutbox } from "../../packages/relay/dist/index.js";
+import {
+  OutboxRelay,
+  attemptHistory,
+  classify,
+  enqueueOutbox,
+  outboxLetterOwner,
+  recentDeaths,
+  reviveDeadLetter,
+  summariseAttemptHistory,
+} from "../../packages/relay/dist/index.js";
 
 const ERP_BASE = process.env["ERP_BASE_URL"] ?? "http://127.0.0.1:8788";
 const JWKS_BASE = process.env["JWKS_BASE_URL"] ?? "http://127.0.0.1:8799";
@@ -1179,6 +1188,114 @@ expect(
   `landed=${landed.seen.recordReads.length} lost=${lost.seen.recordReads.length} blind=${blind.seen.recordReads.length}`,
 );
 
+// ---------------------------------------------------------------------------
+// 6i. THE DEATH HISTORY, in the live ERP's own words.
+//
+// 6f produced a real dead letter: a LeaveRequest missing `request_number`, which
+// the real server validates away. Everything below reads what the TRIGGER wrote
+// about that death — the one part of the dead-letter path no offline test can
+// speak for, because the reason is a sentence the ERP chose and not a fixture.
+//
+// Then it kills the same row a second time with the same payload, which is the
+// shape the history exists to name: the cause was never fixed, so a third press
+// of the retry button is worth nothing. The offline suites assert that shape over
+// reasons they wrote themselves; here the bytes being compared are the server's.
+// ---------------------------------------------------------------------------
+section("6i. the death history carries the live ERP's own reason, and names the shape");
+
+async function inCrm(fn) {
+  const conn = await pool.connect();
+  try {
+    return await withTenantContext(conn, TENANT, fn);
+  } finally {
+    conn.release();
+  }
+}
+
+const firstHistory = await inCrm((tx) => attemptHistory(tx, bad.id));
+expect(
+  firstHistory.length === 1,
+  "the trigger recorded exactly one death for the row the ERP validated away",
+  `entries=${firstHistory.length}`,
+);
+expect(
+  firstHistory[0] !== undefined && firstHistory[0].reason === row.dead_reason,
+  "and the history's reason is byte-identical to the outbox row's — one death, one sentence, not two renderings of it",
+  JSON.stringify(firstHistory[0]?.reason),
+);
+expect(
+  firstHistory[0] !== undefined && /request_number/.test(firstHistory[0].reason ?? ""),
+  "which means the FIELD the live server named survives into the history an operator reads",
+  JSON.stringify(firstHistory[0]?.reason),
+);
+
+// Revived through the same function the route calls, so the bookkeeping is real.
+const revived = await inCrm((tx) => reviveDeadLetter(tx, bad.id, null));
+expect(revived === true, "the dead letter revives", `revived=${revived}`);
+expect(
+  (await inCrm((tx) => attemptHistory(tx, bad.id)))[0]?.revived_at !== null,
+  "and the trigger closes the episode it had left open",
+);
+
+// Same payload, same server: the same refusal, verbatim.
+await relay.drainTenant(TENANT);
+const secondState = await outboxState(bad.id);
+expect(
+  secondState.state === "dead",
+  "re-sending an unchanged bad payload dies again rather than succeeding by accident",
+  `state=${secondState.state}`,
+);
+
+const history = await inCrm((tx) => attemptHistory(tx, bad.id));
+const summary = summariseAttemptHistory(history);
+// THE ONE THIS SECTION WAS WORTH WRITING FOR. Under the old key — `crm-<row id>`, fixed
+// for the life of the row — the revived write re-asked under the key the gateway had
+// already answered, and it keeps a reply's status without its body. So the second refusal
+// arrived bodiless, failed both error parses, and the history recorded
+// `rejected: unrecognised_error_shape` where the first had the ERP's own sentence: the
+// operator who pressed retry was told LESS than before they pressed it, and the history
+// called an identical cause a new one. `idempotencyKeyFor` now carries `revive_count`.
+expect(
+  history[1] !== undefined && history[1].reason === history[0]?.reason,
+  "the second death carries the ERP's OWN sentence again, not the CRM's failure to read a replayed answer",
+  `first=${JSON.stringify(history[0]?.reason)} second=${JSON.stringify(history[1]?.reason)}`,
+);
+expect(
+  history.length === 2 && history[1]?.is_repeat_of_previous === true,
+  "the second death is reported as a REPEAT of the first — the ERP said the same thing twice",
+  `entries=${history.length} repeat=${history[1]?.is_repeat_of_previous}` +
+    ` first=${JSON.stringify(history[0]?.reason)} second=${JSON.stringify(history[1]?.reason)}`,
+);
+expect(
+  summary.alwaysTheSameReason === true && summary.neverTheSameReason === false,
+  "so the summary reads as the button being pressed instead of the cause being fixed",
+  `always=${summary.alwaysTheSameReason} never=${summary.neverTheSameReason} distinct=${summary.distinctReasons}`,
+);
+expect(
+  summary.deaths === 2 && summary.deathsEverRecorded === 2 && summary.episodesMissing === 0,
+  "and it accounts for every episode it was given",
+  `deaths=${summary.deaths} ever=${summary.deathsEverRecorded} missing=${summary.episodesMissing}`,
+);
+expect(
+  summary.impossibleRevivals === 0 && summary.unaccountedRevivals === 0,
+  "with no episode stamped as ending before it began and no revive nothing attributed",
+  `impossible=${summary.impossibleRevivals} unaccounted=${summary.unaccountedRevivals}`,
+);
+
+// The two reads the routes are built on, against the same live data.
+const owner = await inCrm((tx) => outboxLetterOwner(tx, bad.id));
+expect(
+  owner !== null && owner.state === "dead",
+  "`outboxLetterOwner` answers for the row GET /v1/erp-writes/:id/history authorises against",
+  `state=${owner?.state} rep=${owner?.rep_profile_id}`,
+);
+const tenantDeaths = await inCrm((tx) => recentDeaths(tx, { limit: 500 }));
+expect(
+  tenantDeaths.filter((d) => d.outbox_id === bad.id).length === 2,
+  "and the tenant-wide listing GET /v1/admin/erp-writes/deaths serves shows both episodes",
+  `matching=${tenantDeaths.filter((d) => d.outbox_id === bad.id).length} total=${tenantDeaths.length}`,
+);
+
 // The outbox is a work queue, not a ledger: its rows exist to be settled, and the
 // assertions above have already read each one's settled state. Removing this
 // run's rows keeps a second run from claiming the first run's still-pending
@@ -1186,13 +1303,21 @@ expect(
 const cleanup = await pool.connect();
 try {
   const removed = await withTenantContext(cleanup, TENANT, async (tx) => {
+    // The history goes first and by the same pattern. `crm.outbox_dead_letter` has
+    // no foreign key to `crm.outbox` on purpose (0036) — a death has to outlive its
+    // queue row — so deleting the queue would leave this run's deaths behind for the
+    // next run's tenant-wide listing to count.
+    const deaths = await tx.query(
+      `DELETE FROM crm.outbox_dead_letter WHERE tenant_id = $1 AND target_record_id LIKE $2`,
+      [TENANT, `crm-lr-${stamp}-%`],
+    );
     const { rowCount } = await tx.query(`DELETE FROM crm.outbox WHERE tenant_id = $1 AND target_record_id LIKE $2`, [
       TENANT,
       `crm-lr-${stamp}-%`,
     ]);
-    return rowCount ?? 0;
+    return (rowCount ?? 0) + (deaths.rowCount ?? 0);
   });
-  ok(`cleaned up ${removed} outbox row(s) this run created`);
+  ok(`cleaned up ${removed} outbox and dead-letter row(s) this run created`);
 } finally {
   cleanup.release();
 }
