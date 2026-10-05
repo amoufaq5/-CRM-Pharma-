@@ -123,3 +123,20 @@ jobs:
       # already-applied migration is refused.
       - name: Verify the migration runner
         run: ./scripts/verify-migration-runner.sh
+
+  # The deployment stack has never been built or run in this project — no Docker
+  # daemon has been available. `docker compose config` is client-side, so the file
+  # can at least be held to a standard: it resolves against the committed
+  # .env.example, the application services run as crm_app and not the admin,
+  # nothing serves before the migration succeeds, Caddy waits for the api to be
+  # HEALTHY, no image floats on `latest`, the runtime is not root, and only the
+  # scheduler can hold the ERP signing key.
+  #
+  # A pass here does NOT mean the stack works. It means it is well-formed and those
+  # invariants hold. Building an image remains unverified and is called out as such.
+  deploy-stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify the deployment stack
+        run: ./scripts/verify-deploy-stack.sh

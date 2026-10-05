@@ -21,7 +21,8 @@
     "api": "pnpm --filter @crm/api build && node packages/api/dist/bin/api.js",
     "db:migrate:dry": "pnpm --filter @crm/db build && node packages/db/dist/bin/migrate.js --dry-run",
     "db:migrate:verify": "pnpm build && ./scripts/verify-migration-runner.sh",
-    "key": "pnpm --filter @crm/credential build && node packages/credential/dist/bin/service-key.js"
+    "key": "pnpm --filter @crm/credential build && node packages/credential/dist/bin/service-key.js",
+    "deploy:verify": "./scripts/verify-deploy-stack.sh"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

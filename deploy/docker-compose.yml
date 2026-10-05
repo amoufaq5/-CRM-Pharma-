@@ -77,8 +77,9 @@ services:
     command: ["node", "packages/api/dist/bin/api.js"]
     expose: ["8080"]
     healthcheck:
-      # /healthz queries the database, so this reports readiness rather than
-      # merely "the process is alive".
+      # /healthz queries the database AND checks that the connection's role is one
+      # row-level security applies to, so this reports readiness rather than merely
+      # "the process is alive". Caddy gates on it below.
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 10s
       timeout: 5s
@@ -124,7 +125,13 @@ services:
     image: caddy:2
     depends_on:
       api:
-        condition: service_started
+        # HEALTHY, not merely started. The api healthcheck reports readiness, which
+        # since the privilege guard landed includes "connected as a role that row-level
+        # security applies to" — a wrong PGUSER makes /healthz answer 503. Under
+        # `service_started` Caddy would proxy traffic to a container that answers 503 to
+        # every request, which is precisely the misconfiguration the guard exists to
+        # stop reaching users. deploy/README.md claimed this gate; it is now true.
+        condition: service_healthy
     ports: ["80:80", "443:443"]
     environment:
       DOMAIN: ${DOMAIN}

@@ -151,3 +151,12 @@ export const TENANT_ENDPOINTS = "d3000000-0000-4000-8000-000000000008";
 
 /** packages/notify — retention.contract. */
 export const TENANT_RETENTION = "d4000000-0000-4000-8000-000000000009";
+
+/** packages/sample — recall.contract. */
+export const TENANT_RECALL = "d6000000-0000-4000-8000-00000000000a";
+
+/** packages/notify — prune-guard.contract. */
+export const TENANT_PRUNE_GUARD = "d7000000-0000-4000-8000-00000000000b";
+
+/** packages/relay — sequence.contract. */
+export const TENANT_OUTBOX_SEQ = "d8000000-0000-4000-8000-00000000000c";

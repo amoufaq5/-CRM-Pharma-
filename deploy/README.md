@@ -20,6 +20,33 @@ what ships.
 > scheduler booting in production mode). Treat the container plumbing as
 > unexercised until someone runs `docker compose build` once.
 
+## What is and is not verified here
+
+The stack has **never been built or run**: no Docker daemon has been available in
+any session that touched this repo. `docker build` and `docker compose up` are
+therefore both unproven, and so is anything that depends on them — the image's
+`RUN` steps, whether the runtime finds its own `dist/`, and whether the services
+actually talk to each other.
+
+What *is* checked, by `pnpm deploy:verify` (`scripts/verify-deploy-stack.sh`) and in
+CI: `docker compose config` is client-side, needs no daemon, and does real work —
+it resolves the anchors and merges, expands every `${VAR}`, and fails on an unknown
+key or a dangling service reference. On top of that the script asserts the
+invariants this file claims:
+
+- the compose file resolves against the committed `.env.example`, and every
+  `${VAR}` without a default is documented there (a variable added to compose and
+  forgotten in the example is the most likely real failure);
+- `api` and `scheduler` run as `crm_app`, never the admin;
+- neither serves before `migrate` completes successfully, and `caddy` waits for
+  `api` to be healthy;
+- no image floats on `latest`, and the runtime image is not root;
+- only the `scheduler` can be given the ERP signing key.
+
+Each check was confirmed by breaking the thing it checks and watching it fail.
+**A pass still does not mean the stack works.** Read it as: well-formed, and those
+invariants hold.
+
 ## The one ordering constraint: the ERP goes first
 
 ADR-0001 chose a shared database. The CRM reads ERP master data over SQL from the
@@ -59,8 +86,11 @@ So a wrong `PGUSER` does not quietly widen every query:
 | any tenant request | served | `500`, with the reason in the structured log |
 | a `scheduler` tick | runs | `tick_error` per tenant, no work done |
 
-The 503 is the one that matters operationally: point the load balancer or the
-orchestrator at `/healthz` and a misconfigured deployment never takes traffic.
+The 503 is the one that matters operationally, and the compose file now acts on it:
+`caddy` waits for the `api` service to be **healthy**, not merely started, so a
+misconfigured deployment never takes traffic. It gated on `service_started` when
+that paragraph was first written — the claim was ahead of the configuration, and
+`scripts/verify-deploy-stack.sh` now asserts the gate so it cannot drift back.
 The role name appears in `/healthz` and in the log — both read by the operator who
 can change it — and never in a request response, which a tenant can read.
 
