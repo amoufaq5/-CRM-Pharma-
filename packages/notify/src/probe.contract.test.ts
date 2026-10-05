@@ -7,7 +7,7 @@ import { appPool, TENANT_CHANNEL_COVERAGE as TENANT } from "@crm/db/testing";
 
 import { NOTIFICATION_KINDS } from "./kinds.js";
 import { verifyWebhook, type FetchLike } from "./sender.js";
-import { InvalidSmtpRelayError, type SmtpRelayConfig, type SmtpTransport } from "./smtp.js";
+import { InvalidSmtpRelayError, SmtpSender, type SmtpRelayConfig, type SmtpTransport } from "./smtp.js";
 import { selfSignedCert, startSmtpSink, type SmtpSink, type SmtpSinkOptions } from "./testing-smtp.js";
 import {
   DEFAULT_PROBE_COOLDOWN_SECONDS,
@@ -872,6 +872,95 @@ describe("the endpoint probe", () => {
       expect(
         () => new SmtpProber({ relay: { host: "127.0.0.1", port: 25, from: "not-a-mailbox" } }),
       ).toThrow(InvalidSmtpRelayError);
+    });
+
+    /**
+     * The refusals are ONE function (`assertUsableRelay`), asserted from both sides.
+     *
+     * They were two copies, and the plaintext one is the copy that mattered: a send over
+     * plaintext to a remote host puts a rep's name and an account id on the wire, and a
+     * probe AUTHENTICATES, so it puts the password there too — in clear text, purely to
+     * find out whether it was right. A prober that had kept the weaker of two drifting
+     * copies would have been the more dangerous half. The last row is the control: a
+     * relay both must ACCEPT, so the loop could fail rather than passing on a refusal of
+     * everything.
+     */
+    it("refuses exactly what the sender refuses, because it is the same function", () => {
+      const cases: readonly (readonly [string, SmtpRelayConfig, boolean])[] = [
+        ["plaintext to a remote host", { host: "mail.example.com", port: 25, from: "crm@crm.example", transport: "plaintext" }, false],
+        ["a From that is not a mailbox", { host: "127.0.0.1", port: 25, from: "not-a-mailbox" }, false],
+        ["a port that is not a port", { host: "127.0.0.1", port: 0, from: "crm@crm.example" }, false],
+        ["a port above the range", { host: "127.0.0.1", port: 70_000, from: "crm@crm.example" }, false],
+        ["starttls to a remote host", { host: "mail.example.com", port: 587, from: "crm@crm.example" }, true],
+      ];
+      for (const [name, relay, acceptable] of cases) {
+        const sender = ((): unknown => {
+          try {
+            return new SmtpSender({ relay });
+          } catch (err) {
+            return err;
+          }
+        })();
+        const prober = ((): unknown => {
+          try {
+            return new SmtpProber({ relay });
+          } catch (err) {
+            return err;
+          }
+        })();
+        expect(sender instanceof InvalidSmtpRelayError, `sender: ${name}`).toBe(!acceptable);
+        expect(prober instanceof InvalidSmtpRelayError, `prober: ${name}`).toBe(!acceptable);
+        if (!acceptable) {
+          expect((prober as Error).message, name).toBe((sender as Error).message);
+        }
+      }
+    });
+
+    /**
+     * The probe opens its socket through the sender's own `connect`, so it cannot miss the
+     * fix the sender got: `open()` raced a timer against `connect` and on a timeout
+     * rejected WITHOUT destroying the socket, leaking one descriptor per attempt in a
+     * scheduler that retries a down relay every tick, and keeping the event loop alive.
+     * That mattered more for the prober than for the sender, because a probe is triggered
+     * by an administrator clicking a button.
+     *
+     * Measured the same way `smtp.contract.test.ts` measures it — `destroyed !== true`,
+     * because a destroyed socket lingers in `_getActiveHandles()` until its close is
+     * processed and does not hold the loop — and asserted as "does not GROW", which is the
+     * shape of the leak.
+     */
+    it("tears its socket down on a connect that never completes, and does not leak one per attempt", async () => {
+      const liveSockets = (): number =>
+        (
+          process as unknown as {
+            _getActiveHandles: () => readonly { constructor: { name: string }; destroyed?: boolean }[];
+          }
+        )
+          ._getActiveHandles()
+          .filter((h) => /Socket$/.test(h.constructor.name) && h.destroyed !== true).length;
+
+      // Routable-looking and unreachable, so the connect HANGS rather than being refused:
+      // a refused connect closes its own socket and would prove nothing.
+      const p = new SmtpProber({
+        relay: { host: "10.255.255.1", port: 25, from: "crm@crm.example" },
+        env: {},
+        timeoutMs: 200,
+      });
+      const before = liveSockets();
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await p.probe({
+          probeId: "df100000-0000-4000-8000-0000000000d5",
+          tenantId: TENANT,
+          endpointId: "df100000-0000-4000-8000-0000000000d6",
+          channel: "email",
+          url: "mailto:ops@example.com",
+          secretEnv: SECRET_ENV,
+          requestedAt: "2027-01-15T09:00:00.000Z",
+        });
+        expect(outcome.verdict, `attempt ${String(i + 1)}`).toBe("unknown");
+        expect(outcome.detail).toContain("could not connect to 10.255.255.1:25 within 200ms");
+        expect(liveSockets(), `attempt ${String(i + 1)}`).toBe(before);
+      }
     });
   });
 

@@ -313,6 +313,45 @@ export interface SmtpRelayConfig {
   readonly clientName?: string;
 }
 
+/**
+ * The three refusals a relay configuration must survive, in one place because two classes
+ * make them: `SmtpSender` here, and `SmtpProber` in `probe.ts`.
+ *
+ * At construction rather than per send, so a relay configured without TLS fails the
+ * process at boot. The webhook sender's analogous refusal is per-delivery because its
+ * secret is per-endpoint; this is one statement about one process, and a scheduler that
+ * will never be allowed to send should not start and then dead-letter every notification
+ * it is handed.
+ *
+ * The plaintext rule carries the weight, and it carries MORE for the prober. A send over
+ * plaintext to a remote host puts a rep's name and an account id on the wire; a PROBE
+ * AUTHENTICATES, so it puts the password there too, in clear text, purely to find out
+ * whether it was right. Loopback traffic never leaves the machine, so the exception is
+ * narrow in the only way that matters — the destination, not a boolean an operator can
+ * flip for the whole process.
+ *
+ * Returns the resolved transport, so the `starttls` default cannot drift between callers
+ * either.
+ */
+export function assertUsableRelay(relay: SmtpRelayConfig): SmtpTransport {
+  if (!isMailbox(relay.from)) {
+    throw new InvalidSmtpRelayError(`${JSON.stringify(relay.from)} is not a usable From address`);
+  }
+  if (!Number.isInteger(relay.port) || relay.port < 1 || relay.port > 65_535) {
+    throw new InvalidSmtpRelayError(`${String(relay.port)} is not a port`);
+  }
+  const transport = relay.transport ?? "starttls";
+  if (transport === "plaintext" && !isLoopbackHost(relay.host)) {
+    throw new InvalidSmtpRelayError(
+      `plaintext SMTP is allowed only to a loopback relay, not to ${relay.host}. ` +
+        `A notification carries a rep's name and an account id, and a probe authenticates — so the ` +
+        `password would cross the network in clear text just to find out whether it was right. ` +
+        `Use starttls or implicit_tls.`,
+    );
+  }
+  return transport;
+}
+
 export interface SmtpSenderOptions {
   readonly relay: SmtpRelayConfig;
   /** Reads the password by variable name. Injected so a test need not mutate process.env. */
@@ -446,14 +485,48 @@ interface SmtpReply {
   readonly lines: readonly string[];
 }
 
+/** A phase the relay answered positively, carrying the code it answered with. */
+export interface SmtpAccepted {
+  readonly code: number;
+}
+
+/** What the negotiation established: what the relay offers, and what AUTH was performed. */
+export interface SmtpSession {
+  readonly capabilities: EhloCapabilities;
+  /** null when no AUTH was attempted, which is the case whenever no username is configured. */
+  readonly auth: { readonly mechanism: "PLAIN" | "LOGIN"; readonly username: string } | null;
+}
+
+export interface SmtpConversationOptions {
+  readonly relay: SmtpRelayConfig;
+  /** Resolved, not defaulted here: `assertUsableRelay` returns it, and it is checked there. */
+  readonly transport: SmtpTransport;
+  readonly perWaitMs: number;
+  /** The wall-clock millisecond the whole conversation must be finished by. */
+  readonly deadlineAt: number;
+  readonly tlsOptions: Readonly<Omit<ConnectionOptions, "socket" | "host" | "port">>;
+}
+
 /**
- * One SMTP conversation.
+ * One SMTP conversation: the only socket, reply reader and TLS upgrade in this package.
+ *
+ * Exported because `SmtpProber` in `probe.ts` holds the same conversation and stops before
+ * `DATA`, and a second copy of this file's socket plumbing is worse than a wider module
+ * surface. The two copies would have to keep agreeing about what a multi-line reply is,
+ * when a timeout must destroy its socket, and what bytes arriving before a TLS handshake
+ * mean — and a probe that drifted from the sender would report `reachable` for a relay the
+ * sender cannot use, which is the one error a probe must not make, because the probe
+ * exists to tell an operator whether the sender will work.
+ *
+ * What is exported is the PHASES, not the socket: `read`, `send`, `sendRaw`, `take`,
+ * `step` and `upgrade` stay private, so no caller can assemble a different conversation
+ * out of them. Every reply reaches `classifySmtpReply` through `step` and nowhere else.
  *
  * Replies are accumulated by a listener that is always attached, never one added per read:
  * a server is free to send the greeting before anyone asks for it, and bytes that arrive
  * while nothing is listening would be gone.
  */
-class SmtpConversation {
+export class SmtpConversation {
   private socket: Socket | TLSSocket;
   private decoder = new StringDecoder("utf8");
   private buffer = "";
@@ -461,13 +534,56 @@ class SmtpConversation {
   private closed = false;
   private wake: (() => void) | null = null;
 
-  constructor(
+  private constructor(
     socket: Socket | TLSSocket,
-    private readonly perWaitMs: number,
-    private readonly deadlineAt: number,
+    private readonly opts: SmtpConversationOptions,
   ) {
     this.socket = socket;
     this.attach();
+  }
+
+  /**
+   * Opens the socket and returns a conversation positioned on the greeting.
+   *
+   * Throws rather than returning an outcome: a connection that never happened has no
+   * reply to classify, and both callers already read a thrown error as "not now".
+   */
+  static async connect(opts: SmtpConversationOptions): Promise<SmtpConversation> {
+    const { host, port } = opts.relay;
+    const perWait = opts.perWaitMs;
+    const socket: Socket | TLSSocket =
+      opts.transport === "implicit_tls"
+        ? tlsConnect({ ...opts.tlsOptions, host, port })
+        : netConnect({ host, port });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new SmtpTimeoutError(`could not connect to ${host}:${String(port)} within ${perWait}ms`)),
+          Math.max(1, Math.min(perWait, opts.deadlineAt - Date.now())),
+        );
+        const settle = (err?: Error): void => {
+          clearTimeout(timer);
+          socket.removeListener("error", settle);
+          if (err === undefined) resolve();
+          else reject(err);
+        };
+        socket.once(opts.transport === "implicit_tls" ? "secureConnect" : "connect", () => settle());
+        socket.once("error", settle);
+      });
+    } catch (err) {
+      // The socket exists whether or not it connected, and until this `catch` nothing
+      // closed it: a caller's `finally { conversation?.destroy() }` can only reach a
+      // conversation, and on a connect timeout there is no conversation to wrap it in. The
+      // handle therefore stayed open, kept the event loop alive, and — in a scheduler that
+      // retries a down relay every tick — leaked one descriptor per attempt while the
+      // connect it abandoned could still complete later and sit against the relay with no
+      // reader and no QUIT. `destroy()` is safe on a socket that never connected.
+      socket.destroy();
+      throw err;
+    }
+
+    return new SmtpConversation(socket, opts);
   }
 
   private attach(): void {
@@ -485,19 +601,182 @@ class SmtpConversation {
     });
   }
 
-  get pendingBytes(): number {
-    return this.buffer.length;
+  /**
+   * Greeting, EHLO, the STARTTLS upgrade and its second EHLO, then AUTH.
+   *
+   * Everything up to the envelope, which is everything the sender and the probe share.
+   * The password is a parameter rather than configuration because it comes from the
+   * ENDPOINT's named variable, while the username is the relay's: see this file's header.
+   */
+  async negotiate(password: string | undefined): Promise<SmtpSession | SendOutcome> {
+    const { relay, transport, tlsOptions } = this.opts;
+
+    const greeting = await this.step("greeting");
+    if ("kind" in greeting) return greeting;
+
+    const ehloName = relay.clientName ?? domainOf(relay.from);
+    this.send(`EHLO ${ehloName}`);
+    const ehlo = await this.step("ehlo");
+    if ("kind" in ehlo) return ehlo;
+    let caps = parseEhloCapabilities(ehlo.lines);
+
+    if (transport === "starttls") {
+      if (!caps.startTls) {
+        // Fail closed. The alternative is to carry the rep's name and the account id in
+        // clear text to another host, which is the thing the transport rule exists to stop.
+        return {
+          kind: "dead",
+          error:
+            `${relay.host}:${String(relay.port)} does not offer STARTTLS, so anything sent to it would ` +
+            `cross the network in clear text. Refusing to send.`,
+        };
+      }
+      this.send("STARTTLS");
+      const ready = await this.step("starttls");
+      if ("kind" in ready) return ready;
+      if (this.buffer.length > 0) {
+        // Bytes after the 220 would be plaintext the TLS layer never sees — either a
+        // broken relay or someone injecting ahead of the handshake. Neither is sendable.
+        return {
+          kind: "dead",
+          error: `${relay.host} sent data after its STARTTLS reply; refusing to hand a dirty socket to TLS`,
+        };
+      }
+      await this.upgrade(relay.host, tlsOptions);
+
+      // RFC 3207: everything learned in the clear is discarded, extension list included —
+      // a relay that only advertises AUTH after TLS is the normal case, not the exception.
+      this.send(`EHLO ${ehloName}`);
+      const second = await this.step("ehlo");
+      if ("kind" in second) return second;
+      caps = parseEhloCapabilities(second.lines);
+    }
+
+    const username = relay.username;
+    if (username === undefined || password === undefined) {
+      return { capabilities: caps, auth: null };
+    }
+
+    const mechanism = chooseAuthMechanism(caps.authMechanisms);
+    if (mechanism === null) {
+      return {
+        kind: "dead",
+        error:
+          `${relay.host} offers no AUTH mechanism this client supports ` +
+          `(${caps.authMechanisms.length === 0 ? "it advertised none" : caps.authMechanisms.join(", ")}), ` +
+          `but a username is configured. Refusing to send unauthenticated as ${username}.`,
+      };
+    }
+    const refusal = await this.authenticate(mechanism, username, password);
+    if (refusal !== null) return refusal;
+    return { capabilities: caps, auth: { mechanism, username } };
   }
 
-  send(line: string): void {
+  private async authenticate(
+    mechanism: "PLAIN" | "LOGIN",
+    username: string,
+    password: string,
+  ): Promise<SendOutcome | null> {
+    if (mechanism === "PLAIN") {
+      this.send(`AUTH PLAIN ${authPlainToken(username, password)}`);
+      const reply = await this.step("auth");
+      return "kind" in reply ? reply : null;
+    }
+
+    this.send("AUTH LOGIN");
+    const userChallenge = await this.step("auth_challenge");
+    if ("kind" in userChallenge) return userChallenge;
+    this.send(Buffer.from(username, "utf8").toString("base64"));
+    const passChallenge = await this.step("auth_challenge");
+    if ("kind" in passChallenge) return passChallenge;
+    this.send(Buffer.from(password, "utf8").toString("base64"));
+    const reply = await this.step("auth");
+    return "kind" in reply ? reply : null;
+  }
+
+  /**
+   * `MAIL FROM` and `RCPT TO` — the envelope, and the whole of what a probe proves.
+   *
+   * `mailFromParams` is the caller's because only the caller knows what it is about to
+   * transmit: `BODY=8BITMIME` is the sender's, and a probe transmits nothing.
+   */
+  async envelope(to: string, mailFromParams = ""): Promise<SmtpAccepted | SendOutcome> {
+    this.send(`MAIL FROM:<${this.opts.relay.from}>${mailFromParams}`);
+    const mail = await this.step("mail_from");
+    if ("kind" in mail) return mail;
+
+    this.send(`RCPT TO:<${to}>`);
+    const rcpt = await this.step("rcpt_to");
+    if ("kind" in rcpt) return rcpt;
+    return { code: rcpt.code };
+  }
+
+  /** `DATA`, the dot-stuffed message, and the 250 that means the relay has queued it. */
+  async transmit(message: string): Promise<SmtpAccepted | SendOutcome> {
+    this.send("DATA");
+    const ready = await this.step("data");
+    if ("kind" in ready) return ready;
+
+    this.sendRaw(`${dotStuff(message).replace(/(\r\n)+$/, "")}\r\n.\r\n`);
+    const accepted = await this.step("end_of_data");
+    if ("kind" in accepted) return accepted;
+    return { code: accepted.code };
+  }
+
+  /**
+   * `RSET`, so "no message was sent" is explicit in the relay's own log rather than
+   * inferred from a session that stopped before `DATA`.
+   *
+   * The reply is deliberately not read: whatever the caller proved is already proved, and
+   * nothing after this may take it away — the same reason the sender swallows everything
+   * after its 250.
+   */
+  abandon(): void {
+    this.send("RSET");
+  }
+
+  /**
+   * Says goodbye and waits for the close, briefly.
+   *
+   * `end` rather than `write` then `destroy`: a destroy discards whatever has not flushed,
+   * so the relay would log an aborted connection for every message it had just accepted.
+   * The wait is capped because the message is already queued and nothing after this can
+   * change that.
+   */
+  async quit(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        resolve();
+      };
+      timer = setTimeout(done, Math.min(1_000, this.opts.perWaitMs));
+      this.socket.once("close", done);
+      this.socket.end(Buffer.from("QUIT\r\n", "utf8"));
+    });
+  }
+
+  destroy(): void {
+    this.socket.removeAllListeners();
+    this.socket.destroy();
+  }
+
+  /** Reads one reply and classifies it. The single place a reply code becomes a verdict. */
+  private async step(stage: SmtpStage): Promise<SmtpReply | SendOutcome> {
+    const reply = await this.read(stage);
+    const verdict = classifySmtpReply(stage, reply.code, reply.lines.join(" ").trim());
+    return verdict.kind === "delivered" ? reply : verdict;
+  }
+
+  private send(line: string): void {
     this.socket.write(Buffer.from(`${line}\r\n`, "utf8"));
   }
 
-  sendRaw(text: string): void {
+  private sendRaw(text: string): void {
     this.socket.write(Buffer.from(text, "utf8"));
   }
 
-  async read(stage: SmtpStage): Promise<SmtpReply> {
+  private async read(stage: SmtpStage): Promise<SmtpReply> {
     for (;;) {
       const reply = this.take();
       if (reply !== null) return reply;
@@ -510,8 +789,8 @@ class SmtpConversation {
   }
 
   private waitForBytes(stage: SmtpStage): Promise<void> {
-    const remaining = this.deadlineAt - Date.now();
-    const budget = Math.min(this.perWaitMs, remaining);
+    const remaining = this.opts.deadlineAt - Date.now();
+    const budget = Math.min(this.opts.perWaitMs, remaining);
     if (budget <= 0) {
       return Promise.reject(
         new SmtpTimeoutError(`the conversation ran past its overall timeout waiting for ${stage}`),
@@ -560,7 +839,7 @@ class SmtpConversation {
    * The decoder is replaced along with the listener: the old one may hold a partial
    * codepoint from the cleartext phase, which would corrupt the first encrypted reply.
    */
-  async upgrade(
+  private async upgrade(
     host: string,
     tlsOptions: Readonly<Omit<ConnectionOptions, "socket" | "host" | "port">>,
   ): Promise<void> {
@@ -573,8 +852,8 @@ class SmtpConversation {
     try {
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(
-          () => reject(new SmtpTimeoutError(`the TLS handshake did not complete within ${this.perWaitMs}ms`)),
-          Math.max(1, Math.min(this.perWaitMs, this.deadlineAt - Date.now())),
+          () => reject(new SmtpTimeoutError(`the TLS handshake did not complete within ${this.opts.perWaitMs}ms`)),
+          Math.max(1, Math.min(this.opts.perWaitMs, this.opts.deadlineAt - Date.now())),
         );
         secure.once("secureConnect", () => {
           clearTimeout(timer);
@@ -601,32 +880,6 @@ class SmtpConversation {
     this.closed = false;
     this.attach();
   }
-
-  /**
-   * Says goodbye and waits for the close, briefly.
-   *
-   * `end` rather than `write` then `destroy`: a destroy discards whatever has not flushed,
-   * so the relay would log an aborted connection for every message it had just accepted.
-   * The wait is capped because the message is already queued and nothing after this can
-   * change that.
-   */
-  async quit(): Promise<void> {
-    await new Promise<void>((resolve) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const done = (): void => {
-        if (timer !== undefined) clearTimeout(timer);
-        resolve();
-      };
-      timer = setTimeout(done, Math.min(1_000, this.perWaitMs));
-      this.socket.once("close", done);
-      this.socket.end(Buffer.from("QUIT\r\n", "utf8"));
-    });
-  }
-
-  destroy(): void {
-    this.socket.removeAllListeners();
-    this.socket.destroy();
-  }
 }
 
 export class SmtpSender implements ChannelSender {
@@ -634,36 +887,10 @@ export class SmtpSender implements ChannelSender {
   private readonly relay: SmtpRelayConfig;
   private readonly transport: SmtpTransport;
 
-  /**
-   * Transport is checked here rather than at send time, so a relay configured without TLS
-   * fails the process at boot. The webhook sender's analogous refusal is per-delivery
-   * because its secret is per-endpoint; this one is one statement about one process, and a
-   * scheduler that will never be allowed to send should not start and then dead-letter
-   * every notification it is handed.
-   */
   constructor(private readonly opts: SmtpSenderOptions) {
     this.channel = opts.channel ?? "email";
     this.relay = opts.relay;
-    this.transport = opts.relay.transport ?? "starttls";
-
-    if (!isMailbox(this.relay.from)) {
-      throw new InvalidSmtpRelayError(`${JSON.stringify(this.relay.from)} is not a usable From address`);
-    }
-    if (!Number.isInteger(this.relay.port) || this.relay.port < 1 || this.relay.port > 65_535) {
-      throw new InvalidSmtpRelayError(`${String(this.relay.port)} is not a port`);
-    }
-    if (this.transport === "plaintext" && !isLoopbackHost(this.relay.host)) {
-      // Same line the webhook URL constraint draws, for the same reason: a notification
-      // carries a rep's name, an account id and sometimes a lot number, and none of that
-      // goes over plaintext to another host. Loopback traffic never leaves the machine, so
-      // the exception is narrow enough to buy a local sink to test against — and it is
-      // narrow in the only way that matters, the destination, not a boolean an operator
-      // can flip for the whole process.
-      throw new InvalidSmtpRelayError(
-        `plaintext SMTP is allowed only to a loopback relay, not to ${this.relay.host}. ` +
-          `A notification carries a rep's name and an account id; use starttls or implicit_tls.`,
-      );
-    }
+    this.transport = assertUsableRelay(opts.relay);
   }
 
   async send(payload: WebhookPayload, endpoint: EndpointConfig): Promise<SendOutcome> {
@@ -694,14 +921,54 @@ export class SmtpSender implements ChannelSender {
     }
 
     const nowMs = this.opts.now?.() ?? Date.now();
-    const perWait = this.opts.timeoutMs ?? 10_000;
-    const deadlineAt = nowMs + (this.opts.overallTimeoutMs ?? 60_000);
-    const tlsOptions = this.opts.tlsOptions ?? {};
 
-    let conversation: SmtpConversation | null = null;
+    let conn: SmtpConversation | null = null;
     try {
-      conversation = await this.open(perWait, deadlineAt, tlsOptions);
-      return await this.converse(conversation, payload, { to, username, password, nowMs, tlsOptions });
+      conn = await SmtpConversation.connect({
+        relay: this.relay,
+        transport: this.transport,
+        perWaitMs: this.opts.timeoutMs ?? 10_000,
+        deadlineAt: nowMs + (this.opts.overallTimeoutMs ?? 60_000),
+        tlsOptions: this.opts.tlsOptions ?? {},
+      });
+
+      const session = await conn.negotiate(password);
+      if ("kind" in session) return session;
+
+      // The composed body, not `payload.body`: the footer appends the recipient's own
+      // name, so the text that actually goes down the wire can be non-ASCII when the
+      // notification text is not.
+      const encoding = chooseEncoding(composeBody(payload), session.capabilities);
+      const message = buildMessage(payload, { from: this.relay.from, to, nowMs, encoding });
+      const sizeBytes = Buffer.byteLength(message, "utf8");
+      const maxSize = session.capabilities.maxSize;
+      if (maxSize !== null && sizeBytes > maxSize) {
+        // Dead rather than attempted: the relay has already said it will refuse, and the
+        // message will be the same size next time.
+        return {
+          kind: "dead",
+          error: `the message is ${String(sizeBytes)} bytes and ${this.relay.host} accepts at most ${String(maxSize)}`,
+        };
+      }
+
+      // BODY=8BITMIME is how the relay is told the body really is 8-bit; without it a
+      // conforming relay may downgrade or refuse what `chooseEncoding` just decided to
+      // send raw. It is only ever appended when the extension was advertised.
+      const envelope = await conn.envelope(to, encoding === "8bit" ? " BODY=8BITMIME" : "");
+      if ("kind" in envelope) return envelope;
+
+      const accepted = await conn.transmit(message);
+      if ("kind" in accepted) return accepted;
+
+      // The message is queued the moment that 250 arrives. QUIT is courtesy, and anything
+      // that goes wrong in it must not turn a delivered notification into a retry that
+      // sends it a second time.
+      try {
+        await conn.quit();
+      } catch {
+        /* already delivered */
+      }
+      return { kind: "delivered", status: accepted.code };
     } catch (err) {
       if (err instanceof SmtpProtocolError) {
         return { kind: "dead", error: `${err.message} — the relay is not speaking SMTP` };
@@ -710,195 +977,7 @@ export class SmtpSender implements ChannelSender {
       // the relay may be briefly down, and a notification is worth a few minutes.
       return { kind: "retry", error: err instanceof Error ? err.message : String(err) };
     } finally {
-      conversation?.destroy();
+      conn?.destroy();
     }
-  }
-
-  private async open(
-    perWait: number,
-    deadlineAt: number,
-    tlsOptions: Readonly<Omit<ConnectionOptions, "socket" | "host" | "port">>,
-  ): Promise<SmtpConversation> {
-    const { host, port } = this.relay;
-    const socket: Socket | TLSSocket =
-      this.transport === "implicit_tls"
-        ? tlsConnect({ ...tlsOptions, host, port })
-        : netConnect({ host, port });
-
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new SmtpTimeoutError(`could not connect to ${host}:${String(port)} within ${perWait}ms`)),
-          Math.max(1, Math.min(perWait, deadlineAt - Date.now())),
-        );
-        const settle = (err?: Error): void => {
-          clearTimeout(timer);
-          socket.removeListener("error", settle);
-          if (err === undefined) resolve();
-          else reject(err);
-        };
-        socket.once(this.transport === "implicit_tls" ? "secureConnect" : "connect", () => settle());
-        socket.once("error", settle);
-      });
-    } catch (err) {
-      // The socket exists whether or not it connected, and until this `catch` nothing
-      // closed it: `send`'s `finally { conversation?.destroy() }` can only reach a
-      // conversation, and on a connect timeout there is no conversation to wrap it in. The
-      // handle therefore stayed open, kept the event loop alive, and — in a scheduler that
-      // retries a down relay every tick — leaked one descriptor per attempt while the
-      // connect it abandoned could still complete later and sit against the relay with no
-      // reader and no QUIT. `destroy()` is safe on a socket that never connected.
-      socket.destroy();
-      throw err;
-    }
-
-    return new SmtpConversation(socket, perWait, deadlineAt);
-  }
-
-  private async converse(
-    conn: SmtpConversation,
-    payload: WebhookPayload,
-    ctx: {
-      readonly to: string;
-      readonly username: string | undefined;
-      readonly password: string | undefined;
-      readonly nowMs: number;
-      readonly tlsOptions: Readonly<Omit<ConnectionOptions, "socket" | "host" | "port">>;
-    },
-  ): Promise<SendOutcome> {
-    const step = async (stage: SmtpStage): Promise<SendOutcome | SmtpReply> => {
-      const reply = await conn.read(stage);
-      const verdict = classifySmtpReply(stage, reply.code, reply.lines.join(" ").trim());
-      return verdict.kind === "delivered" ? reply : verdict;
-    };
-
-    const greeting = await step("greeting");
-    if ("kind" in greeting) return greeting;
-
-    const ehloName = this.relay.clientName ?? domainOf(this.relay.from);
-    conn.send(`EHLO ${ehloName}`);
-    const ehlo = await step("ehlo");
-    if ("kind" in ehlo) return ehlo;
-    let caps = parseEhloCapabilities(ehlo.lines);
-
-    if (this.transport === "starttls") {
-      if (!caps.startTls) {
-        // Fail closed. The alternative is to carry the rep's name and the account id in
-        // clear text to another host, which is the thing the transport rule exists to stop.
-        return {
-          kind: "dead",
-          error:
-            `${this.relay.host}:${String(this.relay.port)} does not offer STARTTLS, so this message would ` +
-            `cross the network in clear text. Refusing to send.`,
-        };
-      }
-      conn.send("STARTTLS");
-      const ready = await step("starttls");
-      if ("kind" in ready) return ready;
-      if (conn.pendingBytes > 0) {
-        // Bytes after the 220 would be plaintext the TLS layer never sees — either a
-        // broken relay or someone injecting ahead of the handshake. Neither is sendable.
-        return {
-          kind: "dead",
-          error: `${this.relay.host} sent data after its STARTTLS reply; refusing to hand a dirty socket to TLS`,
-        };
-      }
-      await conn.upgrade(this.relay.host, ctx.tlsOptions);
-
-      // RFC 3207: everything learned in the clear is discarded, extension list included —
-      // a relay that only advertises AUTH after TLS is the normal case, not the exception.
-      conn.send(`EHLO ${ehloName}`);
-      const second = await step("ehlo");
-      if ("kind" in second) return second;
-      caps = parseEhloCapabilities(second.lines);
-    }
-
-    if (ctx.username !== undefined && ctx.password !== undefined) {
-      const mechanism = chooseAuthMechanism(caps.authMechanisms);
-      if (mechanism === null) {
-        return {
-          kind: "dead",
-          error:
-            `${this.relay.host} offers no AUTH mechanism this client supports ` +
-            `(${caps.authMechanisms.length === 0 ? "it advertised none" : caps.authMechanisms.join(", ")}), ` +
-            `but a username is configured. Refusing to send unauthenticated as ${ctx.username}.`,
-        };
-      }
-      const authed = await this.authenticate(conn, step, mechanism, ctx.username, ctx.password);
-      if (authed !== null) return authed;
-    }
-
-    // The composed body, not `payload.body`: the footer appends the recipient's own
-    // name, so the text that actually goes down the wire can be non-ASCII when the
-    // notification text is not.
-    const encoding = chooseEncoding(composeBody(payload), caps);
-    const message = buildMessage(payload, {
-      from: this.relay.from,
-      to: ctx.to,
-      nowMs: ctx.nowMs,
-      encoding,
-    });
-    const sizeBytes = Buffer.byteLength(message, "utf8");
-    if (caps.maxSize !== null && sizeBytes > caps.maxSize) {
-      // Dead rather than attempted: the relay has already said it will refuse, and the
-      // message will be the same size next time.
-      return {
-        kind: "dead",
-        error: `the message is ${String(sizeBytes)} bytes and ${this.relay.host} accepts at most ${String(caps.maxSize)}`,
-      };
-    }
-
-    // BODY=8BITMIME is how the relay is told the body really is 8-bit; without it a
-    // conforming relay may downgrade or refuse what `chooseEncoding` just decided to send
-    // raw. It is only ever appended when the extension was advertised.
-    conn.send(`MAIL FROM:<${this.relay.from}>${encoding === "8bit" ? " BODY=8BITMIME" : ""}`);
-    const mail = await step("mail_from");
-    if ("kind" in mail) return mail;
-
-    conn.send(`RCPT TO:<${ctx.to}>`);
-    const rcpt = await step("rcpt_to");
-    if ("kind" in rcpt) return rcpt;
-
-    conn.send("DATA");
-    const data = await step("data");
-    if ("kind" in data) return data;
-
-    conn.sendRaw(`${dotStuff(message).replace(/(\r\n)+$/, "")}\r\n.\r\n`);
-    const accepted = await step("end_of_data");
-    if ("kind" in accepted) return accepted;
-
-    // The message is queued the moment that 250 arrives. QUIT is courtesy, and anything
-    // that goes wrong in it must not turn a delivered notification into a retry that
-    // sends it a second time.
-    try {
-      await conn.quit();
-    } catch {
-      /* already delivered */
-    }
-    return { kind: "delivered", status: accepted.code };
-  }
-
-  private async authenticate(
-    conn: SmtpConversation,
-    step: (stage: SmtpStage) => Promise<SendOutcome | SmtpReply>,
-    mechanism: "PLAIN" | "LOGIN",
-    username: string,
-    password: string,
-  ): Promise<SendOutcome | null> {
-    if (mechanism === "PLAIN") {
-      conn.send(`AUTH PLAIN ${authPlainToken(username, password)}`);
-      const reply = await step("auth");
-      return "kind" in reply ? reply : null;
-    }
-
-    conn.send("AUTH LOGIN");
-    const userChallenge = await step("auth_challenge");
-    if ("kind" in userChallenge) return userChallenge;
-    conn.send(Buffer.from(username, "utf8").toString("base64"));
-    const passChallenge = await step("auth_challenge");
-    if ("kind" in passChallenge) return passChallenge;
-    conn.send(Buffer.from(password, "utf8").toString("base64"));
-    const reply = await step("auth");
-    return "kind" in reply ? reply : null;
   }
 }

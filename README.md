@@ -379,6 +379,17 @@ The webhook probe carries `x-crm-event: endpoint_probe` — deliberately **not**
 parsing the body finds no `kind`, `subject` or `recipient` to misread. It names no rep,
 account or lot, and nothing in a verdict is a secret: `detail` names the *variable*.
 
+The prober and the sender are **one conversation**, not two clients that have to stay in
+step by vigilance. `SmtpConversation` is exported from `smtp.ts` as its phases — connect,
+`negotiate`, `envelope`, `transmit`, `abandon`, `quit` — with a private constructor and a
+private socket, so the prober cannot write a raw byte, cannot read a reply without
+`classifySmtpReply` deciding what it means, and cannot reach `DATA` even by mistake:
+`transmit` has exactly one caller in the package. Both constructors call one
+`assertUsableRelay`, so the From check, the port check and the plaintext-only-to-loopback
+rule cannot drift apart — and that last one matters more for a probe, because a probe
+*authenticates*, so plaintext to a remote host would put the password on the wire purely to
+find out whether it was right.
+
 Three rules sit in the schema rather than the route, so the offline path cannot skip them:
 **one outstanding probe per endpoint** (a partial unique index, because a trigger cannot see
 another transaction's uncommitted row), a **per-tenant cooldown** (120s by default; it
