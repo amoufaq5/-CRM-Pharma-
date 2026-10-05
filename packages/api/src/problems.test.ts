@@ -3,6 +3,7 @@ import * as callplan from "@crm/callplan";
 import * as expense from "@crm/expense";
 import * as notify from "@crm/notify";
 import * as relay from "@crm/relay";
+import * as storage from "@crm/storage";
 import * as role from "@crm/role";
 import * as sample from "@crm/sample";
 
@@ -60,6 +61,10 @@ describe("toProblem covers every domain error", () => {
     InvalidSmtpRelayError: "boot-time relay configuration; the scheduler must fail to start, not answer a request",
     SmtpProtocolError: "the relay spoke something that is not SMTP; becomes a dead SendOutcome",
     SmtpTimeoutError: "a relay stopped answering; becomes a retry SendOutcome",
+    UnknownAttachmentSubjectError:
+      "crm.attachment_subject_rep has no branch for a subject table — the purpose pins the " +
+      "table, so no request can reach this. It means the schema and the code disagree, it " +
+      "names a database function, and only we can fix it",
     UnknownOperationError:
       "an outbox row carries an operation the dispatcher cannot parse — written by our own " +
       "producers, never by a request, so a client cannot provoke it and can do nothing " +
@@ -84,6 +89,7 @@ describe("toProblem covers every domain error", () => {
     // point of this test is that a domain package's errors cannot fall through, and it can
     // only do that for packages it is given.
     ["@crm/relay", relay as unknown as Record<string, unknown>, 1],
+    ["@crm/storage", storage as unknown as Record<string, unknown>, 17],
   ] as const) {
     it(`maps every error exported by ${moduleName}`, () => {
       const classes = errorClasses(mod);
@@ -95,7 +101,20 @@ describe("toProblem covers every domain error", () => {
           continue;
         }
         expect(problem.kind, `${moduleName}.${name} falls through to a 500`).not.toBe("internal");
-        expect(problem.status).toBeLessThan(500);
+        // The invariant is "not a 500 the client can do nothing with", and for every
+        // package until now that was the same as 4xx. `MissingAttachmentBlobError` is the
+        // first legitimate exception: the metadata row exists and the blob store does not
+        // hold its bytes, which is a stated upstream condition rather than our surprise,
+        // and 0033 keeps it as a named refusal so the failure arrives with the backend to
+        // look in rather than as an empty body. `ErpError` has mapped to the same kind
+        // since the ACL shipped; that never reached this assertion because `@crm/acl` is
+        // not in the list above. Allowed BY KIND and not by status, so a new 5xx mapping
+        // has to be added here deliberately.
+        if (problem.kind === "upstream_unavailable") {
+          expect(problem.status, `${name} is upstream_unavailable`).toBe(503);
+        } else {
+          expect(problem.status).toBeLessThan(500);
+        }
       }
     });
   }

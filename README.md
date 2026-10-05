@@ -297,6 +297,63 @@ cannot both create an `Expense` and write the GL. All three are in ADR-0001's op
 with what would close them. Guessing the credit side would dead-letter the write and raise
 `erp_write_failed` at a rep for a misconfiguration they cannot fix.
 
+## Attachments: a signature you can actually produce
+
+A sample disbursement has always committed to its signature's bytes with
+`signature_sha256`, and until now there was nowhere for the image to live — so a
+disbursement could say a signature was taken, and fix exactly which one, without being able
+to produce it. The same was true of `crm.expense_claim.receipt_url`, a URL column with
+nothing behind it.
+
+| | |
+|---|---|
+| `POST\|GET /v1/samples/disbursements/:id/signature` | capture, and every capture for that disbursement |
+| `POST /v1/expenses/:id/receipt` | a receipt, optionally superseding one |
+| `GET /v1/expenses/:id/receipts` | the whole chain, superseded images included |
+| `GET /v1/attachments/:id` | metadata |
+| `GET /v1/attachments/:id/content` | the bytes, base64 in a JSON envelope |
+| `GET /v1/attachments/:id/access-log` | who has read them |
+
+**The commitment is checked twice, from two directions.** A trigger computes
+`sha256` from the **stored octets** and refuses a disagreement with the row's
+`content_sha256`; a second trigger compares that digest against the ledger's
+`signature_sha256` and refuses a mismatch. So the only image that can ever satisfy a
+disbursement's commitment is the one the device captured, and uploading a different one is
+a `409 signature-mismatch` — its own problem type, because no retry of those bytes can
+succeed and the next step is to look at which capture was sent, not to try again.
+
+**Four eyes deliberately does not apply here, and reaching for it would be the exact
+inverse of the bug it was written for.** `requireExpenseApprover` exists because approving,
+rejecting, posting and reimbursing decide whether a rep gets paid. Attaching *evidence*
+approves nothing and moves no money — and a rep must be able to upload their own receipt
+and their own signature capture, which is the whole point. Supervision-including-self is
+the correct gate.
+
+**"Missing" and "not yours" are one answer.** Whether a colleague holds a named doctor's
+signature is itself information about that colleague's work, so both are 404. The signature
+upload route makes the same choice one step earlier and had to avoid an easy mistake:
+`requireSupervision` would have been the obvious gate and its message is "no rep *id* on
+your team" — which hands a caller who guessed a disbursement id the id of the rep who holds
+it. The predicate is reused; the sentence is not.
+
+**No route takes `?on=`.** A write is judged on the day it happened; a *disclosure* is
+judged on who is accountable now, or backdating would give the manager who has since left
+the district continuing access to its personal data. The store no longer accepts a date at
+all.
+
+**No DELETE and no PATCH**, anywhere: all three tables are append-only by trigger, so a
+route would advertise an operation that always 409s. A retake supersedes, and both images
+stay — so "retaken" and "swapped" remain distinguishable, which is what the chain is for.
+
+**One rule lives in the route and should not.** Nothing in the schema reads
+`crm.expense_claim.state`, so the database would let a rep swap the current receipt on an
+already-approved claim: the old image survives, but *which* image is the receipt changes
+under an approval given against the other one. The route holds it in two tiers — adding a
+first receipt is allowed while `draft` or `submitted`, replacing one only in `draft`,
+because an approver may be reading receipt A at the moment it becomes B — and that
+asymmetry is the whole reason the tiers differ. It belongs in a trigger, because a route is
+not where an offline path can be made to honour it; recorded as owed rather than pretended.
+
 ## The disposal audit chain
 
 A disposal deadline survives the material leaving custody and coming back. When expired

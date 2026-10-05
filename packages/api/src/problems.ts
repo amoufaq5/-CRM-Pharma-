@@ -27,6 +27,11 @@ export const PROBLEM_TYPES = {
   // and is wrong in a way a client acts on: a conflict says "the state refuses this", a
   // 429 says "ask again later", and the probe cooldown's own message carries the moment a
   // retry becomes legal.
+  // Its own type, for the reason `lot_expired` and `unmapped_category` have theirs: the
+  // stored image does not hash to what the append-only ledger committed to, and a client
+  // must act on that differently from every other conflict — re-sending the same bytes can
+  // never work, and the next step is to look at which capture was uploaded, not to retry.
+  signature_mismatch: "signature-mismatch",
   too_many_requests: "too-many-requests",
   method_not_allowed: "method-not-allowed",
   unsupported_media_type: "unsupported-media-type",
@@ -59,6 +64,7 @@ const STATUS: Readonly<Record<ProblemKind, number>> = {
   // not said which ledger account the category posts to. A bare 409 would read as "your
   // claim is bad".
   unmapped_category: 409,
+  signature_mismatch: 409,
   too_many_requests: 429,
   method_not_allowed: 405,
   unsupported_media_type: 415,
@@ -80,6 +86,7 @@ const TITLE: Readonly<Record<ProblemKind, string>> = {
   insufficient_stock: "Not enough stock on hand",
   last_administrator: "Last administrator",
   unmapped_category: "Category not mapped to an account",
+  signature_mismatch: "Signature does not match the ledger commitment",
   too_many_requests: "Too many requests",
   method_not_allowed: "Method not allowed",
   unsupported_media_type: "Unsupported media type",
@@ -279,6 +286,50 @@ export function toProblem(err: unknown): ApiError {
     case "InvalidCategoryError":
       return new ApiError("validation_failed", message);
 
+    // Attachments (0033, @crm/storage). A signature is a doctor's biometric-adjacent
+    // personal data and a receipt may be commercially sensitive, so "missing" and "not
+    // yours" are ONE answer — whether a colleague holds a named doctor's signature is
+    // itself information about that colleague's work.
+    case "AttachmentNotFoundError":
+    case "AttachmentSubjectNotFoundError":
+      return new ApiError("not_found", message);
+    // Forbidden and not another 404: the route's own 404 gate ran first, so the caller has
+    // already named a subject they can see and there is nothing left to conceal. The
+    // `TransferNotSenderError` reasoning — "it does not exist" would be a lie they can
+    // check.
+    case "AttachmentForbiddenError":
+      return new ApiError("forbidden", message);
+    case "SignatureCommitmentMismatchError":
+      return new ApiError("signature_mismatch", message);
+    // Well-formed requests the subject's state refuses. `MissingSignatureCommitment` is
+    // distinct from a mismatch: that transaction never claimed a signature, where a
+    // mismatch says "wrong picture".
+    case "MissingSignatureCommitmentError":
+    case "AttachmentNotSupersedableError":
+    case "AttachmentSupersessionError":
+    case "AttachmentIdReusedError":
+    case "AttachmentImmutableError":
+      return new ApiError("conflict", message);
+    // The request's own fields contradict each other — declared size, digest or type
+    // against the bytes actually sent — which is what a 422 with `errors` renders inline.
+    // NOT 415 for the content-type case: the media type IS accepted, the bytes merely are
+    // not that type.
+    case "AttachmentContentMismatchError":
+    case "AttachmentContentTypeMismatchError":
+    case "AttachmentSubjectMismatchError":
+    case "InvalidAttachmentContentError":
+      return new ApiError("validation_failed", message);
+    case "UnsupportedAttachmentTypeError":
+      return new ApiError("unsupported_media_type", message);
+    case "AttachmentTooLargeError":
+      return new ApiError("payload_too_large", message);
+    // The metadata row exists and its bytes do not. Impossible on the Postgres backend,
+    // where the row and the blob commit together, and the stated cost of the `BlobStore`
+    // seam the moment a non-transactional store is wired in. Not a generic 500, because
+    // 0033 keeps it as its own refusal precisely so the failure arrives as a stated
+    // condition rather than an empty body, and the message names which store to look in.
+    case "MissingAttachmentBlobError":
+      return new ApiError("upstream_unavailable", message);
     // @crm/relay. Exported from its barrel and mapped nowhere until now, so it fell
     // through to a 500 — and escaped the structural test below only because `@crm/relay`
     // was missing from that test's module list. Both are fixed together; mapping the class

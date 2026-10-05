@@ -74,6 +74,18 @@ import {
 } from "@crm/expense";
 import { canSupervise, teamRoster, visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
 import {
+  ATTACHMENT_CONTENT_TYPES,
+  MAX_ATTACHMENT_BASE64_CHARS,
+  PostgresBlobStore,
+  attachmentAccessLog,
+  attachmentSubjectOwner,
+  decodeAttachmentContent,
+  listAttachmentsForSubject,
+  putAttachment,
+  readAttachmentContent,
+  requireAttachment,
+} from "@crm/storage";
+import {
   appendNote,
   getVisit,
   getVisitProducts,
@@ -2010,6 +2022,250 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       return { status: 200, body };
     },
   });
+
+  // ---- attachments ------------------------------------------------------------
+  //
+  // Signature captures and expense receipts (0033). Two things shape every route here.
+  //
+  // FOUR EYES DOES NOT APPLY, and reaching for it would be the exact inverse of the bug it
+  // was written for. `requireExpenseApprover` exists because approving, rejecting, posting
+  // and reimbursing decide whether a rep gets paid, so the actor must not be the claimant.
+  // Attaching EVIDENCE approves nothing, posts nothing and moves no money — and a rep must
+  // be able to upload their own receipt and their own signature capture, which is the
+  // whole point. Supervision-including-self is the correct gate, which is what
+  // `crm.attachment_readable_by` already gives through `crm.rep_can_supervise`.
+  //
+  // THE READS NEED NO ROUTE-LEVEL GATE, and that is not an omission. Each read function
+  // takes a reader and scopes itself inside the query: `requireAttachment` answers 404 for
+  // "no such thing" and for "not yours" alike, and `listAttachmentsForSubject` returns an
+  // EMPTY SET to a reader with no claim rather than everything. Whether a colleague holds a
+  // named doctor's signature is itself information about that colleague's work, so one
+  // answer for both is deliberate.
+  //
+  // And no route takes `?on=`. A write is judged on the day it happened; a DISCLOSURE is
+  // judged on who is accountable now, or backdating would give the manager who has since
+  // left the district continuing access to its personal data. The store no longer accepts
+  // a date, so `onDate(ctx)` must not be plumbed into any handler below.
+  const blobStore = new PostgresBlobStore();
+
+  const ATTACHMENT_BODY = z.object({
+    // Device-minted, like a visit and a disbursement: a signature is captured at a clinic
+    // desk with no signal, so the upload is retried and the retry must collapse.
+    id: UUID,
+    contentType: z.enum(ATTACHMENT_CONTENT_TYPES),
+    contentBase64: z.string().min(1).max(MAX_ATTACHMENT_BASE64_CHARS),
+  });
+
+  // There is deliberately no `sha256` and no `subjectTable` field. The digest is computed
+  // from the bytes by the store and recomputed from the STORED octets by a trigger; a
+  // client-supplied hash checked against client-supplied bytes proves only that the client
+  // can run sha256. The subject table is derived from the purpose, so a receipt cannot be
+  // attached to a ledger row by passing a mismatched pair.
+
+  /** The signature for a disbursement. */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/disbursements/:id/signature",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const subjectId = parse(UUID, ctx.params["id"]);
+      const input = parse(ATTACHMENT_BODY, ctx.body);
+      const content = decodeAttachmentContent(input.contentBase64);
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        // 404 BEFORE the trigger's 403, and that order is the point: the trigger refuses an
+        // unentitled uploader with a sentence that confirms the disbursement exists and
+        // names its rep. The existence of another rep's disbursement is information about
+        // their work, so the route answers first and the trigger is the backstop.
+        const owner = await attachmentSubjectOwner(tx, ctx.principal.tenantId, "disbursement_signature", subjectId);
+        // One refusal, naming the DISBURSEMENT and never the rep who owns it.
+        // `requireSupervision` would be the obvious call here and is wrong: its message is
+        // "no rep <id> on your team", which hands a caller who guessed a disbursement id
+        // the id of the rep who holds it. The 404 exists to conceal exactly that, so the
+        // predicate is reused and the sentence is not.
+        if (owner === null || !(await canSupervise(tx, ctx.principal.repProfileId, owner))) {
+          throw notFound(`no sample disbursement ${subjectId} on your team`);
+        }
+        return putAttachment(tx, ctx.principal.tenantId, blobStore, {
+          id: input.id,
+          purpose: "disbursement_signature",
+          subjectId,
+          contentType: input.contentType,
+          content,
+          uploadedBy: ctx.principal.repProfileId,
+        });
+      });
+      return { status: 201, body };
+    },
+  });
+
+  /** Every signature captured for one disbursement. Normally one; a chain if ever retaken. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/disbursements/:id/signature",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const subjectId = parse(UUID, ctx.params["id"]);
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        listAttachmentsForSubject(tx, ctx.principal.tenantId, {
+          readBy: ctx.principal.repProfileId,
+          purpose: "disbursement_signature",
+          subjectId,
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * A receipt for an expense claim, and the one rule the schema does not hold.
+   *
+   * Nothing in `crm.attachment_validate` reads `crm.expense_claim.state`, so the database
+   * will let a rep swap the current receipt on a claim that is already approved, posted or
+   * reimbursed. The old image survives — the table is append-only and the chain stays
+   * readable — but WHICH image is the receipt changes under an approval that was given
+   * against the other one. So the route holds it, in two tiers:
+   *
+   *   - ADDING a first receipt is allowed while `draft` or `submitted`. A claim can
+   *     legitimately gain its evidence while an approver is looking at it.
+   *   - REPLACING one is allowed in `draft` only. In `submitted` an approver may be reading
+   *     receipt A at the moment it becomes B, and would then approve B having reviewed A.
+   *     That race is the whole reason the two tiers differ.
+   *   - `rejected` refuses both: there is nothing left to evidence.
+   *
+   * It belongs in a trigger rather than here, because a route is not where an offline sync
+   * path can be made to honour it — recorded as such in ADR-0001 rather than pretended.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/expenses/:id/receipt",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const subjectId = parse(UUID, ctx.params["id"]);
+      const input = parse(
+        ATTACHMENT_BODY.extend({
+          supersedes: z.object({ attachmentId: UUID, reason: z.string().min(1).max(500) }).optional(),
+        }),
+        ctx.body,
+      );
+      const content = decodeAttachmentContent(input.contentBase64);
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        const claim = await requireClaim(tx, ctx.principal.tenantId, subjectId);
+        if (claim.rep_profile_id !== ctx.principal.repProfileId) {
+          await requireSupervision(tx, ctx.principal, claim.rep_profile_id);
+        }
+        const replacing = input.supersedes !== undefined;
+        const allowed = replacing ? ["draft"] : ["draft", "submitted"];
+        if (!allowed.includes(claim.state)) {
+          throw new ApiError(
+            "conflict",
+            replacing
+              ? `a receipt may not be replaced once the claim has left draft (this one is ` +
+                `${claim.state}); a claim approved against the wrong evidence is corrected by a new claim`
+              : `a receipt may not be attached to a ${claim.state} claim`,
+          );
+        }
+        return putAttachment(tx, ctx.principal.tenantId, blobStore, {
+          id: input.id,
+          purpose: "expense_receipt",
+          subjectId,
+          contentType: input.contentType,
+          content,
+          uploadedBy: ctx.principal.repProfileId,
+          ...(input.supersedes !== undefined ? { supersedes: input.supersedes } : {}),
+        });
+      });
+      return { status: 201, body };
+    },
+  });
+
+  /** The whole receipt chain for a claim, newest first, superseded images included. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/expenses/:id/receipts",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const subjectId = parse(UUID, ctx.params["id"]);
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        listAttachmentsForSubject(tx, ctx.principal.tenantId, {
+          readBy: ctx.principal.repProfileId,
+          purpose: "expense_receipt",
+          subjectId,
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /** One attachment's metadata. 404 for "not here" and "not yours", deliberately alike. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/attachments/:id",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        requireAttachment(tx, ctx.principal.tenantId, id, ctx.principal.repProfileId),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * The bytes, base64 in a JSON envelope.
+   *
+   * Not a binary body, because `send()` JSON-stringifies everything and always writes
+   * `application/json` — a Buffer would go out as `{"type":"Buffer","data":[…]}`. Base64 in
+   * an envelope is symmetric with the upload, needs no change to the router, and inherits
+   * its `cache-control: no-store` and `x-content-type-options: nosniff`, which are exactly
+   * right for a third party's personal data. 512 KiB of base64 fits the 1 MiB body cap by
+   * construction.
+   *
+   * The read is RECORDED — `crm.attachment_access` — and the correlation id goes with it,
+   * so an access record and a log line name the same request.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/attachments/:id/content",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const out = await inTenant(deps, ctx.principal, (tx) =>
+        readAttachmentContent(tx, ctx.principal.tenantId, blobStore, {
+          attachmentId: id,
+          readBy: ctx.principal.repProfileId,
+          correlationId: ctx.correlationId,
+        }),
+      );
+      return {
+        status: 200,
+        body: {
+          id: out.attachment.id,
+          purpose: out.attachment.purpose,
+          contentType: out.attachment.content_type,
+          byteSize: out.attachment.byte_size,
+          contentSha256: out.attachment.content_sha256,
+          contentBase64: out.content.toString("base64"),
+        },
+      };
+    },
+  });
+
+  /**
+   * Who has read this attachment.
+   *
+   * The same predicate as the bytes, so the people entitled to see a signature are exactly
+   * the people entitled to see who else has.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/attachments/:id/access-log",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const raw = Number(ctx.query.get("limit") ?? "200");
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        attachmentAccessLog(tx, ctx.principal.tenantId, id, ctx.principal.repProfileId, raw),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  // There is no DELETE and no PATCH on any of the above. All three tables are append-only
+  // and their triggers refuse both, so a route would advertise an operation that does not
+  // exist and always 409.
 
   /**
    * The tenant's notification endpoints. Administrator only.

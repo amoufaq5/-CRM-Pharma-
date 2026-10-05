@@ -63,6 +63,9 @@ importers:
       '@crm/sample':
         specifier: workspace:*
         version: link:../sample
+      '@crm/storage':
+        specifier: workspace:*
+        version: link:../storage
       '@crm/territory':
         specifier: workspace:*
         version: link:../territory

@@ -29,6 +29,7 @@
     "@crm/relay": "workspace:*",
     "@crm/role": "workspace:*",
     "@crm/sample": "workspace:*",
+    "@crm/storage": "workspace:*",
     "@crm/territory": "workspace:*",
     "@crm/visit": "workspace:*",
     "pg": "^8.13.0",

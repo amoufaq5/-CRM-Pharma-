@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { createSign, generateKeyPairSync, randomUUID } from "node:crypto";
+import { createHash, createSign, generateKeyPairSync, randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
 import { appPool, testPool, TENANT_API as TENANT, TENANT_API_OTHER as OTHER } from "@crm/db/testing";
@@ -113,6 +113,19 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.visit_product WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.visit WHERE tenant_id = $1", [t]);
         await tx.query("ALTER TABLE crm.visit ENABLE TRIGGER visit_reject_delete_when_final");
+        // Attachments reference the sample ledger, the claim AND rep_profile, all ON
+        // DELETE RESTRICT, and all three tables are append-only by trigger — so the
+        // guards come off explicitly, in dependency order, rather than being worked
+        // around.
+        for (const t2 of ["crm.attachment_access", "crm.attachment_blob", "crm.attachment"]) {
+          await tx.query(`ALTER TABLE ${t2} DISABLE TRIGGER USER`);
+        }
+        await tx.query("DELETE FROM crm.attachment_access WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.attachment_blob WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.attachment WHERE tenant_id = $1", [t]);
+        for (const t2 of ["crm.attachment_access", "crm.attachment_blob", "crm.attachment"]) {
+          await tx.query(`ALTER TABLE ${t2} ENABLE TRIGGER USER`);
+        }
         // Before rep_profile: `crm.expense_claim` references it (and `approved_by` /
         // `rejected_by` reference it too), all ON DELETE RESTRICT.
         await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1", [t]);
@@ -1976,6 +1989,282 @@ describe("the API, end to end", () => {
         body: { erpLedgerAccountCode: "6".repeat(33) },
       });
       expect(res.status).toBe(422);
+    });
+  });
+
+  /**
+   * Attachments over HTTP: a disbursement signature and an expense receipt.
+   *
+   * A 1x1 PNG, because `assertAttachmentContent` sniffs magic bytes — a base64 blob of
+   * anything else is refused, which is the point of sending real ones here.
+   */
+  describe("attachments", () => {
+    const PNG = Buffer.from(
+      "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a4944415408d7" +
+        "63f8cfc0000003010100183f9b5b0000000049454e44ae426082",
+      "hex",
+    );
+    const pngBase64 = PNG.toString("base64");
+    const pngSha256 = createHash("sha256").update(PNG).digest("hex");
+
+    let attLotSeq = 0;
+    const aLotFor = async (): Promise<string> => {
+      attLotSeq += 1;
+      const { rows } = await withTenantContext(admin, TENANT, (tx) =>
+        tx.query<{ id: string }>(
+          `INSERT INTO crm.sample_lot (tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+           VALUES ($1,'rec_i1',$2,'2027-01-01','drug_sample') RETURNING id`,
+          [TENANT, `LOT-ATT-${String(attLotSeq)}`],
+        ),
+      );
+      return rows[0]!.id;
+    };
+
+    /** A disbursement whose `signature_sha256` commits to the PNG above. */
+    const disbursement = async (): Promise<string> => {
+      const lotId = await aLotFor();
+      expect(
+        (
+          await call("POST", "/v1/samples/receipts", {
+            body: { id: randomUUID(), lotId, quantity: 10, occurredAt: "2026-10-01T08:00:00.000Z", erpWarehouseId: "rec_wh1" },
+          })
+        ).status,
+      ).toBe(201);
+      const res = await call("POST", "/v1/samples/disbursements", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 1,
+          occurredAt: "2026-10-05T09:00:00.000Z",
+          erpAccountId: "acct_auh",
+          recipientName: "Dr Ada",
+          signatureSha256: pngSha256,
+        },
+      });
+      expect(res.status).toBe(201);
+      return res.body.id as string;
+    };
+
+    it("stores a signature, serves it back, and records who read the bytes", async () => {
+      const id = await disbursement();
+      const up = await call("POST", `/v1/samples/disbursements/${id}/signature`, {
+        body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+      });
+      expect(up.status).toBe(201);
+      expect(up.body.content_sha256).toBe(pngSha256);
+
+      const listed = await call("GET", `/v1/samples/disbursements/${id}/signature`);
+      expect(listed.body.data).toHaveLength(1);
+
+      const content = await call("GET", `/v1/attachments/${up.body.id}/content`);
+      expect(content.status).toBe(200);
+      // Byte-for-byte what was uploaded, which is the only thing a signature is for.
+      expect(content.body.contentBase64).toBe(pngBase64);
+      expect(content.body.contentSha256).toBe(pngSha256);
+
+      // And the read is on the record, with the request's correlation id beside it.
+      const log = await call("GET", `/v1/attachments/${up.body.id}/access-log`);
+      expect(log.body.data.length).toBeGreaterThanOrEqual(1);
+      expect(log.body.data[0].read_by).toBe(rep);
+    });
+
+    it("refuses a signature that does not hash to what the ledger committed to", async () => {
+      const id = await disbursement();
+      const other = Buffer.concat([PNG, Buffer.from("tamper")]);
+      const res = await call("POST", `/v1/samples/disbursements/${id}/signature`, {
+        body: { id: randomUUID(), contentType: "image/png", contentBase64: other.toString("base64") },
+      });
+      // Its own problem type: no retry of these bytes can ever succeed, because the
+      // commitment is immutable. A generic 409 would invite one.
+      expect(res.status).toBe(409);
+      expect(res.body.type).toContain("signature-mismatch");
+    });
+
+    it("404s a signature upload for a disbursement outside the caller's team", async () => {
+      const id = await disbursement();
+      // 404 and not 403, and BEFORE the trigger's own refusal: the trigger's sentence
+      // confirms the disbursement exists and names its rep, which is information about
+      // another rep's work.
+      const res = await call("POST", `/v1/samples/disbursements/${id}/signature`, {
+        auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+      });
+      expect(res.status).toBe(404);
+      expect(JSON.stringify(res.body)).not.toContain(rep);
+    });
+
+    it("refuses a content type the bytes are not", async () => {
+      const id = await disbursement();
+      const res = await call("POST", `/v1/samples/disbursements/${id}/signature`, {
+        body: { id: randomUUID(), contentType: "application/pdf", contentBase64: pngBase64 },
+      });
+      // 422, not 415: the media type IS accepted, the bytes merely are not that type.
+      expect(res.status).toBe(422);
+    });
+
+    it("hides another rep's attachment behind the same 404 as a missing one", async () => {
+      const id = await disbursement();
+      const up = await call("POST", `/v1/samples/disbursements/${id}/signature`, {
+        body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+      });
+      const peer = token({ sub: "idp|rep2", tenant: TENANT });
+      for (const path of [`/v1/attachments/${up.body.id}`, `/v1/attachments/${up.body.id}/content`]) {
+        expect((await call("GET", path, { auth: peer })).status, path).toBe(404);
+      }
+      // And the same 404 for one that was never there, so the two are indistinguishable.
+      expect((await call("GET", "/v1/attachments/ff000000-0000-4000-8000-00000000000f")).status).toBe(404);
+      // A manager, who does supervise the uploader, gets it.
+      expect(
+        (await call("GET", `/v1/attachments/${up.body.id}`, { auth: token({ sub: "idp|mgr", tenant: TENANT }) }))
+          .status,
+      ).toBe(200);
+    });
+
+    describe("expense receipts, and the claim-state rule the route holds", () => {
+      const aClaim = async (): Promise<string> => {
+        await withTenantContext(admin, TENANT, (tx) =>
+          tx.query(
+            `INSERT INTO crm.expense_account_map (tenant_id, crm_category, erp_ledger_account_code, is_active)
+             VALUES ($1,'client_meal','6100',true) ON CONFLICT DO NOTHING`,
+            [TENANT],
+          ),
+        );
+        const res = await call("POST", "/v1/expenses", {
+          body: { crmCategory: "client_meal", amount: "40.00", currency: "AED", incurredOn: "2026-09-01" },
+        });
+        expect(res.status).toBe(201);
+        return res.body.id as string;
+      };
+
+      it("attaches a receipt to a draft claim and serves the chain", async () => {
+        const id = await aClaim();
+        const up = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+        });
+        expect(up.status).toBe(201);
+        const listed = await call("GET", `/v1/expenses/${id}/receipts`);
+        expect(listed.body.data).toHaveLength(1);
+      });
+
+      it("replaces one in draft, and keeps the image it replaced", async () => {
+        const id = await aClaim();
+        const first = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+        });
+        const second = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: {
+            id: randomUUID(),
+            contentType: "image/jpeg",
+            contentBase64: Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex").toString("base64"),
+            supersedes: { attachmentId: first.body.id, reason: "blurred" },
+          },
+        });
+        expect(second.status).toBe(201);
+        // Both survive: the table is append-only, so "retaken" and "swapped" stay
+        // distinguishable and the chain is the record.
+        const listed = await call("GET", `/v1/expenses/${id}/receipts`);
+        expect(listed.body.data).toHaveLength(2);
+      });
+
+      /**
+       * The two tiers, and why they differ.
+       *
+       * Nothing in `crm.attachment_validate` reads the claim's state, so the database
+       * permits both of these. Adding a first receipt to a SUBMITTED claim is fine — a
+       * claim can gain its evidence while an approver is looking at it. REPLACING one is
+       * not: an approver may be reading receipt A at the moment it becomes B, and would
+       * then approve B having reviewed A.
+       */
+      it("allows a first receipt on a submitted claim", async () => {
+        // A claim can legitimately gain its evidence while an approver is looking at it.
+        const id = await aClaim();
+        expect((await call("POST", `/v1/expenses/${id}/submit`)).status).toBe(200);
+        const added = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+        });
+        expect(added.status).toBe(201);
+      });
+
+      /**
+       * And refuses a REPLACEMENT once the claim has left draft.
+       *
+       * An approver may be reading receipt A at the moment it becomes B, and would then
+       * approve B having reviewed A. That race is the whole reason the two tiers differ.
+       */
+      it("refuses a replacement once the claim has left draft", async () => {
+        const id = await aClaim();
+        const first = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+        });
+        expect((await call("POST", `/v1/expenses/${id}/submit`)).status).toBe(200);
+
+        const replaced = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: {
+            id: randomUUID(),
+            contentType: "image/png",
+            contentBase64: pngBase64,
+            supersedes: { attachmentId: first.body.id, reason: "swap" },
+          },
+        });
+        expect(replaced.status).toBe(409);
+        expect(JSON.stringify(replaced.body)).toMatch(/may not be replaced once the claim has left draft/);
+      });
+
+      /**
+       * The schema already stops a SECOND current receipt arriving without superseding the
+       * first, whatever the claim's state — `uq_attachment_current` admits one `current`
+       * row per subject and purpose. So the route's "adding is allowed" tier only ever
+       * applies when there is nothing to replace, which is worth pinning: it means the
+       * route and the schema are not two overlapping opinions about the same thing.
+       */
+      it("will not take a second current receipt without superseding the first", async () => {
+        const id = await aClaim();
+        expect(
+          (
+            await call("POST", `/v1/expenses/${id}/receipt`, {
+              body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+            })
+          ).status,
+        ).toBe(201);
+        const second = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+        });
+        expect(second.status).toBe(409);
+      });
+
+      it("refuses any receipt on a rejected claim", async () => {
+        const id = await aClaim();
+        expect((await call("POST", `/v1/expenses/${id}/submit`)).status).toBe(200);
+        expect(
+          (await call("POST", `/v1/expenses/${id}/reject`, { auth: token({ sub: "idp|mgr", tenant: TENANT }) })).status,
+        ).toBe(200);
+        const res = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+        });
+        expect(res.status).toBe(409);
+      });
+
+      it("lets a rep attach their OWN receipt — four eyes must not apply here", async () => {
+        // The inverse of the bug `requireExpenseApprover` was written for. Attaching
+        // evidence approves nothing and moves no money, and a rep uploading their own
+        // receipt is the entire point; gating it on four eyes would refuse it.
+        const id = await aClaim();
+        const res = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+        });
+        expect(res.status).toBe(201);
+        expect(res.body.uploaded_by).toBe(rep);
+      });
+    });
+
+    it("offers no DELETE or PATCH, because the tables refuse both", async () => {
+      const id = await disbursement();
+      const up = await call("POST", `/v1/samples/disbursements/${id}/signature`, {
+        body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+      });
+      for (const method of ["DELETE", "PATCH"]) {
+        expect((await call(method, `/v1/attachments/${up.body.id}`)).status, method).toBe(405);
+      }
     });
   });
 
