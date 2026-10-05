@@ -172,3 +172,22 @@ export const TENANT_DISPOSAL_REOPEN = "db100000-0000-4000-8000-00000000000f";
 
 /** packages/expense — sweeper.contract. */
 export const TENANT_EXPENSE_SWEEP = "dc100000-0000-4000-8000-000000000010";
+
+/** packages/storage — attachment.contract. */
+export const TENANT_STORAGE = "dd100000-0000-4000-8000-000000000011";
+
+/** packages/storage — a second tenant, for the cross-tenant blob-reach test. */
+export const TENANT_STORAGE_OTHER = "de100000-0000-4000-8000-000000000012";
+
+/** packages/notify — channel-coverage.contract and probe.contract. */
+export const TENANT_CHANNEL_COVERAGE = "df100000-0000-4000-8000-000000000013";
+
+/** db/migrations — composite-fk.contract, the tenant that must NOT be reachable. */
+export const TENANT_FK_A = "e0100000-0000-4000-8000-000000000014";
+export const TENANT_FK_B = "e1100000-0000-4000-8000-000000000015";
+
+/** packages/sample — disposal ordering under one transaction. */
+export const TENANT_DISPOSAL_SEQ = "e2100000-0000-4000-8000-000000000016";
+
+/** scripts/live-erp — the live handshake against a running operate-server. */
+export const TENANT_LIVE_ERP = "e3100000-0000-4000-8000-000000000017";

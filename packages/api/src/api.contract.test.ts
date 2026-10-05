@@ -958,6 +958,89 @@ describe("the API, end to end", () => {
         expect((await call("GET", "/v1/team/samples/obligations?on=2026-10-10")).body.data).toEqual([]);
       });
 
+      /**
+       * The continuation chain, read over HTTP.
+       *
+       * Built by driving the real thing rather than fabricating rows: receive expired
+       * stock, sweep (one obligation), transfer it out, sweep while it is in transit (the
+       * obligation resolves as `transferred`), recall it, sweep again (a CONTINUATION, not
+       * a fresh obligation). The intervening sweep is the whole point — a recall BETWEEN
+       * two sweeps resolves nothing, because `transfer_out` moves the quantity to
+       * `quantity_in_transit` and neither rep holds it on hand, so a test whose dates
+       * drifted would stop exercising the bug and still pass.
+       */
+      it("serves the whole obligation chain, with the ledger's word for each resolution", async () => {
+        const lotId = await expiredInBag(rep, 10);
+        await sweep("2026-10-10");
+
+        const sent = await call("POST", "/v1/samples/transfers", {
+          body: {
+            id: randomUUID(),
+            lotId,
+            quantity: 10,
+            occurredAt: "2026-10-11T08:00:00.000Z",
+            toRepProfileId: otherRep,
+          },
+        });
+        expect(sent.status).toBe(201);
+        // In transit: the sender holds nothing on hand, so the obligation resolves.
+        await sweep("2026-10-12");
+
+        const recalled = await call("POST", `/v1/samples/transfers/${sent.body.id}/recall`, {
+          body: { id: randomUUID(), occurredAt: "2026-10-13T08:00:00.000Z", reason: "sent in error" },
+        });
+        expect(recalled.status).toBe(201);
+        await sweep("2026-10-14");
+
+        const res = await call("GET", `/v1/samples/obligations/${lotId}/history`);
+        expect(res.status).toBe(200);
+        const chain = res.body.data as readonly Record<string, unknown>[];
+        expect(chain).toHaveLength(2);
+        expect(chain.map((r) => r["status"])).toEqual(["resolved", "open"]);
+        expect(chain.map((r) => r["sequence_number"])).toEqual([1, 2]);
+
+        // The resolved link keeps the ledger's own word for what discharged it — not just
+        // "transferred", which is the obligation's view, but the movement kind.
+        expect(chain[0]!["resolution"]).toBe("transferred");
+        expect(chain[0]!["resolving_transaction_kind"]).toBe("transfer_out");
+        expect(chain[0]!["resolving_transaction_id"]).toBe(sent.body.id);
+
+        // And the live link inherited the deadline rather than earning a later one. This
+        // is the assertion the whole continuation design exists for: leaving and coming
+        // back must not buy time.
+        expect(chain[1]!["continues_obligation_id"]).toBe(chain[0]!["id"]);
+        expect(chain[1]!["due_by"]).toBe(chain[0]!["due_by"]);
+        expect(chain[1]!["discovered_on"]).toBe(chain[0]!["discovered_on"]);
+      });
+
+      it("lets a manager read a rep's chain, and a peer read nothing", async () => {
+        const lotId = await expiredInBag(rep, 10);
+        await sweep("2026-10-10");
+
+        const mgrView = await call("GET", `/v1/samples/obligations/${lotId}/history?repProfileId=${rep}`, {
+          auth: token({ sub: "idp|mgr", tenant: TENANT }),
+        });
+        expect(mgrView.status).toBe(200);
+        expect(mgrView.body.data).toHaveLength(1);
+
+        // 404, not 403: whether another rep has an expired lot is information about their
+        // compliance record, and `otherRep` manages nobody.
+        const peer = await call("GET", `/v1/samples/obligations/${lotId}/history?repProfileId=${rep}`, {
+          auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        });
+        expect(peer.status).toBe(404);
+      });
+
+      it("answers an empty chain for a lot with no obligation, rather than 404ing", async () => {
+        // A lot the rep holds and that is not expired has no history, and that is a fact
+        // about it — distinct from a lot they may not see, which is the 404 above.
+        const lotId = await aLot();
+        expect((await receipt(lotId, 5)).status).toBe(201);
+        const res = await call("GET", `/v1/samples/obligations/${lotId}/history`);
+        expect(res.status).toBe(200);
+        expect(res.body.data).toEqual([]);
+      });
+
       it("serves the tenant's disposal policy read-only", async () => {
         const res = await call("GET", "/v1/samples/disposal-policy");
         expect(res.status).toBe(200);

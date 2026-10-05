@@ -92,6 +92,7 @@ import {
   getLot,
   holdingsFor,
   ledgerFor,
+  disposalHistory,
   disposalPolicy,
   setDisposalPolicy,
   getCount,
@@ -1648,6 +1649,45 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       const body = await inTenant(deps, ctx.principal, (tx) => disposalPolicy(tx, ctx.principal.tenantId));
       return { status: 200, body };
+    },
+  });
+
+  /**
+   * The full obligation history for one (rep, lot) — the audit chain, over HTTP.
+   *
+   * 0030 made a disposal deadline survive the material leaving and coming back: rather
+   * than raising a fresh obligation with a later `due_by`, the sweep inserts a
+   * CONTINUATION row inheriting `discovered_on` and `due_by` verbatim and naming the row
+   * it continues. That makes the record correct and makes it a CHAIN, and a chain nobody
+   * can read is not a record — until now it existed only in SQL
+   * (`crm.disposal_obligation_chain`), reachable by someone with a psql prompt.
+   *
+   * It answers both questions an inspector asks, separately: each link's own resolution
+   * (`transferred`, `destroyed`, …) and the LEDGER's word for the movement that
+   * discharged it (`resolving_transaction_kind`, joined from `crm.sample_transaction`) —
+   * so "the obligation was settled" and "the stock went away and came back" stay
+   * distinguishable.
+   *
+   * Ordered by the chain walk, not by time. Two obligations written in one transaction —
+   * which a catch-up sweep produces — share `created_at` to the microsecond, because
+   * `now()` is the transaction clock; the walk is the only ordering that exists.
+   *
+   * Scoped through `canSupervise`, which answers yes for the caller themselves, so one
+   * route serves "my lot" and "my rep's lot". A 404 for anyone else: whether another
+   * rep has an expired lot is information about their compliance record.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/obligations/:lotId/history",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const lotId = parse(UUID, ctx.params["lotId"]);
+      const forRep = ctx.query.get("repProfileId");
+      const data = await inTenant(deps, ctx.principal, async (tx) => {
+        const rep = forRep === null ? ctx.principal.repProfileId : parse(UUID, forRep);
+        if (rep !== ctx.principal.repProfileId) await requireSupervision(tx, ctx.principal, rep);
+        return disposalHistory(tx, rep, lotId);
+      });
+      return { status: 200, body: { data } };
     },
   });
 

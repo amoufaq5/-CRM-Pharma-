@@ -93,6 +93,7 @@ authorisation on its own.
 | `GET /v1/team/samples/ledger` | one rep's custody log, for an audit |
 | `GET /v1/team/visits` | one rep's activity |
 | `GET /v1/samples/obligations` | what the caller must dispose of, with the deadline |
+| `GET /v1/samples/obligations/:lotId/history` | the whole continuation chain for one lot, with each link's resolution and the ledger movement that discharged it |
 | `POST /v1/samples/write-offs` | a destruction or an expiry write-off, with a reason |
 | `POST /v1/samples/returns` | back to a warehouse; mirrored to the ERP as a `receipt` |
 | `GET /v1/samples/disposal-policy` | the tenant's grace period, read-only |
@@ -280,6 +281,33 @@ employee-reimbursements-payable account anywhere in either system, and one ERP s
 cannot both create an `Expense` and write the GL. All three are in ADR-0001's open table
 with what would close them. Guessing the credit side would dead-letter the write and raise
 `erp_write_failed` at a rep for a misconfiguration they cannot fix.
+
+## The disposal audit chain
+
+A disposal deadline survives the material leaving custody and coming back. When expired
+stock goes out on a transfer and the nightly sweep finds the rep holding none of it, the
+obligation resolves as `transferred`; a recall puts it back. Before 0030 the next sweep
+raised a **new** obligation with a fresh `discovered_on` and a later `due_by` — so a round
+trip bought thirty more days, and two reps bouncing a transfer between them could do it
+indefinitely.
+
+The fix is a **continuation row**, not a re-opened one: the resolved obligation is left
+byte-for-byte as it was, because "this material left this rep's custody on this date by
+transaction X" is an attributed ledger fact that stays true, and the new row inherits
+`discovered_on` and `due_by` verbatim while naming the row it continues. A late recall is
+therefore born already overdue and escalates on the same sweep, which is the correct
+outcome and needed no special case.
+
+That makes the record a chain, and `GET /v1/samples/obligations/:lotId/history` is how it
+is read — scoped by supervision, so one route serves "my lot" and "my rep's lot". It
+answers the two questions an inspector asks separately: each link's own resolution, and
+the **ledger's** word for the movement that discharged it (`transfer_out`, not just
+`transferred`), joined from `crm.sample_transaction`. So "the obligation was settled" and
+"the stock went away and came back" stay distinguishable.
+
+Ordered by the chain walk, never by time: two obligations written in one transaction — what
+a catch-up sweep produces — share `created_at` to the microsecond, because `now()` is the
+transaction clock. The walk is the only ordering that exists.
 
 ## Notifications: the email channel
 
