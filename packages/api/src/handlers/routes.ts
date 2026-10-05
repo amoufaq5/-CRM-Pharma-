@@ -23,13 +23,18 @@ import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
 import {
   createEndpoint,
   getEndpoint,
+  grantPruneGuardOverride,
   inbox,
   listEndpoints,
   markAllRead,
   markRead,
   notificationPolicy,
+  notificationPruneGuard,
   prunableNotifications,
+  prunePreview,
+  revokePruneGuardOverride,
   setNotificationPolicy,
+  setNotificationPruneGuard,
   unreadCount,
   updateEndpoint,
 } from "@crm/notify";
@@ -43,6 +48,22 @@ import {
 } from "@crm/role";
 import { deadLetter, deadLetters, reviveDeadLetter, teamDeadLetters } from "@crm/relay";
 import { withTenantContext } from "@crm/db";
+import {
+  EXPENSE_CLAIM_STATES,
+  approveClaim,
+  claimPostingStatus,
+  createClaim,
+  deactivateAccountMapping,
+  listAccountMappings,
+  listClaimsForRep,
+  postClaim,
+  reimburseClaim,
+  rejectClaim,
+  requireClaim,
+  submitClaim,
+  unmappedCategoriesWithClaims,
+  upsertAccountMapping,
+} from "@crm/expense";
 import { canSupervise, teamRoster, visibleAccountIds, visibleTerritoryIds } from "@crm/territory";
 import {
   appendNote,
@@ -73,6 +94,8 @@ import {
   openCount,
   outstandingTransfers,
   receiveSamples,
+  recallTransfer,
+  recallableTransfers,
   openObligations,
   recordCountLine,
   returnToWarehouse,
@@ -325,6 +348,8 @@ async function requireOwnOrSupervisedCount(
   }
   return count;
 }
+
+const EXPENSE_STATE = z.enum(EXPENSE_CLAIM_STATES);
 
 const PLAN_STATUS = z.enum(["draft", "submitted", "approved", "superseded", "withdrawn"]);
 
@@ -817,6 +842,62 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         holdingsFor(tx, ctx.principal.repProfileId, { includeEmpty: ctx.query.get("all") === "true" }),
       );
       return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Material the caller sent that nobody has accepted yet — the list a recall acts on.
+   *
+   * Sender-scoped in SQL (`crm.recallable_transfers`), not here: only the sender's
+   * `quantity_in_transit` holds the material, so offering this to a receiver would be a
+   * button the database refuses.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/transfers/recallable",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        recallableTransfers(tx, ctx.principal.repProfileId),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Take material back out of transit.
+   *
+   * Before this existed, a transfer nobody accepted left the quantity in the sender's
+   * `quantity_in_transit` forever with no way out — the open item ADR-0001 carried
+   * against sample custody. The recall is a new ledger row, never an edit: the material
+   * went out and came back, and both halves stay in the log.
+   *
+   * `id` is device-minted like every other movement, so a replayed offline sync recalls
+   * once. The principal supplies the rep; the database refuses an impostor rather than
+   * this route deciding, so the sender-only rule has exactly one home.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/samples/transfers/:id/recall",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const transferOfId = parse(UUID, ctx.params["id"]);
+      const input = parse(
+        z.object({
+          id: UUID,
+          occurredAt: z.string().datetime(),
+          reason: z.string().max(500).nullish(),
+        }),
+        ctx.body,
+      );
+      const row = await inTenant(deps, ctx.principal, (tx) =>
+        recallTransfer(tx, ctx.principal.tenantId, {
+          id: input.id,
+          transferOf: transferOfId,
+          repProfileId: ctx.principal.repProfileId,
+          occurredAt: new Date(input.occurredAt),
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        }),
+      );
+      return { status: 201, body: row };
     },
   });
 
@@ -1977,10 +2058,308 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       requireRole(ctx.principal, "administrator");
       const limit = parse(z.coerce.number().int().min(1).max(500), ctx.query.get("limit") ?? "100");
-      const data = await inTenant(deps, ctx.principal, (tx) =>
-        prunableNotifications(tx, ctx.principal.tenantId, { limit }),
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        const data = await prunableNotifications(tx, ctx.principal.tenantId, { limit });
+        // The dry run has to answer "and would tonight be refused?", not only "what
+        // would it take". An operator meets the volume guard here or they meet it as a
+        // job summary after a night of nothing happening.
+        return { data, ...(await prunePreview(tx, ctx.principal.tenantId)) };
+      });
+      return { status: 200, body };
+    },
+  });
+
+  /** The volume guard's settings, separate from the horizons. Administrator only. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notifications/prune-guard",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        notificationPruneGuard(tx, ctx.principal.tenantId),
       );
+      return { status: 200, body };
+    },
+  });
+
+  router.add({
+    method: "PUT",
+    pattern: "/v1/admin/notifications/prune-guard",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const input = parse(
+        z.object({
+          maxSharePercent: z.number().int().min(1).max(99).optional(),
+          guardFloorRows: z.number().int().min(0).max(1_000_000).optional(),
+        }),
+        ctx.body,
+      );
+      if (input.maxSharePercent === undefined && input.guardFloorRows === undefined) {
+        throw validationFailed("nothing to change", {
+          _: "supply maxSharePercent, guardFloorRows, or both",
+        });
+      }
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        setNotificationPruneGuard(tx, ctx.principal.tenantId, {
+          ...(input.maxSharePercent !== undefined ? { maxSharePercent: input.maxSharePercent } : {}),
+          ...(input.guardFloorRows !== undefined ? { guardFloorRows: input.guardFloorRows } : {}),
+        }),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Open a window in which the prune may exceed its ceiling.
+   *
+   * A POST that takes `hours` rather than a flag that stays set: a tenant draining a
+   * genuine first backlog needs a way past the guard, and the obvious boolean would
+   * outlive the night's reason and leave the next horizon typo unguarded. The window
+   * expires on its own, names who opened it, and is capped at seven days by the
+   * database. `hours` has no default on purpose — a caller that must say how long is a
+   * caller that has thought about how long.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/admin/notifications/prune-guard/override",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const input = parse(z.object({ hours: z.number().int().min(1).max(168) }), ctx.body);
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        grantPruneGuardOverride(tx, ctx.principal.tenantId, {
+          // Attributed to the caller, not to a string they supply: an override that could
+          // name anyone would be an override that names nobody.
+          grantedBy: `${ctx.principal.displayName} <${ctx.principal.subject}>`,
+          hours: input.hours,
+        }),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  router.add({
+    method: "DELETE",
+    pattern: "/v1/admin/notifications/prune-guard/override",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        revokePruneGuardOverride(tx, ctx.principal.tenantId),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  // ---- expenses --------------------------------------------------------------
+  //
+  // The claim lifecycle is the CRM's (ADR-0001 item 11): the ERP's own Expense workflow
+  // is a flat role check that never reads `Employee.manager_id`, so four-eyes and the
+  // approval graph are enforced here or nowhere. The ERP write goes through the outbox
+  // like every other write.
+  //
+  // Submitting REFUSES while Finance has not mapped the category to an S&M account —
+  // deliberately, and it is the behaviour the whole design turns on: posting to a guessed
+  // ledger account is far worse than a claim that will not leave draft.
+
+  const now = (): Date => deps.now?.() ?? new Date();
+
+  /** A rep's own claims. `?state=` filters; no cross-rep read without supervision. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/expenses",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const forRep = ctx.query.get("repProfileId");
+      const data = await inTenant(deps, ctx.principal, async (tx) => {
+        const rep = forRep === null ? ctx.principal.repProfileId : parse(UUID, forRep);
+        if (rep !== ctx.principal.repProfileId) await requireSupervision(tx, ctx.principal, rep);
+        // `?state=` may repeat: the approval queue wants submitted claims, a rep's
+        // "outstanding" view wants submitted and approved together.
+        const states = ctx.query.getAll("state").map((v) => parse(EXPENSE_STATE, v));
+        return listClaimsForRep(tx, ctx.principal.tenantId, rep, {
+          ...(states.length > 0 ? { states } : {}),
+        });
+      });
       return { status: 200, body: { data } };
+    },
+  });
+
+  router.add({
+    method: "POST",
+    pattern: "/v1/expenses",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const input = parse(
+        z.object({
+          crmCategory: z.string().min(1).max(100),
+          amount: z.string().regex(/^\d{1,12}(\.\d{1,2})?$/, "an amount is a decimal string"),
+          currency: z.string().length(3),
+          incurredOn: ISO_DATE,
+          description: z.string().max(2000).nullish(),
+          receiptUrl: z.string().max(2000).nullish(),
+        }),
+        ctx.body,
+      );
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        createClaim(tx, ctx.principal.tenantId, {
+          // Always the caller's own: a claim is a statement about money somebody spent,
+          // and filing one in another rep's name is not a thing this API does.
+          repProfileId: ctx.principal.repProfileId,
+          crmCategory: input.crmCategory,
+          amount: input.amount,
+          currency: input.currency,
+          incurredOn: input.incurredOn,
+          ...(input.description !== undefined ? { description: input.description } : {}),
+          ...(input.receiptUrl !== undefined ? { receiptUrl: input.receiptUrl } : {}),
+        }),
+      );
+      return { status: 201, body };
+    },
+  });
+
+  /**
+   * Submit. Snapshots the S&M account in force at this instant onto the claim, so
+   * re-mapping the category next quarter cannot re-attribute a claim already submitted.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/expenses/:id/submit",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        const claim = await requireClaim(tx, ctx.principal.tenantId, id);
+        // Own claim only. 404 and not 403: whether another rep's claim exists is
+        // information about their spending.
+        if (claim.rep_profile_id !== ctx.principal.repProfileId) throw notFound(`no expense claim ${id}`);
+        return submitClaim(tx, ctx.principal.tenantId, id, now());
+      });
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Approve or reject. The approver must supervise the claimant AND must not be them —
+   * the second half is a CHECK in the database, so this route cannot forget it.
+   */
+  for (const [verb, run] of [
+    ["approve", true],
+    ["reject", false],
+  ] as const) {
+    router.add({
+      method: "POST",
+      pattern: `/v1/expenses/:id/${verb}`,
+      handler: async (ctx: Ctx): Promise<HandlerResult> => {
+        const id = parse(UUID, ctx.params["id"]);
+        const body = await inTenant(deps, ctx.principal, async (tx) => {
+          const claim = await requireClaim(tx, ctx.principal.tenantId, id);
+          await requireSupervision(tx, ctx.principal, claim.rep_profile_id);
+          return run
+            ? approveClaim(tx, ctx.principal.tenantId, id, ctx.principal.repProfileId, now())
+            : rejectClaim(tx, ctx.principal.tenantId, id);
+        });
+        return { status: 200, body };
+      },
+    });
+  }
+
+  /**
+   * Hand the approved claim to the ERP, and later record the reimbursement.
+   *
+   * Separate acts rather than a side effect of approval, which is what
+   * `idx_expense_claim_unsent` ("approved, not yet handed over") is for. Both enqueue an
+   * outbox row; neither writes the ERP directly.
+   */
+  for (const [verb, run] of [
+    ["post", true],
+    ["reimburse", false],
+  ] as const) {
+    router.add({
+      method: "POST",
+      pattern: `/v1/expenses/:id/${verb}`,
+      handler: async (ctx: Ctx): Promise<HandlerResult> => {
+        const id = parse(UUID, ctx.params["id"]);
+        const body = await inTenant(deps, ctx.principal, async (tx) => {
+          const claim = await requireClaim(tx, ctx.principal.tenantId, id);
+          await requireSupervision(tx, ctx.principal, claim.rep_profile_id);
+          return run
+            ? postClaim(tx, ctx.principal.tenantId, id, now())
+            : reimburseClaim(tx, ctx.principal.tenantId, id);
+        });
+        return { status: 200, body };
+      },
+    });
+  }
+
+  /** Where the claim's ERP writes have got to — the honest view of the outbox lag. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/expenses/:id/erp",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const data = await inTenant(deps, ctx.principal, async (tx) => {
+        const claim = await requireClaim(tx, ctx.principal.tenantId, id);
+        if (claim.rep_profile_id !== ctx.principal.repProfileId) {
+          await requireSupervision(tx, ctx.principal, claim.rep_profile_id);
+        }
+        return claimPostingStatus(tx, ctx.principal.tenantId, id);
+      });
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * The category-to-account map. ADMINISTRATOR, not compliance: this is a Finance
+   * parameter — which ledger account a category posts to — and no rep is measured
+   * against it.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/expense-accounts",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const body = await inTenant(deps, ctx.principal, async (tx) => ({
+        data: await listAccountMappings(tx, ctx.principal.tenantId),
+        // The Finance to-do list, as a number to watch reach zero: categories reps are
+        // already claiming against that nothing can post.
+        unmapped: await unmappedCategoriesWithClaims(tx, ctx.principal.tenantId),
+      }));
+      return { status: 200, body };
+    },
+  });
+
+  router.add({
+    method: "PUT",
+    pattern: "/v1/admin/expense-accounts/:category",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const category = parse(z.string().min(1).max(100), ctx.params["category"]);
+      const input = parse(
+        z.object({
+          erpLedgerAccountCode: z.string().min(1).max(64),
+          erpCostCenterCode: z.string().min(1).max(64).nullish(),
+        }),
+        ctx.body,
+      );
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        upsertAccountMapping(tx, ctx.principal.tenantId, {
+          crmCategory: category,
+          erpLedgerAccountCode: input.erpLedgerAccountCode,
+          ...(input.erpCostCenterCode !== undefined ? { erpCostCenterCode: input.erpCostCenterCode } : {}),
+        }),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  router.add({
+    method: "DELETE",
+    pattern: "/v1/admin/expense-accounts/:category",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const category = parse(z.string().min(1).max(100), ctx.params["category"]);
+      // Deactivated, not deleted: a claim already submitted carries its own snapshot, and
+      // the row is the record of what the mapping used to be.
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        deactivateAccountMapping(tx, ctx.principal.tenantId, category),
+      );
+      return { status: 200, body };
     },
   });
 

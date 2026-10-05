@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import * as callplan from "@crm/callplan";
+import * as expense from "@crm/expense";
 import * as notify from "@crm/notify";
 import * as role from "@crm/role";
 import * as sample from "@crm/sample";
@@ -42,17 +43,44 @@ describe("toProblem covers every domain error", () => {
 
   // The minimum is per module and deliberately close to the real count: a module whose
   // errors all vanish from the barrel would otherwise pass this test by exporting none.
+  /**
+   * Errors that SHOULD fall through to a 500, with the reason each one does.
+   *
+   * The rule above exists to catch an error class added to a domain package and never
+   * mapped. It is not a claim that every error belongs in a response: these three happen
+   * inside the SCHEDULER while it talks to an SMTP relay, where the sender converts them
+   * into a `SendOutcome` and the dispatcher logs them. None can reach a request, and
+   * giving one a client-facing status would invent a meaning it does not have.
+   *
+   * Explicit and listed, like RLS_EXEMPT in schema.contract.test.ts, so adding one is a
+   * visible act with a reason attached rather than a silent hole.
+   */
+  const DELIBERATELY_INTERNAL: Readonly<Record<string, string>> = {
+    InvalidSmtpRelayError: "boot-time relay configuration; the scheduler must fail to start, not answer a request",
+    SmtpProtocolError: "the relay spoke something that is not SMTP; becomes a dead SendOutcome",
+    SmtpTimeoutError: "a relay stopped answering; becomes a retry SendOutcome",
+  };
+
   for (const [moduleName, mod, atLeast] of [
     ["@crm/sample", sample as unknown as Record<string, unknown>, 6],
     ["@crm/callplan", callplan as unknown as Record<string, unknown>, 6],
     ["@crm/role", role as unknown as Record<string, unknown>, 6],
     ["@crm/notify", notify as unknown as Record<string, unknown>, 1],
+    // Added after every one of this package's twelve refusals reached a client as a 500 —
+    // including `UnmappedCategoryError`, which is the designed refusal the whole Finance
+    // dependency rests on. A new domain package is exactly what this test is for, and it
+    // only works if the package is in this list.
+    ["@crm/expense", expense as unknown as Record<string, unknown>, 10],
   ] as const) {
     it(`maps every error exported by ${moduleName}`, () => {
       const classes = errorClasses(mod);
       expect(classes.length).toBeGreaterThanOrEqual(atLeast);
       for (const [name, instance] of classes) {
         const problem = toProblem(instance);
+        if (name in DELIBERATELY_INTERNAL) {
+          expect(problem.kind, `${name} is listed as internal; if that changed, map it`).toBe("internal");
+          continue;
+        }
         expect(problem.kind, `${moduleName}.${name} falls through to a 500`).not.toBe("internal");
         expect(problem.status).toBeLessThan(500);
       }
@@ -77,6 +105,14 @@ describe("toProblem covers every domain error", () => {
       `${PROBLEM_BASE}/insufficient-stock`,
     );
     expect(toProblem(new callplan.PlanFrozenError("are fixed")).body().type).toBe(`${PROBLEM_BASE}/plan-final`);
+  });
+
+  it("gives an unmapped expense category its own type, because Finance must act on it", () => {
+    const problem = toProblem(new expense.UnmappedCategoryError("congress"));
+    expect(problem.body().type).toBe(`${PROBLEM_BASE}/unmapped-category`);
+    expect(problem.status).toBe(409);
+    // The sentence has to survive: it names the category and the table Finance fills in.
+    expect(problem.detail).toContain("congress");
   });
 
   it("gives the lockout refusal its own type, because a client must act on it", () => {

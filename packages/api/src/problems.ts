@@ -22,6 +22,7 @@ export const PROBLEM_TYPES = {
   lot_expired: "lot-expired",
   insufficient_stock: "insufficient-stock",
   last_administrator: "last-administrator",
+  unmapped_category: "unmapped-category",
   method_not_allowed: "method-not-allowed",
   unsupported_media_type: "unsupported-media-type",
   payload_too_large: "payload-too-large",
@@ -48,6 +49,11 @@ const STATUS: Readonly<Record<ProblemKind, number>> = {
   // without reading prose: a client can say "appoint a successor first" and offer the
   // grant form, where a bare 409 would just look like a failed request.
   last_administrator: 409,
+  // Its own type because it is the one expense refusal a client must ACT on rather than
+  // merely report: the claim is correct and nothing is wrong with it, Finance simply has
+  // not said which ledger account the category posts to. A bare 409 would read as "your
+  // claim is bad".
+  unmapped_category: 409,
   method_not_allowed: 405,
   unsupported_media_type: 415,
   payload_too_large: 413,
@@ -67,6 +73,7 @@ const TITLE: Readonly<Record<ProblemKind, string>> = {
   lot_expired: "Lot is expired or withdrawn",
   insufficient_stock: "Not enough stock on hand",
   last_administrator: "Last administrator",
+  unmapped_category: "Category not mapped to an account",
   method_not_allowed: "Method not allowed",
   unsupported_media_type: "Unsupported media type",
   payload_too_large: "Payload too large",
@@ -161,8 +168,19 @@ export function toProblem(err: unknown): ApiError {
       return new ApiError("validation_failed", message);
     case "LedgerImmutableError":
     case "TransferMismatchError":
+    // A transfer that already has its one terminal event — accepted, or recalled
+    // already. A conflict rather than a validation failure: the request was well formed
+    // and the material's state refuses it.
+    case "TransferAlreadySettledError":
     case "SampleCountError":
       return new ApiError("conflict", message);
+    // Not a conflict: only the sender may take material back, because it is their
+    // `quantity_in_transit` the recall draws down. 403 rather than the 404 the
+    // supervision helpers return, because an outstanding transfer is already visible to
+    // BOTH reps — hiding its existence from the one who can see it buys nothing and
+    // would send them hunting for a typo.
+    case "TransferNotSenderError":
+      return new ApiError("forbidden", message);
     case "SampleLotNotFoundError":
     case "CallPlanNotFoundError":
       return new ApiError("not_found", message);
@@ -196,6 +214,41 @@ export function toProblem(err: unknown): ApiError {
       return new ApiError("last_administrator", message);
     case "InvalidEndpointError":
     case "InvalidRetentionError":
+    // A `mailto:` endpoint that is not one mailbox. Reachable from an admin route
+    // configuring a channel, so it gets a real status rather than a 500.
+    case "InvalidMailEndpointError":
+      return new ApiError("validation_failed", message);
+
+    // Expenses (0006, @crm/expense). ADR-0001 item 11.
+    //
+    // THE ONE THAT MATTERS: an unmapped category is the designed refusal that makes the
+    // Finance dependency safe — the claim stays in draft rather than posting to a guessed
+    // ledger account. It reached a client as a 500 "an unexpected error occurred" until
+    // these cases existed, which turned the system's most deliberate refusal into a bug
+    // report. The structural test below now covers this package so it cannot recur.
+    case "UnmappedCategoryError":
+      return new ApiError("unmapped_category", message);
+    case "ExpenseClaimNotFoundError":
+      return new ApiError("not_found", message);
+    // Four eyes, refused by a CHECK in 0006. Forbidden rather than conflict: the state is
+    // fine, the actor is not.
+    case "FourEyesViolationError":
+      return new ApiError("forbidden", message);
+    case "InvalidExpenseClaimTransitionError":
+      return new ApiError("conflict", message);
+    // A rep with no `erp_employee_id` cannot be the subject of an ERP Expense. A
+    // configuration gap in the mapping table ADR-0001 Q3 exists for, not a bad request —
+    // but the caller can do nothing with a 500, and an administrator can act on this.
+    case "RepNotMappedToEmployeeError":
+    case "MissingAccountSnapshotError":
+    case "ApprovalFieldsError":
+    case "MissingErpExpenseIdError":
+      return new ApiError("conflict", message);
+    case "InvalidAmountError":
+    case "InvalidCurrencyError":
+    case "InvalidDateError":
+    case "InvalidAccountCodeError":
+    case "InvalidCategoryError":
       return new ApiError("validation_failed", message);
 
     case "ErpError":

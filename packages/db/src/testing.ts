@@ -160,3 +160,9 @@ export const TENANT_PRUNE_GUARD = "d7000000-0000-4000-8000-00000000000b";
 
 /** packages/relay — sequence.contract. */
 export const TENANT_OUTBOX_SEQ = "d8000000-0000-4000-8000-00000000000c";
+
+/** packages/expense — accounts.contract. */
+export const TENANT_EXPENSE_MAP = "d9000000-0000-4000-8000-00000000000d";
+
+/** packages/expense — store.contract. */
+export const TENANT_EXPENSE_STORE = "da100000-0000-4000-8000-00000000000e";

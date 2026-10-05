@@ -7,7 +7,9 @@ export {
   OutsideTerritoryError,
   SampleCountError,
   SampleLotNotFoundError,
+  TransferAlreadySettledError,
   TransferMismatchError,
+  TransferNotSenderError,
   translateSampleError,
 } from "./errors.js";
 export {
@@ -61,3 +63,11 @@ export {
   type ExpirySweepResult,
 } from "./expiry-sweep.js";
 export { enqueueErpMirror, erpMirrorFor, mirrorRecordId, type ErpStockMirror } from "./erp-mirror.js";
+export {
+  recallOf,
+  recallTransfer,
+  recallableTransfers,
+  type RecallTransactionKind,
+  type RecallableTransfer,
+  type TransferRecall,
+} from "./recall.js";

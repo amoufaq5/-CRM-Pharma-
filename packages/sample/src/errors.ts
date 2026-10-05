@@ -1,5 +1,5 @@
 /**
- * Typed forms of the refusals in 0017/0018.
+ * Typed forms of the refusals in 0017/0018/0025.
  *
  * The rules live in the database so that the interactive path and the offline-sync
  * path cannot enforce different ones. These classes exist so a caller can tell an
@@ -54,6 +54,29 @@ export class TransferMismatchError extends Error {
   }
 }
 
+/**
+ * The transfer already has its one terminal event: it was accepted, or recalled.
+ *
+ * A subclass of TransferMismatchError so `instanceof` still groups the transfer
+ * refusals, but with its OWN `name`: the API maps by name, and these two want different
+ * answers — "too late" is a 409 and "not yours" is a 403. It carried the parent's name
+ * when it was written, which was the safe choice before the mapping existed; now that
+ * `problems.ts` has a case for each, the name is the useful thing.
+ */
+export class TransferAlreadySettledError extends TransferMismatchError {
+  override readonly name = "TransferAlreadySettledError";
+}
+
+/**
+ * Someone other than the sender tried to take the material back.
+ *
+ * Only the sender can: it is their `quantity_in_transit` the recall draws down. A
+ * receiver who does not want it is refusing, which is a different act and is not built.
+ */
+export class TransferNotSenderError extends TransferMismatchError {
+  override readonly name = "TransferNotSenderError";
+}
+
 /** A disbursement with no recipient name or signature, or a write-off with no reason. */
 export class IncompleteRecordError extends Error {
   constructor(message: string) {
@@ -90,6 +113,8 @@ const CONSTRAINT_MESSAGES: Readonly<Record<string, string>> = {
   sample_tx_warehouse_fields: "a receipt or return must name the ERP warehouse it came from or went back to",
   sample_tx_transfer_out_fields: "a transfer must name another rep to send to, and cannot reference a transfer itself",
   sample_tx_transfer_in_fields: "an acceptance must name the sending rep and the transfer_out it accepts",
+  sample_tx_transfer_recall_fields:
+    "a recall must name the rep the material was sent to and the transfer_out it takes back",
   sample_tx_reason_required: "an adjustment, destruction or write-off must carry a reason",
   sample_tx_recipient_only_on_disbursement:
     "a recipient, signature or visit may only appear on a disbursement",
@@ -112,8 +137,17 @@ export function translateSampleError(err: unknown): Error {
   if (e?.constraint === "sample_holding_quantity_on_hand_check") {
     return new InsufficientHoldingError(`that movement would drive a holding negative: ${message}`);
   }
+  // The index is the backstop under the readable check in the validate trigger: it is
+  // reached only when two terminal events race, so it cannot say WHICH one won. Since
+  // 0025 there are two of them, and claiming an acceptance here would be a guess.
   if (e?.constraint === "uq_sample_tx_transfer_accepted" || message.includes("uq_sample_tx_transfer_accepted")) {
-    return new TransferMismatchError("that transfer has already been accepted");
+    return new TransferAlreadySettledError("that transfer already has a terminal event recorded against it");
+  }
+  if (message.includes("already been accepted") || message.includes("already been recalled")) {
+    return new TransferAlreadySettledError(message);
+  }
+  if (message.includes("only the sender can take material back")) {
+    return new TransferNotSenderError(message);
   }
 
   if (message.includes("cannot record a")) return new InsufficientHoldingError(message);
@@ -123,7 +157,10 @@ export function translateSampleError(err: unknown): Error {
   if (message.includes("is not this rep's visit")) return new TransferMismatchError(message);
   if (
     message.includes("acceptance must match") ||
+    message.includes("must take back exactly what was sent") ||
     message.includes("cannot accept it from") ||
+    message.includes("must name the rep it was sent to") ||
+    message.includes("already has a") ||
     message.includes("is a ") && message.includes("not a transfer_out") ||
     message.includes("transfer_of")
   ) {

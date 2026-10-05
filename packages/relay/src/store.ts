@@ -16,7 +16,8 @@ const ROW_COLUMNS =
   "id, tenant_id, entity, operation, payload, target_record_id, source_table, source_id, attempts";
 
 /**
- * Claims up to `limit` due rows for this worker.
+ * Claims up to `limit` due rows for this worker, oldest due first and in
+ * enqueue order within a tie.
  *
  * `FOR UPDATE SKIP LOCKED` is what makes multiple relay workers safe: each
  * claims a disjoint set without blocking on the others. Without SKIP LOCKED,
@@ -27,6 +28,21 @@ const ROW_COLUMNS =
  * mid-dispatch has still consumed an attempt, so a row that reliably kills its
  * worker — the poison message — walks its way to dead-lettering instead of being
  * retried forever by successive victims.
+ *
+ * The tie-breaker is `seq` (0027), not `created_at`: `created_at` defaults to
+ * `now()`, which is the TRANSACTION timestamp, so two rows enqueued together —
+ * a create and the transition that acts on it, the normal shape here — carry the
+ * same value to the microsecond and the order between them was whatever the plan
+ * produced. `seq` is allocated per INSERT, so it orders them. It does NOT order
+ * concurrent enqueues: sequence values are handed out before commit and in no
+ * particular relation to it, so a lower `seq` can become visible after a higher
+ * one and be claimed by a later drain. `classify`'s `retry_ordering` remains the
+ * backstop for that; see 0027's header.
+ *
+ * Returned as a SORTED SELECT over a data-modifying CTE rather than straight
+ * from `RETURNING`, because `RETURNING` row order is unspecified — it follows the
+ * update's physical scan, not the subquery's ORDER BY. The relay dispatches this
+ * array in order, so sorting it is the half of the fix that is actually visible.
  *
  * NOTE: runs inside `withTenantContext`, so RLS confines it to one tenant. The
  * relay loops over tenants rather than draining the table globally; a
@@ -41,21 +57,24 @@ export async function claimBatch(
   now: Date,
 ): Promise<readonly OutboxRow[]> {
   const { rows } = await tx.query<OutboxRow>(
-    `UPDATE crm.outbox SET
-       state      = 'in_flight',
-       attempts   = attempts + 1,
-       claimed_at = $4,
-       claimed_by = $3
-     WHERE id IN (
+    `WITH due AS (
        SELECT id FROM crm.outbox
         WHERE tenant_id = $1
           AND state = 'pending'
           AND next_attempt_at <= $4
-        ORDER BY next_attempt_at, created_at
+        ORDER BY next_attempt_at, seq
         FOR UPDATE SKIP LOCKED
         LIMIT $2
+     ), claimed AS (
+       UPDATE crm.outbox SET
+         state      = 'in_flight',
+         attempts   = attempts + 1,
+         claimed_at = $4,
+         claimed_by = $3
+       WHERE id IN (SELECT id FROM due)
+       RETURNING ${ROW_COLUMNS}, next_attempt_at, seq
      )
-     RETURNING ${ROW_COLUMNS}`,
+     SELECT ${ROW_COLUMNS} FROM claimed ORDER BY next_attempt_at, seq`,
     [tenantId, limit, workerId, now],
   );
   return rows;
@@ -203,6 +222,11 @@ export interface EnqueueInput {
  * a replayed offline batch, must be a no-op rather than two ERP writes under two
  * different target ids — which no downstream constraint would catch, because they
  * would be two legitimately distinct records.
+ *
+ * `seq` comes from the column default, which is evaluated BEFORE the conflict is
+ * detected — so a collapsed duplicate burns a sequence value and leaves a gap.
+ * Routine rather than exceptional here, since a replayed offline batch is a
+ * normal day: nothing may read `seq` as a count or infer a missing row from one.
  */
 export async function enqueueOutbox(
   tx: PoolClient,

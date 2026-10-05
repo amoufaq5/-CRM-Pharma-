@@ -531,6 +531,176 @@ Concretely, and these specifics are the decision, not commentary on it:
     horizon set over HTTP minutes earlier, which is the two halves proving they are wired
     to each other.
 
+16. **A transfer can be taken back, and the ledger says so twice.** A `transfer_out`
+    moved material out of the sender's `quantity_on_hand` and into their
+    `quantity_in_transit`, where it stayed forever if the receiver never accepted — the
+    sender had no way to retrieve it and an adjustment only touches `on_hand`. The recall
+    (migration 0025) is a NEW ledger kind, never an edit: the material went out and came
+    back, and both halves stay in the log. `crm.sample_effect` is still the one place
+    direction is decided.
+
+    **Exactly one terminal event per transfer**, and the symmetry is the point: an
+    accepted transfer cannot be recalled, a recalled one cannot be accepted, and the
+    refusal names which event already happened and when — the sender needs to know the
+    material is somebody else's now. A partial recall is refused, because the remainder
+    would be stranded with no second terminal event able to clear it.
+
+    **Only the sender may recall**, since it is their transit balance the recall draws
+    down; a receiver refusing delivery is a different act and is not built. That refusal
+    is a **403**, not the 404 the supervision helpers return, because an outstanding
+    transfer is already visible to both reps and hiding it from the one who can see it
+    buys nothing.
+
+    **An expired or withdrawn lot is deliberately NOT refused** — the same reasoning 0020
+    gives for not refusing a `transfer_in`. Material already in custody has to be
+    somewhere, and refusing the only exit from transit strands it with nobody accountable,
+    which is the bug being fixed. A withdrawn lot is the likeliest reason to recall.
+
+    **And the receiver is told** (`sample_transfer_recalled`, migration 0029).
+    `transferOut` told them material was waiting; after a recall that notification names
+    stock in somebody else's bag, and a rep who goes looking for it has been sent on an
+    errand by us. The correction is raised in the same transaction as the ledger row.
+
+17. **A prune may be refused for taking too much, and the way past it expires.** Item 15
+    shipped with its own objection recorded: a prune is irreversible, so the two horizons
+    were the only thing between a tenant and a deleted inbox, and an administrator who
+    means to type 365 and types 1 loses a year of unread messages that night.
+
+    The guard (migration 0026) is a **share** — 25% of the inbox by default — not an
+    absolute row cap. The choice is the design: a cap of 5,000 stops a tenant with two
+    million notifications from ever running a legitimate steady-state prune, and a cap of
+    500,000 lets a tenant with 800 lose all 800 unnoticed. The failure being defended
+    against is a horizon wrong by an order of magnitude, and that failure has the same
+    signature at every scale — it takes most of the inbox at once, where a correct nightly
+    prune takes a day's worth. An absolute number appears anyway, as a **floor**
+    (`prune_guard_floor_rows`, 100): beneath about a hundred rows the ratio is noise, and
+    a guard that refuses nightly becomes a nag operators learn to override by reflex.
+
+    **It refuses wholesale and deletes nothing.** A half-applied prune is still
+    irreversible and leaves the operator unable to tell whether the number in front of
+    them is the whole mistake or a slice of it.
+
+    **Measured against what the pass WANTS, not what tonight would take.** The 50,000-row
+    batch cap is a throttle; judging the guard on the batched number would let a
+    two-million-row inbox with a one-day horizon propose 2.5% every night, pass every
+    night, and empty itself in forty passes with no refusal ever logged. A pass that hits
+    the batch cap is normal; a pass that trips the guard is not.
+
+    **The override is a window, not a flag**, and that distinction is the whole value. A
+    boolean — or a `force` option on the job — gets set once for one night's reason and
+    then outlives the reason, silently, leaving the next horizon typo unguarded. This one
+    names who opened it, expires on its own, is capped at seven days by a CHECK, and takes
+    an `hours` argument with no default, because a caller that must say how long is a
+    caller that has thought about how long. Every pass it admits reports `overridden`.
+
+    The ceiling stops at 99: a ceiling that permits 100% is not a ceiling, and stored as a
+    number it would read like a configured value rather than a disabled guard.
+
+18. **The outbox has a monotonic sequence, and the claim order is now observable.** Two
+    rows enqueued in one transaction shared `created_at` to the microsecond, so
+    `ORDER BY next_attempt_at, created_at` did not order them — a create and the
+    transition acting on it could be dispatched either way round.
+
+    What the sequence guarantees and what it does not is the useful part. It gives a total
+    order WITHIN one transaction, which is the actual problem. It does **not** make the
+    order gap-free — a rolled-back enqueue burns a value permanently, and so does an
+    `ON CONFLICT DO NOTHING` collapse, because the column default is evaluated before the
+    unique index is consulted — so nothing may read `seq` as a count. And ACROSS
+    transactions it is allocation order, not commit order: a lower `seq` can become
+    visible later and be claimed by a later drain. The `retry_ordering` classification
+    therefore **stays**, as the backstop for the case the sequence does not fix.
+
+    **The sequence alone would have fixed nothing**, which is the finding worth keeping:
+    `UPDATE … WHERE id IN (SELECT … ORDER BY …) RETURNING` does not return rows in the
+    subquery's order, it returns them in the order the update's scan found them. The claim
+    is now a sorted SELECT over a data-modifying CTE, and that is the half that is
+    actually observable.
+
+19. **A 409 from the ERP is not one thing, and reading it as success was dropping
+    writes.** `classify` treated every `kind === "conflict"` as `already_delivered` —
+    correct for the duplicate target id it was written for, and wrong for the other thing
+    the ERP answers 409 to: `invalid_transition`, which means the write did not land and
+    never touched the record. The outbox row was marked delivered and the transition
+    silently lost, leaving the CRM and the ERP disagreeing about a record's state with
+    nothing anywhere reporting it.
+
+    Found by reading, not by a failing test, while building the expense posting — which is
+    the kind of multi-row transition chain that makes it bite. Now classified as
+    `retry_ordering`, for the same reason a 404 on a transition is: the sibling write that
+    moves the record into the right state is very likely still queued behind. If the state
+    is genuinely unreachable, the attempt cap ends it and the dead-letter alarm puts it in
+    front of a human, which is where a disagreement no retry can settle belongs. Pinned by
+    tests that were confirmed to fail against the old classification.
+
+20. **Email is a real channel now, and the reason it was not is worth recording as
+    wrong.** This ADR carried "no email or SMS sender" as open, with the justification
+    that an SMTP client "could not be verified from here and the ERP's own stack shows
+    where unverifiable senders end up". The first half was simply false: a minimal SMTP
+    sink is a few hundred lines, and writing one makes the client verifiable end to end.
+    The lesson is not about email — it is that "cannot be verified" deserves a second look
+    before it becomes a reason not to build something.
+
+    No new dependency (`node:net`, `node:tls`). The classification is the heart of it:
+    4xx retries, 5xx dead-letters, and a positive code at the wrong stage is dead because
+    the conversation has lost step. Getting that backwards means either a bounced address
+    retried forever or a greylist — extremely common, and a 4xx — thrown away. TLS is
+    required by default and refused in the CONSTRUCTOR rather than per send, so a relay
+    configured without it fails the scheduler at boot instead of dead-lettering
+    everything; certificate verification is genuinely exercised, with an untrusted
+    certificate yielding a retry and nothing sent. Subjects are RFC 2047 encoded, because
+    this product's locales include Arabic and a raw 8-bit header is a real bug here.
+
+    Migration 0029 was needed before any of it could be configured: `channel` admitted
+    only `'webhook'`, so the channel had no legal value. The url shape is now per channel
+    rather than a flat disjunction — the flat version would have accepted a webhook
+    pointed at a mailbox and an email endpoint pointed at an HTTPS host, two
+    configurations with no sender and no error.
+
+21. **Expense claims are built end to end, and the Finance dependency is now a single
+    row.** `crm.expense_account_map` and `crm.expense_claim` had existed since migration
+    0006 with not one line of TypeScript. `packages/expense` is the lifecycle
+    (`draft → submitted → approved → posted → reimbursed`, with `rejected` from
+    `submitted`), the account map, and the outbox payload.
+
+    The behaviour the whole design rests on: **submitting a claim whose category has no
+    active mapping is refused**, with a sentence naming the category, the table, and the
+    `LedgerAccount.account_code` Finance must supply. That refusal reached clients as a
+    **500 "an unexpected error occurred"** until it was caught in live verification —
+    every one of the package's twelve errors fell through, because the structural test in
+    `problems.test.ts` did not cover the new package. It does now, which is the fix that
+    matters: the test exists precisely to catch a new domain package, and it only works if
+    the package is in its list.
+
+    The account is **snapshotted at submit**, not read at posting time, so re-mapping a
+    category next quarter cannot re-attribute a claim already submitted. Two guards sit in
+    TypeScript rather than SQL because Postgres will not provide them, both verified
+    against the live cluster: `'NaN'::numeric(14,2) > 0` is TRUE, so 0006's
+    `CHECK (amount > 0)` admits a NaN that would poison every `sum(amount)`; and
+    `'us'::char(3) = 'us '` is TRUE, so `currency` pads rather than refusing.
+
+    **The journal entry is NOT posted**, and the reasons are in the Still-open table
+    rather than worked around. An `Expense` record posts and carries the account and cost
+    centre in its description so the manual journal entry is readable off it. Item 11 says
+    the entry posts "on reimburse"; 0006's `idx_expense_claim_unsent` and the existence of
+    a `posted` state before `reimbursed` both say approve→post, and the schema is right —
+    the GL recognises the expense when it is approved, not when cash leaves. That text
+    wants reconciling.
+
+22. **Test files are typechecked now, and were not before.** Every package excludes
+    `src/**/*.test.ts` from `tsc` — correctly, so tests are not emitted into `dist` — and
+    vitest transpiles without typechecking. The consequence went unnoticed for the whole
+    life of the project: not one of ~1,100 tests was ever typechecked, in a codebase whose
+    stated discipline is strict TypeScript with no `any`.
+
+    What it hid, found the hour the gate was written: `outcome.test.ts` typed its ErpError
+    `kind` through `Parameters<typeof ErpError>`. A class is not callable, so that fails
+    its constraint and the parameter collapsed to `never` — meaning the test that proves
+    ERP write-guard codes are told apart by CODE and not by status was providing no type
+    safety at all on the codes. `scheduler.contract.test.ts` had the same mistake via
+    `typeof X.prototype.constructor`. Both passed at runtime; both were lying about what
+    they checked. `pnpm typecheck:tests` is now a CI gate, and it caught two more real
+    violations in code written the same day, including one of this session's own.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -768,7 +938,8 @@ reasoning behind each constrains what follows.
 
 | Question | Owner | Deadline |
 |---|---|---|
-| **Which `LedgerAccount.account_code` is the S&M expense account per tenant, and does it exist yet?** It must be `account_type = 'expense'` and `is_postable`. Until Finance names it, `crm.expense_account_map` has no rows and no claim can leave draft — deliberately, since posting to a guessed account is worse than blocking. | Finance | _set a date_ |
+| **Which `LedgerAccount.account_code` is the S&M expense account per tenant?** Unchanged as a question and now the ONLY thing standing between a rep and a filed claim: `packages/expense` is built, and submitting a claim whose category has no active `crm.expense_account_map` row is refused with a 409 naming the category, the table and what Finance must supply. One row per category is the whole unblock. | Finance | _set a date_ |
+| **The JournalEntry still cannot be posted, for three reasons beyond the account code.** (a) `JournalLine.ledger_account_id` is a record REFERENCE and the CRM holds a code; ADR item 11 says it is "resolved at posting time via `resolveAccountId`", but that is a private function inside the ERP's `write-effects.ts` and is not on the HTTP API, and `packages/sync` projects no `LedgerAccount`, so no code→id path exists today. That is a hole in item 11's reasoning, not an omission in the code. (b) There is no employee-reimbursements-payable account anywhere in either system: `FinanceSettings` has `apAccountCode` (supplier AP control) and `cashAccountCode`, and crediting either mis-states something — AP would carry an employee liability with no `Bill` behind it, cash would assert money moved before it did. (c) One ERP scope cannot do both halves: `Expense.create` excludes `controller` while GL writes require it, so a tenant wanting both must grant `erp_admin`, which is wider than item 11's security note contemplated. The `Expense` record posts today and carries the account and cost centre in its description so the manual journal entry is readable off it. | Finance + Security | _set a date_ |
 | Which `CostCenter.code` (if any) to hook per category. Optional by design — NULL posts to the account with no dimension. `CostCenter.segment` has no `functional` value (`operating\|geographic\|product\|service\|other`), so S&M would sit under `operating`. | Finance | _set a date_ |
 | Does the CRM need more than one S&M account (e.g. splitting congresses from detailing samples), or does one account with cost-centre and CRM-side category reporting suffice? The map is per-category already, so several accounts cost nothing structurally. | Finance | _set a date_ |
 | Which OIDC IdP for human login (Q8 tier 1), and does the CRM service credential holding `controller` (needed for the GL posting in item 11) pass security review? The credential itself is built; the question is whether `controller` per tenant is the right grant, and it is per-tenant configuration (`crm.erp_service_principal`) so narrowing it costs nothing structurally. | Security | _set a date_ |
@@ -777,16 +948,17 @@ reasoning behind each constrains what follows.
 | Staleness budget per snapshot table (item 8) — how old may a product price or a rep roster be on a mobile device before the UI blocks the action rather than warning? | Product | _set a date_ |
 | Does the platform have a date for `meta.webhook_deliveries` (Q9)? Affects only when we retire `PollingChangeSource`, not whether we build it. | Platform | _set a date_ |
 | Sample custody: may a rep declare their own receipt of stock? `POST /v1/samples/receipts` has the rep confirm it, because no warehouse-side admin surface exists yet. The stronger model is warehouse-initiated issue with rep acknowledgement. What makes the weaker one defensible meanwhile: the ledger is append-only, every correction carries a reason, and the cycle count reconciles against physical stock. | Compliance | _set a date_ |
-| A transfer that is never accepted leaves material in `quantity_in_transit` indefinitely. It stays visible (`GET /v1/samples/transfers`) and accounted for, but there is no recall or timeout — the sender cannot take it back, and an adjustment only touches `quantity_on_hand`. | Product | _set a date_ |
 | Signature images have nowhere to live. `signature_sha256` commits to what the device captured; the blob needs the object storage report §13 records as absent. Until then a disbursement says a signature was taken and fixes which one, without being able to produce it. | Product | _set a date_ |
 | Controlled substances are flagged (`sample_lot.controlled`) and not otherwise handled. Unit-level serial custody is a stricter obligation than this schema discharges. | Compliance | _set a date_ |
-| Two outbox rows enqueued in ONE transaction have no deterministic order: `created_at` defaults to `now()`, which is the transaction timestamp, so both carry the same value to the microsecond. The relay copes — a transition that reaches the ERP before its create is classified `retry_ordering` and retried — so this is a latent inefficiency rather than a defect. A `BIGSERIAL` on `crm.outbox` would remove it. Found by a test that assumed a sequence the table does not provide. | Platform | _set a date_ |
-| No email or SMS sender. `ChannelSender` in `@crm/notify` is the seam and in-app plus webhook are the implementations; an SMTP or provider client was deliberately not written, because it could not be verified from here and the ERP's own stack shows where unverifiable senders end up. A webhook into Slack, Teams or PagerDuty covers the paging case today. | Product | _set a date_ |
 | `crm.outbox_recipient` maps three producing tables to a rep (sample movements, visits, expense claims) and returns NULL for anything else. A new producer needs a branch added — deliberately a visible act in a diff rather than an inference — and until then its dead letters are unattributed: counted by the relay, listed with a null rep, and reachable only through SQL. | Platform | _set a date_ |
 | A dead letter keeps only its LATEST reason. `revive_count` says a row has died more than once but not why each time. A per-attempt history belongs in its own table if one is ever needed, not in more columns on `crm.outbox`. | Platform | _set a date_ |
 | Nothing picks up `ALTER ROLE crm_app BYPASSRLS` on a running system. The privilege verdict is cached per role NAME for the life of the process, because asking the catalog costs ~82 µs and asking it on every transaction is the wrong trade. A restart notices; so does `/healthz` in a new process. Altering the role is a superuser action on a role the deployment creates `NOSUPERUSER NOBYPASSRLS`, so the exposure is an operator deliberately widening their own application role. | Platform | _set a date_ |
-| A prune is irreversible and there is no undo. The policy's horizons are the only thing standing between a tenant and a deleted inbox, and `GET /v1/admin/notifications/prune-candidates` is the only way to look before leaping — nothing stages a prune, asks for confirmation, or keeps a tombstone. Defensible because a notification is a copy and the fact it refers to survives in its own table, but a tenant who shortens `retain_unread_days` to 1 by accident loses a year of unread messages that night. A confirmation step, or a "no more than N% in one pass" guard, is the obvious mitigation. | Product | _set a date_ |
 | Deleting a notification takes its `crm.notification_delivery` rows with it, by the `ON DELETE CASCADE` migration 0021 wrote. So the retention period for a notification is also the retention period for the record of where that signal was pushed — which is coherent (the policy says the tenant no longer keeps this) but means delivery history cannot be retained longer than the notification it describes. Separating them needs the delivery rows to stop depending on the notification row. | Platform | _set a date_ |
+| A recall can reset a disposal deadline, and now one party can do it alone. If a rep's expired stock reaches zero by `transfer_out`, the sweep resolves the obligation as `transferred`; a recall puts the stock back and the next sweep raises a NEW obligation with a fresh `discovered_on` and `due_by`. Two reps could already achieve this by bouncing a transfer between them — the recall makes it unilateral. The fix is in 0020's territory: re-open the resolved obligation rather than raise a new one, or key the deadline to the lot's expiry rather than to discovery. | Compliance | _set a date_ |
+| The SMTP sender has never spoken to a real mail server. It is verified end to end against a sink written alongside it — reply classification at every stage, dot-stuffing, RFC 2047 subjects, STARTTLS with certificate verification, AUTH PLAIN and LOGIN — and the sink is faithful to RFC 5321/3207/4616 as far as it goes, but it is not Postfix, Exchange or SES. Untested in the wild: PIPELINING, a relay that enforces SIZE rather than advertising it, reply codes outside the ranges covered, and whether a given provider accepts `8bit`. It also does no DKIM signing, which is not claimed anywhere. | Platform | _set a date_ |
+| No route and no scheduler job calls `postClaim`; a human does, through `POST /v1/expenses/{id}/post`. Deliberate — `idx_expense_claim_unsent` ("approved, not yet handed over") only means anything if posting is a separate act — but it means an approved claim sits until somebody presses the button. A sweeper over `unpostedApprovedClaims` would want a new `scheduled_job` kind. | Product | _set a date_ |
+| `crm.expense_claim` has no `rejected_by` / `rejected_at`, so WHO rejected a claim is not recorded. Overloading `approved_by` was rejected as a fix: a rejecter stored in a column named `approved_by` reads as an approval to every query that does not know better, the four-eyes CHECK's own wording included. It wants two columns and a migration. | Compliance | _set a date_ |
+| `packages/acl/schema/baseline.json` holds TWO entities — `Item` and `Opportunity`. `Expense`, `JournalEntry`, `JournalLine`, `LedgerAccount` and `CostCenter` are all absent, so the expense payloads are typed by hand against the ERP's manifest rather than against generated code, and `posting.test.ts` names every field so a typo fails a test rather than a request. The same is already true of `StockMovement` in the sample mirror. Re-capturing the baseline against a server serving the full `pack-erp-core` would close it; rule 3 is not violated, because that rule is about paths and filters and this write resolves its slug from the tenant's live `/v1/meta/schema`. | Platform | _set a date_ |
 | `crm.notification_subject_open` has a branch per producing table and nothing enforces that the set of branches matches the set of producers. A new producer that sets `subject_table` without adding a branch prunes at the normal horizon; the job's `unknownSubjects` count is the only signal, and only after the fact. The same shape as `crm.outbox_recipient` (0022) and open for the same reason — a test that derives the producer list from the code would have to parse it. | Platform | _set a date_ |
 | A role grant's `granted_by` / `revoked_by` are plain FKs to `crm.rep_profile (id)`, as every rep-profile reference in this schema is. Nothing but RLS and the explicit tenant match stops one naming a profile in another tenant. A composite `(tenant_id, id)` FK would close it structurally, and changing the convention for one table would be worse than leaving it stated here. | Platform | _set a date_ |
 | Roles cover the two administrative surfaces that exist (`crm.disposal_policy`, `crm.notification_endpoint`) and nothing else. `crm.cycle`, `crm.territory`, `crm.territory_assignment`, `crm.sample_lot` and `crm.expense_account_map` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |

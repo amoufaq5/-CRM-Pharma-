@@ -21,12 +21,20 @@ import { SampleCountError, SampleLotNotFoundError, translateSampleError } from "
 export type MaterialKind = "drug_sample" | "promo_material";
 export type LotStatus = "active" | "quarantined" | "withdrawn";
 
+/**
+ * Every kind the ledger can hold. Mirrors `sample_transaction_kind_check`.
+ *
+ * `transfer_recall` is in this list because `ledgerFor` and `getTransaction` read the
+ * whole table: leaving it out did not prevent a recall row from being returned, it only
+ * made the type claim it was one of the other kinds.
+ */
 export type TransactionKind =
   | "receipt"
   | "transfer_in"
   | "adjustment_in"
   | "disbursement"
   | "transfer_out"
+  | "transfer_recall"
   | "return_to_warehouse"
   | "destruction"
   | "expiry_writeoff"

@@ -224,7 +224,15 @@ export class Scheduler {
             `deletedRead=${r.deletedRead} deletedUnread=${r.deletedUnread} ` +
             `keptSubjectOpen=${r.keptSubjectOpen} keptDeliveryUnsettled=${r.keptDeliveryUnsettled} ` +
             `unknownSubjects=${r.unknownSubjects} more=${r.moreRemaining} ` +
-            `retainRead=${r.policy.retain_read_days}d retainUnread=${r.policy.retain_unread_days}d`
+            `retainRead=${r.policy.retain_read_days}d retainUnread=${r.policy.retain_unread_days}d ` +
+            // The guard's numbers go in every line, not only on a refusal: a share that
+            // has been creeping towards the ceiling is the warning, and it is only
+            // visible if the ordinary line carries it.
+            `share=${r.sharePercent}%/${r.guard.prune_max_share_percent}% ` +
+            `prunable=${r.prunableTotal} inbox=${r.inboxTotal}` +
+            (r.overridden ? " overridden=true" : "") +
+            // A refusal deleted NOTHING, so it must not read like a quiet zero.
+            (r.refused ? ` REFUSED: ${r.refusalReason ?? "over the ceiling"}` : "")
           );
         } finally {
           client.release();

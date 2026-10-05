@@ -30,6 +30,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/callplan/` | Cycles, call plans and adherence. Four-eyed approval, frozen once approved. |
 | `packages/sample/` | Sample and promo-material custody: lots, expiry, balances, transfers, counts, the ERP mirror. |
 | `packages/role/` | The administrative roles: dated grants, four eyes, and the guard against locking a tenant out. |
+| `packages/expense/` | Expense claims: the lifecycle, the category-to-account map, and the ERP posting. Refuses until Finance maps the category. |
 | `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints. See [`deploy/README.md`](deploy/README.md). |
 | `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres). |
 
@@ -77,6 +78,8 @@ authorisation on its own.
 | `POST /v1/samples/disbursements` | a hand-over, with recipient and signature hash |
 | `GET\|POST /v1/samples/transfers` | outstanding transfers / send to another rep |
 | `POST /v1/samples/transfers/:id/accept` | the receiving rep accepts |
+| `GET /v1/samples/transfers/recallable` | material the caller sent that nobody has accepted |
+| `POST /v1/samples/transfers/:id/recall` | take it back — **sender only**; a new ledger row, never an edit |
 | `GET /v1/samples/ledger` | the append-only custody log |
 | `POST /v1/sync/disbursements` | offline flush, **per-row** results |
 | `POST /v1/call-plans` | create, for self or a supervised rep; then `/targets`, `/products` |
@@ -111,7 +114,16 @@ authorisation on its own.
 | `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; there is no DELETE |
 | `GET /v1/admin/notifications/retention` | how long inboxes keep things — readable by every rep |
 | `PUT /v1/admin/notifications/retention` | the two horizons (**administrator**) |
-| `GET /v1/admin/notifications/prune-candidates` | what tonight's prune would take, and what it would hold back |
+| `GET /v1/admin/notifications/prune-candidates` | what tonight's prune would take, what it would hold back, and whether it would be refused |
+| `GET\|PUT /v1/admin/notifications/prune-guard` | the volume ceiling and its floor (**administrator**) |
+| `POST\|DELETE /v1/admin/notifications/prune-guard/override` | open or close a bounded, attributed window past the ceiling |
+| `GET\|POST /v1/expenses` | own claims (`?state=` repeats) / file one |
+| `POST /v1/expenses/:id/submit` | snapshots the S&M account in force now; **refused if the category is unmapped** |
+| `POST /v1/expenses/:id/{approve,reject}` | the approver must supervise the claimant and not be them |
+| `POST /v1/expenses/:id/{post,reimburse}` | hand it to the ERP, then record the reimbursement |
+| `GET /v1/expenses/:id/erp` | where the claim's ERP writes have got to |
+| `GET /v1/admin/expense-accounts` | the map, plus the categories reps claim against that nothing can post |
+| `PUT\|DELETE /v1/admin/expense-accounts/:category` | map a category, or deactivate it (**administrator**) |
 
 Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
 emits two on the same API, and a client that handles only one misreads the other.
@@ -127,7 +139,7 @@ So there are two roles, held by nobody implicitly, each a **dated grant** on a r
 
 | | |
 |---|---|
-| `administrator` | configures the tenant: notification endpoints, inbox retention, and who holds roles |
+| `administrator` | configures the tenant: notification endpoints, inbox retention and its volume guard, the expense category-to-account map, and who holds roles |
 | `compliance` | the SOP parameters reps are held to: the disposal grace period, the promo auto-write-off switch |
 
 The split is not arbitrary. A `compliance` parameter is one reps are **measured against**;
@@ -198,10 +210,69 @@ notify_prune  deletedRead=2 deletedUnread=0 keptSubjectOpen=1 keptDeliveryUnsett
               unknownSubjects=1 more=false retainRead=30d retainUnread=200d
 ```
 
-Each pass is capped at 50,000 rows and reports `more`, so a tenant turning retention on
-after a year of growth drains over a few nights rather than in one long transaction.
+**And a pass that would take too much is refused outright.** `prune_max_share_percent`
+(25% by default) is a ceiling on the share of the inbox one pass may delete; over it, the
+pass deletes *nothing* and says why, because a half-applied prune is still irreversible and
+leaves nobody able to tell whether the number in front of them is the whole mistake. A
+share rather than a row cap on purpose: the failure being defended against is a horizon
+wrong by an order of magnitude, and that looks the same at 800 rows and at two million,
+where any absolute cap protects one size and fails the other. `prune_guard_floor_rows`
+(100) is the count below which the ratio is noise and the guard stays quiet.
+
+Past it only by a **window**: `POST /v1/admin/notifications/prune-guard/override` takes
+`hours` with no default, names who opened it, is capped at seven days, and expires on its
+own. A boolean would be set once for one night's reason and outlive it silently, leaving
+the next horizon typo unguarded.
+
+Each pass is also capped at 50,000 rows and reports `more`, so a tenant turning retention
+on after a year of growth drains over a few nights rather than in one long transaction.
+That cap is a throttle, not a refusal — and the guard is measured against what the pass
+*wants*, not what tonight would take, or a two-million-row inbox with a one-day horizon
+would propose 2.5% every night and empty itself in forty passes unchallenged.
 `GET /v1/admin/notifications/prune-candidates` answers "what would tonight take" before
 anything is deleted.
+
+## Expenses
+
+A rep files a claim; their manager approves it; it is handed to the ERP. The approval graph
+is the CRM's (ADR-0001 item 11) because the ERP's own `Expense` workflow is a flat role
+check that never reads `Employee.manager_id` — so four-eyes is enforced here or nowhere.
+
+**Submitting is refused while Finance has not mapped the category.** That is the designed
+behaviour, not a gap: `crm.expense_account_map` names the Sales & Marketing
+`LedgerAccount.account_code` each category posts to, and posting to a guessed account
+mis-states the P&L far more expensively than a claim that will not leave draft. The refusal
+is a 409 naming the category and the table, and
+`GET /v1/admin/expense-accounts` returns the categories reps are already claiming against
+that nothing can post — the Finance to-do list, as a number to watch reach zero.
+
+The account is **snapshotted at submit**, so re-mapping a category next quarter cannot
+re-attribute a claim already submitted.
+
+What posts today is the ERP `Expense` record, carrying the account and cost centre in its
+description. **The `JournalEntry` does not post**, for three reasons that are Finance's and
+Security's rather than ours — no code→record-id path for `LedgerAccount`, no
+employee-reimbursements-payable account anywhere in either system, and one ERP scope that
+cannot both create an `Expense` and write the GL. All three are in ADR-0001's open table
+with what would close them. Guessing the credit side would dead-letter the write and raise
+`erp_write_failed` at a rep for a misconfiguration they cannot fix.
+
+## Notifications: the email channel
+
+Two senders, both real. **Webhook** HMAC-signs a POST. **Email** speaks SMTP over
+`node:net`/`node:tls` with no dependency — STARTTLS required by default and refused at
+construction rather than per send, so a relay configured without TLS fails the scheduler at
+boot instead of dead-lettering every message; AUTH PLAIN and LOGIN; RFC 2047 subjects,
+because this product's locales include Arabic and a raw 8-bit header is a real bug here.
+
+The classification is the part worth knowing: **4xx retries, 5xx dead-letters**, and a
+positive reply at the wrong stage dead-letters because the conversation has lost step.
+Backwards, that is either a bounced address retried forever or a greylist — a 4xx, and
+extremely common — thrown away.
+
+It has **never spoken to a real mail server**: it is verified end to end against a sink
+written alongside it, which is faithful to RFC 5321/3207/4616 as far as it goes and is not
+Postfix. It does no DKIM signing. Both are in the ADR's open table.
 
 ## The background process
 

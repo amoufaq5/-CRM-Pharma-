@@ -17,6 +17,15 @@ export const NOTIFICATION_KINDS = [
   /** Material was sent to a rep who has no other reason to expect it. */
   "sample_transfer_awaiting_acceptance",
   /**
+   * The sender took it back before it was accepted.
+   *
+   * The counterpart to the kind above, and the reason it exists: that one told the
+   * receiver material was waiting for them, and after a recall that notification names
+   * material sitting in somebody else's bag. Correcting it is not optional — a rep who
+   * goes looking for stock the inbox promised them has been sent on an errand by us.
+   */
+  "sample_transfer_recalled",
+  /**
    * A write to the ERP failed permanently.
    *
    * The one signal about something the rep believes already happened: the CRM recorded it,

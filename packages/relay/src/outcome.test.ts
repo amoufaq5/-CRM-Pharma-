@@ -2,8 +2,19 @@ import { describe, expect, it } from "vitest";
 import { ErpError } from "@crm/acl";
 import { classify, isTerminal } from "./outcome.js";
 
-const erp = (kind: Parameters<typeof ErpError>[0] extends never ? never : ConstructorParameters<typeof ErpError>[0], status: number, code: string, detail?: string) =>
-  new ErpError(kind, status, code, detail, null);
+/**
+ * `ConstructorParameters`, not `Parameters`. A class is not callable, so
+ * `Parameters<typeof ErpError>` fails its constraint and the conditional that used to
+ * stand here collapsed the kind to `never` — which typechecks as long as nothing
+ * typechecks it, and every call below was an error nobody ever saw. Test files are
+ * excluded from `tsc` in this repo; `pnpm typecheck:tests` is what found it.
+ */
+const erp = (
+  kind: ConstructorParameters<typeof ErpError>[0],
+  status: number,
+  code: string,
+  detail?: string,
+) => new ErpError(kind, status, code, detail, null);
 
 describe("write-guard codes — all 422, told apart by CODE not status", () => {
   // The single most important behaviour here. `period_locked` and
@@ -101,4 +112,53 @@ describe("transient versus terminal", () => {
     expect(out.kind).toBe("retry_transient");
     expect(out.reason).toContain("unclassified");
   });
+
+/**
+ * The defect this suite did not cover: a 409 means two different things at the ERP, and
+ * only one of them is a delivered write.
+ *
+ * `invalid_transition` says the record was NOT touched. Reading it as success marked the
+ * outbox row delivered and dropped the transition, leaving the CRM and the ERP
+ * disagreeing about a record's state with nothing anywhere reporting it. Found by
+ * reading, not by a failing test — which is why these exist now.
+ */
+describe("409 is not one thing", () => {
+  it("retries an invalid_transition as an ordering problem, never as delivered", () => {
+    const out = classify({
+      error: new ErpError("conflict", 409, "invalid_transition", "'approve' cannot fire from 'draft'", null),
+      isTransition: true,
+    });
+    expect(out.kind).toBe("retry_ordering");
+    expect(out.kind).not.toBe("already_delivered");
+    expect(isTerminal(out.kind)).toBe(false);
+    // The sentence has to say what the ERP said, because the eventual dead letter is
+    // read by a human deciding whether the two systems really disagree.
+    expect(out.reason).toContain("cannot fire from 'draft'");
+  });
+
+  it("still treats a duplicate target id as delivered — the case the branch was written for", () => {
+    for (const detail of [
+      "duplicate key value violates unique constraint",
+      "record already exists",
+    ]) {
+      const out = classify({
+        error: new ErpError("conflict", 409, "conflict", detail, null),
+        isTransition: false,
+
+      });
+      expect(out.kind).toBe("already_delivered");
+    }
+  });
+
+  it("does not let an invalid_transition reach the conflict branch by its detail text", () => {
+    // Belt and braces on the ORDER of the two branches: a detail mentioning
+    // idempotency alongside the transition code must still not read as delivered.
+    const out = classify({
+      error: new ErpError("conflict", 409, "invalid_transition", "idempotency: already exists", null),
+      isTransition: true,
+    });
+    expect(out.kind).toBe("retry_ordering");
+  });
+});
+
 });

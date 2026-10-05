@@ -42,6 +42,14 @@ const GUARD_FATAL = new Set([
 /** Postgres/ERP signals that the record already exists — a replay, not a failure. */
 const ALREADY_EXISTS = /duplicate key|already exists|unique constraint|idempotenc/i;
 
+/**
+ * The ERP's code for "that transition cannot fire from this state".
+ *
+ * Named rather than inlined because it is the one 409 that must NOT be read as a
+ * delivered write — see the branch that uses it.
+ */
+const INVALID_TRANSITION = "invalid_transition";
+
 export interface ClassifyInput {
   readonly error: unknown;
   /** True when this row drives a lifecycle transition rather than a create. */
@@ -76,6 +84,37 @@ export function classify(input: ClassifyInput): Outcome {
 
   if (GUARD_FATAL.has(err.code)) {
     return { kind: "dead", reason: `${err.code}: ${err.detail ?? "write guard refused"}` };
+  }
+
+  // A 409 FROM A TRANSITION IS NOT A SUCCESS, and reading it as one was a real defect
+  // here until an expense-posting chain made it matter.
+  //
+  // The ERP answers 409 for at least two different things. One is the duplicate target
+  // id below, which genuinely means the write landed. The other is
+  // `invalid_transition` — `'approve' cannot fire from 'draft'`
+  // (operate-runtime/src/handlers.ts) — which means the write did NOT land and never
+  // touched the record. Classifying that as `already_delivered` marked the outbox row
+  // delivered and dropped the transition silently, with the ERP and the CRM left
+  // disagreeing about a record's state and nothing anywhere saying so.
+  //
+  // Treated as ordering for the same reason a 404 on a transition is: the sibling row
+  // that moves the record into the right state is very likely still queued behind this
+  // one. If the state is genuinely unreachable — somebody moved the record in the ERP's
+  // own UI — the attempt cap ends it and the dead-letter alarm puts it in front of a
+  // human, which is the correct destination for a disagreement no retry can settle.
+  if (err.code === INVALID_TRANSITION) {
+    if (input.isTransition) {
+      return {
+        kind: "retry_ordering",
+        reason: `the ERP refused this transition from the record's current state (${
+          err.detail ?? "no detail"
+        }) — a sibling write may not have landed yet`,
+      };
+    }
+    // Not reachable from a create today: only the transition handler emits this code.
+    // Dead rather than retried, because a create cannot be waiting on an ordering it
+    // does not participate in.
+    return { kind: "dead", reason: `invalid_transition on a non-transition write: ${err.detail ?? ""}` };
   }
 
   if (err.kind === "conflict" || ALREADY_EXISTS.test(err.detail ?? "")) {

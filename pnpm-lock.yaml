@@ -48,6 +48,9 @@ importers:
       '@crm/db':
         specifier: workspace:*
         version: link:../db
+      '@crm/expense':
+        specifier: workspace:*
+        version: link:../expense
       '@crm/notify':
         specifier: workspace:*
         version: link:../notify
@@ -99,6 +102,18 @@ importers:
 
   packages/db:
     dependencies:
+      pg:
+        specifier: ^8.13.0
+        version: 8.23.0
+
+  packages/expense:
+    dependencies:
+      '@crm/db':
+        specifier: workspace:*
+        version: link:../db
+      '@crm/relay':
+        specifier: workspace:*
+        version: link:../relay
       pg:
         specifier: ^8.13.0
         version: 8.23.0

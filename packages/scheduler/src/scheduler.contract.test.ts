@@ -82,7 +82,14 @@ describe("scheduler against a real database", () => {
     );
   });
 
-  function scheduler(opts: Partial<Parameters<typeof Scheduler.prototype.constructor>[0]> = {}, events: SchedulerEvent[] = []) {
+  // `ConstructorParameters<typeof Scheduler>`, not `Parameters<typeof
+  // Scheduler.prototype.constructor>`: the latter is typed `Function`, fails the
+  // constraint, and degrades the whole options type to `never` — invisible while test
+  // files sat outside `tsc`.
+  function scheduler(
+    opts: Partial<ConstructorParameters<typeof Scheduler>[0]> = {},
+    events: SchedulerEvent[] = [],
+  ) {
     const { relay } = stubRelay();
     const { refresher } = stubRefresher();
     return new Scheduler({

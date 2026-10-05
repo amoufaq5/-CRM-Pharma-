@@ -24,6 +24,7 @@
     "@crm/callplan": "workspace:*",
     "@crm/credential": "workspace:*",
     "@crm/db": "workspace:*",
+    "@crm/expense": "workspace:*",
     "@crm/notify": "workspace:*",
     "@crm/relay": "workspace:*",
     "@crm/role": "workspace:*",

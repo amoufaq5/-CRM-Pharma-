@@ -1,14 +1,18 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { appPool, TENANT_RETENTION as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_PRUNE_GUARD, TENANT_RETENTION as TENANT } from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import {
+  grantPruneGuardOverride,
   InvalidRetentionError,
   notificationPolicy,
+  notificationPruneGuard,
   prunableNotifications,
   pruneNotifications,
+  revokePruneGuardOverride,
   setNotificationPolicy,
+  setNotificationPruneGuard,
 } from "./retention.js";
 
 /**
@@ -591,5 +595,315 @@ describe("notification retention", () => {
     const r = await withTenantContext(tx, other, (c) => pruneNotifications(c, other, { asOf: NOW }));
     expect(r.deletedRead + r.deletedUnread).toBe(0);
     expect(await remaining()).toBe(1);
+  });
+});
+
+/**
+ * The guard on the prune (migration 0026).
+ *
+ * The rule that needs proving is not "a big prune is refused" — it is the SHAPE of the
+ * decision: a share rather than a row count, so it reads the same at every inbox size; a
+ * refusal rather than a trim, because the deletion cannot be undone; measured against
+ * what the pass WANTS rather than what tonight's batch would take, which is the one way
+ * an inbox could otherwise drain 50,000 rows a night past a ceiling it never approached.
+ *
+ * Its own tenant, so the counts the guard divides by are not the retention suite's
+ * fixtures. A share is a statement about a whole inbox, and a shared one would make every
+ * number here depend on a test next door.
+ */
+describe("the prune guard", () => {
+  let pool: Pool;
+  let tx: PoolClient;
+
+  const T = TENANT_PRUNE_GUARD;
+  const REP = "e6300000-0000-4000-8000-000000000003";
+
+  const inT = <R>(fn: (c: PoolClient) => Promise<R>): Promise<R> => withTenantContext(tx, T, fn);
+
+  const NOW = new Date("2026-06-01T12:00:00Z");
+  const daysAgo = (n: number): Date => new Date(NOW.getTime() - n * 86_400_000);
+
+  let batch = 0;
+  /** Many rows at once: the guard is about counts, and 150 round trips prove nothing extra. */
+  const seed = async (
+    c: PoolClient,
+    opts: { count: number; createdDaysAgo: number; read?: boolean },
+  ): Promise<void> => {
+    batch += 1;
+    await c.query(
+      `INSERT INTO crm.notification
+         (tenant_id, recipient_rep_profile_id, kind, severity, subject, body, dedup_key,
+          created_at, read_at)
+       SELECT $1, $2, 'call_plan_approved', 'info', 's', 'b', $3 || '-' || g,
+              $4::timestamptz, CASE WHEN $5::boolean THEN $4::timestamptz END
+         FROM generate_series(1, $6::int) g`,
+      [T, REP, `pg-${batch}`, daysAgo(opts.createdDaysAgo), opts.read ?? true, opts.count],
+    );
+  };
+
+  /** 150 past the horizon out of 210 held: 71.4%, well over the default 25% ceiling. */
+  const seedOverCeiling = (): Promise<void> =>
+    inT(async (c) => {
+      await seed(c, { count: 150, createdDaysAgo: 400 });
+      await seed(c, { count: 60, createdDaysAgo: 2 });
+    });
+
+  const prune = (opts: { maxRows?: number } = {}) =>
+    inT((c) => pruneNotifications(c, T, { asOf: NOW, ...opts }));
+
+  const remaining = (): Promise<number> =>
+    inT(async (c) => {
+      const { rows } = await c.query<{ n: string }>(
+        "SELECT count(*) AS n FROM crm.notification WHERE tenant_id = $1",
+        [T],
+      );
+      return Number(rows[0]!.n);
+    });
+
+  const clear = async (): Promise<void> => {
+    await inT(async (c) => {
+      await c.query("DELETE FROM crm.notification WHERE tenant_id = $1", [T]);
+      await c.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [T]);
+      await c.query("DELETE FROM crm.notification_policy WHERE tenant_id = $1", [T]);
+    });
+  };
+
+  beforeAll(async () => {
+    pool = appPool();
+    tx = await pool.connect();
+    await inT(async (c) => {
+      await c.query(
+        `INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name)
+         VALUES ($1,$2,'prune-guard-rep','prune-guard-rep','Guard Recipient') ON CONFLICT DO NOTHING`,
+        [REP, T],
+      );
+    });
+  });
+
+  afterAll(async () => {
+    await clear();
+    await inT((c) => c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [T]));
+    tx?.release();
+    await pool?.end();
+  });
+
+  beforeEach(clear);
+
+  describe("the settings", () => {
+    it("defaults to a quarter of the inbox, not bothering under a hundred rows, no override", async () => {
+      expect(await inT((c) => notificationPruneGuard(c, T))).toEqual({
+        prune_max_share_percent: 25,
+        prune_guard_floor_rows: 100,
+        prune_guard_override_by: null,
+        prune_guard_override_granted_at: null,
+        prune_guard_override_until: null,
+      });
+    });
+
+    it("changes the ceiling without disturbing the floor", async () => {
+      const g = await inT((c) => setNotificationPruneGuard(c, T, { maxSharePercent: 40 }));
+      expect(g.prune_max_share_percent).toBe(40);
+      expect(g.prune_guard_floor_rows).toBe(100);
+    });
+
+    /** A ceiling that permits 100% is not a ceiling — and stored, it would not look like
+     *  a disabled guard, it would look like a number somebody chose. */
+    it("refuses a ceiling of 100, and one of 0", async () => {
+      await expect(
+        inT((c) => setNotificationPruneGuard(c, T, { maxSharePercent: 100 })),
+      ).rejects.toBeInstanceOf(InvalidRetentionError);
+      await expect(
+        inT((c) => setNotificationPruneGuard(c, T, { maxSharePercent: 0 })),
+      ).rejects.toBeInstanceOf(InvalidRetentionError);
+    });
+
+    it("refuses a floor outside the allowed range", async () => {
+      await expect(
+        inT((c) => setNotificationPruneGuard(c, T, { guardFloorRows: -1 })),
+      ).rejects.toBeInstanceOf(InvalidRetentionError);
+      await expect(
+        inT((c) => setNotificationPruneGuard(c, T, { guardFloorRows: 1_000_001 })),
+      ).rejects.toBeInstanceOf(InvalidRetentionError);
+    });
+  });
+
+  describe("a pass over the ceiling", () => {
+    it("deletes nothing at all, and says why", async () => {
+      await seedOverCeiling();
+      const r = await prune();
+      expect(r.refused).toBe(true);
+      expect(r.deletedRead).toBe(0);
+      expect(r.deletedUnread).toBe(0);
+      expect(r.prunableTotal).toBe(150);
+      expect(r.inboxTotal).toBe(210);
+      expect(r.sharePercent).toBe(71.4);
+      expect(r.guard.prune_max_share_percent).toBe(25);
+      expect(r.refusalReason).toMatch(/71\.4% of this tenant's inbox of 210, over its 25% ceiling/);
+      // The whole point: the rows are still there to look at.
+      expect(await remaining()).toBe(210);
+      // And the operator is told there is work outstanding, not that there was none.
+      expect(r.moreRemaining).toBe(true);
+    });
+
+    /**
+     * The interaction the batch cap makes easy to get wrong. Five rows is 2.4% of this
+     * inbox — under any ceiling — so a guard that judged the BATCH would wave this
+     * through, and the next forty passes with it, until the inbox was empty.
+     */
+    it("judges what the pass wants, not what tonight's batch would take", async () => {
+      await seedOverCeiling();
+      const r = await prune({ maxRows: 5 });
+      expect(r.refused).toBe(true);
+      expect(r.prunableTotal).toBe(150);
+      expect(await remaining()).toBe(210);
+    });
+
+    it("still reports what it would have held back", async () => {
+      await inT(async (c) => {
+        const { rows } = await c.query<{ id: string }>(
+          `INSERT INTO crm.outbox (tenant_id, entity, operation, payload, target_record_id,
+                                   source_table, source_id, state)
+           VALUES ($1,'Item','create','{}'::jsonb,'crm_pg_1','crm.visit',gen_random_uuid(),'dead')
+           RETURNING id`,
+          [T],
+        );
+        await seed(c, { count: 150, createdDaysAgo: 400 });
+        await c.query(
+          `INSERT INTO crm.notification
+             (tenant_id, recipient_rep_profile_id, kind, severity, subject, body, dedup_key,
+              subject_table, subject_id, created_at, read_at)
+           VALUES ($1,$2,'erp_write_failed','info','s','b','pg-open','crm.outbox',$3,$4,$4)`,
+          [T, REP, rows[0]!.id, daysAgo(400)],
+        );
+      });
+      const r = await prune();
+      expect(r.refused).toBe(true);
+      // The exemptions are facts about the candidate set, not about whether the delete
+      // ran — a refusal that blanked them would hide the shape of the backlog.
+      expect(r.keptSubjectOpen).toBe(1);
+      expect(r.prunableTotal).toBe(150);
+    });
+  });
+
+  describe("a pass within it", () => {
+    it("runs normally, and is not a refusal", async () => {
+      await inT(async (c) => {
+        await setNotificationPruneGuard(c, T, { guardFloorRows: 5 });
+        await seed(c, { count: 20, createdDaysAgo: 400 });
+        await seed(c, { count: 80, createdDaysAgo: 2 });
+      });
+      const r = await prune();
+      expect(r.refused).toBe(false);
+      expect(r.refusalReason).toBeNull();
+      expect(r.overridden).toBe(false);
+      expect(r.deletedRead).toBe(20);
+      expect(r.sharePercent).toBe(20);
+      expect(await remaining()).toBe(80);
+    });
+
+    /** Hitting the batch cap is a throttle doing its job (0024), not a guard tripping. */
+    it("reports moreRemaining when it hits the batch cap, and does not call that a refusal", async () => {
+      await inT(async (c) => {
+        await setNotificationPruneGuard(c, T, { guardFloorRows: 5 });
+        await seed(c, { count: 20, createdDaysAgo: 400 });
+        await seed(c, { count: 80, createdDaysAgo: 2 });
+      });
+      const r = await prune({ maxRows: 5 });
+      expect(r.refused).toBe(false);
+      expect(r.deletedRead).toBe(5);
+      expect(r.moreRemaining).toBe(true);
+    });
+
+    /**
+     * Beneath the floor the share is not consulted at all. Eight notifications of which
+     * eight are past their horizon is 100% of an inbox with nothing in it, and refusing
+     * that nightly would teach an operator to override the guard by reflex.
+     */
+    it("does not consult the share beneath the floor", async () => {
+      await inT(async (c) => {
+        await setNotificationPruneGuard(c, T, { maxSharePercent: 1, guardFloorRows: 10 });
+        await seed(c, { count: 8, createdDaysAgo: 400 });
+      });
+      const r = await prune();
+      expect(r.refused).toBe(false);
+      expect(r.sharePercent).toBe(100);
+      expect(r.deletedRead).toBe(8);
+    });
+  });
+
+  describe("the override", () => {
+    it("lets the refused pass through, and says that it did", async () => {
+      await seedOverCeiling();
+      expect((await prune()).refused).toBe(true);
+      await inT((c) => grantPruneGuardOverride(c, T, { grantedBy: "ops@example.test", hours: 24 }));
+      const r = await prune();
+      expect(r.refused).toBe(false);
+      expect(r.overridden).toBe(true);
+      expect(r.deletedRead).toBe(150);
+      expect(r.guard.prune_guard_override_by).toBe("ops@example.test");
+      expect(await remaining()).toBe(60);
+    });
+
+    it("brings the refusal straight back when revoked", async () => {
+      await seedOverCeiling();
+      await inT((c) => grantPruneGuardOverride(c, T, { grantedBy: "ops@example.test", hours: 24 }));
+      await inT((c) => revokePruneGuardOverride(c, T));
+      const r = await prune();
+      expect(r.refused).toBe(true);
+      expect(r.guard.prune_guard_override_until).toBeNull();
+      expect(await remaining()).toBe(210);
+    });
+
+    /**
+     * The property that stops it being an accidental permanent default: it runs out. The
+     * window is written directly here because the grant anchors itself to `now()` — a
+     * window already behind the prune's clock is precisely what the setter cannot produce.
+     */
+    it("stops letting passes through once the window has closed", async () => {
+      await seedOverCeiling();
+      await inT(async (c) => {
+        await c.query(
+          `UPDATE crm.notification_policy
+              SET prune_guard_override_by         = 'ops@example.test',
+                  prune_guard_override_granted_at = $2,
+                  prune_guard_override_until      = $3
+            WHERE tenant_id = $1`,
+          [T, daysAgo(3), daysAgo(2)],
+        );
+      });
+      const r = await prune();
+      expect(r.refused).toBe(true);
+      expect(r.overridden).toBe(false);
+      expect(await remaining()).toBe(210);
+    });
+
+    it("refuses a window longer than a week, and one of no length at all", async () => {
+      await expect(
+        inT((c) => grantPruneGuardOverride(c, T, { grantedBy: "ops@example.test", hours: 200 })),
+      ).rejects.toBeInstanceOf(InvalidRetentionError);
+      await expect(
+        inT((c) => grantPruneGuardOverride(c, T, { grantedBy: "ops@example.test", hours: 0 })),
+      ).rejects.toBeInstanceOf(InvalidRetentionError);
+    });
+
+    it("refuses one that names nobody", async () => {
+      await expect(
+        inT((c) => grantPruneGuardOverride(c, T, { grantedBy: "", hours: 24 })),
+      ).rejects.toBeInstanceOf(InvalidRetentionError);
+    });
+
+    /** `overridden` means the guard was overridden, not that a window happens to be open. */
+    it("is not reported as overriding a pass that was within the ceiling anyway", async () => {
+      await inT(async (c) => {
+        await setNotificationPruneGuard(c, T, { guardFloorRows: 5 });
+        await seed(c, { count: 20, createdDaysAgo: 400 });
+        await seed(c, { count: 80, createdDaysAgo: 2 });
+        await grantPruneGuardOverride(c, T, { grantedBy: "ops@example.test", hours: 24 });
+      });
+      const r = await prune();
+      expect(r.refused).toBe(false);
+      expect(r.overridden).toBe(false);
+      expect(r.deletedRead).toBe(20);
+    });
   });
 });

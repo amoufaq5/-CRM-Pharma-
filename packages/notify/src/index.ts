@@ -53,15 +53,44 @@ export {
   type UpdateEndpointInput,
 } from "./endpoints.js";
 export {
+  DEFAULT_PRUNE_GUARD_FLOOR_ROWS,
+  DEFAULT_PRUNE_MAX_SHARE_PERCENT,
   DEFAULT_RETAIN_READ_DAYS,
   DEFAULT_RETAIN_UNREAD_DAYS,
   InvalidRetentionError,
+  MAX_PRUNE_OVERRIDE_HOURS,
   MAX_PRUNE_ROWS,
+  grantPruneGuardOverride,
   notificationPolicy,
+  notificationPruneGuard,
   prunableNotifications,
   pruneNotifications,
+  prunePreview,
+  revokePruneGuardOverride,
   setNotificationPolicy,
+  setNotificationPruneGuard,
   type NotificationPolicy,
   type PruneCandidate,
+  type PruneGuard,
+  type PrunePreview,
   type PruneResult,
 } from "./retention.js";
+/**
+ * The SMTP sender. `testing-smtp.ts` is deliberately NOT re-exported: it is a test
+ * double, and the one test helper this repo does publish (`@crm/db/testing`) does it
+ * through its own subpath export rather than the main barrel.
+ */
+export {
+  InvalidMailEndpointError,
+  InvalidSmtpRelayError,
+  SMTP_EXPECTED,
+  SMTP_STAGES,
+  SmtpProtocolError,
+  SmtpSender,
+  SmtpTimeoutError,
+  classifySmtpReply,
+  type SmtpRelayConfig,
+  type SmtpSenderOptions,
+  type SmtpStage,
+  type SmtpTransport,
+} from "./smtp.js";

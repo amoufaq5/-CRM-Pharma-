@@ -39,6 +39,9 @@
     },
     {
       "path": "./packages/sample"
+    },
+    {
+      "path": "./packages/expense"
     }
   ]
 }
