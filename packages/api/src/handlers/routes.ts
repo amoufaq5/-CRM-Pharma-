@@ -401,9 +401,20 @@ function attributionOf(p: Principal): string {
   if (subject.length >= MAX_PRUNE_OVERRIDE_BY_CHARS) {
     return `${subject.slice(0, MAX_PRUNE_OVERRIDE_BY_CHARS - 1)}\u2026`;
   }
+  // The space for a name, after the subject and the separator. At two characters there is
+  // room for one letter and an ellipsis; at less than that, a truncated name is all
+  // ellipsis and says nothing, so the subject stands alone.
+  //
+  // This is where the first version overflowed the cap it documents as guaranteed. With
+  // `room` at zero it still took the truncating branch, `slice(0, -1 → 0)` gave the empty
+  // string, and the ellipsis appended to it made a one-character "name" — so the length
+  // check below passed and the result was 201 characters against a CHECK of 200. One
+  // subject length in 220 hit it (197), which is why a test of a single long display name
+  // never found it.
   const room = MAX_PRUNE_OVERRIDE_BY_CHARS - subject.length - 1;
+  if (room < 2) return subject;
   const name =
-    p.displayName.length <= room ? p.displayName : `${p.displayName.slice(0, Math.max(0, room - 1))}\u2026`;
+    p.displayName.length <= room ? p.displayName : `${p.displayName.slice(0, room - 1)}\u2026`;
   return name.length === 0 ? subject : `${name} ${subject}`;
 }
 
@@ -2073,7 +2084,10 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
    * attributable or it does not happen.
    *
    * Every refusal is the database's, translated — one outstanding probe per endpoint (a
-   * partial unique index, so two requests racing cannot both win), a per-tenant cooldown,
+   * partial unique index, so two requests racing cannot both win), a cooldown whose LENGTH
+   * is the tenant's and whose SCOPE is one endpoint (`WHERE endpoint_id = …`, because each
+   * endpoint is a different third party and a quiet one should not be rationed by a noisy
+   * one — note this bounds the rate per destination, NOT the tenant's total probe volume),
    * and an endpoint in another tenant. The cooldown answers 429 rather than 409: it is rate
    * limiting, and its message carries the moment a retry becomes legal.
    */

@@ -252,7 +252,9 @@ A rep files a claim; their manager approves it; it is handed to the ERP. The app
 is the CRM's (ADR-0001 item 11) because the ERP's own `Expense` workflow is a flat role
 check that never reads `Employee.manager_id` — so four-eyes is enforced here or nowhere.
 
-**Four eyes covers all four decisions — approve, reject, post and reimburse.** It did not,
+**Four eyes covers the three decisions a person makes — approve, reject and reimburse — and
+`post` only when a person does it.** It covered none of them, and the way it failed is worth
+keeping: `crm.rep_can_supervise` answers *yes* for the
 and the way it failed is worth keeping: `crm.rep_can_supervise` answers *yes* for the
 caller themselves, which is correct for a read (a rep may always see their own work, and it
 is why one helper serves "mine" and "my team's"), and every write transition gated on
@@ -261,6 +263,16 @@ supervision alone. `expense_claim_four_eyes` caught the approve in the database 
 so no constraint could ever have caught those. A rep could hand their own claim to the
 ledger and mark it paid. The rule is now in the route, once, for all four, as a 403 that
 names which rule was broken rather than a constraint violation with no explanation.
+
+**And `post` is no longer only a route, which weakens the check there to a formality.**
+Migration 0031 added the `expense_post` sweep, which hands every approved claim to the ERP
+every five minutes with no actor and no four-eyes test — so a claimant who wants their own
+claim posted now simply waits. Not exploitable, and worth being precise about why: reaching
+`approved` still takes a second person (the route's check and
+`expense_claim_four_eyes` both), and `reimburse` has no automated path at all. But the
+route's guard on `post` is a dead check a future reader would take for a live guard, and the
+honest reading is that four eyes protects the decisions a person makes, not the hand-over a
+job performs on their behalf.
 
 **A rejection names who made it.** `rejected_by` and `rejected_at`, under their own
 four-eyes CHECK — it was the one decision in the lifecycle that left no record of its
@@ -392,7 +404,10 @@ find out whether it was right.
 
 Three rules sit in the schema rather than the route, so the offline path cannot skip them:
 **one outstanding probe per endpoint** (a partial unique index, because a trigger cannot see
-another transaction's uncommitted row), a **per-tenant cooldown** (120s by default; it
+another transaction's uncommitted row), a **cooldown per endpoint, of the tenant's chosen
+length** (120s by default — each endpoint is a different third party, so a quiet one is not
+rationed by a noisy one; this bounds the rate per destination and not the tenant's total
+probe volume, which nothing bounds yet; it
 answers `429`, not `409` — this is rate limiting and the message says when a retry becomes
 legal), and `requested_at` **overwritten by the trigger**, because a caller who could supply
 it could backdate one probe and make the next legal immediately.
@@ -431,6 +446,38 @@ next function forgets.
 rather than passing for it. It carries a `pg_constraint` drift guard too: a table added next
 month by someone who does not know this rule fails a test instead of quietly reopening the
 class.
+
+## The snapshot refresh tells you when it could not be incremental
+
+`snapshot_incremental` cannot be incremental against `pack-erp-core`, and until recently
+nothing said so. **0 of 51 served entities publish `updated_at` as a filterable field**, so
+`since` bounds nothing and every pass is a full read of every record — while the one
+human-visible log line said `mode=incremental`, because that is what was *asked for*.
+
+The degradation is now carried on the result and named per snapshot in the job's summary:
+
+```
+snapshot_incremental  mode=incremental read=4821 upserted=4821 deleted=0 rejected=0
+                      UNBOUNDED: product,account published no filterable+sortable
+                      updated_at, so `since` bounded nothing and each was read in full;
+                      their high-water marks were NOT advanced
+```
+
+**And the high-water mark is deliberately not advanced from such a pass** — which matters
+more than the log line. A full read walks pages of a view the ERP did not sort (34 of 51
+entities publish no sortable field at all), so a keyset walk over it can revisit and skip
+rows. The maximum `updated_at` over what was read can therefore sit *above* the newest
+record actually stored, and resuming from it would skip the ones that were missed. A
+watermark is a promise that everything older is accounted for; an unordered read cannot
+make that promise, so none is recorded.
+
+The suite had been asserting the opposite against a fixture more capable than the real
+server: `erpServing`'s handler honoured `updated_at[gte]` while serving the captured
+schema, which declares it unfilterable — so "resumes incrementally from the stored
+high-water mark" passed against a server that cannot exist. The incremental path is now
+exercised against an explicitly **augmented** schema, named as not the ERP's, and the real
+one gets its own test asserting the degradation. That is the third time this repo has been
+bitten by a fixture that was kinder than reality.
 
 ## The background process
 

@@ -31,6 +31,20 @@ export interface RefreshResult {
   /** Records that could not be coerced. Non-empty means data the CRM cannot represent. */
   readonly rejected: readonly RejectedRecord[];
   readonly highWaterMark: string | null;
+  /**
+   * The ERP could not bound this read, so `since` applied to nothing.
+   *
+   * `ChangeSource` reports `mode: "full_sweep"` when the entity does not publish
+   * `updated_at` as both filterable and sortable — which, measured against a real
+   * `operate-server` serving `pack-erp-core`, is ALL 51 of them. Nothing read this flag
+   * until now, so a `snapshot_incremental` job paged the entire entity every five minutes
+   * per tenant while the only human-visible line said `mode=incremental`.
+   *
+   * Carried here rather than inferred, because the inference is wrong in both directions: a
+   * caller cannot tell from the record count whether a bound applied, and the request's own
+   * `mode` is what we ASKED for, not what the ERP did.
+   */
+  readonly degraded: boolean;
 }
 
 export interface SnapshotRefresherOptions {
@@ -116,9 +130,16 @@ export class SnapshotRefresher {
           tenantId,
           snapshot,
           {
-            // Only advance the mark when the sweep actually finished. An
-            // interrupted run must re-read rather than skip.
-            highWaterMark: result.drained ? result.highWaterMark : null,
+            // Only advance the mark when the sweep actually finished AND the ERP could
+            // bound it. An interrupted run must re-read rather than skip — and so must a
+            // DEGRADED one, for a less obvious reason: a full sweep's pages walk a view
+            // the ERP did not sort (34 of 51 entities publish no sortable field at all),
+            // so keyset paging over it can revisit and skip rows. The max `updated_at`
+            // over what we happened to read can therefore sit ABOVE the newest record we
+            // actually stored, and resuming from it would skip the ones we missed. A
+            // watermark is a promise that everything older is accounted for, and an
+            // unordered read cannot make it.
+            highWaterMark: result.drained && !result.degraded ? result.highWaterMark : null,
             rowsSynced: result.upserted,
             rowsDeleted: deleted,
             fullSweep: mode === "full" && result.drained,
@@ -135,7 +156,8 @@ export class SnapshotRefresher {
         upserted: result.upserted,
         deleted,
         rejected: result.rejected,
-        highWaterMark: result.drained ? result.highWaterMark : null,
+        highWaterMark: result.drained && !result.degraded ? result.highWaterMark : null,
+        degraded: result.degraded,
       };
     } catch (err) {
       // The failure is recorded so a snapshot that has been failing for a day is
@@ -186,6 +208,7 @@ export class SnapshotRefresher {
     rejected: RejectedRecord[];
     highWaterMark: string | null;
     drained: boolean;
+    degraded: boolean;
   }> {
     let cursor: string | undefined;
     let read = 0;
@@ -194,12 +217,22 @@ export class SnapshotRefresher {
     const rejected: RejectedRecord[] = [];
     let pages = 0;
     let drained = false;
+    let degraded = false;
 
     do {
       if (pages >= this.maxPages) {
         throw new Error(
           `${projection.name} sweep exceeded ${this.maxPages} pages — refusing to loop. ` +
-            `A cursor that never terminates usually means the ERP's keyset sort field changed.`,
+            (degraded
+              ? // The likelier cause by far, and the old message named the wrong one: the
+                // ERP publishes `updated_at` as filterable on no entity, so `since`
+                // bounded nothing and this read is the WHOLE entity. A reader sent to look
+                // for a changed keyset sort field would find nothing wrong with it.
+                `This entity does not support an incremental read (it published no ` +
+                `filterable, sortable \`updated_at\`), so \`since\` bounded nothing and this ` +
+                `was a full pass over every record. Either the entity is larger than ` +
+                `${String(this.maxPages)} pages or the ERP's keyset sort field changed.`
+              : `A cursor that never terminates usually means the ERP's keyset sort field changed.`),
         );
       }
       pages += 1;
@@ -211,6 +244,9 @@ export class SnapshotRefresher {
         cursor,
       );
       read += batch.records.length;
+      // Sticky across pages: one unbounded page makes the whole sweep unbounded, and a
+      // later page that happened to be filterable would not undo it.
+      if (batch.mode === "full_sweep") degraded = true;
 
       const projected: Record<string, unknown>[] = [];
       const pageRejected: string[] = [];
@@ -250,9 +286,12 @@ export class SnapshotRefresher {
     } while (cursor !== undefined);
 
     // `mode` is unused in the loop but load-bearing in the caller's delete step;
-    // named here so the signature reads honestly.
+    // named here so the signature reads honestly. NOTE it is a different thing from
+    // `degraded`: this is the mode we asked for, that is what the ERP could actually do.
+    // The two sitting next to each other under similar names is how the degradation went
+    // unread for as long as it did.
     void mode;
 
-    return { read, upserted, rejected, highWaterMark: high, drained };
+    return { read, upserted, rejected, highWaterMark: high, drained, degraded };
   }
 }

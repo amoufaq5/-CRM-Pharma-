@@ -2267,6 +2267,46 @@ describe("the API, end to end", () => {
        * because it is the half that identifies the grantor; the name gives way, with an
        * ellipsis so a reader can see something was dropped.
        */
+      /**
+       * Every subject length, not one example.
+       *
+       * The first version of this guarantee was tested with one long DISPLAY NAME and a
+       * short subject, and overflowed at exactly one subject length in 220 — 197, where
+       * the room for a name is zero and the truncating branch still produced a
+       * one-character ellipsis. A property that says "never longer than 200" is tested by
+       * trying to make it longer than 200, not by trying one input that is not.
+       */
+      it("never exceeds the column's cap, at any subject length", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const longest = "A".repeat(400);
+        for (let n = 1; n <= 220; n += 1) {
+          const subject = `idp|${"s".repeat(n)}`;
+          await withTenantContext(admin, TENANT, (tx) =>
+            tx.query("UPDATE crm.rep_profile SET subject = $2, display_name = $3 WHERE id = $1", [
+              rep,
+              subject,
+              longest,
+            ]),
+          );
+          const res = await call("POST", "/v1/admin/notifications/prune-guard/override", {
+            body: { hours: 1 },
+            auth: token({ sub: subject }),
+          });
+          expect(res.status, `subject length ${String(n)}`).toBe(200);
+          expect((res.body.prune_guard_override_by as string).length).toBeLessThanOrEqual(200);
+          // The window has to be closed again or the next iteration hits the live-override
+          // branch instead of the attribution it is here to exercise.
+          await withTenantContext(admin, TENANT, (tx) =>
+            tx.query(
+              `UPDATE crm.notification_policy SET prune_guard_override_until = NULL,
+                      prune_guard_override_by = NULL, prune_guard_override_granted_at = NULL
+                WHERE tenant_id = $1`,
+              [TENANT],
+            ),
+          );
+        }
+      });
+
       it("fits a long display name into the override's attribution instead of failing", async () => {
         await grant(() => rep, "administrator", () => manager);
         const long = "Ä".repeat(400);

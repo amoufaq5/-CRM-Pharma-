@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Pool, type PoolClient } from "pg";
-import { ErpClient, type FetchLike, type TenantCredential } from "@crm/acl";
+import { ErpClient, type FetchLike, type TenantCredential, type UiSchema } from "@crm/acl";
 import { ERP_SCHEMA_FIXTURE } from "@crm/acl/fixtures";
 import { withTenantContext } from "@crm/db";
 
@@ -18,10 +18,54 @@ import { appPool, TENANT_SYNC as TENANT } from "@crm/db/testing";
  */
 
 /** An ERP serving a fixed set of Items, honouring ?updated_at[gte]= and the cursor. */
-function erpServing(items: Array<Record<string, unknown>>, pageSize = 100): ErpClient {
+/**
+ * A schema in which `Item.updated_at` IS filterable and sortable. It is NOT the ERP's.
+ *
+ * No entity a real `operate-server` serves publishes `updated_at` at all — 0 of 51,
+ * measured — so an incremental read is impossible against `pack-erp-core` and
+ * `PollingChangeSource` reports `mode: "full_sweep"` instead.
+ *
+ * This fixture exists so the incremental PATH can be exercised at all, and it is named
+ * rather than implied because the suite used to do it by accident: `erpServing`'s handler
+ * honoured `updated_at[gte]` while serving the real schema, which declares it
+ * unfilterable. So "resumes incrementally from the stored high-water mark" passed against
+ * a server that cannot exist — the same shape as the hand-written fixture that once made
+ * six `PollingChangeSource` tests green against code that always threw.
+ *
+ * Built by ADDING the field to the captured baseline rather than hand-writing a schema, so
+ * everything else about it stays whatever the ERP really serves.
+ */
+const withUpdatedAt = (): UiSchema => ({
+  ...ERP_SCHEMA_FIXTURE,
+  entities: ERP_SCHEMA_FIXTURE.entities.map((e) =>
+    e.name === "Item"
+      ? {
+          ...e,
+          fields: [
+            ...e.fields,
+            {
+              name: "updated_at",
+              label: "Updated At",
+              input: "datetime" as const,
+              required: true,
+              defaulted: true,
+            },
+          ],
+          filterableFields: [...e.filterableFields, "updated_at"],
+          sortableFields: [...e.sortableFields, "updated_at"],
+        }
+      : e,
+  ),
+});
+
+function erpServing(
+  items: Array<Record<string, unknown>>,
+  pageSize = 100,
+  schema: UiSchema = withUpdatedAt(),
+): ErpClient {
   const fetchImpl: FetchLike = (url) => {
     if (url.endsWith("/v1/meta/schema")) {
-      return Promise.resolve(res(200, ERP_SCHEMA_FIXTURE));
+      return Promise.resolve(res(200, schema));
     }
     const q = new URL(url).searchParams;
     const since = q.get("updated_at[gte]") ?? "";
@@ -171,6 +215,44 @@ describe("snapshot refresh against a real database", () => {
     // than repeating, and the write is an idempotent upsert.
     expect(second.read).toBe(2);
     expect(second.highWaterMark).toBe("2026-09-05T00:00:00.000Z");
+  });
+
+  /**
+   * The ERP as it actually is, rather than as the fixture above pretends.
+   *
+   * `since` bounds nothing, so the pass reads everything — and the high-water mark is
+   * deliberately NOT advanced. The reason is not just honesty about the mode: a full pass
+   * walks pages of a view the ERP did not sort (34 of 51 entities publish no sortable field
+   * at all), so a keyset walk over it can revisit and skip rows. The max `updated_at` over
+   * what was read can therefore sit above the newest record actually stored, and resuming
+   * from it would skip the ones that were missed. A watermark promises everything older is
+   * accounted for, and an unordered read cannot make that promise.
+   */
+  it("reports an unbounded read and refuses to advance the watermark from it", async () => {
+    const r = new SnapshotRefresher({
+      pool: p,
+      client: erpServing(
+        [
+          item("rec_1", { updated_at: "2026-09-01T00:00:00.000Z" }),
+          item("rec_2", { updated_at: "2026-09-05T00:00:00.000Z" }),
+        ],
+        100,
+        ERP_SCHEMA_FIXTURE,
+      ),
+    });
+    const out = await r.refresh(TENANT, "product", "incremental");
+
+    expect(out.degraded).toBe(true);
+    // The records still arrive and are still stored — what is untrue of them is that
+    // `since` bounded the read.
+    expect(out.read).toBe(2);
+    expect(out.upserted).toBe(2);
+    expect(out.highWaterMark).toBeNull();
+
+    // And nothing was written for a later pass to resume from, so the next run reads in
+    // full again rather than skipping from a mark it cannot trust.
+    const f = await withTenantContext(admin, TENANT, (tx) => readFreshness(tx, TENANT, "product"));
+    expect(f?.high_water_mark ?? null).toBeNull();
   });
 
   it("paginates a sweep larger than one page", async () => {

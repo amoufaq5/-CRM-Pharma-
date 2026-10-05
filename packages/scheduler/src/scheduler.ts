@@ -307,7 +307,21 @@ export class Scheduler {
         const upserted = ok.reduce((n, r) => n + r.upserted, 0);
         const deleted = ok.reduce((n, r) => n + r.deleted, 0);
         const rejected = ok.reduce((n, r) => n + r.rejected.length, 0);
-        return `mode=${mode} upserted=${upserted} deleted=${deleted} rejected=${rejected}`;
+        const read = ok.reduce((n, r) => n + r.read, 0);
+        // `mode` is what we ASKED for. `degraded` is what the ERP could actually do, and
+        // until it was reported this line said `mode=incremental` while the job paged
+        // every record of every entity — the one human-visible signal asserting the
+        // opposite of what happened. Named per snapshot, because which entities cannot be
+        // read incrementally is the fact an operator acts on.
+        const degraded = ok.filter((r) => r.degraded).map((r) => r.snapshot);
+        return (
+          `mode=${mode} read=${read} upserted=${upserted} deleted=${deleted} rejected=${rejected}` +
+          (degraded.length === 0
+            ? ""
+            : ` UNBOUNDED: ${degraded.join(",")} published no filterable+sortable updated_at, ` +
+              `so \`since\` bounded nothing and each was read in full; their high-water marks ` +
+              `were NOT advanced, because a keyset walk over an unsorted view can skip rows`)
+        );
       }
     }
   }

@@ -41,9 +41,17 @@ const MAPPING_COLUMNS =
   "crm_category, erp_ledger_account_code, erp_cost_center_code, is_active, updated_at";
 
 /**
- * The ERP's own limit on both code fields — see `InvalidAccountCodeError`. Measured, not
- * assumed: `LedgerAccount.account_code` and `CostCenter.code` are both `maxLength: 32` in
- * the captured schema (`packages/acl/schema/baseline.json`).
+ * The ERP's own limit on both code fields — see `InvalidAccountCodeError`.
+ *
+ * `LedgerAccount.account_code` and `CostCenter.code` are both `maxLength: 32`, and the
+ * source is the ERP's MANIFEST (`pack-erp-core/src/entities-finance.ts`), not the captured
+ * schema. An earlier version of this comment cited `packages/acl/schema/baseline.json`,
+ * which does not contain the string `maxLength` at all — `buildUiSchema` publishes
+ * filterability, sortability and enum values but no field lengths. The number is right; the
+ * provenance was wrong, and it matters because `erp:codegen:check` can gate a drift in the
+ * captured schema and cannot gate this. Same class as the `updated_at` fixture that made
+ * six tests pass against code that always threw: a value attributed to a file that could
+ * not have supplied it.
  *
  * Exported because the API route validated these at 64 and 100 while the store refused
  * anything over 32 and 120 — both ended in a 422, so nothing was corrupted, but the route
