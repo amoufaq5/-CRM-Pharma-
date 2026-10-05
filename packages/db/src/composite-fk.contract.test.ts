@@ -11,9 +11,9 @@ import { withTenantContext } from "./tenant-context.js";
  * tenant match stops one naming a profile in another tenant" — and it had already happened:
  * `crm.revoke_rep_role` matched a grant on its id alone, so a rep of one tenant ended a
  * grant in another. The fix was `AND tenant_id = p_tenant_id` in one function, which is a
- * fix the next function forgets. Migration 0035 made the whole class impossible instead:
- * every reference inside `crm.*` is now `(tenant_id, <ref>_id) REFERENCES
- * <target>(tenant_id, id)`.
+ * fix the next function forgets. Migrations 0035 and 0037 made the whole class impossible
+ * instead: every reference inside `crm.*` is now `(tenant_id, <ref>_id) REFERENCES
+ * <target>(tenant_id, id)` — all 46 of them, with nothing left behind.
  *
  * THIS SUITE CONNECTS AS `crm_app`, AND THAT IS THE WHOLE POINT. The original bug survived
  * a green suite because the suite connected as a superuser, so row-level security was off
@@ -26,8 +26,13 @@ import { withTenantContext } from "./tenant-context.js";
  * is a foreign key, and a foreign key is checked after the BEFORE triggers have had their
  * say. Several of these tables have one that would raise first — `sample_holding_guard`
  * refuses every direct write, `sample_transaction_validate` refuses a `transfer_of` it
- * cannot see, `visit_check_territory` refuses a rep who covers no account — and a test that
- * accepted any error as proof would pass just as happily with no constraint there at all.
+ * cannot see, `visit_check_territory` refuses a rep who covers no account,
+ * `notification_endpoint_probe_guard` refuses a foreign `endpoint_id` by reading the parent
+ * under the caller's own RLS, `attachment_validate` refuses an uploader who neither owns nor
+ * supervises the subject's rep, `attachment_blob_verify` compares the parent's `tenant_id`
+ * itself — and a test that accepted any error as proof would pass just as happily with no
+ * constraint there at all. Several of those guards are deliberately kept (0037 argues for the
+ * probe one), which is exactly why the constraint underneath has to be probed on its own.
  * `ALTER TABLE … DISABLE TRIGGER USER` leaves the internal referential triggers running (it
  * touches only non-internal ones), so each probe is answered by the constraint it names and
  * by nothing else. It is done inside a transaction that always rolls back, so the schema is
@@ -37,7 +42,10 @@ import { withTenantContext } from "./tenant-context.js";
  * end-to-end path is covered too rather than only the constraint in isolation.
  */
 
-/** The 38 references migration 0035 made tenant-scoped, and what each one must still be. */
+/**
+ * The 46 references migrations 0035 (38) and 0037 (the last 8) made tenant-scoped, and what
+ * each one must still be.
+ */
 interface Hardened {
   /** The referencing table, unqualified. */
   readonly table: string;
@@ -46,12 +54,20 @@ interface Hardened {
   /** The referenced table, unqualified. Always referenced by `(tenant_id, id)`. */
   readonly parent: string;
   /**
-   * Preserved exactly from before 0035 — this is the business rule, and a drop-and-recreate
-   * is where one gets silently rewritten. CASCADE means the child is part of the parent;
-   * RESTRICT means the child is the audit trail and outlives nothing.
+   * Preserved exactly from before the conversion — this is the business rule, and a
+   * drop-and-recreate is where one gets silently rewritten. CASCADE means the child is part
+   * of the parent; RESTRICT means the child is the audit trail and outlives nothing.
    */
   readonly onDelete: "RESTRICT" | "CASCADE";
-  /** Only `call_plan.superseded_by`: both rows are written in one transaction. */
+  /**
+   * DEFERRABLE INITIALLY DEFERRED. Two references, and the same mechanism in both:
+   * `call_plan.superseded_by` and `attachment.superseded_by_attachment_id` are written on
+   * the predecessor before the successor exists, because each table admits only one live row
+   * per subject and so the old row has to be stood down first. Deferring to COMMIT is what
+   * makes "superseded by a row that was never written" fail instead of commit. Note the
+   * asymmetry on `crm.attachment`: the FORWARD link `supersedes_attachment_id` is NOT
+   * deferrable, because the row it names already exists by then.
+   */
   readonly deferred?: true;
 }
 
@@ -103,47 +119,57 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   rep_role_rep_profile_id_fkey: { table: "rep_role", column: "rep_profile_id", parent: "rep_profile", onDelete: "RESTRICT" },
   rep_role_granted_by_fkey: { table: "rep_role", column: "granted_by", parent: "rep_profile", onDelete: "RESTRICT" },
   rep_role_revoked_by_fkey: { table: "rep_role", column: "revoked_by", parent: "rep_profile", onDelete: "RESTRICT" },
+
+  // 0037: the eight that lived on tables 0033 and 0034 created, which both run BEFORE 0035
+  // and so could not be reached by it. Every `ON DELETE` here is RESTRICT because
+  // `crm.attachment` cannot be deleted at all (its append-only trigger refuses every
+  // DELETE) and because an uploader, a reader and a probe requester are attribution on a
+  // regulated record — except the one CASCADE, which is an endpoint's test history.
+  attachment_uploaded_by_fkey: { table: "attachment", column: "uploaded_by", parent: "rep_profile", onDelete: "RESTRICT" },
+  attachment_supersedes_attachment_id_fkey: { table: "attachment", column: "supersedes_attachment_id", parent: "attachment", onDelete: "RESTRICT" },
+  attachment_superseded_by_attachment_id_fkey: { table: "attachment", column: "superseded_by_attachment_id", parent: "attachment", onDelete: "RESTRICT", deferred: true },
+  attachment_blob_attachment_id_fkey: { table: "attachment_blob", column: "attachment_id", parent: "attachment", onDelete: "RESTRICT" },
+  attachment_access_attachment_id_fkey: { table: "attachment_access", column: "attachment_id", parent: "attachment", onDelete: "RESTRICT" },
+  attachment_access_read_by_fkey: { table: "attachment_access", column: "read_by", parent: "rep_profile", onDelete: "RESTRICT" },
+
+  notification_endpoint_probe_endpoint_id_fkey: { table: "notification_endpoint_probe", column: "endpoint_id", parent: "notification_endpoint", onDelete: "CASCADE" },
+  notification_endpoint_probe_requested_by_fkey: { table: "notification_endpoint_probe", column: "requested_by", parent: "rep_profile", onDelete: "RESTRICT" },
 };
 
 /**
  * References into a tenant-scoped table that are STILL single-column, each with the reason.
  *
- * This is the drift guard, and an empty-by-intent list is the point of it: there is no good
- * reason for a reference inside `crm.*` to be tenant-blind, so nothing is here "by design".
- * Every entry is a DEBT — a table whose creating migration was authored in parallel with
- * 0035, named here so it is finite and visible rather than a quietly reopened class. A
- * reference that appears without being added here fails this suite, which is what makes the
- * next table somebody adds obey the rule without having to know it exists.
+ * IT IS EMPTY, AND THAT IS THE POINT — but it is kept rather than deleted, because the
+ * empty list is what the drift guard below compares against. There is no good reason for a
+ * reference inside `crm.*` to be tenant-blind, so nothing would ever belong here "by
+ * design": every entry is a DEBT, and the only debt there ever was has been paid.
  *
- * Each needs the same treatment in a migration that can reach it — 0033 and 0034 both run
- * BEFORE 0035, so any later migration can convert their eight. 0035 does not, deliberately:
- * both files were still being written while this one was, and a migration that names another
- * in-flight file's constraints breaks the whole ordered chain if that file changes, where a
- * stale entry here breaks one test with a message saying what to do.
+ * What was here, so a reader of the history knows what this slot is for. 0035 converted 38
+ * references and left eight, on the four tables `0033_attachments.sql` and
+ * `0034_endpoint_probe.sql` create — `crm.attachment`, `crm.attachment_blob`,
+ * `crm.attachment_access`, `crm.notification_endpoint_probe`. Both files run BEFORE 0035,
+ * so 0035 COULD have converted them and deliberately did not: both were still being written
+ * while it was, and a migration that names another in-flight file's constraints breaks the
+ * whole ordered chain if that file changes, where a stale entry here breaks one test with a
+ * message saying what to do. `0037_composite_fks_part_two.sql` is the migration that reached
+ * them, once 0033 and 0034 were applied and hash-gated. All eight are now in `HARDENED`
+ * above with a probe each — and 0037's catalog survey found one attribute the list here had
+ * never recorded, `attachment_superseded_by_attachment_id_fkey` being DEFERRABLE INITIALLY
+ * DEFERRED, which is exactly the kind of thing a hand-written list loses and a `pg_constraint`
+ * read does not.
  *
- * `crm.outbox_dead_letter` (0036) is the counter-example worth knowing about, and it is NOT
- * in this list: that table carries `revived_by` with no foreign key at all, by its own
+ * A reference that appears without being added here fails this suite, which is what makes
+ * the next table somebody adds obey the rule without having to know the rule exists. If you
+ * are here because that test failed: convert it in a migration. Adding it here is for a
+ * reference that genuinely cannot be converted yet, and the entry has to say why and name
+ * the migration that owes it.
+ *
+ * `crm.outbox_dead_letter` (0036) is the counter-example worth knowing about, and it was
+ * never in this list: that table carries `revived_by` with no foreign key at all, by its own
  * argument. A column with no reference is outside what this guard can see — it checks the
  * references that exist, not the ones that should.
  */
-const AWAITING_CONVERSION: Readonly<Record<string, string>> = {
-  attachment_uploaded_by_fkey:
-    "crm.attachment (0033), authored in parallel with 0035 — owed (tenant_id, uploaded_by) -> crm.rep_profile (tenant_id, id)",
-  attachment_supersedes_attachment_id_fkey:
-    "crm.attachment self-reference (0033), authored in parallel with 0035 — owed (tenant_id, supersedes_attachment_id) -> crm.attachment (tenant_id, id)",
-  attachment_superseded_by_attachment_id_fkey:
-    "crm.attachment self-reference (0033), authored in parallel with 0035 — owed (tenant_id, superseded_by_attachment_id) -> crm.attachment (tenant_id, id)",
-  attachment_blob_attachment_id_fkey:
-    "crm.attachment_blob (0033), authored in parallel with 0035 — owed (tenant_id, attachment_id) -> crm.attachment (tenant_id, id)",
-  attachment_access_attachment_id_fkey:
-    "crm.attachment_access (0033), authored in parallel with 0035 — owed (tenant_id, attachment_id) -> crm.attachment (tenant_id, id)",
-  attachment_access_read_by_fkey:
-    "crm.attachment_access (0033), authored in parallel with 0035 — owed (tenant_id, read_by) -> crm.rep_profile (tenant_id, id)",
-  notification_endpoint_probe_endpoint_id_fkey:
-    "crm.notification_endpoint_probe (0034), authored in parallel with 0035 — owed (tenant_id, endpoint_id) -> crm.notification_endpoint (tenant_id, id)",
-  notification_endpoint_probe_requested_by_fkey:
-    "crm.notification_endpoint_probe (0034), authored in parallel with 0035 — owed (tenant_id, requested_by) -> crm.rep_profile (tenant_id, id)",
-};
+const AWAITING_CONVERSION: Readonly<Record<string, string>> = {};
 
 /** Deterministic fixture ids, one connected graph per tenant. */
 interface Fixture {
@@ -160,6 +186,10 @@ interface Fixture {
   readonly obl: string;
   readonly ntf: string;
   readonly endp: string;
+  /** An expense claim, which is what an `expense_receipt` attachment hangs off (0033). */
+  readonly claim: string;
+  /** That claim's receipt — the parent the four `crm.attachment` references need. */
+  readonly att: string;
 }
 
 const fixture = (p: "a" | "b"): Fixture => ({
@@ -176,6 +206,8 @@ const fixture = (p: "a" | "b"): Fixture => ({
   obl: `${p}0000000-0000-4000-8000-000000000081`,
   ntf: `${p}0000000-0000-4000-8000-000000000091`,
   endp: `${p}0000000-0000-4000-8000-0000000000a1`,
+  claim: `${p}0000000-0000-4000-8000-0000000000b1`,
+  att: `${p}0000000-0000-4000-8000-0000000000c1`,
 });
 
 const A = fixture("a");
@@ -429,6 +461,82 @@ const PROBES: Readonly<Record<string, Probe>> = {
           VALUES ($1, $2, 'compliance', $3, CURRENT_DATE, $4, now())`,
     params: [TENANT_FK_B, B.rep2, B.rep1, A.rep1],
   },
+
+  // --- 0037's eight. -------------------------------------------------------------------
+  //
+  // `crm.attachment` has no column default for `id` and several CHECKs that fire ahead of
+  // any foreign key, so each probe below supplies a whole valid row and varies exactly one
+  // reference. `subject_id` is `gen_random_uuid()` rather than a fixture id on purpose:
+  // `uq_attachment_current` is UNIQUE (tenant_id, subject_table, subject_id, purpose) WHERE
+  // status = 'current', and a unique index is checked during the heap insert — ahead of the
+  // referential triggers — so reusing the fixture's subject would answer 23505 and the probe
+  // would pass for the wrong constraint. With the user triggers disabled nothing resolves
+  // `subject_id`, so an unused one is free.
+  attachment_uploaded_by_fkey: {
+    what: "an attachment uploaded by another tenant's rep",
+    sql: `INSERT INTO crm.attachment (id, tenant_id, purpose, subject_table, subject_id,
+                                      content_type, byte_size, content_sha256, uploaded_by)
+          VALUES (gen_random_uuid(), $1, 'expense_receipt', 'crm.expense_claim',
+                  gen_random_uuid(), 'image/png', 64, $3, $2)`,
+    params: [TENANT_FK_B, A.rep1, SIG],
+  },
+  attachment_supersedes_attachment_id_fkey: {
+    what: "an attachment superseding another tenant's attachment",
+    sql: `INSERT INTO crm.attachment (id, tenant_id, purpose, subject_table, subject_id,
+                                      content_type, byte_size, content_sha256, uploaded_by,
+                                      supersedes_attachment_id)
+          VALUES (gen_random_uuid(), $1, 'expense_receipt', 'crm.expense_claim',
+                  gen_random_uuid(), 'image/png', 64, $3, $2, $4)`,
+    params: [TENANT_FK_B, B.rep1, SIG, A.att],
+  },
+  attachment_superseded_by_attachment_id_fkey: {
+    what: "an attachment superseded by another tenant's attachment",
+    // The one deferred reference here: it is not checked until `SET CONSTRAINTS ALL
+    // IMMEDIATE` in `attempt`. `status = 'superseded'` and a reason are both forced by
+    // CHECKs (`attachment_superseded_pair`, `attachment_superseded_reason`), which is why
+    // this row is not just the one above with a different column set.
+    sql: `INSERT INTO crm.attachment (id, tenant_id, purpose, subject_table, subject_id,
+                                      content_type, byte_size, content_sha256, uploaded_by,
+                                      status, superseded_by_attachment_id, superseded_reason)
+          VALUES (gen_random_uuid(), $1, 'expense_receipt', 'crm.expense_claim',
+                  gen_random_uuid(), 'image/png', 64, $3, $2,
+                  'superseded', $4, 'fk probe')`,
+    params: [TENANT_FK_B, B.rep1, SIG, A.att],
+  },
+  attachment_blob_attachment_id_fkey: {
+    what: "bytes stored against another tenant's attachment",
+    // A real PNG magic number, and 8 octets satisfies `attachment_blob_size`. `decode`
+    // rather than a bytea literal so no backslash has to survive a template literal.
+    sql: `INSERT INTO crm.attachment_blob (tenant_id, attachment_id, content)
+          VALUES ($1, $2, decode('89504e470d0a1a0a', 'hex'))`,
+    params: [TENANT_FK_B, A.att],
+  },
+  attachment_access_attachment_id_fkey: {
+    what: "a read recorded against another tenant's attachment",
+    sql: `INSERT INTO crm.attachment_access (tenant_id, attachment_id, read_by) VALUES ($1, $2, $3)`,
+    params: [TENANT_FK_B, A.att, B.rep1],
+  },
+  attachment_access_read_by_fkey: {
+    what: "a read recorded for another tenant's rep",
+    sql: `INSERT INTO crm.attachment_access (tenant_id, attachment_id, read_by) VALUES ($1, $2, $3)`,
+    params: [TENANT_FK_B, B.att, A.rep1],
+  },
+  notification_endpoint_probe_endpoint_id_fkey: {
+    what: "a probe aimed at another tenant's endpoint",
+    // `notification_endpoint_probe_guard` would refuse this first with
+    // `probe-foreign-endpoint:` — it reads the parent under the caller's RLS — and that arm
+    // deliberately stays (0037). Disabling the user triggers is what makes this a test of
+    // the constraint underneath it rather than of the guard on top.
+    sql: `INSERT INTO crm.notification_endpoint_probe (tenant_id, endpoint_id, requested_by)
+          VALUES ($1, $2, $3)`,
+    params: [TENANT_FK_B, A.endp, B.rep1],
+  },
+  notification_endpoint_probe_requested_by_fkey: {
+    what: "a probe requested by another tenant's rep",
+    sql: `INSERT INTO crm.notification_endpoint_probe (tenant_id, endpoint_id, requested_by)
+          VALUES ($1, $2, $3)`,
+    params: [TENANT_FK_B, B.endp, A.rep1],
+  },
 };
 
 /** Thrown when a probe's row was NOT refused, to force the probe transaction to roll back. */
@@ -525,21 +633,50 @@ describe("a cross-tenant reference is refused by the database", () => {
          VALUES ($1, $2, 'webhook', 'https://fk.example.test/hook', 'FK_FIXTURE_SECRET')`,
         [f.endp, tenant],
       );
+      // An `expense_receipt` is the attachment purpose with no cryptographic commitment to
+      // satisfy, so a draft claim is all the subject it needs — a `disbursement_signature`
+      // would have to hash to whatever the ledger row committed to (0033).
+      await tx.query(
+        `INSERT INTO crm.expense_claim (id, tenant_id, rep_profile_id, crm_category, amount,
+                                        currency, incurred_on)
+         VALUES ($1, $2, $3, 'travel', 12.00, 'USD', DATE '2026-01-09')`,
+        [f.claim, tenant, f.rep1],
+      );
+      // Seeded with the triggers LIVE, like the visit fixture above: `attachment_validate`
+      // asks `crm.rep_can_supervise(uploaded_by, <the claim's rep>)`, so the uploader has to
+      // really be entitled to attach rather than be waved through. rep1 owns the claim, and
+      // owning counts.
+      await tx.query(
+        `INSERT INTO crm.attachment (id, tenant_id, purpose, subject_table, subject_id,
+                                     content_type, byte_size, content_sha256, uploaded_by)
+         VALUES ($1, $2, 'expense_receipt', 'crm.expense_claim', $3, 'image/png', 64, $4, $5)`,
+        [f.att, tenant, f.claim, SIG, f.rep1],
+      );
     });
   };
 
   /**
    * Deletes in reverse dependency order. `crm.sample_transaction` and `crm.rep_role` are
-   * append-only by trigger and `crm.sample_holding` refuses direct writes, so the teardown
-   * disables user triggers for the duration — a fixture has to be removable even when the
-   * table it is in is not.
+   * append-only by trigger, `crm.sample_holding` refuses direct writes, and the three
+   * attachment tables refuse every DELETE outright (0033 — an attachment IS the regulated
+   * record, so it is superseded rather than removed), so the teardown disables user triggers
+   * for the duration: a fixture has to be removable even when the table it is in is not.
    */
+  const SILENCED = [
+    "sample_transaction", "sample_holding", "rep_role", "visit", "call_plan",
+    "attachment", "attachment_blob", "attachment_access",
+  ];
+
   const unseed = async (tenant: string): Promise<void> => {
     await withTenantContext(client, tenant, async (tx) => {
-      for (const t of ["sample_transaction", "sample_holding", "rep_role", "visit", "call_plan"]) {
+      for (const t of SILENCED) {
         await tx.query(`ALTER TABLE crm.${t} DISABLE TRIGGER USER`);
       }
       for (const t of [
+        // Attachments first: they are RESTRICT onto `crm.rep_profile` and onto each other,
+        // and `crm.attachment` is the parent of the other two.
+        "attachment_access", "attachment_blob", "attachment",
+        "notification_endpoint_probe",
         "notification_delivery", "notification", "notification_endpoint",
         "disposal_obligation", "sample_count_line", "sample_count",
         "sample_holding", "sample_transaction", "sample_lot",
@@ -554,7 +691,7 @@ describe("a cross-tenant reference is refused by the database", () => {
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1 AND parent_id IS NOT NULL", [tenant]);
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1", [tenant]);
       await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [tenant]);
-      for (const t of ["sample_transaction", "sample_holding", "rep_role", "visit", "call_plan"]) {
+      for (const t of SILENCED) {
         await tx.query(`ALTER TABLE crm.${t} ENABLE TRIGGER USER`);
       }
     });
@@ -738,7 +875,7 @@ describe("no reference in crm escapes its tenant", () => {
     ).toEqual(known);
   });
 
-  it("the references 0035 hardened are all still composite", () => {
+  it("every hardened reference is still composite", () => {
     const composite = live
       .filter((f) => f.child_cols.split(",").length === 2)
       .map((f) => f.conname)
@@ -764,9 +901,13 @@ describe("no reference in crm escapes its tenant", () => {
 
   /**
    * ON DELETE is the business rule — RESTRICT where the child is the audit trail, CASCADE
-   * where the child is part of the parent — and 0035 rewrote all 38 constraints, which is
-   * exactly where one gets silently changed. Asserted per constraint so a future migration
-   * that "tidies" a RESTRICT into a CASCADE has to argue with a test.
+   * where the child is part of the parent — and 0035 and 0037 between them rewrote all 46
+   * constraints, which is exactly where one gets silently changed. Asserted per constraint so
+   * a future migration that "tidies" a RESTRICT into a CASCADE has to argue with a test, and
+   * so that deferrability is pinned too: 0037's catalog survey found
+   * `attachment_superseded_by_attachment_id_fkey` deferrable where the debt list had never
+   * recorded it, and recreating it immediate would have broken superseding at the first
+   * attempt rather than at migration time.
    */
   it("ON DELETE, ON UPDATE, deferrability and match type are what each reference declares", () => {
     const ON_DELETE: Readonly<Record<string, "RESTRICT" | "CASCADE">> = { r: "RESTRICT", c: "CASCADE" };
@@ -777,8 +918,8 @@ describe("no reference in crm escapes its tenant", () => {
         if (want === undefined) return [];
         const found = {
           onDelete: ON_DELETE[f.on_delete] ?? `confdeltype=${f.on_delete}`,
-          // 'a' is NO ACTION. Nothing in this schema updates a primary key, and all 38 were
-          // NO ACTION before 0035.
+          // 'a' is NO ACTION. Nothing in this schema updates a primary key, and all 46 were
+          // NO ACTION before being converted.
           onUpdate: f.on_update,
           deferred: f.deferrable && f.deferred,
           // 's' is MATCH SIMPLE, which is load-bearing: under it a reference whose column is

@@ -104,6 +104,22 @@ export const MAX_PROBE_ATTEMPTS = 3;
 /** How long a claim is honoured before another pass may take it over. */
 export const PROBE_LEASE_MS = 60_000;
 
+/**
+ * The rep a probe is attributed to is not in this tenant.
+ *
+ * Its own class rather than `EndpointNotFoundError`, for the reason 0030 gave for not
+ * overloading `approved_by` with a rejecter: a refusal that names the wrong noun sends the
+ * reader looking for a problem they do not have. Reachable since 0037 made
+ * `requested_by` a composite `(tenant_id, id)` reference — before that a cross-tenant rep
+ * satisfied the foreign key, because a referential check runs with row security disabled.
+ */
+export class ProbeRequesterNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProbeRequesterNotFoundError";
+  }
+}
+
 export class EndpointNotFoundError extends Error {
   constructor(message: string) {
     super(message);
@@ -386,7 +402,24 @@ function translateProbeError(err: unknown, endpointId: string): Error {
   const e = err as { code?: string; constraint?: string; message?: string };
   const message = e.message ?? String(err);
 
-  if (message.includes("probe-foreign-endpoint") || e.code === "23503") {
+  // The trigger's sentence first, because it runs BEFORE the constraint and is the one a
+  // caller normally gets. A bare 23503 is the backstop, and since 0037 it must be
+  // discriminated: both of this table's references are composite `(tenant_id, …)`, so a
+  // `requested_by` naming a rep in another tenant now raises the same code as a foreign
+  // endpoint and was being reported as a missing endpoint — sending an administrator to
+  // look at the endpoint they had just successfully selected.
+  if (message.includes("probe-foreign-endpoint")) {
+    return new EndpointNotFoundError(
+      `notification endpoint ${endpointId} does not exist in this tenant, so there is nothing to probe`,
+    );
+  }
+  if (e.code === "23503") {
+    if (e.constraint === "notification_endpoint_probe_requested_by_fkey") {
+      return new ProbeRequesterNotFoundError(
+        `the rep profile asking for this probe does not exist in this tenant, so the probe could not be ` +
+          `attributed — and 0034 makes a probe attributable or it does not happen`,
+      );
+    }
     return new EndpointNotFoundError(
       `notification endpoint ${endpointId} does not exist in this tenant, so there is nothing to probe`,
     );

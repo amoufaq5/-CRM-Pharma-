@@ -92,6 +92,7 @@ export {
 export {
   DEFAULT_PROBE_COOLDOWN_SECONDS,
   EndpointNotFoundError,
+  ProbeRequesterNotFoundError,
   EndpointProbeRunner,
   InvalidProbeCooldownError,
   MAX_PROBE_ATTEMPTS,

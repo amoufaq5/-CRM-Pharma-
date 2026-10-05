@@ -12,6 +12,7 @@ import { selfSignedCert, startSmtpSink, type SmtpSink, type SmtpSinkOptions } fr
 import {
   DEFAULT_PROBE_COOLDOWN_SECONDS,
   EndpointNotFoundError,
+  ProbeRequesterNotFoundError,
   EndpointProbeRunner,
   InvalidProbeCooldownError,
   MAX_PROBE_ATTEMPTS,
@@ -277,6 +278,31 @@ describe("the endpoint probe", () => {
           }),
         ),
       ).rejects.toThrow(EndpointNotFoundError);
+    });
+
+    /**
+     * The refusal names the REP, not the endpoint.
+     *
+     * Reachable only since 0037 made `requested_by` a composite `(tenant_id, id)`
+     * reference: before that a rep in another tenant satisfied the foreign key, because a
+     * referential check runs with row security disabled. Both of this table's references
+     * now raise `23503`, so a translator keyed on the code alone reported a bad requester
+     * as a missing ENDPOINT — sending an administrator to look at the endpoint they had
+     * just successfully selected.
+     */
+    it("names the rep, not the endpoint, when the requester is not in this tenant", async () => {
+      const endpoint = await addEndpoint();
+      const err = await inTenant(TENANT, (tx) =>
+        requestProbe(tx, TENANT, { endpointId: endpoint, requestedBy: OTHER_ADMIN }).then(
+          () => null,
+          (e: unknown) => e as Error,
+        ),
+      );
+      expect(err).toBeInstanceOf(ProbeRequesterNotFoundError);
+      expect(err).not.toBeInstanceOf(EndpointNotFoundError);
+      expect(err?.message).toMatch(/rep profile asking for this probe/);
+      // And the endpoint it names is NOT blamed: the message must not send the reader to it.
+      expect(err?.message).not.toContain(endpoint);
     });
 
     it("hides a probe from every other tenant", async () => {

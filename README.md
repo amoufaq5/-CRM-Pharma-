@@ -411,9 +411,11 @@ deployment clean.
 
 ## Tenant isolation is structural, not just a policy
 
-Every foreign key in `crm.*` into a tenant-scoped table is now **composite** —
-`(tenant_id, ref_id) → (tenant_id, id)`, all 38, with constraint names and every `ON DELETE`
-preserved byte for byte (measured against the catalog before and after, not asserted by eye).
+Every foreign key in `crm.*` into a tenant-scoped table is **composite** —
+`(tenant_id, ref_id) → (tenant_id, id)`, **all 46 of them, with none left single-column**,
+and with constraint names and every `ON DELETE`, `ON UPDATE`, deferrability and match type
+preserved byte for byte (measured against the catalog before and after, not asserted by
+eye).
 
 This closes a class, not an instance. **A referential check runs with row security
 disabled** — that is what makes foreign keys usable at all — so RLS was never standing
@@ -424,7 +426,7 @@ returned `0`, because RLS then hides the damage. That is the shipped bug
 `crm.revoke_rep_role` had — fixed once, in one function, which is exactly the kind of fix the
 next function forgets.
 
-`packages/db/src/composite-fk.contract.test.ts` probes all 38 individually, asserting both
+`packages/db/src/composite-fk.contract.test.ts` probes all 46 individually, asserting both
 `23503` **and** the constraint name, so a CHECK that fired first or a trigger fails the test
 rather than passing for it. It carries a `pg_constraint` drift guard too: a table added next
 month by someone who does not know this rule fails a test instead of quietly reopening the

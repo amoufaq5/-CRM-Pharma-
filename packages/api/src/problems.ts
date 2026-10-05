@@ -224,6 +224,9 @@ export function toProblem(err: unknown): ApiError {
     // the cooldown you tried to set is out of range. A 500 for any of them would be the
     // API reporting its own surprise at a rule it enforces.
     case "EndpointNotFoundError":
+    // Also a 404, and a separate class on purpose: "the endpoint is not here" and "the rep
+    // asking is not here" send an administrator to look at different things.
+    case "ProbeRequesterNotFoundError":
       return new ApiError("not_found", message);
     case "ProbeInFlightError":
       return new ApiError("conflict", message);
