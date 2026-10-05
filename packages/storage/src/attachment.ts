@@ -3,6 +3,8 @@ import type { PoolClient } from "pg";
 import type { BlobStore } from "./blob.js";
 import { assertAttachmentContent, sha256Hex } from "./content.js";
 import {
+  AttachmentContentTypeMismatchError,
+  AttachmentForbiddenError,
   AttachmentIdReusedError,
   AttachmentNotFoundError,
   AttachmentNotSupersedableError,
@@ -31,12 +33,17 @@ import {
  * Two things about the shape of this module are deliberate and worth reading before
  * changing it.
  *
- * EVERY READ TAKES A READER. There is no `getAttachment(id)` that answers without being
- * told who is asking. A signature is a third party's biometric-adjacent data and RLS does
- * not help — a rep and a colleague's rep are in the same tenant, so the policy admits
- * both rows and `crm.rep_can_supervise` is the only thing between them (README rule 19).
- * A function that could be called without a reader is a function a route will eventually
- * call without one.
+ * EVERY READ OF AN ATTACHMENT TAKES A READER. There is no `getAttachment(id)` that answers
+ * without being told who is asking. A signature is a third party's biometric-adjacent data
+ * and RLS does not help — a rep and a colleague's rep are in the same tenant, so the policy
+ * admits both rows and `crm.rep_can_supervise` is the only thing between them (README rule
+ * 19). A function that could be called without a reader is a function a route will
+ * eventually call without one.
+ *
+ * `attachmentSubjectOwner` is the one exception and is not a counter-example: it reads the
+ * SUBJECT, not an attachment, and answers a rep id so that a route can decide who the
+ * reader would have to be. It is an input to an authorisation decision and never a
+ * response body — see its own note.
  *
  * THERE IS NO `supersedeAttachment`. Replacing an attachment is `putAttachment` with a
  * `supersedes` block, because the two halves — marking the old row and writing the new
@@ -163,6 +170,23 @@ export async function putAttachment(
 
   const existing = await findById(tx, tenantId, input.id);
   if (existing !== null) {
+    // AUTHORISE BEFORE COMPARING, and the order is the finding rather than a preference.
+    //
+    // A first write is authorised by `crm.attachment_validate`; a retry writes no metadata
+    // row, so no trigger speaks for it and this branch is the only thing that can. It has
+    // to come first because the comparison below refuses in a sentence that names the
+    // stored row's purpose, subject and content hash — so checking identity first would
+    // answer a caller with no claim on the subject with facts about a colleague's doctor
+    // signature. The predicate is `crm.attachment_readable_by`, which asks
+    // `crm.rep_can_supervise(actor, owner)` as of today: the same question the trigger
+    // asks, so the same act gets the same answer whether it is the first write or the
+    // fourth retry of it.
+    if (!(await isActorEntitled(tx, tenantId, existing.id, input.uploadedBy))) {
+      throw new AttachmentForbiddenError(
+        `rep ${input.uploadedBy} neither owns nor supervises the rep whose record attachment ` +
+          `${existing.id} hangs off, so may not act on it`,
+      );
+    }
     if (
       existing.content_sha256 !== digest ||
       existing.subject_table !== subjectTable ||
@@ -176,6 +200,19 @@ export async function putAttachment(
           `thing an append-only attachment table must refuse.`,
       );
     }
+    // `content_type` is compared too, separately, because the fault and the remedy are not
+    // the comparison above's. Identical bytes can legally carry only ONE of the three
+    // declared types — the trigger's magic-byte sniff decides which — so renaming stored
+    // PNG bytes `application/pdf` is a declaration a first write is refused for. Left out,
+    // it was accepted in silence and answered with the stored row, which made the retry
+    // path the one way into this table more permissive than the write it replays.
+    if (existing.content_type !== contentType) {
+      throw new AttachmentContentTypeMismatchError(
+        `attachment ${existing.id} holds bytes declared ${existing.content_type} and this upload ` +
+          `calls the same bytes ${contentType} — they cannot both be right, and a first write of ` +
+          `them under that type is refused by the magic-byte check`,
+      );
+    }
     // Same id, same bytes, same subject: a retry. The blob write is idempotent, so it is
     // repeated rather than skipped — a row whose metadata landed and whose bytes did not
     // (a connection lost between statements in an earlier attempt) is healed by the retry
@@ -185,7 +222,14 @@ export async function putAttachment(
   }
 
   if (input.supersedes !== undefined) {
-    await markSuperseded(tx, tenantId, input.supersedes.attachmentId, input.id, input.supersedes.reason);
+    await markSuperseded(
+      tx,
+      tenantId,
+      input.supersedes.attachmentId,
+      input.id,
+      input.supersedes.reason,
+      input.uploadedBy,
+    );
   }
 
   let row: AttachmentRow;
@@ -247,7 +291,23 @@ async function markSuperseded(
   attachmentId: string,
   successorId: string,
   reason: string,
+  actor: string,
 ): Promise<void> {
+  // The row being replaced is authorised SEPARATELY, before it is touched, even though the
+  // insert that follows would refuse an unentitled actor anyway. Two reasons, and the
+  // second is why this is not belt-and-braces. The trigger on the successor refuses after
+  // this UPDATE has already run, so whether it affected a row or not is observable in the
+  // refusal that comes back — "no current attachment to supersede" against the trigger's
+  // own sentence tells a caller holding a guessed id whether a colleague has a current
+  // attachment of that purpose. And a legitimate replacement cannot be refused here: the
+  // trigger requires the predecessor to hang off the SAME subject, so an actor entitled to
+  // attach to the subject is by construction entitled to the row they are replacing.
+  if (!(await isActorEntitled(tx, tenantId, attachmentId, actor))) {
+    throw new AttachmentSupersessionError(
+      `no current attachment ${attachmentId} to supersede — it does not exist, it has already ` +
+        `been replaced, or it is not yours to replace`,
+    );
+  }
   try {
     const { rowCount } = await tx.query(
       `UPDATE crm.attachment
@@ -272,6 +332,27 @@ async function markSuperseded(
   }
 }
 
+/**
+ * May this rep act on an attachment that already exists?
+ *
+ * `crm.attachment_readable_by` rather than a second supervision query: that function is
+ * where the predicate lives, it resolves the owner through the same `CASE` the trigger
+ * does, and it is already the gate on every read here.
+ */
+async function isActorEntitled(
+  tx: PoolClient,
+  tenantId: string,
+  attachmentId: string,
+  actor: string,
+): Promise<boolean> {
+  const { rows } = await tx.query<{ ok: boolean }>(
+    `SELECT crm.attachment_readable_by(a.id, $3) AS ok
+       FROM crm.attachment a WHERE a.tenant_id = $1 AND a.id = $2`,
+    [tenantId, attachmentId, actor],
+  );
+  return rows[0]?.ok === true;
+}
+
 /** Unscoped lookup by id. Private: every exported read takes a reader. */
 async function findById(tx: PoolClient, tenantId: string, id: string): Promise<AttachmentRow | null> {
   const { rows } = await tx.query<AttachmentRow>(
@@ -288,19 +369,30 @@ async function findById(tx: PoolClient, tenantId: string, id: string): Promise<A
  * holds a named doctor's signature is itself information about that colleague's work, and
  * the house convention for every supervision-scoped record is that the two are one
  * answer.
+ *
+ * NO `on` PARAMETER, and its absence is the rule rather than an omission. 0033's header
+ * states the one place this subsystem departs from README rule 8: a WRITE is judged on the
+ * day it happened, so a territory change cannot invalidate June's hand-over, but "who may
+ * look at this doctor's signature" is a question about who is accountable NOW — dating it
+ * backwards would give the manager who has since left the district continuing access to
+ * its personal data and give the manager who runs it none. `?on=` is a parameter several
+ * team reads in this API do honour, so a route author threading it through here would be
+ * following the house pattern into exactly that failure. It cannot be threaded through
+ * something that does not accept it. The SQL functions keep their date argument for a
+ * psql prompt asking an audit question; no caller in this package supplies one, and the
+ * bytes and the access log never accepted one either.
  */
 export async function getAttachment(
   tx: PoolClient,
   tenantId: string,
   attachmentId: string,
   readBy: string,
-  on?: string,
 ): Promise<AttachmentRow | null> {
   const { rows } = await tx.query<AttachmentRow>(
     `SELECT ${ATTACHMENT_COLUMNS} FROM crm.attachment a
       WHERE a.tenant_id = $1 AND a.id = $2
-        AND crm.attachment_readable_by(a.id, $3, COALESCE($4::date, CURRENT_DATE))`,
-    [tenantId, attachmentId, readBy, on ?? null],
+        AND crm.attachment_readable_by(a.id, $3, CURRENT_DATE)`,
+    [tenantId, attachmentId, readBy],
   );
   return rows[0] ?? null;
 }
@@ -311,9 +403,8 @@ export async function requireAttachment(
   tenantId: string,
   attachmentId: string,
   readBy: string,
-  on?: string,
 ): Promise<AttachmentRow> {
-  const row = await getAttachment(tx, tenantId, attachmentId, readBy, on);
+  const row = await getAttachment(tx, tenantId, attachmentId, readBy);
   if (row === null) throw new AttachmentNotFoundError(attachmentId);
   return row;
 }
@@ -326,6 +417,8 @@ export async function requireAttachment(
  * `crm.attachments_for_subject` does the scoping inside the query — never by filtering
  * afterwards on a rep id the caller supplied (README rule 19) — so a reader with no claim
  * on the subject gets an empty set.
+ *
+ * As of today, for the reason `getAttachment` gives.
  */
 export async function listAttachmentsForSubject(
   tx: PoolClient,
@@ -334,7 +427,6 @@ export async function listAttachmentsForSubject(
     readonly readBy: string;
     readonly purpose: AttachmentPurpose;
     readonly subjectId: string;
-    readonly on?: string;
   },
 ): Promise<readonly OwnedAttachmentRow[]> {
   const { rows } = await tx.query<OwnedAttachmentRow>(
@@ -345,9 +437,9 @@ export async function listAttachmentsForSubject(
             f.content_type, f.byte_size, f.content_sha256, f.storage_backend, f.status,
             f.uploaded_by, f.uploaded_at, f.seq, f.supersedes_attachment_id,
             f.superseded_by_attachment_id, f.superseded_reason, f.owner_rep_profile_id
-       FROM crm.attachments_for_subject($1, $3, $4, COALESCE($5::date, CURRENT_DATE)) f
+       FROM crm.attachments_for_subject($1, $3, $4, CURRENT_DATE) f
       WHERE f.purpose = $2`,
-    [input.readBy, input.purpose, subjectTableFor(input.purpose), input.subjectId, input.on ?? null],
+    [input.readBy, input.purpose, subjectTableFor(input.purpose), input.subjectId],
   );
   return rows;
 }
@@ -408,7 +500,11 @@ export async function attachmentAccessLog(
   readBy: string,
   limit = 200,
 ): Promise<readonly AttachmentAccessRow[]> {
-  const bounded = Math.max(1, Math.min(1000, Math.trunc(limit)));
+  // `Number.isFinite` first, because the clamp alone does not survive a NaN: a route
+  // reading `Number(query.limit)` off a querystring hands it one for any garbage, and
+  // `Math.max(1, Math.min(1000, NaN))` is NaN, which reaches Postgres as the text "NaN"
+  // and answers a disclosure question with a 500.
+  const bounded = Number.isFinite(limit) ? Math.max(1, Math.min(1000, Math.trunc(limit))) : 200;
   const { rows } = await tx.query<AttachmentAccessRow>(
     `SELECT x.id, x.attachment_id, x.read_by, x.read_at, x.seq, x.correlation_id
        FROM crm.attachment_access x
@@ -426,19 +522,37 @@ export async function attachmentAccessLog(
 /**
  * The rep an attachment's subject belongs to, or null.
  *
- * Exposed because a route occasionally needs the owner before it has decided what to do —
- * and because the fail-closed default is worth being able to observe: an unknown subject
- * table resolves to null, which means nobody may read the attachment, where the
- * identically shaped `crm.notification_subject_open` defaults the other way.
+ * Exposed because a route needs the owner before it has decided what to do — it is how a
+ * route answers "whose claim is this" in order to apply supervision to an upload — and
+ * because the fail-closed default is worth being able to observe: an unknown subject table
+ * resolves to null, which means nobody may read the attachment, where the identically
+ * shaped `crm.notification_subject_open` defaults the other way.
+ *
+ * THE TENANT IS AN ARGUMENT, not just the session's setting, so this read carries the
+ * explicit predicate every other read here carries. `crm.attachment_subject_rep` takes no
+ * tenant, and the owner branches must not be restated in TypeScript, so the predicate is
+ * against `app.current_tenant_id` itself: a caller holding the wrong tenant, or one that
+ * forgot `withTenantContext`, gets null rather than an answer about whichever context the
+ * pooled connection was left in.
+ *
+ * It answers a rep id and never an attachment, so it is not a disclosure of content — but
+ * it is still an answer about a colleague's work, and a route must treat it as an input to
+ * an authorisation decision rather than as a response body.
  */
 export async function attachmentSubjectOwner(
   tx: PoolClient,
+  tenantId: string,
   purpose: AttachmentPurpose,
   subjectId: string,
 ): Promise<string | null> {
   const { rows } = await tx.query<{ owner: string | null }>(
-    "SELECT crm.attachment_subject_rep($1, $2) AS owner",
-    [subjectTableFor(purpose), subjectId],
+    // `NULLIF(…, '')` is the spelling every crm.* policy uses, and it is not decoration:
+    // on a pooled connection the GUC reverts to the EMPTY STRING rather than to NULL once
+    // it has existed, so the unguarded cast raises `invalid input syntax for type uuid`
+    // instead of answering nothing (`packages/db/src/rls.contract.test.ts` pins both).
+    `SELECT crm.attachment_subject_rep($2, $3) AS owner
+      WHERE NULLIF(current_setting('app.current_tenant_id', true), '')::uuid = $1::uuid`,
+    [tenantId, subjectTableFor(purpose), subjectId],
   );
   return rows[0]?.owner ?? null;
 }

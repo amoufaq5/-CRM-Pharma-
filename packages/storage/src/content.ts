@@ -5,7 +5,7 @@ import {
   InvalidAttachmentContentError,
   UnsupportedAttachmentTypeError,
 } from "./errors.js";
-import { ATTACHMENT_CONTENT_TYPES, isAttachmentContentType, type AttachmentContentType } from "./subjects.js";
+import { isAttachmentContentType, type AttachmentContentType } from "./subjects.js";
 
 /**
  * The bytes themselves: how big they may be, how they arrive, and what they hash to.
@@ -23,7 +23,8 @@ import { ATTACHMENT_CONTENT_TYPES, isAttachmentContentType, type AttachmentConte
  * route cannot deliver under is worse than a smaller one, because the rep is then told
  * "payload too large" by the router for a file the schema advertises as acceptable.
  *
- * (The 10 MiB figure in the README is the ERP's cap on its own API, not this one's.)
+ * (The 10 MiB figure that comment in `router.ts` mentions is the ERP's cap on its own API,
+ * not this one's. Nothing in this repo's README states a body cap at all.)
  *
  * `0033_attachments.sql` carries the same number in two CHECK constraints;
  * `attachment.contract.test.ts` asserts the schema and this constant agree, because two
@@ -35,6 +36,10 @@ export const MAX_ATTACHMENT_BYTES = 524_288;
  * What `MAX_ATTACHMENT_BYTES` costs once base64-encoded, so a route can refuse an
  * oversized upload by looking at the string it already has rather than by decoding it
  * first.
+ *
+ * It is a ceiling and not an equivalence: a maximum-size blob encodes to exactly this many
+ * characters WITH one padding character, so an unpadded string of the same length decodes
+ * to one byte more. `decodeAttachmentContent` therefore checks the decoded length as well.
  */
 export const MAX_ATTACHMENT_BASE64_CHARS = 4 * Math.ceil(MAX_ATTACHMENT_BYTES / 3);
 
@@ -81,6 +86,16 @@ export function decodeAttachmentContent(base64: string): Buffer {
         "or the encoding is non-canonical — refusing rather than storing a truncated capture",
     );
   }
+  // And the DECODED length, because the ceiling above is one byte loose and cannot be
+  // tightened. `MAX_ATTACHMENT_BASE64_CHARS` is the length of the base64 of a maximum-size
+  // blob, which carries one padding character; an unpadded string of that same length
+  // decodes to 524,289 bytes. `assertAttachmentContent` would refuse it a moment later, so
+  // nothing oversized was ever stored — but the base64 ceiling is documented as what lets
+  // a route refuse without decoding, and a check that is exact only to within a byte is
+  // worth saying so beside rather than leaving to be rediscovered.
+  if (content.length > MAX_ATTACHMENT_BYTES) {
+    throw new AttachmentTooLargeError(content.length, MAX_ATTACHMENT_BYTES);
+  }
   return content;
 }
 
@@ -97,7 +112,7 @@ export function assertAttachmentContent(
   content: Buffer,
 ): asserts contentType is AttachmentContentType {
   if (!isAttachmentContentType(contentType)) {
-    throw new UnsupportedAttachmentTypeError(contentType, ATTACHMENT_CONTENT_TYPES);
+    throw new UnsupportedAttachmentTypeError(contentType);
   }
   if (content.length === 0) {
     throw new InvalidAttachmentContentError("attachment content is empty");

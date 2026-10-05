@@ -457,6 +457,44 @@ describe("attachments", () => {
     expect(readable).toBeNull();
   });
 
+  /**
+   * A read is authorised AS OF TODAY, and no caller can date it otherwise.
+   *
+   * 0033's header names this as the one place the subsystem departs from README rule 8: a
+   * write is judged on the day it happened, a disclosure on who is accountable now, because
+   * backdating it would give the manager who has left the district continuing access to its
+   * personal data and the manager who runs it none. The store used to accept an `on`
+   * argument and pass it straight into the predicate, which is how a route following the
+   * house `?on=` pattern would have reached exactly that. The first assertion proves the
+   * date really does change the SQL predicate's answer — so the parameter was not inert —
+   * and the second proves the reads no longer have a way to supply one.
+   */
+  it("authorises a read as of today, with no way for a caller to backdate it", async () => {
+    const answers = await inTenant(async (tx) => {
+      const row = await putSignature(tx);
+      const { rows } = await tx.query<{ then: boolean; now: boolean }>(
+        `SELECT crm.attachment_readable_by($1, $2, DATE '2025-01-01') AS then,
+                crm.attachment_readable_by($1, $2, CURRENT_DATE) AS now`,
+        [row.id, BOSS],
+      );
+      return {
+        predicate: rows[0]!,
+        viaStore: await getAttachment(tx, TENANT, row.id, BOSS),
+        viaListing: await listAttachmentsForSubject(tx, TENANT, {
+          readBy: BOSS,
+          purpose: "disbursement_signature",
+          subjectId: disbursementId,
+        }),
+      };
+    });
+    // BOSS manages the region from 2026-01-01, so the predicate says no for a date before
+    // that and yes for today.
+    expect(answers.predicate.then).toBe(false);
+    expect(answers.predicate.now).toBe(true);
+    expect(answers.viaStore).not.toBeNull();
+    expect(answers.viaListing).toHaveLength(1);
+  });
+
   it("answers 'not yours' and 'no such thing' identically, so existence does not leak", async () => {
     const err = await inTenant(async (tx) => {
       const row = await putSignature(tx);
@@ -780,6 +818,56 @@ describe("attachments", () => {
     expect(err.message).toContain("already");
   });
 
+  /**
+   * The row being REPLACED is authorised too, before it is touched.
+   *
+   * The successor's trigger would refuse PEER anyway — it asks whether the uploader
+   * supervises the subject's rep — but it refuses AFTER `markSuperseded` has run, so which
+   * refusal comes back tells a caller holding a guessed id whether that attachment is the
+   * current one. PEER here names a receipt on REP's claim and a subject PEER cannot attach
+   * to, and gets the same sentence as for an id that does not exist.
+   */
+  it("refuses to supersede an attachment the actor has no claim on, in the same words as a missing one", async () => {
+    const { notYours, missing } = await inTenant(async (tx) => {
+      const first = await putReceipt(tx);
+      return {
+        notYours: await refuses(tx, () =>
+          putReceipt(tx, {
+            uploadedBy: PEER,
+            content: jpeg("peer's attempt"),
+            supersedes: { attachmentId: first.id, reason: "r" },
+          }),
+        ),
+        missing: await refuses(tx, () =>
+          putReceipt(tx, {
+            uploadedBy: PEER,
+            content: jpeg("peer's attempt"),
+            supersedes: { attachmentId: randomUUID(), reason: "r" },
+          }),
+        ),
+      };
+    });
+    expect(notYours).toBeInstanceOf(AttachmentSupersessionError);
+    expect(missing).toBeInstanceOf(AttachmentSupersessionError);
+    // The two refusals differ only in the id they name, which is the id the caller sent.
+    expect(notYours.message.replace(/[0-9a-f-]{36}/, "ID")).toBe(
+      missing.message.replace(/[0-9a-f-]{36}/, "ID"),
+    );
+  });
+
+  it("still lets a supervisor replace a rep's receipt, so the gate is not simply closed", async () => {
+    const second = await inTenant(async (tx) => {
+      const first = await putReceipt(tx);
+      return putReceipt(tx, {
+        uploadedBy: BOSS,
+        content: jpeg("the right taxi"),
+        supersedes: { attachmentId: first.id, reason: "wrong receipt" },
+      });
+    });
+    expect(second.uploaded_by).toBe(BOSS);
+    expect(second.status).toBe("current");
+  });
+
   it("refuses to supersede an attachment that does not exist", async () => {
     const err = await inTenant(async (tx) =>
       refuses(tx, () => putReceipt(tx, { supersedes: { attachmentId: randomUUID(), reason: "r" } })),
@@ -863,6 +951,69 @@ describe("attachments", () => {
       return refuses(tx, () => putSignature(tx, { id }));
     });
     expect(err).toBeInstanceOf(AttachmentIdReusedError);
+  });
+
+  /**
+   * The retry path authorises its uploader, like the first write does.
+   *
+   * A first write is authorised by `crm.attachment_validate`, which asks
+   * `crm.rep_can_supervise(uploaded_by, owner)` — but a retry writes no metadata row, so no
+   * trigger speaks for it. Without a check of its own the collapse branch answered a rep
+   * with no claim on the subject with the whole row: the purpose, the subject, the uploader
+   * and the content hash of a colleague's doctor signature, which is the disclosure the
+   * read predicate exists to prevent. PEER holds the bytes here only because the test has
+   * them; the point is that nothing asked whether PEER was entitled to the answer.
+   */
+  it("refuses a retried upload from a rep with no claim on the subject", async () => {
+    const err = await inTenant(async (tx) => {
+      const id = randomUUID();
+      await putSignature(tx, { id });
+      return refuses(tx, () => putSignature(tx, { id, uploadedBy: PEER }));
+    });
+    expect(err).toBeInstanceOf(AttachmentForbiddenError);
+    expect(err.message).toContain("neither owns nor supervises");
+  });
+
+  it("lets the owner and their supervisor retry, so the collapse still heals a lost write", async () => {
+    const rows = await inTenant(async (tx) => {
+      const id = randomUUID();
+      const first = await putSignature(tx, { id });
+      return [first, await putSignature(tx, { id }), await putSignature(tx, { id, uploadedBy: BOSS })];
+    });
+    // All three answers are the SAME row, and `uploaded_by` still names whoever wrote it
+    // first — a retry is not a second act of attribution.
+    expect(rows.map((r) => r.id)).toEqual([rows[0]!.id, rows[0]!.id, rows[0]!.id]);
+    expect(rows.map((r) => r.uploaded_by)).toEqual([REP, REP, REP]);
+  });
+
+  /**
+   * The retry comparison covers `content_type` too, because a first write would not have
+   * survived without it.
+   *
+   * Identical bytes can only legally carry one of the three declared types — the trigger's
+   * magic-byte sniff decides which — so a retry that renames PNG bytes `application/pdf`
+   * is a declaration the schema refuses outright on a first write. Omitted from the
+   * identity comparison, it was accepted silently and answered with the stored row, which
+   * made the retry path the one way into this table that is more permissive than the
+   * write it is replaying.
+   */
+  it("refuses a retry that redeclares the stored bytes as another content type", async () => {
+    const err = await inTenant(async (tx) => {
+      const id = randomUUID();
+      await putSignature(tx, { id });
+      return refuses(tx, () =>
+        putAttachment(tx, TENANT, store, {
+          id,
+          purpose: "disbursement_signature",
+          subjectId: disbursementId,
+          contentType: "application/pdf",
+          content: SIGNATURE,
+          uploadedBy: REP,
+        }),
+      );
+    });
+    expect(err).toBeInstanceOf(AttachmentContentTypeMismatchError);
+    expect(err.message).toContain("image/png");
   });
 
   // -------------------------------------------------------------------------
@@ -992,13 +1143,38 @@ describe("attachments", () => {
 
   it("resolves the owning rep for each subject, and null for a subject that is gone", async () => {
     const owners = await inTenant(async (tx) => ({
-      signature: await attachmentSubjectOwner(tx, "disbursement_signature", disbursementId),
-      receipt: await attachmentSubjectOwner(tx, "expense_receipt", claimId),
-      missing: await attachmentSubjectOwner(tx, "expense_receipt", randomUUID()),
+      signature: await attachmentSubjectOwner(tx, TENANT, "disbursement_signature", disbursementId),
+      receipt: await attachmentSubjectOwner(tx, TENANT, "expense_receipt", claimId),
+      missing: await attachmentSubjectOwner(tx, TENANT, "expense_receipt", randomUUID()),
     }));
     expect(owners.signature).toBe(REP);
     expect(owners.receipt).toBe(REP);
     expect(owners.missing).toBeNull();
+  });
+
+  /**
+   * And it carries the explicit tenant predicate this module says every read carries.
+   *
+   * `crm.attachment_subject_rep` takes no tenant argument, so this was the one exported
+   * read with nothing but the policy between it and the wrong tenant's rows — the shape
+   * ADR-0001 item 14 records a real cross-tenant write for. The predicate is against the
+   * session's own `app.current_tenant_id` rather than against a column, because the branch
+   * that resolves the owner is in SQL and must not be restated here: what it buys is that a
+   * route holding the wrong tenant, or one outside `withTenantContext` altogether, gets
+   * null instead of an answer about whatever context the connection happened to be in.
+   */
+  it("resolves no owner when asked under a tenant that is not the session's", async () => {
+    const answers = await inTenant(async (tx) => ({
+      right: await attachmentSubjectOwner(tx, TENANT, "expense_receipt", claimId),
+      wrong: await attachmentSubjectOwner(tx, OTHER_TENANT, "expense_receipt", claimId),
+    }));
+    expect(answers.right).toBe(REP);
+    expect(answers.wrong).toBeNull();
+  });
+
+  it("resolves no owner with no tenant context at all, rather than one from the catalog", async () => {
+    const owner = await attachmentSubjectOwner(client, TENANT, "expense_receipt", claimId);
+    expect(owner).toBeNull();
   });
 
   /**
@@ -1162,6 +1338,27 @@ describe("attachments", () => {
     expect(log.zero).toHaveLength(1);
     expect(log.negative).toHaveLength(1);
     expect(log.huge).toHaveLength(1);
+  });
+
+  /**
+   * And a limit that is not a number at all.
+   *
+   * A route reads `Number(query.limit)` and gets NaN for any garbage — and the clamp does
+   * not survive it, because `Math.max(1, Math.min(1000, NaN))` is NaN, which reaches
+   * Postgres as the text "NaN" and fails the statement. So "who has read this signature"
+   * answered 500 for `?limit=all`.
+   */
+  it("falls back to the default for a limit that is not a number", async () => {
+    const log = await inTenant(async (tx) => {
+      const row = await putSignature(tx);
+      await readAttachmentContent(tx, TENANT, store, { attachmentId: row.id, readBy: REP });
+      return {
+        nan: await attachmentAccessLog(tx, TENANT, row.id, REP, Number("all")),
+        infinite: await attachmentAccessLog(tx, TENANT, row.id, REP, Number.POSITIVE_INFINITY),
+      };
+    });
+    expect(log.nan).toHaveLength(1);
+    expect(log.infinite).toHaveLength(1);
   });
 
   it("writes the blob into the caller's transaction, so a rollback leaves nothing behind", async () => {

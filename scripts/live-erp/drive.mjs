@@ -863,8 +863,320 @@ expect(
 const stripped = toErpError(dupProbe.status, { error: dupProbe.body.error });
 expect(
   classify({ error: stripped, isTransition: false }).kind === "retry_transient",
-  "and WITHOUT that text the identical status and code classify as a retry — so an ERP that stopped leaking the driver message would report a delivered write as dead at the attempt cap",
+  "and WITHOUT that text the identical status and code are, to `classify` ALONE, just a retry — the string is the only thing in the answer, and a string is not evidence",
   classify({ error: stripped, isTransition: false }).kind,
+);
+// That used to be the end of it, and it was the highest-value open item in
+// ADR-0001: a platform that stopped leaking node-postgres's message — ordinary
+// hardening, and the kind of change nobody would think to announce — would have
+// turned a delivered write into a dead letter at a rep. 6h is the close.
+
+// ---------------------------------------------------------------------------
+// 6h. THE LEAK, CLOSED: the relay ASKS instead of reading the driver's mind.
+//
+// Everything below runs against the SAME live server. The only thing changed is
+// the one thing the ERP should not have been promising: a shim removes `detail`
+// from a 500 `write_failed` on the way back, which is exactly the counterfactual
+// the open item describes. Reads are never touched, so every verdict below is the
+// real server answering about a real record.
+// ---------------------------------------------------------------------------
+section("6h. an ERP that does NOT leak the driver message still settles a landed write");
+
+const STRIPPED_WRITE_BODY = JSON.stringify({ error: "write_failed" });
+
+/** A FetchLike response, for the one case where no request is sent at all. */
+const synthetic = (status, body) => ({
+  status,
+  headers: { get: (n) => (n.toLowerCase() === "content-type" ? "application/json" : null) },
+  text: async () => body,
+});
+
+/**
+ * An `ErpClient` against the live server, with the platform's leak removed.
+ *
+ *   - a 500 `write_failed` comes back as `{"error":"write_failed"}` — same status,
+ *     same code, no driver sentence;
+ *   - `suppress` ids never reach the server at all, so the write genuinely did not
+ *     land and the identical stripped body is the only thing the relay is told;
+ *   - `breakRecordReads` makes the probe read fail (the schema read is left alone,
+ *     or nothing could be dispatched in the first place).
+ *
+ * Record reads are recorded, because "the relay asked" is a claim about a request
+ * and has to be measured as one.
+ */
+function nonLeakingErp({ suppress = new Set(), breakRecordReads = false } = {}) {
+  const seen = { recordReads: [], writeBodies: [], leaked: [] };
+  const client = new ErpClient({
+    baseUrl: ERP_BASE,
+    credential,
+    fetch: async (url, init) => {
+      const path = new URL(url).pathname;
+      const method = init.method ?? "GET";
+
+      if (method === "GET") {
+        if (path === "/v1/meta/schema") return fetch(url, init);
+        seen.recordReads.push(path);
+        if (breakRecordReads) return synthetic(503, JSON.stringify({ error: "service_unavailable" }));
+        return fetch(url, init);
+      }
+
+      const bodyId = init.body === undefined ? null : (JSON.parse(init.body).id ?? null);
+      if ((bodyId !== null && suppress.has(bodyId)) || [...suppress].some((id) => path.includes(id))) {
+        seen.writeBodies.push(STRIPPED_WRITE_BODY);
+        return synthetic(500, STRIPPED_WRITE_BODY);
+      }
+
+      const res = await fetch(url, init);
+      const text = await res.text();
+      let parsed = null;
+      try {
+        parsed = text === "" ? null : JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+      if (res.status === 500 && parsed?.error === "write_failed") {
+        // DERIVED from what the live server actually said, not a constant: the
+        // comparison in (ii) is only worth making if this really is the live body
+        // with its `detail` dropped and nothing else changed.
+        const kept = JSON.stringify({ error: parsed.error });
+        seen.leaked.push(text);
+        seen.writeBodies.push(kept);
+        return synthetic(500, kept);
+      }
+      return synthetic(res.status, text);
+    },
+  });
+  return { client, seen };
+}
+
+function relayOver(erpClient, sink) {
+  return new OutboxRelay({ pool, client: erpClient, workerId: "live-erp-verify-6h", onEvent: (e) => sink.push(e) });
+}
+
+/** Enqueues a LeaveRequest create for `id` and drains it once through `erpClient`. */
+async function drainCreate(erpClient, id, suffix) {
+  const sink = [];
+  const enqueued = await enqueue({
+    entity: "LeaveRequest",
+    operation: "create",
+    payload: {
+      request_number: `RT-${stamp}-${suffix}`,
+      employee_id: "emp-1",
+      leave_type: "annual",
+      start_date: "2026-11-01",
+      end_date: "2026-11-02",
+      days: 2,
+      state: "draft",
+    },
+    targetRecordId: id,
+    sourceTable: "crm.visit",
+    sourceId: srcId(),
+  });
+  await relayOver(erpClient, sink).drainTenant(TENANT);
+  return { row: await outboxState(enqueued.id), events: sink, id: enqueued.id };
+}
+
+// (i) THE HEADLINE. The record is already at the ERP; the relay's create collides
+// on the real unique constraint and the real 500 comes back with the sentence
+// removed. It must still settle — and the only thing left that could settle it is
+// having read the record back.
+const landedId = `crm-lr-${stamp}-f`;
+const prePlaced = await raw("/v1/leave-requests", goodToken, {
+  method: "POST",
+  body: {
+    id: landedId,
+    request_number: `RT-${stamp}-F`,
+    employee_id: "emp-1",
+    leave_type: "annual",
+    start_date: "2026-11-01",
+    end_date: "2026-11-02",
+    days: 2,
+    state: "draft",
+  },
+});
+expect(
+  prePlaced.status === 201,
+  "the record the redelivery will collide with is really at the ERP first",
+  `POST /v1/leave-requests = ${prePlaced.status}`,
+);
+
+const landed = await nonLeakingErp();
+const landedOut = await drainCreate(landed.client, landedId, "F");
+expect(
+  landed.seen.leaked.some((b) => /duplicate key value violates unique constraint/.test(b)),
+  "the live server did answer the collision with the driver sentence — so the shim removed something real",
+  `${JSON.stringify(landed.seen.leaked[0])?.slice(0, 120)}`,
+);
+expect(
+  landed.seen.writeBodies.length === 1 && landed.seen.writeBodies[0] === STRIPPED_WRITE_BODY,
+  "and what reached the relay was that body with `detail` dropped and nothing else — a platform that hardened its errors",
+  `relay was given: ${JSON.stringify(landed.seen.writeBodies)}`,
+);
+expect(
+  landed.seen.recordReads.includes(`/v1/leave-requests/${landedId}`),
+  "and the relay went back and READ the target id it had minted",
+  `record reads: ${JSON.stringify(landed.seen.recordReads)}`,
+);
+expect(
+  landedOut.row.state === "delivered" &&
+    landedOut.events.some((e) => e.type === "already_delivered" && e.row.id === landedOut.id),
+  "a landed write settles as already_delivered against an ERP that leaks nothing — THE OPEN ITEM, CLOSED",
+  `state=${landedOut.row.state} events=${landedOut.events.map((e) => e.type).join(",")}`,
+);
+expect(
+  landedOut.row.last_error === null,
+  "PINNED GAP: a delivered row records no reason, so which mechanism settled it is not readable from the queue — `markDelivered` takes none (relay.ts / store.ts, not touched by this increment)",
+  `last_error=${JSON.stringify(landedOut.row.last_error)}`,
+);
+const landedCount = (await raw(`/v1/leave-requests?limit=500`, goodToken)).body.data.filter(
+  (r) => r.request_number === `RT-${stamp}-F`,
+).length;
+expect(landedCount === 1, "and the ERP still holds exactly ONE record, not two", `${landedCount} record(s)`);
+
+// (ii) THE CONTROL that makes (i) mean something. BYTE-IDENTICAL error body, and a
+// target id the ERP does not hold — the write was intercepted before it was sent,
+// so it really did not land. If the probe were a rubber stamp rather than a read,
+// this would settle too, and a write that never happened would be marked delivered.
+const lostId = `crm-lr-${stamp}-g`;
+const lost = await nonLeakingErp({ suppress: new Set([lostId]) });
+const lostOut = await drainCreate(lost.client, lostId, "G");
+expect(
+  lost.seen.writeBodies.length === 1 && lost.seen.writeBodies[0] === landed.seen.writeBodies[0],
+  "the two cases were told the SAME thing, to the byte — so the only difference between delivered and pending is what the ERP said about the RECORD",
+  `${JSON.stringify(lost.seen.writeBodies[0])} vs ${JSON.stringify(landed.seen.writeBodies[0])}`,
+);
+expect(
+  lostOut.row.state === "pending" && lostOut.row.dead_reason === null,
+  "the write the ERP does NOT hold stays pending — the probe read it and said no",
+  `state=${lostOut.row.state} dead_reason=${JSON.stringify(lostOut.row.dead_reason)}`,
+);
+expect(
+  typeof lostOut.row.last_error === "string" && lostOut.row.last_error.includes(`does not hold ${lostId}`),
+  "and the row names the record the ERP does not have, which is the whole of the evidence",
+  JSON.stringify(lostOut.row.last_error)?.slice(0, 140),
+);
+const lostAtErp = await raw(`/v1/leave-requests/${lostId}`, goodToken);
+expect(lostAtErp.status === 404, "confirmed independently: the ERP really has no such record", `GET = ${lostAtErp.status}`);
+
+// (iii) A PROBE THAT CANNOT ANSWER falls back to the regex, and the regex is still
+// there. Same live duplicate collision, driver sentence LEFT IN, record reads
+// broken: the old mechanism settles it, unchanged.
+const fallbackId = `crm-lr-${stamp}-h`;
+await raw("/v1/leave-requests", goodToken, {
+  method: "POST",
+  body: {
+    id: fallbackId,
+    request_number: `RT-${stamp}-H`,
+    employee_id: "emp-1",
+    leave_type: "annual",
+    start_date: "2026-11-01",
+    end_date: "2026-11-02",
+    days: 2,
+    state: "draft",
+  },
+});
+const fallbackClient = new ErpClient({
+  baseUrl: ERP_BASE,
+  credential,
+  fetch: async (url, init) => {
+    const path = new URL(url).pathname;
+    if ((init.method ?? "GET") === "GET" && path !== "/v1/meta/schema") {
+      return synthetic(503, JSON.stringify({ error: "service_unavailable" }));
+    }
+    return fetch(url, init);
+  },
+});
+const fallbackOut = await drainCreate(fallbackClient, fallbackId, "H");
+expect(
+  fallbackOut.row.state === "delivered",
+  "with the probe unable to answer and the driver sentence still present, the regex settles it as before",
+  `state=${fallbackOut.row.state} last_error=${JSON.stringify(fallbackOut.row.last_error)?.slice(0, 80)}`,
+);
+
+// (iv) NEITHER can answer: no sentence, no read. The row stays PENDING. A failure
+// to CHECK must not be worse than the failure it was checking — dead-lettering
+// here would turn an ERP outage into lost writes.
+const blindId = `crm-lr-${stamp}-i`;
+await raw("/v1/leave-requests", goodToken, {
+  method: "POST",
+  body: {
+    id: blindId,
+    request_number: `RT-${stamp}-I`,
+    employee_id: "emp-1",
+    leave_type: "annual",
+    start_date: "2026-11-01",
+    end_date: "2026-11-02",
+    days: 2,
+    state: "draft",
+  },
+});
+const blind = await nonLeakingErp({ breakRecordReads: true });
+const blindOut = await drainCreate(blind.client, blindId, "I");
+expect(
+  blind.seen.recordReads.length >= 1 && blindOut.row.state === "pending" && blindOut.row.dead_reason === null,
+  "with neither a sentence nor a readable record the row is retried, never dead-lettered on a failure to check",
+  `reads=${blind.seen.recordReads.length} state=${blindOut.row.state} dead=${JSON.stringify(blindOut.row.dead_reason)}`,
+);
+// (i) against (iv) is the proof that the READ is the mechanism, and it needs no
+// string anywhere: the record is already at the ERP in both, the collision is real
+// in both, the stripped 500 is byte-identical in both. The only difference is
+// whether the probe could be answered — and that is the difference between a
+// delivered write and a pending one.
+expect(
+  landedOut.row.state === "delivered" && blindOut.row.state === "pending",
+  "same stripped 500, same record present at the ERP: it settles when the read succeeds and waits when it cannot — so the read, not a string, is what decides",
+  `probe answered -> ${landedOut.row.state}; probe broken -> ${blindOut.row.state}`,
+);
+
+// (v) THE OPERATION GATE. A transition's target record already exists by
+// definition, so "does it exist" answers nothing about whether the transition
+// fired — and the probe must not spend a read pretending otherwise. Forced through
+// the identical ambiguous 500 so what is being measured is the OPERATION, not the
+// status.
+const txId = `crm-lr-${stamp}-j`;
+await raw("/v1/leave-requests", goodToken, {
+  method: "POST",
+  body: {
+    id: txId,
+    request_number: `RT-${stamp}-J`,
+    employee_id: "emp-1",
+    leave_type: "annual",
+    start_date: "2026-11-01",
+    end_date: "2026-11-02",
+    days: 2,
+    state: "draft",
+  },
+});
+const txSink = [];
+const txErp = nonLeakingErp({ suppress: new Set([txId]) });
+const txEnqueued = await enqueue({
+  entity: "LeaveRequest",
+  operation: "transition:submit",
+  payload: {},
+  targetRecordId: txId,
+  sourceTable: "crm.visit",
+  sourceId: srcId(),
+});
+await relayOver(txErp.client, txSink).drainTenant(TENANT);
+const txRow = await outboxState(txEnqueued.id);
+expect(
+  txErp.seen.writeBodies.includes(STRIPPED_WRITE_BODY) && txErp.seen.recordReads.length === 0,
+  "an ambiguous 500 on a TRANSITION reads nothing back — existence is not the question there",
+  `writes=${txErp.seen.writeBodies.length} recordReads=${JSON.stringify(txErp.seen.recordReads)}`,
+);
+expect(
+  txRow.state === "pending" && txRow.dead_reason === null,
+  "and it simply retries, exactly as it did before this increment",
+  `state=${txRow.state}`,
+);
+
+// (vi) COST. A probe is one primary-key read on a path that has already failed,
+// and only where the id is ours and the answer was ambiguous. Measured rather
+// than asserted, because "it adds a request" is the whole objection to it.
+expect(
+  landed.seen.recordReads.length === 1 && lost.seen.recordReads.length === 1 && blind.seen.recordReads.length === 1,
+  "each ambiguous create costs exactly ONE extra read — never a retry loop of them",
+  `landed=${landed.seen.recordReads.length} lost=${lost.seen.recordReads.length} blind=${blind.seen.recordReads.length}`,
 );
 
 // The outbox is a work queue, not a ledger: its rows exist to be settled, and the

@@ -9,10 +9,22 @@
  * cheaper and kinder before half a megabyte crosses the wire, which is why size, base64
  * validity and the content-type allow-list are refused here as well.
  *
- * Mapped by NAME in `packages/api/src/problems.ts` and asserted structurally by
- * `problems.test.ts`, so a class added here without a mapping fails that test rather
- * than reaching a client as "an unexpected error occurred".
+ * These are mapped by NAME in `packages/api/src/problems.ts`, and the mapping is what
+ * decides whether a refusal reaches a client as its own status or as "an unexpected error
+ * occurred". NOTHING IN THIS PACKAGE IS MAPPED YET: `problems.test.ts` asserts the mapping
+ * structurally, but only over the modules named in its own list, and `@crm/storage` is not
+ * in it — the package is reachable from no route (ADR-0001's open table). Adding it there
+ * is part of wiring these routes, not a later tidy-up, and until it happens every class
+ * below is a 500.
+ *
+ * Every class takes arguments that survive `new C("x", "y")`, because that is literally how
+ * `problems.test.ts` discovers them: it constructs each exported function whose name ends
+ * in `Error` and keeps the ones that come back as an `Error` naming themselves. A
+ * constructor that throws on those arguments is skipped in silence, so it would be exempt
+ * from the very gate this comment relies on.
  */
+
+import { ATTACHMENT_CONTENT_TYPES } from "./subjects.js";
 
 interface PgErrorShape {
   readonly message?: string;
@@ -229,15 +241,22 @@ export class InvalidAttachmentContentError extends Error {
   }
 }
 
-/** A content type outside the allow-list. */
+/**
+ * A content type outside the allow-list.
+ *
+ * It reads `ATTACHMENT_CONTENT_TYPES` itself rather than being handed the list. Passing it
+ * in read better and made this the one class `problems.test.ts` could not discover: that
+ * gate constructs every exported `*Error` as `new C("x", "y")`, a string is not an array,
+ * `allowed.join` threw, and a constructor that throws there is skipped in silence — so the
+ * single refusal in this package a client must act on by sending a different header was
+ * exempt from the check that it maps to anything at all.
+ */
 export class UnsupportedAttachmentTypeError extends Error {
-  constructor(
-    readonly contentType: string,
-    allowed: readonly string[],
-  ) {
+  constructor(readonly contentType: string) {
     super(
       `content type ${JSON.stringify(contentType)} is not stored here; this system accepts ` +
-        `${allowed.join(", ")}. SVG is excluded deliberately — it is a script container.`,
+        `${ATTACHMENT_CONTENT_TYPES.join(", ")}. SVG is excluded deliberately — it is a ` +
+        `script container.`,
     );
     this.name = "UnsupportedAttachmentTypeError";
   }

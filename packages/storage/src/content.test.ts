@@ -123,6 +123,27 @@ describe("attachment content", () => {
     expect((err as AttachmentTooLargeError).maxBytes).toBe(MAX_ATTACHMENT_BYTES);
   });
 
+  /**
+   * The one byte the base64 ceiling cannot see.
+   *
+   * `MAX_ATTACHMENT_BASE64_CHARS` is the length of the base64 of a maximum-size blob, and
+   * that encoding carries one padding character — so an UNPADDED string of the same length
+   * is legal base64 for 524,289 bytes and slips under the pre-decode ceiling. It never
+   * reached storage (`assertAttachmentContent` refuses it, and so does the schema), but the
+   * constant is documented as what lets a route refuse without decoding, and this is where
+   * that claim is held to being true.
+   */
+  it("refuses a blob one byte over the cap that the base64 ceiling admits", () => {
+    const over = Buffer.alloc(MAX_ATTACHMENT_BYTES + 1, 2);
+    const b64 = over.toString("base64");
+    // The premise: it is exactly at the ceiling, not over it, so the cheap check passes it.
+    expect(b64.length).toBe(MAX_ATTACHMENT_BASE64_CHARS);
+    expect(b64.endsWith("=")).toBe(false);
+    const err = catchError(() => decodeAttachmentContent(b64));
+    expect(err).toBeInstanceOf(AttachmentTooLargeError);
+    expect((err as AttachmentTooLargeError).byteSize).toBe(MAX_ATTACHMENT_BYTES + 1);
+  });
+
   it("accepts a blob of exactly the maximum size", () => {
     const biggest = Buffer.alloc(MAX_ATTACHMENT_BYTES, 1);
     expect(decodeAttachmentContent(biggest.toString("base64")).length).toBe(MAX_ATTACHMENT_BYTES);

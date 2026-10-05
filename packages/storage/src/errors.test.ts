@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { ATTACHMENT_CONTENT_TYPES } from "./subjects.js";
 import {
   AttachmentContentMismatchError,
   AttachmentContentTypeMismatchError,
@@ -50,7 +51,7 @@ describe("translateAttachmentError", () => {
       new AttachmentIdReusedError("m"),
       new AttachmentTooLargeError(1, 2),
       new InvalidAttachmentContentError("m"),
-      new UnsupportedAttachmentTypeError("x", ["image/png"]),
+      new UnsupportedAttachmentTypeError("x"),
       new MissingAttachmentBlobError("a", "postgres"),
     ];
     for (const instance of instances) {
@@ -235,9 +236,34 @@ describe("translateAttachmentError", () => {
   });
 
   it("names the rejected content type and the allow-list", () => {
-    const err = new UnsupportedAttachmentTypeError("text/html", ["image/png", "application/pdf"]);
+    const err = new UnsupportedAttachmentTypeError("text/html");
     expect(err.message).toContain("text/html");
-    expect(err.message).toContain("image/png, application/pdf");
+    expect(err.message).toContain(ATTACHMENT_CONTENT_TYPES.join(", "));
     expect(err.contentType).toBe("text/html");
+  });
+
+  /**
+   * The constructor shape `problems.test.ts` depends on.
+   *
+   * That gate finds a domain package's error classes by constructing each exported
+   * `*Error` as `new C("x", "y")` and keeping the ones that answer with their own name. A
+   * constructor that THROWS on those arguments is skipped in silence — which is what the
+   * allow-list parameter did here, exempting the one refusal a client fixes by sending a
+   * different header from the check that it maps to anything at all. Asserted rather than
+   * remembered, because the next error class added here will be written by someone reading
+   * the classes above and not this comment.
+   */
+  it("constructs every exported error the way problems.test.ts discovers them", async () => {
+    const mod = (await import("./index.js")) as unknown as Record<string, unknown>;
+    const found: string[] = [];
+    for (const [name, value] of Object.entries(mod)) {
+      if (typeof value !== "function" || !name.endsWith("Error")) continue;
+      const instance = new (value as new (...a: unknown[]) => unknown)("x", "y");
+      if (instance instanceof Error && instance.name === name) found.push(name);
+    }
+    // Every class in the barrel, not all but one: `translateAttachmentError` also ends in
+    // "Error" and is excluded by the name check rather than by throwing, exactly as it is
+    // over there.
+    expect(found).toHaveLength(17);
   });
 });
