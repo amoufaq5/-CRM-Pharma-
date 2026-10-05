@@ -21,6 +21,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The per-package config this writes is a transient, and an interrupted run used to leave
+# one behind — which is how `packages/sample/tsconfig.typecheck-tests.json` turned up as an
+# untracked file and came one `git add -A` away from being committed as though it were
+# source. The trap cleans up on any exit, including Ctrl-C and a failure mid-loop;
+# `.gitignore` is the belt under it. A generated file in a repository is worse than a
+# missing one: the next reader cannot tell it from something they are meant to edit.
+cleanup() { rm -f packages/*/tsconfig.typecheck-tests.json; }
+trap cleanup EXIT INT TERM
+
 status=0
 for dir in packages/*/; do
   pkg="$(basename "$dir")"
