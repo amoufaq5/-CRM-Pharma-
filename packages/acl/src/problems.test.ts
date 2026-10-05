@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { codeFromProblemType, ErpError, toErpError } from "./problems.js";
+import { codeFromProblemType, describeFieldErrors, ErpError, toErpError } from "./problems.js";
 
 describe("toErpError — the gateway's RFC 9457 shape", () => {
   it("maps a problem+json body to a typed error", () => {
@@ -70,5 +70,61 @@ describe("codeFromProblemType", () => {
 
   it("does not throw on a malformed type", () => {
     expect(codeFromProblemType("")).toBe("");
+  });
+});
+
+describe("toErpError — a 422's field errors", () => {
+  // The exact body a live operate-server emits for a rejected write
+  // (`operate-runtime/src/handlers.ts`): `fields`, and no `detail`. Every other
+  // fixture in this file supplies a `detail`, which is why the loss below went
+  // unnoticed until scripts/verify-live-erp.sh drove a bad payload at a real server.
+  const LIVE_422 = {
+    error: "validation_failed",
+    fields: [{ field: "request_number", code: "required", message: "request_number is required" }],
+  };
+
+  it("carries the rejected field into detail when the handler sent no detail", () => {
+    const err = toErpError(422, LIVE_422);
+    expect(err.kind).toBe("validation_failed");
+    expect(err.code).toBe("validation_failed");
+    expect(err.detail).toBe("request_number is required");
+  });
+
+  it("joins several field errors, so a dead letter names every one", () => {
+    expect(
+      toErpError(422, {
+        error: "validation_failed",
+        fields: [
+          { field: "sku", code: "required", message: "sku is required" },
+          { field: "status", code: "enum", message: "status must be one of: draft, active" },
+        ],
+      }).detail,
+    ).toBe("sku is required; status must be one of: draft, active");
+  });
+
+  it("prefers an explicit detail over the fields array", () => {
+    expect(toErpError(422, { ...LIVE_422, detail: "spelled out" }).detail).toBe("spelled out");
+  });
+
+  it("leaves detail undefined when there are no field errors to describe", () => {
+    expect(toErpError(422, { error: "validation_failed" }).detail).toBeUndefined();
+    expect(toErpError(422, { error: "validation_failed", fields: [] }).detail).toBeUndefined();
+  });
+
+  it("names the field and code when a future ERP omits the message", () => {
+    expect(describeFieldErrors({ fields: [{ field: "days", code: "type" }] })).toBe("days: type");
+    expect(describeFieldErrors({ fields: [{ field: "days" }] })).toBe("days: invalid");
+  });
+
+  it("keeps a body whose fields array is unreadable CLASSIFIABLE rather than unrecognised", () => {
+    // The fail-safe direction, and the reason `fields` is parsed separately from
+    // HandlerErrorSchema: a 422 that became `unrecognised_error_shape` would
+    // classify as a transient retry and burn the attempt cap on a payload no
+    // retry can fix.
+    const err = toErpError(422, { error: "validation_failed", fields: "not an array" });
+    expect(err.code).toBe("validation_failed");
+    expect(err.kind).toBe("validation_failed");
+    expect(err.detail).toBeUndefined();
+    expect(describeFieldErrors({ fields: "not an array" })).toBeUndefined();
   });
 });

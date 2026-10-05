@@ -28,6 +28,47 @@ export const HandlerErrorSchema = z.object({
   detail: z.string().optional(),
 });
 
+/**
+ * The field-level half of a 422, which the handler puts in `fields` and NOT in
+ * `detail`.
+ *
+ * `operate-runtime/src/handlers.ts` answers a rejected write with
+ * `{ error: "validation_failed", fields: [{field, code, message}] }` and no
+ * `detail` at all — verified against a live operate-server, where every offline
+ * fixture in this repo had supplied a `detail` and so the gap was invisible. A
+ * mapper reading only `detail` therefore normalises the one ERP error whose cause
+ * is fully described into an error carrying no cause, and because the relay
+ * dead-letters a 422 rather than retrying it, `crm.outbox.dead_reason` — the
+ * whole of what a human gets, and the thing README rule 31's "way back" depends
+ * on — read `validation_failed: write guard refused`.
+ *
+ * Parsed SEPARATELY from `HandlerErrorSchema` rather than as a member of it, and
+ * leniently. If `fields` were a required-shape member, an ERP that one day
+ * changed it would make the whole body unrecognisable — turning a precisely
+ * classified 422 into `unrecognised_error_shape`, which classifies as a transient
+ * retry and burns the attempt cap on a payload that will never be accepted. A
+ * body this cannot read keeps whatever `detail` it had.
+ */
+const HandlerFieldErrorsSchema = z.object({
+  fields: z.array(
+    z
+      .object({ field: z.string(), code: z.string().optional(), message: z.string().optional() })
+      .passthrough(),
+  ),
+});
+
+/** Renders the `fields` array into one readable sentence, or undefined if there is nothing to say. */
+export function describeFieldErrors(body: unknown): string | undefined {
+  const parsed = HandlerFieldErrorsSchema.safeParse(body);
+  if (!parsed.success || parsed.data.fields.length === 0) return undefined;
+  const parts = parsed.data.fields.map((f) =>
+    // `message` already names the field ("name is required"), so it stands alone.
+    // Without one, the pair is the only thing that identifies what was rejected.
+    f.message !== undefined && f.message !== "" ? f.message : `${f.field}: ${f.code ?? "invalid"}`,
+  );
+  return parts.join("; ");
+}
+
 export type ErpErrorKind =
   | "unauthenticated"
   | "forbidden"
@@ -108,7 +149,7 @@ export function toErpError(status: number, body: unknown): ErpError {
       KIND_BY_CODE[handler.data.error] ?? kindForStatus(status),
       status,
       handler.data.error,
-      handler.data.detail,
+      handler.data.detail ?? describeFieldErrors(body),
       body,
     );
   }

@@ -364,6 +364,40 @@ It needs a credential for the ERP. In production that is a CRM-minted Ed25519 se
 token; `ERP_TOKEN` is a development-only static credential and the process refuses to start
 with it under `NODE_ENV=production`.
 
+## Verified against a running ERP
+
+```bash
+PGUSER=… PGHOST=… ./scripts/verify-live-erp.sh
+```
+
+Boots a real `operate-server` over a real Postgres, points it at the CRM's own JWKS, and
+runs **60 checks** through the shipped `dist` of `@crm/acl`, `@crm/credential` and
+`@crm/relay`. Everything the integration assumes had previously been read out of the ERP's
+source and a captured schema; this is the first time a socket answered. The gate
+fingerprints every file in the ERP checkout before the run and diffs after — that repo is
+read-only this phase and the check proves it.
+
+What it pins, beyond the handshake: all 51 declared slugs route and the naive pluraliser
+really is naive (`/v1/opportunitys` serves, `/v1/opportunities` 404s); an unknown filter is
+**silently ignored** and a non-sortable sort **silently falls back**, each with a control
+proving the test could have failed; `baseline.json` is byte-identical to the live schema;
+numeric filters are wrong and ISO dates are the exemption; keyset pagination is complete and
+non-repeating; and a full outbox round trip — create, transition, replay, out-of-order.
+
+**Three things we believed turned out to be false**, and they are the reason this gate
+exists:
+
+- A duplicate record id does **not** answer 409. It answers `500 write_failed` carrying
+  node-postgres's message, so the replay-as-success guarantee rests on the ERP leaking that
+  string to clients. Pinned in both directions; in the ADR's open table as a decision.
+- The ERP's JWT-vs-header tenant cross-check only fires **when the token carries a usable
+  tenant claim**. Our minter's UUID check is what makes that condition hold, which promotes
+  it from tidiness to a security control.
+- A 422 carries its cause in `fields`, with **no `detail`** — so a rejected write
+  dead-lettered with `dead_reason = "validation_failed: write guard refused"` and nothing an
+  operator could act on. Invisible offline because every fixture supplied a `detail` the
+  real server never sends. Fixed; the reason now names the field.
+
 ## The ERP credential
 
 The CRM signs its own ERP-facing token. Two tiers that never mix (ADR-0001 item 10): any

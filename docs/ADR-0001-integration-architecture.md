@@ -258,6 +258,21 @@ Concretely, and these specifics are the decision, not commentary on it:
     single scope in each token is that tenant's ERP service role; the tenant rides in
     `x-tenant-id` and the gateway cross-checks it against the claim.
 
+    **Correction (2026-10-05), from a live run — see `docs/LIVE_ERP_VERIFICATION.md`.**
+    That cross-check is **conditional on the claim being present**. The gateway's test is
+    `authTenant !== null && headerTenant !== null && authTenant !== headerTenant`
+    (`api-gateway-runtime/src/auth.ts`), and `principals.ts` sets the principal's tenant to
+    `null` for a `tenant_id` claim that is absent or not a UUID — so a validly signed token
+    carrying no usable tenant claim is accepted with `x-tenant-id` **alone** selecting the
+    tenant. One signing key plus a header then reads any tenant. Verified live: 200 with
+    the correct rows, and 200 again with no header at all (falling back to the claim).
+
+    So the claim is authoritative **when present**, and what guarantees it is present is on
+    OUR side: `mintServiceToken` refuses a non-UUID `tenantId`. That check was written as
+    tidiness — its own comment says the ERP "sets the principal's tenant to NULL and the
+    request proceeds without one" — and it is now a load-bearing security control. It must
+    not be relaxed, and the live gate asserts it beside the gap it covers.
+
     **This replaces `--api-key` entirely, and that is the point.** Static API keys are
     passed as argv (visible in `ps`), held in memory, and need a process restart to rotate
     — three properties that make them the weakest credential in the system. Minting our own
@@ -915,7 +930,14 @@ blocked. Order matters for the reasons given, not for missing inputs.
    nightly `crm.referential_check` orphan job alongside them, not after them.
 5. **Outbox + relay.** `crm.outbox(id, tenant_id, aggregate, payload, target_record_id,
    attempts, next_attempt_at, state)`. Deterministic `crm_<uuidv7>` target ids. Exponential
-   backoff with jitter, dead-letter, lag metric. Unique-violation-on-replay = success.
+   backoff with jitter, dead-letter, lag metric. Unique-violation-on-replay = success —
+   but **not via a 409**, which is what this said and what `classify`'s own
+   `kind === "conflict"` branch expects. The live server answers a duplicate record id
+   `500 {"error":"write_failed","detail":"duplicate key value violates unique constraint …"}`,
+   because `operate-runtime/src/handlers.ts` forwards `e.message` verbatim. That normalises
+   to `unavailable`, so only the `ALREADY_EXISTS` regex over `detail` rescues it. See the
+   open table: the guarantee currently rests on the ERP leaking node-postgres's message to
+   clients.
 6. **Typed snapshot tables + incremental refresh** on `updated_at`, with a one-command
    full rebuild exercised in CI. These are the read path, not an optimisation (item 8) —
    every numeric filter and sort in the product depends on them, because the ERP cannot
@@ -925,7 +947,9 @@ blocked. Order matters for the reasons given, not for missing inputs.
 **API details that will bite** (all evidenced in the report):
 
 - `x-tenant-id` is load-bearing — a JWT principal's tenant comes from the header, and the
-  gateway cross-checks it against the token.
+  gateway cross-checks it against the token **only when the token carries a usable tenant
+  claim**. See the correction in item 10: our minter's UUID check is what makes that
+  condition hold.
 - List envelope is `{ data: [...], page: { limit, nextCursor } }`; read/create/update
   return the bare record; delete returns `204`.
 - Pagination is keyset, `?cursor=`, `?limit=` capped at 500. Not offset.
@@ -1020,7 +1044,6 @@ reasoning behind each constrains what follows.
 | Does the CRM need more than one S&M account (e.g. splitting congresses from detailing samples), or does one account with cost-centre and CRM-side category reporting suffice? The map is per-category already, so several accounts cost nothing structurally. | Finance | _set a date_ |
 | Which OIDC IdP for human login (Q8 tier 1), and does the CRM service credential holding `controller` (needed for the GL posting in item 11) pass security review? The credential itself is built; the question is whether `controller` per tenant is the right grant, and it is per-tenant configuration (`crm.erp_service_principal`) so narrowing it costs nothing structurally. | Security | _set a date_ |
 | Where does the signing key live? Ed25519 signing is not offered by every managed key service and the ERP accepts nothing else, so this is a real constraint rather than a preference. Until it is answered the key is a PEM in a secret, loaded into the scheduler's memory at boot. | Security | _set a date_ |
-| Has a CRM-minted token been accepted by a **running** operate-server? The acceptance test transcribes the ERP's verifier (alg, kid, both base64 conversions, which claims it checks) and passes, but no live handshake has happened — no ERP instance was available. | Platform | _set a date_ |
 | Staleness budget per snapshot table (item 8) — how old may a product price or a rep roster be on a mobile device before the UI blocks the action rather than warning? | Product | _set a date_ |
 | Does the platform have a date for `meta.webhook_deliveries` (Q9)? Affects only when we retire `PollingChangeSource`, not whether we build it. | Platform | _set a date_ |
 | Sample custody: may a rep declare their own receipt of stock? `POST /v1/samples/receipts` has the rep confirm it, because no warehouse-side admin surface exists yet. The stronger model is warehouse-initiated issue with rep acknowledgement. What makes the weaker one defensible meanwhile: the ledger is append-only, every correction carries a reason, and the cycle count reconciles against physical stock. | Compliance | _set a date_ |
@@ -1039,6 +1062,11 @@ reasoning behind each constrains what follows.
 | **No incremental polling is possible against `pack-erp-core` at all.** Measured from the captured baseline: 0 of 51 entities declare `updated_at` and 0 expose it as filterable. `PollingChangeSource` asks the schema and returns `mode: "full_sweep"` rather than sending a filter the ERP would silently drop, so every snapshot refresh is a full read of every entity. That is correct and expensive, and it is the strongest argument for Q9's `meta.webhook_deliveries` that exists — the alternative is the platform adding `updated_at` to the pack's filterable sets. | Platform | _set a date_ |
 | **34 of 51 entities expose no sortable fields**, so a `sort` on them silently falls back to the view's default order. Keyset pagination over an unordered view can revisit and skip rows, which means a paged full sweep of those entities is not provably complete. Nothing in the CRM pages them today; the snapshot refresher reads the entities that do sort. Worth knowing before anything new pages one. | Platform | _set a date_ |
 | **A channel with no sender in the running process now RETRIES rather than dead-letters**, which is right (a missing sender is a fact about the binary, not the destination, and the notification is deliverable the moment a process that has the channel takes a tick) and bounded (`markRetry` gives up at `MAX_ATTEMPTS`). But it means a channel nobody ever registers burns five attempts per delivery before dead-lettering, and nothing warns an operator that their endpoint's channel is unsendable until the first delivery is already late. A boot-time check against the distinct channels in `crm.notification_endpoint` would say it once, at the right moment. | Platform | _set a date_ |
+| **The CRM's idempotency guarantee rests on the ERP leaking a driver message to clients.** A redelivery of a write that already landed must read as success, or the relay retries to the cap and raises `erp_write_failed` at a rep for a write that is fine. The live server answers a duplicate record id `500 {"error":"write_failed","detail":"duplicate key value violates unique constraint …"}` — `handlers.ts` forwards `e.message` verbatim — which normalises to `unavailable`, not `conflict`, so `classify`'s own conflict branch never fires and only the `ALREADY_EXISTS` regex over `detail` saves it. Pinned in both directions by the live gate: with the driver text, `already_delivered`; same status and code with the text removed, `retry_transient`. **If the platform ever stops leaking that string — which it should — this breaks silently and in the expensive direction.** Closing it means asking for a stable error code, or having the relay re-`GET` the target record on an ambiguous 500; the second is a design change, not a defect fix, so it is a decision rather than a task. | Platform + us | _set a date_ |
+| **The ERP's JWT-vs-header tenant cross-check is conditional on the claim being present** (item 10's correction). A validly signed token with no usable `tenant_id` claim is accepted with `x-tenant-id` alone selecting the tenant, so one signing key plus a header reads any tenant. ERP-side defect, reported and deliberately not fixed — `/home/user/CrossEngin` is read-only this phase. We are not exposed because `mintServiceToken` refuses a non-UUID tenant, which means that check is now a security control and must be treated as one. | Platform | _set a date_ |
+| **A replay resolves three different ways depending on timing, and the ADR names only one.** Within one ERP process lifetime the same `Idempotency-Key` returns `201` with an **empty body** (the gateway's in-memory store), so `ErpClient` returns null and `erp_response` is stored null; after a restart the same replay hits the unique violation above; and a genuine first delivery returns the record. All three are handled, none is wrong, and nothing documented that there were three. | Platform | _set a date_ |
+| **A non-string `detail` fails both error parses.** `invalid_settings` puts an array in `detail`, which satisfies neither `HandlerErrorSchema` nor the problem-details shape, so it normalises to `unrecognised_error_shape` — which classifies as a transient retry and would burn the attempt cap. Unreachable from the outbox today (no outbox operation can provoke it), which is why the mapper was not widened on an unverified path. Worth closing the moment anything can reach it. | Platform | _set a date_ |
+| **`WhtCertificate` is routed by the ERP with empty `access` lists on all five operations**, so no role can reach it and it 403s to everybody. Found while asserting that all 51 declared slugs route. ERP-side, reported not acted on. It matters to us only if withholding-tax certificates ever enter the CRM's read set; recorded so nobody debugs it twice. | Platform | _set a date_ |
 | **THERE IS NO CLIENT.** The CRM is an API and a background process: 14 packages, 32 migrations, 85 routes, no web UI, no mobile app, no on-device store. This is the largest thing not written down anywhere until now, and it matters more than its one row suggests, because "offline-first" is load-bearing in the brief and a great deal of this system exists to serve a client that does not exist: device-minted ids for idempotent replay (0017), `POST /v1/sync/visits` and the per-row batch results, the `UiSchema`-free hand-rolled route surface, the staleness question below, and the signature capture that commits to bytes no app has produced. Every one of those is a guess about a consumer until something consumes it. Choosing the shape — a PWA like the ERP's `operate-web`, a Capacitor wrapper, or native — is a product decision with a long tail, not an increment to slot in. | Product | _set a date_ |
 | There is no `GET /v1/admin/notification-endpoints/:id/test` — no way for an administrator to confirm that the environment variable their endpoint names actually holds a secret. The API cannot answer it: the sender runs in the **scheduler** process and reads a different environment, so a check in the API would report confidently about the wrong one. A test-send route would have to be driven by the scheduler, or the verdict recorded by it and read here. | Platform | _set a date_ |
 
