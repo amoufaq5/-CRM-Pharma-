@@ -148,3 +148,6 @@ export const TENANT_ROLE = "d2000000-0000-4000-8000-000000000007";
 /** packages/notify — endpoints.contract. Separate from TENANT_NOTIFY: the endpoint
  *  suite creates and disables endpoints, which the dispatch suite reads. */
 export const TENANT_ENDPOINTS = "d3000000-0000-4000-8000-000000000008";
+
+/** packages/notify — retention.contract. */
+export const TENANT_RETENTION = "d4000000-0000-4000-8000-000000000009";

@@ -245,6 +245,92 @@ describe("scheduler against a real database", () => {
     });
   });
 
+  /**
+   * The prune, like the sweep, touches nothing outside the CRM — so the real thing runs
+   * rather than a stub, and the summary line is asserted because for this job the log is
+   * where `unknownSubjects` becomes visible at all. A producer that forgets a branch in
+   * `crm.notification_subject_open` is reported here and nowhere else.
+   */
+  it("runs the notification prune and reports what it took and held back", async () => {
+    const { relay } = stubRelay();
+    const { refresher } = stubRefresher();
+    const events: SchedulerEvent[] = [];
+    const NOW = new Date("2026-06-01T02:00:00Z");
+    const daysAgo = (n: number): Date => new Date(NOW.getTime() - n * 86_400_000);
+
+    let repId = "";
+    await withTenantContext(admin, TENANT, async (tx) => {
+      // Same residue tolerance as the sweep above, in FK order.
+      await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.notification_policy WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [TENANT]);
+      await tx.query(`DELETE FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'sched-prune'`, [TENANT]);
+
+      const r = await tx.query<{ id: string }>(
+        `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name)
+         VALUES ($1,'sched-prune','SP-1','Prune Rep') RETURNING id`,
+        [TENANT],
+      );
+      repId = r.rows[0]!.id;
+
+      // An ERP write that is still dead: the notification about it must survive, however
+      // old, because it is the only thing telling the rep their write never landed.
+      const dead = await tx.query<{ id: string }>(
+        `INSERT INTO crm.outbox (tenant_id, entity, operation, payload, target_record_id,
+                                 source_table, source_id, state)
+         VALUES ($1,'Item','create','{}'::jsonb,'crm_prune_1','crm.visit',gen_random_uuid(),'dead')
+         RETURNING id`,
+        [TENANT],
+      );
+
+      const add = (kind: string, dedup: string, days: number, table: string | null, id: string | null) =>
+        tx.query(
+          `INSERT INTO crm.notification
+             (tenant_id, recipient_rep_profile_id, kind, severity, subject, body, dedup_key,
+              subject_table, subject_id, created_at, read_at)
+           VALUES ($1,$2,$3,'info','s','b',$4,$5,$6,$7,$7)`,
+          [TENANT, repId, kind, dedup, table, id, daysAgo(days)],
+        );
+      await add("call_plan_approved", "pr-old", 400, null, null);
+      await add("erp_write_failed", "pr-dead", 400, "crm.outbox", dead.rows[0]!.id);
+      await add("call_plan_approved", "pr-unknown", 400, "crm.not_a_table", repId);
+      await add("call_plan_approved", "pr-recent", 2, null, null);
+    });
+
+    await new Scheduler({
+      pool: p,
+      relay,
+      refresher,
+      random: () => 0.5,
+      now: () => NOW,
+      onEvent: (e) => events.push(e),
+    }).tick();
+
+    const ok = events.find((e) => e.type === "job_ok" && e.job === "notify_prune");
+    expect(ok).toBeDefined();
+    const detail = (ok as { detail: string }).detail;
+    // Two taken (the plain old one and the unrecognised-subject one), one held back
+    // because its ERP write is still dead, one not yet past any horizon.
+    expect(detail).toContain("deletedRead=2");
+    expect(detail).toContain("keptSubjectOpen=1");
+    expect(detail).toContain("unknownSubjects=1");
+    expect(detail).toContain("retainRead=30d");
+
+    await withTenantContext(admin, TENANT, async (tx) => {
+      const { rows } = await tx.query<{ dedup_key: string }>(
+        "SELECT dedup_key FROM crm.notification WHERE tenant_id = $1 ORDER BY dedup_key",
+        [TENANT],
+      );
+      expect(rows.map((r) => r.dedup_key)).toEqual(["pr-dead", "pr-recent"]);
+
+      await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.notification_policy WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [TENANT]);
+      await tx.query("DELETE FROM crm.rep_profile WHERE id = $1", [repId]);
+    });
+  });
+
   it("does not re-run a job before it is due", async () => {
     const { relay, calls } = stubRelay();
     const { refresher } = stubRefresher();

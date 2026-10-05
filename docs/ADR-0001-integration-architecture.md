@@ -464,6 +464,73 @@ Concretely, and these specifics are the decision, not commentary on it:
     suite now exercises both instead of neither.
 
 
+15. **An inbox has two retention horizons, and an unfinished subject outlives both.**
+    `crm.notification` grew without bound — every signal the CRM had ever raised stayed in
+    the table, read by an index that grew with it. ADR-0001 recorded this twice, both
+    times with the same blocker: a retention period is a tenant's decision and there was
+    no principal to restrict the setting to. Item 13 answered that half.
+
+    **Two horizons, not one** (`crm.notification_policy`, migration 0024): 30 days for a
+    read notification, 365 for an unread one. A read notification has done its job; an
+    unread one has NOT, and deleting it deletes a message nobody ever saw. A CHECK forbids
+    the unread horizon from being the shorter of the two, so `read=90, unread=7` is refused
+    rather than quietly losing exactly the notifications that still mattered — and it is
+    enforced on a PARTIAL update too, because raising only the read horizon above the
+    stored unread one is the same mistake arriving from the other side.
+
+    **What makes pruning safe at all** is that a notification is a COPY of a signal. The
+    obligation, the dead letter, the transfer and the plan live in their own tables and a
+    prune never touches them, so it loses an inbox entry and never a fact.
+
+    **What makes it correct** is the exemption that follows from that: a notification about
+    something UNFINISHED is not old news, however old it is. `crm.notification_subject_open`
+    decides, with one branch per producing table — an obligation still `open` or `overdue`,
+    an ERP write still `dead`, a `transfer_out` with no acceptance recorded against it, a
+    call plan still `submitted`. Each branch is tested with BOTH answers, because a
+    predicate that always says "open" and one that always says "closed" both pass a
+    one-sided test. A webhook push still pending, in flight or dead holds a notification
+    back too: `crm.notification_delivery` cascades from this row, so pruning would erase
+    the evidence that a push failed along with the thing it failed to push.
+
+    **An unknown subject table prunes, and is counted.** That is deliberately the opposite
+    of fail-closed, and the reasoning is specific to what is being fixed: the failure here
+    IS unbounded growth, so "keep forever when unsure" would reintroduce it silently for
+    any kind whose producer forgot a branch. The job reports `unknownSubjects` instead —
+    the same trade `crm.outbox_recipient` (0022) makes with its unattributed rows, where
+    the alternative to counting it is never finding out.
+
+    **Capped at 50,000 rows a pass**, reporting `moreRemaining`. A tenant turning retention
+    on after a year of growth has a backlog, and deleting all of it in one transaction
+    holds a snapshot open for as long as it takes; the job runs again tomorrow. Oldest
+    first, so a capped pass is not an arbitrary slice.
+
+    **The role is `administrator`, not `compliance`**, and the compliance officer is
+    explicitly refused. The disposal policy next door is `compliance` because it is an SOP
+    parameter reps are measured against; retention is a statement about the system's own
+    storage and no rep's performance turns on it. That the regulated facts survive a prune
+    is what makes the split defensible rather than a coin toss. Reading it is open to every
+    rep, like the disposal policy: a rep whose notification disappeared is entitled to know
+    it was a rule and not a bug.
+
+    Also landed, as the insurance item 14 asked for: a schema test that **no `crm` function
+    is `SECURITY DEFINER`** and no `crm` view is owned by a role that bypasses RLS. Item
+    14's guard asks which role a CONNECTION runs under, which is the wrong question for a
+    definer function — it runs as its owner, so one owned by a privileged role would read
+    every tenant's rows whoever called it, and the guard would have said yes. Verified by
+    adding such a function on purpose and watching the test name it. The new
+    `crm.notification_prune_candidates` view is owned by `crm_app`, which is subject to the
+    policies, and its tenant scoping was checked live rather than reasoned about.
+
+    **Verified** live: the retention routes through the real `api` binary as `crm_app` (a
+    rep reads the policy and is refused the write; the administrator shortens the unread
+    horizon to 200 days; `unread < read` comes back 422 with its sentence intact; the
+    candidate listing shows `open=true` on the dead-ERP-write row and `unknown=true` on a
+    made-up subject table), and then the job through the real `scheduler` binary, which
+    reported `deletedRead=2 deletedUnread=0 keptSubjectOpen=1 keptDeliveryUnsettled=0
+    unknownSubjects=1 more=false retainRead=30d retainUnread=200d` — picking up the 200-day
+    horizon set over HTTP minutes earlier, which is the two halves proving they are wired
+    to each other.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -718,10 +785,11 @@ reasoning behind each constrains what follows.
 | `crm.outbox_recipient` maps three producing tables to a rep (sample movements, visits, expense claims) and returns NULL for anything else. A new producer needs a branch added — deliberately a visible act in a diff rather than an inference — and until then its dead letters are unattributed: counted by the relay, listed with a null rep, and reachable only through SQL. | Platform | _set a date_ |
 | A dead letter keeps only its LATEST reason. `revive_count` says a row has died more than once but not why each time. A per-attempt history belongs in its own table if one is ever needed, not in more columns on `crm.outbox`. | Platform | _set a date_ |
 | Nothing picks up `ALTER ROLE crm_app BYPASSRLS` on a running system. The privilege verdict is cached per role NAME for the life of the process, because asking the catalog costs ~82 µs and asking it on every transaction is the wrong trade. A restart notices; so does `/healthz` in a new process. Altering the role is a superuser action on a role the deployment creates `NOSUPERUSER NOBYPASSRLS`, so the exposure is an operator deliberately widening their own application role. | Platform | _set a date_ |
-| The guard answers "which role will these statements run under", not "does the policy actually confine this query". A `SECURITY DEFINER` function owned by a privileged role, or a query shaped so the policy does not apply, would still pass it. Nothing in the schema is `SECURITY DEFINER` today — the role model's functions are deliberately `SECURITY INVOKER` — and a test asserting that none ever becomes one would be cheap insurance. | Platform | _set a date_ |
+| A prune is irreversible and there is no undo. The policy's horizons are the only thing standing between a tenant and a deleted inbox, and `GET /v1/admin/notifications/prune-candidates` is the only way to look before leaping — nothing stages a prune, asks for confirmation, or keeps a tombstone. Defensible because a notification is a copy and the fact it refers to survives in its own table, but a tenant who shortens `retain_unread_days` to 1 by accident loses a year of unread messages that night. A confirmation step, or a "no more than N% in one pass" guard, is the obvious mitigation. | Product | _set a date_ |
+| Deleting a notification takes its `crm.notification_delivery` rows with it, by the `ON DELETE CASCADE` migration 0021 wrote. So the retention period for a notification is also the retention period for the record of where that signal was pushed — which is coherent (the policy says the tenant no longer keeps this) but means delivery history cannot be retained longer than the notification it describes. Separating them needs the delivery rows to stop depending on the notification row. | Platform | _set a date_ |
+| `crm.notification_subject_open` has a branch per producing table and nothing enforces that the set of branches matches the set of producers. A new producer that sets `subject_table` without adding a branch prunes at the normal horizon; the job's `unknownSubjects` count is the only signal, and only after the fact. The same shape as `crm.outbox_recipient` (0022) and open for the same reason — a test that derives the producer list from the code would have to parse it. | Platform | _set a date_ |
 | A role grant's `granted_by` / `revoked_by` are plain FKs to `crm.rep_profile (id)`, as every rep-profile reference in this schema is. Nothing but RLS and the explicit tenant match stops one naming a profile in another tenant. A composite `(tenant_id, id)` FK would close it structurally, and changing the convention for one table would be worse than leaving it stated here. | Platform | _set a date_ |
 | Roles cover the two administrative surfaces that exist (`crm.disposal_policy`, `crm.notification_endpoint`) and nothing else. `crm.cycle`, `crm.territory`, `crm.territory_assignment`, `crm.sample_lot` and `crm.expense_account_map` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |
-| Notification retention is still unbounded, and now has an obvious home: a per-tenant retention parameter behind the `administrator` role, pruned by the scheduler. The role model was the missing half; the parameter is the other. | Platform | _set a date_ |
 | There is no `GET /v1/admin/notification-endpoints/:id/test` — no way for an administrator to confirm that the environment variable their endpoint names actually holds a secret. The API cannot answer it: the sender runs in the **scheduler** process and reads a different environment, so a check in the API would report confidently about the wrong one. A test-send route would have to be driven by the scheduler, or the verdict recorded by it and read here. | Platform | _set a date_ |
 
 > The deadlines in the original table (8–26 September) all lapsed before the answers came

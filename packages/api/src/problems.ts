@@ -195,6 +195,7 @@ export function toProblem(err: unknown): ApiError {
     case "LastAdministratorError":
       return new ApiError("last_administrator", message);
     case "InvalidEndpointError":
+    case "InvalidRetentionError":
       return new ApiError("validation_failed", message);
 
     case "ErpError":

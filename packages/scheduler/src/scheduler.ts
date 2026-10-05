@@ -1,6 +1,6 @@
 import { withTenantContext } from "@crm/db";
 import type { OutboxRelay } from "@crm/relay";
-import type { NotificationDispatcher } from "@crm/notify";
+import { pruneNotifications, type NotificationDispatcher } from "@crm/notify";
 import { sweepExpiredStock } from "@crm/sample";
 import type { SnapshotRefresher } from "@crm/sync";
 import type { Pool, PoolClient } from "pg";
@@ -207,6 +207,24 @@ export class Scheduler {
             `expired=${r.expiredHoldings} opened=${r.opened} resolved=${r.resolved} ` +
             `overdue=${r.markedOverdue} autoWrittenOff=${r.autoWrittenOff} ` +
             `unattributed=${r.unattributed} graceDays=${r.policy.grace_days}`
+          );
+        } finally {
+          client.release();
+        }
+      }
+      case "notify_prune": {
+        // In the CRM's own tables only, like the expiry sweep, so it runs in one
+        // transaction: either tonight's prune lands or none of it does.
+        const client = await this.options.pool.connect();
+        try {
+          const r = await withTenantContext(client, tenantId, (tx) =>
+            pruneNotifications(tx, tenantId, { asOf: this.now() }),
+          );
+          return (
+            `deletedRead=${r.deletedRead} deletedUnread=${r.deletedUnread} ` +
+            `keptSubjectOpen=${r.keptSubjectOpen} keptDeliveryUnsettled=${r.keptDeliveryUnsettled} ` +
+            `unknownSubjects=${r.unknownSubjects} more=${r.moreRemaining} ` +
+            `retainRead=${r.policy.retain_read_days}d retainUnread=${r.policy.retain_unread_days}d`
           );
         } finally {
           client.release();

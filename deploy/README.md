@@ -299,12 +299,17 @@ the tenant stays usable — but fixing it then needs a psql prompt again. With t
 is self-sustaining.
 
 Everything else an administrator needs is over HTTP: `POST /v1/admin/roles` to appoint the
-compliance officer, `PUT /v1/admin/samples/disposal-policy` for the SOP parameters, and
-`POST /v1/admin/notification-endpoints` for the webhooks below.
+compliance officer, `PUT /v1/admin/samples/disposal-policy` for the SOP parameters,
+`POST /v1/admin/notification-endpoints` for the webhooks below, and
+`PUT /v1/admin/notifications/retention` for how long inboxes keep things.
 
 Scheduled jobs need no provisioning: the scheduler creates missing rows at their
 default cadence on every tick, so a tenant added by hand — or a job added by a
-later release — starts running without a backfill.
+later release — starts running without a backfill. `notify_prune` arrived that
+way, and on a tenant with a long-standing inbox its first few nights will each
+report `more=true` while the backlog drains 50,000 rows at a time. Ask
+`GET /v1/admin/notifications/prune-candidates` first if you want to see what it
+will take before it takes it.
 
 ## Notifications
 
@@ -338,6 +343,14 @@ dead-letters the delivery rather than sending unsigned.
 approved) out of a paging channel. `kinds` is NULL for everything, or an allow-list — and the
 API checks an allow-list against the real vocabulary, because `kinds` is a bare `text[]` with
 no CHECK and an endpoint filtered to a kind that does not exist receives nothing at all.
+
+Notifications do not accumulate forever: a nightly `notify_prune` job enforces a
+per-tenant retention policy (two horizons — shorter for read, longer for unread),
+and never prunes one whose subject is still unfinished or whose webhook push has
+not settled. README.md has the rules; `PUT /v1/admin/notifications/retention`
+sets the numbers. Deleting a notification takes its `crm.notification_delivery`
+rows with it by cascade, so a retention period is also the retention period for
+the record of where that signal was pushed.
 
 An endpoint is retired with `PATCH /v1/admin/notification-endpoints/:id` and
 `{"enabled":false}`. **There is no delete**, by design: `crm.notification_delivery`

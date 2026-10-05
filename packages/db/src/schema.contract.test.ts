@@ -64,6 +64,48 @@ describe("CRM schema invariants", () => {
     }
   });
 
+  /**
+   * The hole the privilege guard in `withTenantContext` cannot see through.
+   *
+   * That guard asks which ROLE the statements will run under, which is the right question
+   * for a connection and the wrong one for a `SECURITY DEFINER` function: such a function
+   * runs as its OWNER, so one owned by a privileged role would read every tenant's rows
+   * no matter who called it, and the guard would have said yes. A view without
+   * `security_invoker` is the same hole wearing a different hat — RLS is then evaluated
+   * against the view's owner.
+   *
+   * Nothing in `crm` is either today, and both functions in the role model (0023) are
+   * deliberately `SECURITY INVOKER` so tenant scoping reaches them. This test is the
+   * cheap insurance that keeps it that way: adding one has to be a conscious act that
+   * fails this test and makes someone argue for it.
+   */
+  it("no crm function is SECURITY DEFINER, and no crm view evades its caller's RLS", async () => {
+    const { rows: definers } = await client.query<{ name: string }>(`
+      SELECT p.proname AS name
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE n.nspname = 'crm' AND p.prosecdef
+       ORDER BY p.proname`);
+    expect(
+      definers.map((r) => r.name),
+      "a SECURITY DEFINER function runs as its owner, so RLS is evaluated for the owner, not the caller",
+    ).toEqual([]);
+
+    // A view owned by a NON-privileged role is safe either way, because that owner is
+    // subject to the policies too — which is why `crm.notification_prune_candidates`
+    // scopes correctly (verified live). The check is therefore on the owner, not on
+    // security_invoker: the thing that breaks isolation is a privileged owner.
+    const { rows: views } = await client.query<{ name: string; owner: string }>(`
+      SELECT c.relname AS name, c.relowner::regrole::text AS owner
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'crm' AND c.relkind IN ('v', 'm')
+         AND (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE oid = c.relowner)
+       ORDER BY c.relname`);
+    expect(
+      views.map((r) => `${r.name} owned by ${r.owner}`),
+      "a view owned by a role that bypasses RLS serves every tenant's rows to any caller",
+    ).toEqual([]);
+  });
+
   it("an RLS-exempt table holds no tenant data", async () => {
     // The exemption is only defensible while the table stays a registry. If
     // someone adds a column that belongs to a tenant, this fails and the

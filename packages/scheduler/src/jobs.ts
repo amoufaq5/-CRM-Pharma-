@@ -5,6 +5,7 @@ export const JOB_NAMES = [
   "snapshot_full",
   "expiry_sweep",
   "notify_dispatch",
+  "notify_prune",
 ] as const;
 export type JobName = (typeof JOB_NAMES)[number];
 
@@ -27,6 +28,10 @@ export type JobName = (typeof JOB_NAMES)[number];
  *   record the same date and cost twelve times as much.
  * - **notify_dispatch (30s).** A notification is only useful while it is still news, so
  *   this matches the relay rather than the sweep. The work is usually zero rows.
+ * - **notify_prune (24h).** Retention is measured in days, so nothing a shorter interval
+ *   could notice — and the pass is capped at 50,000 rows, so a tenant turning retention
+ *   on after a year of growth drains over a few nights rather than in one long
+ *   transaction. Daily is what makes that cap a schedule rather than a cliff.
  */
 export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   relay_drain: 30_000,
@@ -34,6 +39,7 @@ export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   snapshot_full: 24 * 60 * 60_000,
   expiry_sweep: 24 * 60 * 60_000,
   notify_dispatch: 30_000,
+  notify_prune: 24 * 60 * 60_000,
 };
 
 /**

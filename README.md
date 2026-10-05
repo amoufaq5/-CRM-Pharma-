@@ -109,6 +109,9 @@ authorisation on its own.
 | `PUT /v1/admin/samples/disposal-policy` | the grace period and the promo switch (**compliance**) |
 | `GET\|POST /v1/admin/notification-endpoints` | where signals are pushed (**administrator**) |
 | `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; there is no DELETE |
+| `GET /v1/admin/notifications/retention` | how long inboxes keep things — readable by every rep |
+| `PUT /v1/admin/notifications/retention` | the two horizons (**administrator**) |
+| `GET /v1/admin/notifications/prune-candidates` | what tonight's prune would take, and what it would hold back |
 
 Every error is RFC 9457 `application/problem+json` — one shape, no exceptions. The ERP
 emits two on the same API, and a client that handles only one misreads the other.
@@ -124,8 +127,13 @@ So there are two roles, held by nobody implicitly, each a **dated grant** on a r
 
 | | |
 |---|---|
-| `administrator` | configures the tenant: notification endpoints, and who holds roles |
+| `administrator` | configures the tenant: notification endpoints, inbox retention, and who holds roles |
 | `compliance` | the SOP parameters reps are held to: the disposal grace period, the promo auto-write-off switch |
+
+The split is not arbitrary. A `compliance` parameter is one reps are **measured against**;
+an `administrator` one is a statement about the system itself. Retention is the second
+kind — the regulated facts a notification refers to live in their own tables and a prune
+never touches them.
 
 Four rules, all of them in the database (`db/migrations/0023_roles.sql`), so a route cannot
 forget one:
@@ -153,6 +161,47 @@ VALUES ('<tenant>', '<the administrator>', 'administrator', '<anyone else>', CUR
 A role is resolved once per request, with the principal, **as of today** — never as of a
 `?on=` parameter, which several reads honour. A revoked role is gone on the caller's next
 request.
+
+## Inbox retention
+
+`crm.notification` used to grow forever. It is now bounded by a per-tenant policy with
+**two** horizons, and a nightly `notify_prune` job:
+
+| | default | why two |
+|---|---|---|
+| `retain_read_days` | 30 | a read notification has done its job |
+| `retain_unread_days` | 365 | an unread one has **not**, and deleting it deletes a message nobody saw |
+
+A CHECK forbids the unread horizon from being the shorter of the two, so `read=90,
+unread=7` is refused rather than silently losing exactly the notifications that still
+mattered.
+
+**An open subject survives either horizon.** A notification is a *copy* of a signal — the
+obligation, the dead letter, the transfer and the plan all live in their own tables and a
+prune never touches them. So pruning loses an inbox entry, never a fact; and a
+notification about something **unfinished** is not old news, however old it is:
+
+- a disposal obligation still `open` or `overdue`
+- an ERP write still `dead`
+- material still in transit (a `transfer_out` with no acceptance against it)
+- a call plan still `submitted`, waiting on an approver
+- …or any notification whose webhook push is still pending, in flight or dead
+
+`crm.notification_subject_open` is the one place that decides, with a branch per producing
+table. A table it has no branch for reads as **not** open and prunes normally — the
+deliberate opposite of fail-closed, because the failure being fixed is unbounded growth
+and "keep forever when unsure" would bring it back silently. The job counts those
+instead, so a missing branch shows up in its own summary:
+
+```
+notify_prune  deletedRead=2 deletedUnread=0 keptSubjectOpen=1 keptDeliveryUnsettled=0
+              unknownSubjects=1 more=false retainRead=30d retainUnread=200d
+```
+
+Each pass is capped at 50,000 rows and reports `more`, so a tenant turning retention on
+after a year of growth drains over a few nights rather than in one long transaction.
+`GET /v1/admin/notifications/prune-candidates` answers "what would tonight take" before
+anything is deleted.
 
 ## The background process
 

@@ -91,6 +91,10 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.disposal_policy WHERE tenant_id = $1", [t]);
+        // Per-tenant policy rows are STATE, not fixtures: leaving one behind made the
+        // "documented defaults" test below pass on a fresh database and fail on the
+        // second run against the same one.
+        await tx.query("DELETE FROM crm.notification_policy WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_count_line WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_count WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [t]);
@@ -1855,6 +1859,63 @@ describe("the API, end to end", () => {
           body: { enabled: false },
         });
         expect(res.status).toBe(404);
+      });
+    });
+
+    describe("notification retention", () => {
+      it("is readable by every rep, with the documented defaults", async () => {
+        const res = await call("GET", "/v1/admin/notifications/retention");
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ retain_read_days: 30, retain_unread_days: 365 });
+      });
+
+      it("refuses a write without the administrator role", async () => {
+        const res = await call("PUT", "/v1/admin/notifications/retention", { body: { retainReadDays: 7 } });
+        expect(res.status).toBe(403);
+        expect(res.body.detail).toContain("administrator");
+      });
+
+      /**
+       * Administrator rather than compliance, and the compliance officer does NOT get it.
+       * The disposal policy next door is the other way round — the split is the point:
+       * one is an SOP parameter reps are measured against, the other is a statement about
+       * the system's own storage.
+       */
+      it("does not accept the compliance role in place of administrator", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        expect((await call("PUT", "/v1/admin/notifications/retention", { body: { retainReadDays: 7 } })).status).toBe(403);
+      });
+
+      it("sets the horizons for an administrator", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("PUT", "/v1/admin/notifications/retention", {
+          body: { retainReadDays: 14, retainUnreadDays: 180 },
+        });
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ retain_read_days: 14, retain_unread_days: 180 });
+        expect((await call("GET", "/v1/admin/notifications/retention")).body.retain_read_days).toBe(14);
+      });
+
+      it("refuses an unread horizon shorter than the read one, as a 422", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("PUT", "/v1/admin/notifications/retention", {
+          body: { retainReadDays: 90, retainUnreadDays: 7 },
+        });
+        expect(res.status).toBe(422);
+        expect(JSON.stringify(res.body)).toContain("sooner than a read one");
+      });
+
+      it("refuses an empty change rather than reporting a no-op as success", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        expect((await call("PUT", "/v1/admin/notifications/retention", { body: {} })).status).toBe(422);
+      });
+
+      it("lists prune candidates for an administrator and nobody else", async () => {
+        expect((await call("GET", "/v1/admin/notifications/prune-candidates")).status).toBe(403);
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("GET", "/v1/admin/notifications/prune-candidates");
+        expect(res.status).toBe(200);
+        expect(res.body.data).toEqual([]);
       });
     });
 

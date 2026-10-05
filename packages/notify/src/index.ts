@@ -52,3 +52,16 @@ export {
   type EndpointRow,
   type UpdateEndpointInput,
 } from "./endpoints.js";
+export {
+  DEFAULT_RETAIN_READ_DAYS,
+  DEFAULT_RETAIN_UNREAD_DAYS,
+  InvalidRetentionError,
+  MAX_PRUNE_ROWS,
+  notificationPolicy,
+  prunableNotifications,
+  pruneNotifications,
+  setNotificationPolicy,
+  type NotificationPolicy,
+  type PruneCandidate,
+  type PruneResult,
+} from "./retention.js";

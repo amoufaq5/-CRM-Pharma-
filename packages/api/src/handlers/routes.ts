@@ -27,6 +27,9 @@ import {
   listEndpoints,
   markAllRead,
   markRead,
+  notificationPolicy,
+  prunableNotifications,
+  setNotificationPolicy,
   unreadCount,
   updateEndpoint,
 } from "@crm/notify";
@@ -1906,6 +1909,78 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         });
       });
       return { status: 200, body };
+    },
+  });
+
+  /**
+   * How long this tenant's inboxes keep things. Readable by every rep, like the disposal
+   * policy and for the same reason: a rep whose notification disappeared is entitled to
+   * know it was a retention rule rather than a bug.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notifications/retention",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        notificationPolicy(tx, ctx.principal.tenantId),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Set the horizons. ADMINISTRATOR, not compliance.
+   *
+   * The disposal policy next door is `compliance` because it is an SOP parameter reps are
+   * measured against. This one is not: it is a statement about the system's own storage,
+   * and no rep's performance turns on it. The regulated facts a notification refers to
+   * live in their own tables and are never touched by a prune — which is also why the
+   * split is defensible rather than arbitrary.
+   */
+  router.add({
+    method: "PUT",
+    pattern: "/v1/admin/notifications/retention",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const input = parse(
+        z.object({
+          retainReadDays: z.number().int().min(1).max(3650).optional(),
+          retainUnreadDays: z.number().int().min(1).max(3650).optional(),
+        }),
+        ctx.body,
+      );
+      if (input.retainReadDays === undefined && input.retainUnreadDays === undefined) {
+        throw validationFailed("nothing to change", {
+          _: "supply retainReadDays, retainUnreadDays, or both",
+        });
+      }
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        setNotificationPolicy(tx, ctx.principal.tenantId, {
+          ...(input.retainReadDays !== undefined ? { retainReadDays: input.retainReadDays } : {}),
+          ...(input.retainUnreadDays !== undefined ? { retainUnreadDays: input.retainUnreadDays } : {}),
+        }),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * What tonight's prune would take, and what it would hold back.
+   *
+   * The question anybody sensibly asks before shortening a retention period for the first
+   * time, and it is read-only — the job is the only thing that deletes. `subject_open` on
+   * a row is why it would survive its horizon.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notifications/prune-candidates",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const limit = parse(z.coerce.number().int().min(1).max(500), ctx.query.get("limit") ?? "100");
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        prunableNotifications(tx, ctx.principal.tenantId, { limit }),
+      );
+      return { status: 200, body: { data } };
     },
   });
 
