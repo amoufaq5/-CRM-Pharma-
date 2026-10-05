@@ -618,4 +618,32 @@ describe("recordResult", () => {
       expect(rows[0]?.last_duration_ms).toBe(1235);
     });
   });
+
+  /**
+   * `JOB_NAMES` and the CHECK on `crm.scheduled_job.job` must agree.
+   *
+   * They have diverged by omission twice in this project's history: the CHECK is restated
+   * in full by every migration that adds a job, and a forgotten value means `ensureJobs`
+   * inserts a row the database refuses, so the scheduler's FIRST tick fails for every
+   * tenant. The failure is loud, which is lucky — it is also entirely avoidable, and
+   * `health.map(h => h.job)` above only proves the rows that exist, not that every job
+   * the code knows about can have one.
+   */
+  it("every job the code runs is a job the database accepts", async () => {
+    const { rows } = await admin.query<{ def: string }>(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conrelid = 'crm.scheduled_job'::regclass AND conname = 'scheduled_job_job_check'`,
+    );
+    const accepted = new Set(
+      [...(rows[0]?.def ?? "").matchAll(/'([a-z_]+)'::text/g)].map((m) => m[1]!),
+    );
+    expect([...JOB_NAMES].filter((j) => !accepted.has(j)), "jobs the CHECK would refuse").toEqual([]);
+    // And the other way: a value the CHECK admits that nothing runs is a job that was
+    // renamed or removed and left behind in a migration.
+    expect(
+      [...accepted].filter((j) => !(JOB_NAMES as readonly string[]).includes(j)),
+      "jobs the CHECK admits that no code runs",
+    ).toEqual([]);
+  });
+
 });

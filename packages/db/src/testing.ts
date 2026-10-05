@@ -166,3 +166,9 @@ export const TENANT_EXPENSE_MAP = "d9000000-0000-4000-8000-00000000000d";
 
 /** packages/expense — store.contract. */
 export const TENANT_EXPENSE_STORE = "da100000-0000-4000-8000-00000000000e";
+
+/** packages/sample — disposal-reopen.contract. */
+export const TENANT_DISPOSAL_REOPEN = "db100000-0000-4000-8000-00000000000f";
+
+/** packages/expense — sweeper.contract. */
+export const TENANT_EXPENSE_SWEEP = "dc100000-0000-4000-8000-000000000010";

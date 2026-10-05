@@ -23,7 +23,8 @@
     "db:migrate:verify": "pnpm build && ./scripts/verify-migration-runner.sh",
     "key": "pnpm --filter @crm/credential build && node packages/credential/dist/bin/service-key.js",
     "deploy:verify": "./scripts/verify-deploy-stack.sh",
-    "typecheck:tests": "./scripts/typecheck-tests.sh"
+    "typecheck:tests": "./scripts/typecheck-tests.sh",
+    "smtp:crosscheck": "./scripts/crosscheck-smtp.sh"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
