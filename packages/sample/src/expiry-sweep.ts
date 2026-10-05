@@ -406,6 +406,15 @@ export async function sweepExpiredStock(
  */
 export interface DisposalObligationHistoryEntry {
   readonly id: string;
+  /**
+   * The INSERT order (0036), as a decimal string because it is a `bigint`.
+   *
+   * Distinct from `sequence_number`, which is the continuation walk's depth: `seq` says
+   * when the row was written, the depth says where it sits in the chain. They agree for
+   * every chain this schema writes and diverge for a row written by hand, which is the
+   * only way a row gets a depth of 0.
+   */
+  readonly seq: string;
   readonly sequence_number: number;
   readonly continues_obligation_id: string | null;
   readonly quantity_at_discovery: string;
@@ -427,7 +436,7 @@ export async function disposalHistory(
   lotId: string,
 ): Promise<readonly DisposalObligationHistoryEntry[]> {
   const { rows } = await tx.query<DisposalObligationHistoryEntry>(
-    `SELECT id, sequence_number, continues_obligation_id,
+    `SELECT id, seq::text AS seq, sequence_number, continues_obligation_id,
             quantity_at_discovery::text AS quantity_at_discovery,
             expired_on::text AS expired_on, discovered_on::text AS discovered_on,
             due_by::text AS due_by, status,

@@ -23,6 +23,9 @@ import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
 import {
   ENDPOINT_CHANNELS,
   MAX_PRUNE_GUARD_FLOOR_ROWS,
+  latestProbe,
+  listProbes,
+  requestProbe,
   MAX_PRUNE_OVERRIDE_BY_CHARS,
   createEndpoint,
   getEndpoint,
@@ -2051,6 +2054,85 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         }),
       );
       return { status: 201, body };
+    },
+  });
+
+  /**
+   * Ask the scheduler to test an endpoint, and read the verdict it recorded.
+   *
+   * A POST, not the `GET` ADR-0001's open row spelled: this sends real traffic to a third
+   * party and is rate-limited, so it is neither safe nor idempotent.
+   *
+   * The API cannot answer the question itself and that is the whole shape of this. The
+   * secret an endpoint names lives in the SCHEDULER's environment — a check here would
+   * report confidently about the wrong one — so the scheduler probes, records the verdict,
+   * and this reads the row. `202`, because it is queued, not answered; the client polls
+   * the GET below, which the next `notify_dispatch` tick (30s) fills in.
+   *
+   * `requestedBy` is the authenticated principal, never client-supplied: a probe is
+   * attributable or it does not happen.
+   *
+   * Every refusal is the database's, translated — one outstanding probe per endpoint (a
+   * partial unique index, so two requests racing cannot both win), a per-tenant cooldown,
+   * and an endpoint in another tenant. The cooldown answers 429 rather than 409: it is rate
+   * limiting, and its message carries the moment a retry becomes legal.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/admin/notification-endpoints/:id/test",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const id = parse(UUID, ctx.params["id"]);
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        requestProbe(tx, ctx.principal.tenantId, {
+          endpointId: id,
+          requestedBy: ctx.principal.repProfileId,
+        }),
+      );
+      return { status: 202, body };
+    },
+  });
+
+  /** The verdict of the last test, or 404 if the endpoint has never been tested. */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notification-endpoints/:id/test",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const id = parse(UUID, ctx.params["id"]);
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        // Through the endpoint, so a probe id from another tenant cannot be read by
+        // guessing: RLS confines both, and an endpoint this tenant cannot see has no
+        // probes to show.
+        if ((await getEndpoint(tx, id)) === null) throw notFound(`no notification endpoint ${id}`);
+        return latestProbe(tx, id);
+      });
+      if (body === null) throw notFound(`endpoint ${id} has not been tested`);
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * The test history for one endpoint, newest first.
+   *
+   * Bounded at twenty by the database, not by this limit: 0034 trims to the newest twenty
+   * complete probes per endpoint on insert. A probe result is operational, not an audit
+   * record — nobody asks which day in March a webhook was tested — and a ring needs no
+   * scheduled job to honour it, where a horizon would have added one more thing somebody
+   * still has to wire.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notification-endpoints/:id/tests",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const id = parse(UUID, ctx.params["id"]);
+      const limit = Number(ctx.query.get("limit") ?? "20");
+      const data = await inTenant(deps, ctx.principal, async (tx) => {
+        if ((await getEndpoint(tx, id)) === null) throw notFound(`no notification endpoint ${id}`);
+        return listProbes(tx, id, Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 20) : 20);
+      });
+      return { status: 200, body: { data } };
     },
   });
 

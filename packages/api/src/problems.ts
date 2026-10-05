@@ -23,6 +23,11 @@ export const PROBLEM_TYPES = {
   insufficient_stock: "insufficient-stock",
   last_administrator: "last-administrator",
   unmapped_category: "unmapped-category",
+  // A cooldown is rate limiting, and 429 is the status for it. 409 was the alternative
+  // and is wrong in a way a client acts on: a conflict says "the state refuses this", a
+  // 429 says "ask again later", and the probe cooldown's own message carries the moment a
+  // retry becomes legal.
+  too_many_requests: "too-many-requests",
   method_not_allowed: "method-not-allowed",
   unsupported_media_type: "unsupported-media-type",
   payload_too_large: "payload-too-large",
@@ -54,6 +59,7 @@ const STATUS: Readonly<Record<ProblemKind, number>> = {
   // not said which ledger account the category posts to. A bare 409 would read as "your
   // claim is bad".
   unmapped_category: 409,
+  too_many_requests: 429,
   method_not_allowed: 405,
   unsupported_media_type: 415,
   payload_too_large: 413,
@@ -74,6 +80,7 @@ const TITLE: Readonly<Record<ProblemKind, string>> = {
   insufficient_stock: "Not enough stock on hand",
   last_administrator: "Last administrator",
   unmapped_category: "Category not mapped to an account",
+  too_many_requests: "Too many requests",
   method_not_allowed: "Method not allowed",
   unsupported_media_type: "Unsupported media type",
   payload_too_large: "Payload too large",
@@ -212,6 +219,18 @@ export function toProblem(err: unknown): ApiError {
       return new ApiError("conflict", message);
     case "LastAdministratorError":
       return new ApiError("last_administrator", message);
+    // The endpoint probe (0034). Four refusals, each a different instruction to the
+    // administrator: the endpoint is gone; one is already running; you asked too recently;
+    // the cooldown you tried to set is out of range. A 500 for any of them would be the
+    // API reporting its own surprise at a rule it enforces.
+    case "EndpointNotFoundError":
+      return new ApiError("not_found", message);
+    case "ProbeInFlightError":
+      return new ApiError("conflict", message);
+    case "ProbeCooldownError":
+      return new ApiError("too_many_requests", message);
+    case "InvalidProbeCooldownError":
+      return new ApiError("validation_failed", message);
     case "InvalidEndpointError":
     case "InvalidRetentionError":
     // A `mailto:` endpoint that is not one mailbox. Reachable from an admin route

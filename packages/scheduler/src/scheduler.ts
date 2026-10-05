@@ -1,6 +1,6 @@
 import { withTenantContext } from "@crm/db";
 import type { OutboxRelay } from "@crm/relay";
-import { pruneNotifications, type NotificationDispatcher } from "@crm/notify";
+import { pruneNotifications, type EndpointProbeRunner, type NotificationDispatcher } from "@crm/notify";
 import { sweepExpiredStock } from "@crm/sample";
 import { summariseExpensePostSweep, sweepApprovedExpenseClaims } from "@crm/expense";
 import type { SnapshotRefresher } from "@crm/sync";
@@ -19,6 +19,17 @@ export interface SchedulerOptions {
    * raised them — so a deployment with no webhook endpoints needs no dispatcher.
    */
   readonly notifications?: NotificationDispatcher;
+  /**
+   * Optional: answers endpoint probes an administrator has requested (0034).
+   *
+   * Deliberately NOT its own `scheduled_job` kind. `notify_dispatch` already ticks every
+   * 30s per tenant, which is the latency an administrator waiting on a test-send needs,
+   * and a second job would add a row to `crm.scheduled_job` and a value to its CHECK for
+   * work that is answered by a function call. The probe has to run HERE and not in the
+   * API because the secret an endpoint names lives in this process's environment — a
+   * check in the API would answer confidently about the wrong one.
+   */
+  readonly endpointProbes?: EndpointProbeRunner;
   /** How often to look for due work. Not the job cadence — that is per job. */
   readonly tickIntervalMs?: number;
   readonly now?: () => Date;
@@ -261,10 +272,26 @@ export class Scheduler {
         const dispatcher = this.options.notifications;
         if (dispatcher === undefined) return "no dispatcher configured; in-app notifications unaffected";
         const r = await dispatcher.drainTenant(tenantId);
-        return (
+        const line =
           `claimed=${r.claimed} delivered=${r.delivered} retried=${r.retried} ` +
-          `dead=${r.dead} pending=${r.pending}`
-        );
+          `dead=${r.dead} pending=${r.pending}`;
+        // Probes ride this tick rather than a job of their own. A probe failure must not
+        // fail the dispatch: the notifications went out, and an administrator's test-send
+        // going unanswered is not a reason to engage the job's failure backoff and stop
+        // delivering for this tenant.
+        const probes = this.options.endpointProbes;
+        if (probes === undefined) return line;
+        try {
+          const p = await probes.runTenant(tenantId);
+          if (p.claimed === 0) return line;
+          const verdicts = Object.entries(p.byVerdict)
+            .filter(([, n]) => n > 0)
+            .map(([v, n]) => `${v}=${String(n)}`)
+            .join(" ");
+          return `${line} | probes=${p.claimed} ${verdicts}${p.abandoned > 0 ? ` abandoned=${String(p.abandoned)}` : ""}`;
+        } catch (err) {
+          return `${line} | probes FAILED: ${err instanceof Error ? err.message : String(err)}`;
+        }
       }
       case "snapshot_incremental":
       case "snapshot_full": {

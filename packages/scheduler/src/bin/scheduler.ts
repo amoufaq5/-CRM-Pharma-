@@ -3,9 +3,14 @@ import { Pool } from "pg";
 import { ErpClient, type FetchLike } from "@crm/acl";
 import { buildServiceCredential } from "@crm/credential";
 import {
+  EndpointProbeRunner,
   NotificationDispatcher,
+  SmtpProber,
   SmtpSender,
+  WebhookProber,
   WebhookSender,
+  checkChannelCoverage,
+  type ChannelProber,
   type ChannelSender,
   type FetchLike as NotifyFetch,
   type SmtpRelayConfig,
@@ -15,6 +20,7 @@ import { OutboxRelay } from "@crm/relay";
 import { SnapshotRefresher } from "@crm/sync";
 
 import { Scheduler, type SchedulerEvent } from "../scheduler.js";
+import { activeTenants } from "../store.js";
 
 /**
  * The CRM's background process: drains the outbox to the ERP and keeps the
@@ -47,7 +53,7 @@ const SMTP_TRANSPORTS: readonly SmtpTransport[] = ["starttls", "implicit_tls", "
  * row names in `secret_env`, so two tenants relaying through the same host with different
  * credentials need no second process.
  */
-function buildMailSender(): SmtpSender | null {
+function buildMailRelay(): SmtpRelayConfig | null {
   const host = process.env["SMTP_HOST"];
   if (host === undefined || host === "") return null;
 
@@ -66,11 +72,11 @@ function buildMailSender(): SmtpSender | null {
     ...(process.env["SMTP_USERNAME"] !== undefined ? { username: process.env["SMTP_USERNAME"] } : {}),
     ...(process.env["SMTP_CLIENT_NAME"] !== undefined ? { clientName: process.env["SMTP_CLIENT_NAME"] } : {}),
   };
-  return new SmtpSender({
-    relay,
-    ...(process.env["SMTP_TIMEOUT_MS"] !== undefined ? { timeoutMs: Number(process.env["SMTP_TIMEOUT_MS"]) } : {}),
-  });
+  return relay;
 }
+
+const SMTP_TIMEOUT = (): { timeoutMs?: number } =>
+  process.env["SMTP_TIMEOUT_MS"] !== undefined ? { timeoutMs: Number(process.env["SMTP_TIMEOUT_MS"]) } : {};
 
 function log(event: SchedulerEvent): void {
   // One JSON object per line: greppable, and ready for a log shipper whenever
@@ -135,14 +141,61 @@ async function main(): Promise<void> {
     fetch: globalThis.fetch as unknown as FetchLike,
   });
 
-  const mail = buildMailSender();
+  // One relay config, two consumers. The sender and the prober must agree about the host,
+  // the transport and the From, or a probe would report on a relay the sender never uses.
+  const mailRelay = buildMailRelay();
   const senders: readonly ChannelSender[] = [
     new WebhookSender({ fetch: globalThis.fetch as unknown as NotifyFetch }),
-    ...(mail === null ? [] : [mail]),
+    ...(mailRelay === null ? [] : [new SmtpSender({ relay: mailRelay, ...SMTP_TIMEOUT() })]),
+  ];
+  const probers: readonly ChannelProber[] = [
+    new WebhookProber({ fetch: globalThis.fetch as unknown as NotifyFetch }),
+    ...(mailRelay === null ? [] : [new SmtpProber({ relay: mailRelay, ...SMTP_TIMEOUT() })]),
   ];
   console.log(
     JSON.stringify({ ts: new Date().toISOString(), type: "senders", channels: senders.map((x) => x.channel) }),
   );
+
+  /**
+   * Does every endpoint in the database have a sender in THIS process? (0034)
+   *
+   * Said once, at boot, because that is when an operator is looking. It does NOT refuse to
+   * start, and that is the decision: the TLS refusal in `SmtpSender`'s constructor is a
+   * statement about this process's own configuration with no legitimate counter-example,
+   * whereas coverage is a statement about tenant data that changes while the process runs
+   * — an administrator can create an email endpoint a minute after a webhook-only
+   * scheduler booted. And the blast radius is inverted: refusing to start takes down the
+   * relay drain, the expiry sweep and expense posting for EVERY tenant because one tenant
+   * configured one endpoint this binary cannot serve. A late notification is a late
+   * notification; a scheduler that will not start means a rep's write never reaches the
+   * ERP.
+   *
+   * Per tenant, necessarily: `crm.notification_endpoint` is RLS-forced and boot happens
+   * before any tenant context exists, so a single cross-tenant SELECT returns zero rows
+   * — correctly, and silently, which would report every deployment clean.
+   */
+  const coverageClient = await pool.connect();
+  let tenantIds: readonly string[];
+  try {
+    tenantIds = (await activeTenants(coverageClient)).map((t) => t.tenant_id);
+  } finally {
+    coverageClient.release();
+  }
+  const coverage = await checkChannelCoverage(pool, tenantIds, senders);
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      type: "channel_coverage",
+      verdict: coverage.verdict,
+      registered: coverage.registered,
+      tenants: coverage.tenantsChecked,
+      unreadable: coverage.unreadable,
+      summary: coverage.summary,
+    }),
+  );
+  for (const line of coverage.lines) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), type: "warning", detail: line }));
+  }
 
   const workerId = `${process.env["HOSTNAME"] ?? "local"}-${process.pid}`;
   const scheduler = new Scheduler({
@@ -153,6 +206,7 @@ async function main(): Promise<void> {
     // secret is in the database and the process needs no configuration beyond the
     // variables those endpoints point at.
     notifications: new NotificationDispatcher({ pool, senders }),
+    endpointProbes: new EndpointProbeRunner({ pool, probers, workerId }),
     ...(process.env["TICK_INTERVAL_MS"] !== undefined
       ? { tickIntervalMs: Number(process.env["TICK_INTERVAL_MS"]) }
       : {}),

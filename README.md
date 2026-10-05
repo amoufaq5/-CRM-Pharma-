@@ -113,6 +113,9 @@ authorisation on its own.
 | `PUT /v1/admin/samples/disposal-policy` | the grace period and the promo switch (**compliance**) |
 | `GET\|POST /v1/admin/notification-endpoints` | where signals are pushed (**administrator**) |
 | `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; there is no DELETE |
+| `POST /v1/admin/notification-endpoints/:id/test` | ask the scheduler to probe it; `202`, because it is queued, not answered |
+| `GET /v1/admin/notification-endpoints/:id/test` | the verdict the scheduler recorded |
+| `GET /v1/admin/notification-endpoints/:id/tests` | the last twenty, newest first |
 | `GET /v1/admin/notifications/retention` | how long inboxes keep things — readable by every rep |
 | `PUT /v1/admin/notifications/retention` | the two horizons (**administrator**) |
 | `GET /v1/admin/notifications/prune-candidates` | what tonight's prune would take, what it would hold back, and whether it would be refused |
@@ -345,6 +348,76 @@ conversation: an ASCII body for `أحمد الموفق` goes out as `8bit` with 
 It has **never spoken to a real mail server**: it is verified end to end against a sink
 written alongside it, which is faithful to RFC 5321/3207/4616 as far as it goes and is not
 Postfix. It does no DKIM signing. Both are in the ADR's open table.
+
+## Testing an endpoint, and knowing a channel can be sent
+
+**The API cannot tell you whether your endpoint works, and that is a fact about where the
+secret lives.** `secret_env` names an environment variable; the sender runs in the
+**scheduler**, which reads a different environment. A check in the API would answer
+confidently about the wrong one. So the scheduler probes and records the verdict and the API
+reads the row: `POST …/test` returns `202`, and the next `notify_dispatch` tick (30s) fills
+in the answer.
+
+Four verdicts, each naming only what was proven:
+
+| | |
+|---|---|
+| `delivered` | a probe message was accepted — a **webhook** got a real signed POST back 2xx |
+| `reachable` | the destination accepted us and **nothing was delivered** — **email** walks greeting → EHLO → STARTTLS → AUTH → `MAIL FROM` → `RCPT TO` → **`RSET`** → QUIT |
+| `refused` | answered and said no, permanently |
+| `unknown` | **fail closed** — a timeout, a refused connection, no prober for the channel |
+
+Email stops before `DATA` on purpose. A real probe email puts a message in front of a person
+who did not ask for one every time an administrator checks a setting, and buys only the
+`DATA` phase; a bare connect-and-AUTH check is too weak, because a relay that authenticates
+and then refuses the mailbox would report as fine. `MAIL FROM` + `RCPT TO` proves the
+envelope sender and the mailbox, which is the misconfiguration that actually happens. `RSET`
+before `QUIT`, so "no message was sent" is explicit in the relay's own log.
+
+The webhook probe carries `x-crm-event: endpoint_probe` — deliberately **not** a
+`NotificationKind`, so a receiver switching on the event falls to its default branch and one
+parsing the body finds no `kind`, `subject` or `recipient` to misread. It names no rep,
+account or lot, and nothing in a verdict is a secret: `detail` names the *variable*.
+
+Three rules sit in the schema rather than the route, so the offline path cannot skip them:
+**one outstanding probe per endpoint** (a partial unique index, because a trigger cannot see
+another transaction's uncommitted row), a **per-tenant cooldown** (120s by default; it
+answers `429`, not `409` — this is rate limiting and the message says when a retry becomes
+legal), and `requested_at` **overwritten by the trigger**, because a caller who could supply
+it could backdate one probe and make the next legal immediately.
+
+**And at boot the scheduler says whether it can send what the database asks for.** It
+compares the channels on each tenant's enabled endpoints against the senders it registered
+and logs `covered`, `dormant` (only disabled endpoints on an unregistered channel — nothing
+is late, but enabling one would be) or `unsendable`. It **warns and starts**: the TLS refusal
+in `SmtpSender`'s constructor is a statement about this process's own configuration, where
+coverage is a statement about tenant data that changes while the process runs — and refusing
+to boot would take down the relay drain, the expiry sweep and expense posting for every
+tenant because one tenant configured one endpoint this binary cannot serve. Per tenant
+necessarily: the table is RLS-forced and boot precedes any tenant context, so a single
+cross-tenant `SELECT` returns zero rows — correctly, silently, and reporting every
+deployment clean.
+
+## Tenant isolation is structural, not just a policy
+
+Every foreign key in `crm.*` into a tenant-scoped table is now **composite** —
+`(tenant_id, ref_id) → (tenant_id, id)`, all 38, with constraint names and every `ON DELETE`
+preserved byte for byte (measured against the catalog before and after, not asserted by eye).
+
+This closes a class, not an instance. **A referential check runs with row security
+disabled** — that is what makes foreign keys usable at all — so RLS was never standing
+between a row and another tenant's parent. Demonstrated before being fixed: as `crm_app`,
+under FORCE RLS, inside `withTenantContext`, a tenant-B `rep_role` naming a tenant-A profile
+as `granted_by` inserted and **committed**; and `SELECT count(*)` with no tenant context
+returned `0`, because RLS then hides the damage. That is the shipped bug
+`crm.revoke_rep_role` had — fixed once, in one function, which is exactly the kind of fix the
+next function forgets.
+
+`packages/db/src/composite-fk.contract.test.ts` probes all 38 individually, asserting both
+`23503` **and** the constraint name, so a CHECK that fired first or a trigger fails the test
+rather than passing for it. It carries a `pg_constraint` drift guard too: a table added next
+month by someone who does not know this rule fails a test instead of quietly reopening the
+class.
 
 ## The background process
 
