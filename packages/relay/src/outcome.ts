@@ -39,8 +39,83 @@ const GUARD_FATAL = new Set([
   "validation_failed", // schema rejection; the payload is wrong, not late
 ]);
 
-/** Postgres/ERP signals that the record already exists — a replay, not a failure. */
+/**
+ * Postgres/ERP signals that the record already exists — a replay, not a failure.
+ *
+ * KEPT, and deliberately. The live server answers a duplicate record id
+ * `500 {"error":"write_failed","detail":"duplicate key value violates unique
+ * constraint …"}` because `operate-runtime/src/handlers.ts` forwards the driver's
+ * message verbatim, so today this regex alone settles a redelivery, for free and
+ * without a second request. What it is NOT is evidence: it reads a sentence the
+ * platform never promised to keep, and it cannot tell a collision on OUR id from a
+ * collision on some other unique column — a duplicate `invoice_number` would match
+ * this and mean the write never landed.
+ *
+ * So it is now the fallback, not the mechanism: it answers only when the probe
+ * could not (see `TargetConfirmedAbsentError`), and for the operations the probe
+ * cannot speak for at all.
+ */
 const ALREADY_EXISTS = /duplicate key|already exists|unique constraint|idempotenc/i;
+
+/**
+ * A dispatch read the target record back and the ERP HOLDS it: a previous attempt
+ * landed and its response was lost.
+ *
+ * Minted by `dispatch`, never by the ERP. The ERP's own duplicate-key answer is a
+ * 500 that says nothing about the record; this says something about the record,
+ * which is why it exists as a distinct type rather than as a synthesised 409 —
+ * nothing here should pretend the platform answered something it did not.
+ */
+export class TargetAlreadyPresentError extends Error {
+  constructor(
+    readonly recordId: string,
+    readonly writeError: unknown,
+  ) {
+    super(`the ERP holds ${recordId}: an earlier attempt landed and its response was lost`);
+    this.name = "TargetAlreadyPresentError";
+  }
+}
+
+/**
+ * A dispatch read the target record back and the ERP does NOT hold it: whatever
+ * the write error said, the write did not land.
+ *
+ * Carries the original failure, which is what actually gets classified — the
+ * absence only decides that no existence GUESS may override it.
+ */
+export class TargetConfirmedAbsentError extends Error {
+  constructor(
+    readonly recordId: string,
+    readonly writeError: unknown,
+  ) {
+    super(`the ERP does not hold ${recordId}: the write did not land`);
+    this.name = "TargetConfirmedAbsentError";
+  }
+}
+
+/**
+ * Whether a write failure leaves it unknown what happened to the record.
+ *
+ * The line is drawn on whether we were TOLD an outcome, not on a list of ERP
+ * codes. Below 500 the ERP made a decision and reported it: 401, 403, 404, 409,
+ * 422 and 429 each state what happened, and reading the record back could only
+ * confirm what we already have. At 500 and above the server failed to describe its
+ * own outcome — `write_failed` is emitted by a `catch` around the write unit
+ * itself, which is as close to "I do not know" as a server gets. And a failure
+ * that is not an `ErpError` at all — a reset mid-flight, the client-side timeout
+ * before any body was read — says least of all: the write may have been executed
+ * and the answer lost.
+ *
+ * Enumerating codes instead would be the same defect one layer up from the one
+ * this closes. The leak dependency exists because a classification was built on
+ * knowledge of the platform's internals that the platform never promised; a
+ * hand-maintained list of its 5xx codes would break the same way, silently, in the
+ * same expensive direction.
+ */
+export function isAmbiguousWriteFailure(error: unknown): boolean {
+  if (!(error instanceof ErpError)) return true;
+  return error.status >= 500;
+}
 
 /**
  * The ERP's code for "that transition cannot fire from this state".
@@ -66,7 +141,34 @@ export interface ClassifyInput {
  * document — where retrying forever only hides the problem.
  */
 export function classify(input: ClassifyInput): Outcome {
-  const err = input.error;
+  if (input.error instanceof TargetAlreadyPresentError) {
+    return {
+      kind: "already_delivered",
+      reason:
+        `the ERP already holds ${input.error.recordId} — read back from the ERP, ` +
+        `not inferred from the error text`,
+    };
+  }
+
+  if (input.error instanceof TargetConfirmedAbsentError) {
+    // The probe outranks the regex, and this is where that happens. Without the
+    // suppression the override would be inert: the error a probe runs on is usually
+    // the very duplicate-key sentence `ALREADY_EXISTS` matches, so classifying the
+    // inner failure normally would hand back `already_delivered` for a record the
+    // ERP demonstrably does not have. An answer beats a guess; a guess that
+    // contradicts an answer is simply wrong.
+    const inner = classifyFailure(input.error.writeError, input.isTransition, true);
+    return {
+      kind: inner.kind,
+      reason: `${inner.reason} — and the ERP does not hold ${input.error.recordId}, so the write did not land`,
+    };
+  }
+
+  return classifyFailure(input.error, input.isTransition, false);
+}
+
+function classifyFailure(error: unknown, isTransition: boolean, targetConfirmedAbsent: boolean): Outcome {
+  const err = error;
 
   if (!(err instanceof ErpError)) {
     // A socket reset, a DNS blip, a bug in our own dispatch code. Retrying a
@@ -103,7 +205,7 @@ export function classify(input: ClassifyInput): Outcome {
   // own UI — the attempt cap ends it and the dead-letter alarm puts it in front of a
   // human, which is the correct destination for a disagreement no retry can settle.
   if (err.code === INVALID_TRANSITION) {
-    if (input.isTransition) {
+    if (isTransition) {
       return {
         kind: "retry_ordering",
         reason: `the ERP refused this transition from the record's current state (${
@@ -117,17 +219,22 @@ export function classify(input: ClassifyInput): Outcome {
     return { kind: "dead", reason: `invalid_transition on a non-transition write: ${err.detail ?? ""}` };
   }
 
-  if (err.kind === "conflict" || ALREADY_EXISTS.test(err.detail ?? "")) {
+  if (!targetConfirmedAbsent && (err.kind === "conflict" || ALREADY_EXISTS.test(err.detail ?? ""))) {
     // The deterministic target id already exists at the ERP, so a previous
     // attempt DID land and we never saw the response. The unique constraint on
     // (tenant_id, entity, record_id) is what makes this safe to call success —
     // not the Idempotency-Key header, whose store is in-memory in the deployed
     // binary and dies on restart (report R6).
+    //
+    // Reached only when nothing better is available: a `create` whose failure was
+    // ambiguous has been read back from the ERP first, and lands here only if that
+    // read could not answer. `targetConfirmedAbsent` is the case where it answered
+    // NO, and an inference from a sentence must not overturn it.
     return { kind: "already_delivered", reason: `already at the ERP: ${err.code}` };
   }
 
   if (err.kind === "not_found") {
-    if (input.isTransition) {
+    if (isTransition) {
       // Very likely ordering: the create that this transition acts on has not
       // landed yet. Retrying lets the sibling row catch up. The attempt cap
       // stops it if the record genuinely does not exist.

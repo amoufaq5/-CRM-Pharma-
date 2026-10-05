@@ -35,7 +35,17 @@ export type RelayEvent =
   | { readonly type: "already_delivered"; readonly row: OutboxRow }
   | { readonly type: "retry"; readonly row: OutboxRow; readonly delayMs: number; readonly outcome: Outcome }
   | { readonly type: "dead"; readonly row: OutboxRow; readonly outcome: Outcome }
-  | { readonly type: "reclaimed"; readonly tenantId: string; readonly count: number };
+  | { readonly type: "reclaimed"; readonly tenantId: string; readonly count: number }
+  /**
+   * Another worker settled this row first, so our settlement was refused.
+   *
+   * `reclaimStale` exists so a killed worker's rows are not stranded, and it necessarily
+   * creates an overlap: A claims, its lease expires, the row returns to `pending`, B claims
+   * it, and then A's ERP call finally returns. Both try to settle. The guards in `store.ts`
+   * make the database refuse the loser; this event is how the loss becomes visible instead
+   * of being counted as a settlement that happened.
+   */
+  | { readonly type: "settle_lost"; readonly row: OutboxRow; readonly outcome: Outcome };
 
 export interface RelayResult {
   readonly claimed: number;
@@ -50,6 +60,15 @@ export interface RelayResult {
    * show up in the scheduler's log line.
    */
   readonly unattributed: number;
+  /**
+   * Settlements the database refused because another worker got there first.
+   *
+   * Counted rather than silently dropped: a non-zero number here means two workers raced
+   * over the same row, which `reclaimStale` makes possible by design, and it is the
+   * difference between "this row was settled" and "we tried to settle a row somebody else
+   * had". Before the guards in `store.ts` these were counted as settlements that happened.
+   */
+  readonly settleLost: number;
   readonly lag: OutboxLag;
 }
 
@@ -103,6 +122,7 @@ export class OutboxRelay {
       let dead = 0;
       let alarmed = 0;
       let unattributed = 0;
+      let lost = 0;
 
       for (const row of rows) {
         // Deliberately outside any transaction — see the class comment.
@@ -112,7 +132,11 @@ export class OutboxRelay {
           switch (outcome.kind) {
             case "delivered":
             case "already_delivered": {
-              await markDelivered(tx, row.id, this.now(), outcome.response);
+              if (!(await markDelivered(tx, row.id, this.now(), outcome.response))) {
+                lost += 1;
+                this.options.onEvent?.({ type: "settle_lost", row, outcome });
+                return;
+              }
               delivered += 1;
               this.options.onEvent?.({
                 type: outcome.kind === "delivered" ? "delivered" : "already_delivered",
@@ -121,7 +145,15 @@ export class OutboxRelay {
               return;
             }
             case "dead": {
-              await markDead(tx, row.id, this.now(), outcome.reason);
+              // The guard first, and the alarm only after it holds. `markDead` refuses a
+              // row another worker has already DELIVERED, and that is the ordering with a
+              // user-visible consequence: the write reached the ERP, and raising the alarm
+              // anyway tells a rep urgently that it did not — about a write that is fine.
+              if (!(await markDead(tx, row.id, this.now(), outcome.reason))) {
+                lost += 1;
+                this.options.onEvent?.({ type: "settle_lost", row, outcome });
+                return;
+              }
               dead += 1;
               // In the SAME transaction as the state change: there must be no window in
               // which a write is permanently dead and nobody was told.
@@ -135,7 +167,11 @@ export class OutboxRelay {
               const policy = policyFor(outcome.kind);
               if (row.attempts >= policy.maxAttempts) {
                 const reason = `giving up after ${row.attempts} attempts — ${outcome.reason}`;
-                await markDead(tx, row.id, this.now(), reason);
+                if (!(await markDead(tx, row.id, this.now(), reason))) {
+                  lost += 1;
+                  this.options.onEvent?.({ type: "settle_lost", row, outcome });
+                  return;
+                }
                 dead += 1;
                 const alarm = await raiseDeadLetterAlarm(tx, tenantId, row, reason);
                 alarmed += alarm.notified;
@@ -144,12 +180,17 @@ export class OutboxRelay {
                 return;
               }
               const delayMs = nextDelayMs(row.attempts, policy, this.random);
-              await markRetry(
-                tx,
-                row.id,
-                new Date(this.now().getTime() + delayMs),
-                outcome.reason,
-              );
+              if (
+                !(await markRetry(tx, row.id, new Date(this.now().getTime() + delayMs), outcome.reason))
+              ) {
+                // `markRetry` refuses a row already `dead`. Without the guard this put a
+                // dead letter back in the queue with `revive_count` untouched, which the
+                // 0036 trigger reads as a revive nobody performed — the relay
+                // manufacturing by hand the exact falsehood the history exists to expose.
+                lost += 1;
+                this.options.onEvent?.({ type: "settle_lost", row, outcome });
+                return;
+              }
               retried += 1;
               this.options.onEvent?.({ type: "retry", row, delayMs, outcome });
             }
@@ -160,7 +201,7 @@ export class OutboxRelay {
       const lag = await withTenantContext(client, tenantId, (tx) =>
         outboxLag(tx, tenantId, this.now()),
       );
-      return { claimed: rows.length, delivered, retried, dead, alarmed, unattributed, lag };
+      return { claimed: rows.length, delivered, retried, dead, alarmed, unattributed, settleLost: lost, lag };
     } finally {
       client.release();
     }

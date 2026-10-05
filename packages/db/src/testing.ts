@@ -191,3 +191,9 @@ export const TENANT_DISPOSAL_SEQ = "e2100000-0000-4000-8000-000000000016";
 
 /** scripts/live-erp — the live handshake against a running operate-server. */
 export const TENANT_LIVE_ERP = "e3100000-0000-4000-8000-000000000017";
+
+/** packages/relay — the dead-letter attempt history. */
+export const TENANT_ATTEMPT_HISTORY = "e4100000-0000-4000-8000-000000000018";
+
+/** packages/relay — the outbox store's settle guards. */
+export const TENANT_RELAY_STORE = "e5100000-0000-4000-8000-000000000019";

@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { ErpError } from "@crm/acl";
-import { classify, isTerminal } from "./outcome.js";
+import {
+  TargetAlreadyPresentError,
+  TargetConfirmedAbsentError,
+  classify,
+  isAmbiguousWriteFailure,
+  isTerminal,
+} from "./outcome.js";
 
 /**
  * `ConstructorParameters`, not `Parameters`. A class is not callable, so
@@ -161,4 +167,122 @@ describe("409 is not one thing", () => {
   });
 });
 
+});
+
+/**
+ * The live duplicate-key answer, byte for byte.
+ *
+ * `operate-runtime/src/handlers.ts` wraps the write unit in a `catch` and forwards
+ * `e.message`, so node-postgres's sentence reaches the client inside a 500. Used
+ * as the inner error throughout this block so each assertion is measured against
+ * the real thing rather than a shape invented for the test.
+ */
+const LIVE_DUPLICATE = () =>
+  erp(
+    "unavailable",
+    500,
+    "write_failed",
+    'duplicate key value violates unique constraint "operate_entity_records_tenant_entity_record_key"',
+  );
+
+/** The same answer from a platform that stopped leaking the driver message. */
+const SILENT_DUPLICATE = () => erp("unavailable", 500, "write_failed");
+
+describe("what counts as ambiguous", () => {
+  // The rule is "were we told an outcome", not a list of ERP codes. A list would be
+  // the same defect one layer up from the leak this closes.
+  it.each([
+    ["the live duplicate-key 500", LIVE_DUPLICATE()],
+    ["the same 500 with no detail at all", SILENT_DUPLICATE()],
+    ["a 503 from the gateway", erp("unavailable", 503, "service_unavailable", "down")],
+    ["the client's own 504 timeout", erp("unavailable", 504, "client_timeout", "POST /v1/items exceeded 15000ms")],
+    ["an unreadable 502 body", erp("unavailable", 502, "unrecognised_error_shape")],
+    ["a socket reset, which is not an ErpError at all", new Error("ECONNRESET")],
+  ])("%s is ambiguous — the ERP did not say what happened to the record", (_label, error) => {
+    expect(isAmbiguousWriteFailure(error)).toBe(true);
+  });
+
+  it.each([
+    ["401", erp("unauthenticated", 401, "authentication_required")],
+    ["403", erp("forbidden", 403, "forbidden", "role may not post")],
+    ["404", erp("not_found", 404, "not_found")],
+    ["409", erp("conflict", 409, "conflict_idempotency_mismatch")],
+    ["409 invalid_transition", erp("conflict", 409, "invalid_transition", "'approve' cannot fire from 'draft'")],
+    ["422 period_locked", erp("validation_failed", 422, "period_locked", "fiscal period is closed")],
+    ["422 validation_failed", erp("validation_failed", 422, "validation_failed", "request_number is required")],
+    ["429", erp("rate_limited", 429, "too_many_requests")],
+  ])("%s is NOT ambiguous — it states an outcome, so a read could only repeat it", (_label, error) => {
+    expect(isAmbiguousWriteFailure(error)).toBe(false);
+  });
+});
+
+describe("a probe that read the record back", () => {
+  it("settles the row as delivered, and says it ASKED rather than guessed", () => {
+    const out = classify({
+      error: new TargetAlreadyPresentError("crm-exp-42", SILENT_DUPLICATE()),
+      isTransition: false,
+    });
+    expect(out.kind).toBe("already_delivered");
+    expect(isTerminal(out.kind)).toBe(true);
+    expect(out.reason).toContain("crm-exp-42");
+    // The distinction is the whole increment: the row's `last_error` has to say
+    // which mechanism settled it, or the next live run cannot tell them apart.
+    expect(out.reason).toMatch(/read back from the ERP/);
+  });
+
+  it("settles a write whose 500 carried NO driver text — the case that used to die at the cap", () => {
+    // The before/after in one pair. Same status, same code, no `detail`:
+    // classification alone can only retry it, and a probe makes it delivered.
+    expect(classify({ error: SILENT_DUPLICATE(), isTransition: false }).kind).toBe("retry_transient");
+    expect(
+      classify({ error: new TargetAlreadyPresentError("crm-exp-42", SILENT_DUPLICATE()), isTransition: false }).kind,
+    ).toBe("already_delivered");
+  });
+});
+
+describe("a probe that found the record ABSENT outranks the regex", () => {
+  it("refuses to call a write delivered on a duplicate-key sentence the ERP contradicts", () => {
+    // NON-VACUITY: the inner error is the real live 500, whose detail `ALREADY_EXISTS`
+    // matches — asserted on the very next line. If the suppression were removed this
+    // would read `already_delivered`, so the test cannot pass while the rule is broken.
+    const inner = LIVE_DUPLICATE();
+    expect(classify({ error: inner, isTransition: false }).kind).toBe("already_delivered");
+
+    const out = classify({ error: new TargetConfirmedAbsentError("crm-exp-43", inner), isTransition: false });
+    expect(out.kind).not.toBe("already_delivered");
+    expect(out.kind).toBe("retry_transient");
+    expect(isTerminal(out.kind)).toBe(false);
+  });
+
+  it("keeps the ERP's own sentence AND says the record is not there", () => {
+    const out = classify({
+      error: new TargetConfirmedAbsentError("crm-exp-43", LIVE_DUPLICATE()),
+      isTransition: false,
+    });
+    expect(out.reason).toContain("duplicate key value");
+    expect(out.reason).toContain("does not hold crm-exp-43");
+  });
+
+  it("does not let a 409 on another unique column read as delivered either", () => {
+    // The disagreement that makes the probe authoritative rather than a second
+    // opinion: a collision on some OTHER unique column — an invoice number, an
+    // employee number — answers the same way while our record was never written.
+    const out = classify({
+      error: new TargetConfirmedAbsentError(
+        "crm-exp-44",
+        erp("conflict", 409, "conflict", 'duplicate key value violates unique constraint "invoice_number_key"'),
+      ),
+      isTransition: false,
+    });
+    expect(out.kind).not.toBe("already_delivered");
+  });
+
+  it("still dead-letters a failure that cannot fix itself, absence or not", () => {
+    // Absence suppresses the existence GUESS and nothing else: a 403 is still a 403.
+    const out = classify({
+      error: new TargetConfirmedAbsentError("crm-exp-45", erp("forbidden", 403, "forbidden", "role may not post")),
+      isTransition: false,
+    });
+    expect(out.kind).toBe("dead");
+  });
 });

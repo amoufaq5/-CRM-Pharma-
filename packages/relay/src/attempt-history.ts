@@ -14,6 +14,11 @@ import type { PoolClient } from "pg";
  * change rather than by this package, so no path records a death without recording its
  * history. This module is the read side and the question-answering side; nothing here
  * writes.
+ *
+ * The trigger records whatever the state change says, which puts the other half of the
+ * guarantee in `store.ts`: a settlement that arrives after another worker has already
+ * settled the row would otherwise write a death that never happened, permanently, into a
+ * table nothing prunes. See the note above `markDelivered` there.
  */
 
 export interface DeadLetterAttempt {
@@ -84,16 +89,27 @@ export async function attemptHistory(
  * revived and then delivered has left it — and so has one whose queue row was deleted.
  * This reads the history table alone, so neither disappears.
  *
- * Ordered by `died_at`, which does not tie here for the reason it ties everywhere else in
- * this schema: the relay settles each row in its OWN transaction, so each death carries
- * its own clock reading. `attempt` is the tie-break anyway, and within one outbox row it
- * is the only ordering that means anything.
+ * ORDERING. `died_at` DOES tie, and the earlier claim here that it could not — "the relay
+ * settles each row in its own transaction, so each death carries its own clock reading" —
+ * was wrong twice over. `died_at` is not `now()`: the trigger copies `crm.outbox.dead_at`,
+ * which `markDead` receives as a caller-supplied `Date`, so a separate transaction buys
+ * nothing. And a `Date` has millisecond resolution, where the one path that dead-letters
+ * without an ERP round trip in between — `UnknownOperationError`, refused before any HTTP
+ * call — settles a whole batch inside one millisecond. Two rows in one drain therefore
+ * share `died_at` exactly, and `attempt` is no tie-break at all across different outbox
+ * rows, because both are 1. That is Part 1 of 0036's own lesson, in Part 2's read side.
+ *
+ * So the sort ends on `(outbox_id, attempt)`, which is UNIQUE and therefore makes the
+ * order total: within one outbox row the newest episode first, and between rows a uuid,
+ * which is meaningless as an ordering and is the point — where the data cannot say, pick
+ * once and keep picking the same way (0027, and 0036's own backfill). What it buys is a
+ * page boundary that does not drop or duplicate a row between two identical requests.
+ * Recovering the real write order needs a `seq` on this table; see the follow-up.
  */
 export async function recentDeaths(
   tx: PoolClient,
   opts: { readonly limit?: number } = {},
 ): Promise<readonly DeadLetterAttempt[]> {
-  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
   const { rows } = await tx.query<DeadLetterAttempt>(
     `SELECT d.id, d.outbox_id, d.attempt, d.revive_count_at_death, d.dispatch_attempts,
             d.died_at, d.reason, d.entity, d.operation, d.target_record_id::text AS target_record_id,
@@ -108,14 +124,50 @@ export async function recentDeaths(
               AS is_repeat_of_previous
        FROM crm.outbox_dead_letter d
        LEFT JOIN crm.rep_profile rp ON rp.id = d.revived_by
-      ORDER BY d.died_at DESC, d.attempt DESC
-      LIMIT ${limit}`,
+      ORDER BY d.died_at DESC, d.outbox_id, d.attempt DESC
+      LIMIT $1`,
+    [clampLimit(opts.limit)],
   );
   return rows;
 }
 
+/**
+ * Bound the page size, as a parameter rather than as text.
+ *
+ * `LIMIT ${n}` was interpolated, and the clamp around it admitted anything numeric: a
+ * `1.5` reached Postgres verbatim and a `NaN` — which `Math.min(Math.max(NaN, 1), 500)`
+ * returns unchanged — reached it as the identifier `NaN`, so a caller passing a parsed
+ * query parameter got a syntax error instead of a page. Every other query in this package
+ * binds its arguments; this one now does too, and a value that is not a whole number is
+ * truncated towards the floor rather than refused, because a listing is not the place to
+ * invent a 400.
+ */
+function clampLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return 100;
+  return Math.min(Math.max(Math.floor(limit), 1), 500);
+}
+
 export interface AttemptHistorySummary {
+  /** Deaths IN HAND — rows this summary was given. */
   readonly deaths: number;
+  /**
+   * Deaths this outbox row has ever had, from the highest `attempt` present.
+   *
+   * The trigger allocates `attempt` as one past the highest already recorded, so the
+   * newest surviving row carries the true count however many older ones are gone. That is
+   * what makes a history that is pruned still able to say how much it is not showing, and
+   * it is why the retention answer can be a ring rather than a cascade: discarding the
+   * oldest episodes loses their reasons, never the count.
+   */
+  readonly deathsEverRecorded: number;
+  /**
+   * Episodes that happened and are not here — `deathsEverRecorded - deaths`.
+   *
+   * Non-zero today means a history row was deleted by hand, since nothing prunes this
+   * table yet; under a ring it means the oldest episodes were trimmed. Either way a
+   * reader is told rather than shown a short list that looks complete.
+   */
+  readonly episodesMissing: number;
   /** Episodes that ended — the row left `dead`, by a revive or otherwise. */
   readonly revives: number;
   /** Distinct non-null reasons. */
@@ -134,12 +186,39 @@ export interface AttemptHistorySummary {
    * the "progress is being made" shape.
    */
   readonly neverTheSameReason: boolean;
+  /*
+   * Both shapes above compare the entries IN HAND from the second onward, so they describe
+   * a page rather than a history whenever `episodesMissing` is non-zero. The first entry's
+   * own `is_repeat_of_previous` is deliberately not folded in: for a complete history it is
+   * always false, since episode 1 has no predecessor, and counting it would make
+   * `alwaysTheSameReason` unreachable.
+   */
   /**
    * Deaths whose `attempt` and `revive_count_at_death` disagree: the row was put back in
    * the queue without `crm.revive_outbox_letter`, so a revive happened that nothing
    * attributed.
    */
   readonly unaccountedRevivals: number;
+  /**
+   * Episodes stamped as having ended BEFORE they began — `revived_at < died_at`.
+   *
+   * Impossible by construction on the attributed path, and reachable today: the trigger's
+   * revive branch takes `COALESCE(NEW.revived_at, now())`, and on the hand-written path
+   * that moves a row out of `dead` without `crm.revive_outbox_letter`, `crm.outbox`
+   * still holds the PREVIOUS revive's timestamp — so the episode is closed with a moment
+   * that predates its own death. Demonstrated against the real database; see the contract
+   * suite, and the follow-up for the one-line trigger fix 0037 should carry.
+   *
+   * Counted rather than corrected, for the reason every other number here is: a history
+   * that quietly repaired its own rows would be the one record nobody could audit.
+   *
+   * It compares two clocks, which is sound only in production. `died_at` is the relay's
+   * `now` for that settlement; `revived_at` is `now()` in the transaction that closed the
+   * episode, because `crm.outbox` has nowhere to record "the episode ended at" and the
+   * trigger has nothing else to fall back on. Under an injected clock — every test, and
+   * `RelayOptions.now` — the two are unrelated and this will count a sound row.
+   */
+  readonly impossibleRevivals: number;
   readonly latestReason: string | null;
 }
 
@@ -180,8 +259,12 @@ export function summariseAttemptHistory(
   const consecutive = ordered.slice(1);
   const latest = ordered[ordered.length - 1];
 
+  const everRecorded = ordered.length === 0 ? 0 : Math.max(...ordered.map((e) => e.attempt));
+
   return {
     deaths: ordered.length,
+    deathsEverRecorded: everRecorded,
+    episodesMissing: Math.max(0, everRecorded - ordered.length),
     revives: ordered.filter((e) => e.revived_at !== null).length,
     distinctReasons: counts.size,
     repeatedReasons,
@@ -193,6 +276,9 @@ export function summariseAttemptHistory(
     neverTheSameReason:
       consecutive.length > 0 && consecutive.every((e) => !e.is_repeat_of_previous),
     unaccountedRevivals: ordered.filter((e) => e.attempt !== e.revive_count_at_death + 1).length,
+    impossibleRevivals: ordered.filter(
+      (e) => e.revived_at !== null && e.revived_at.getTime() < e.died_at.getTime(),
+    ).length,
     latestReason: latest?.reason ?? null,
   };
 }

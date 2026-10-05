@@ -2,7 +2,18 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_DISPOSAL_SEQ as TENANT, appPool } from "@crm/db/testing";
+import { appPool } from "@crm/db/testing";
+
+/**
+ * A reserved tenant of this file's own, derived from the `e…` block in
+ * `packages/db/src/testing.ts` by continuing its numbering past `TENANT_LIVE_ERP`
+ * (`…017`). It is declared here because that file is not this change's to edit, and the
+ * id is NOT `TENANT_DISPOSAL_SEQ`: this suite deletes every `crm.outbox` row in its
+ * tenant after each test, so sharing a block with another file is a loaded gun even
+ * while `fileParallelism: false` keeps them from firing it. Owed an entry in
+ * `testing.ts` as `TENANT_ATTEMPT_HISTORY`.
+ */
+const TENANT = "e4100000-0000-4000-8000-000000000018";
 
 import {
   attemptHistory,
@@ -30,18 +41,16 @@ import { claimBatch, enqueueOutbox, markDead, markDelivered, markRetry } from ".
  *
  * `appPool()` connects as `crm_app`, so RLS is live and the isolation assertions mean
  * something. A superuser connection bypasses the policy even under FORCE.
- *
- * TENANT. Shares `TENANT_DISPOSAL_SEQ` with `packages/sample`'s disposal ordering suite:
- * the two touch disjoint tables (`crm.outbox` + `crm.outbox_dead_letter` here,
- * `crm.disposal_obligation` there) and test files run sequentially. A reserved block of
- * its own means editing `packages/db/src/testing.ts`, which this change does not own.
  */
 describe("a dead letter's per-attempt history", () => {
   let pool: Pool;
   let client: PoolClient;
 
-  const REVIVER = "e2dd0000-0000-4000-8000-000000000001";
-  const OTHER_TENANT = "e2cc0000-0000-4000-8000-000000000099";
+  // Both derived from this file's own tenant block, so no fixture of another suite's can
+  // already hold the id under a different `tenant_id` — which the composite
+  // `outbox_revived_by_fkey` refuses, and which is exactly how a shared block fails.
+  const REVIVER = "e4100000-0000-4000-8000-0000000000a1";
+  const OTHER_TENANT = "e4100000-0000-4000-8000-0000000000b9";
 
   const at = (iso: string): Date => new Date(iso);
 
@@ -313,6 +322,59 @@ describe("a dead letter's per-attempt history", () => {
       });
     });
 
+    /**
+     * 0038 closed this, and the test is inverted rather than deleted.
+     *
+     * The trigger used to copy `crm.outbox.revived_at` unguarded. That column holds ONE
+     * value, overwritten by each revive, so a hand-written revive that did not set it
+     * stamped the closing episode with an EARLIER revive's timestamp — an episode recorded
+     * as having ended before it began, which the old assertion pinned as a known defect.
+     *
+     * 0038 trusts a supplied moment only when `revive_count` moved AND the timestamp is
+     * not older than the death it closes, and uses `now()` otherwise. Guarding on the
+     * counter alone was tried first and is not enough: a hand-written revive that bumps
+     * the counter and forgets the timestamp passes that guard and still records the
+     * impossible pair. Both paths are asserted below.
+     */
+    it("never closes an episode before the death it closes, on either revive path", async () => {
+      for (const bumpsCounter of [true, false]) {
+        await inTenant(async (tx) => {
+          // Through the real writer, so the row is one the relay could actually produce.
+          const { id } = await queued(tx);
+          await tx.query(
+            `UPDATE crm.outbox SET state = 'dead', dead_at = '2026-10-01T10:00:00.000Z',
+                                   dead_reason = 'first' WHERE id = $1`,
+            [id],
+          );
+          await tx.query(
+            `UPDATE crm.outbox SET state = 'pending', revive_count = 1,
+                                   revived_at = '2026-10-02T08:00:00.000Z', dead_at = NULL
+              WHERE id = $1`,
+            [id],
+          );
+          await tx.query(
+            `UPDATE crm.outbox SET state = 'dead', dead_at = '2026-10-02T09:00:00.000Z',
+                                   dead_reason = 'second' WHERE id = $1`,
+            [id],
+          );
+          // The stale `revived_at` (08:00) is still on the row and is BEFORE this
+          // episode's death (09:00), which is what makes it detectable as a leftover.
+          await tx.query(
+            `UPDATE crm.outbox SET state = 'pending', revive_count = $2, dead_at = NULL
+              WHERE id = $1`,
+            [id, bumpsCounter ? 2 : 1],
+          );
+          const { rows } = await tx.query<{ impossible: boolean | null }>(
+            `SELECT bool_or(revived_at < died_at) AS impossible
+               FROM crm.outbox_dead_letter
+              WHERE outbox_id = $1 AND revived_at IS NOT NULL`,
+            [id],
+          );
+          expect(rows[0]?.impossible, `counter ${bumpsCounter ? "moved" : "static"}`).toBe(false);
+        });
+      }
+    });
+
     it("leaves attempt and revive_count disagreeing, which the summary reports", async () => {
       await inTenant(async (tx) => {
         const row = await queued(tx);
@@ -372,6 +434,31 @@ describe("a dead letter's per-attempt history", () => {
       });
     });
 
+    it("says how many episodes are not in the list when one is deleted by hand", async () => {
+      await inTenant(async (tx) => {
+        const row = await queued(tx);
+        await markDead(tx, row.id, at("2026-10-01T10:00:00Z"), "account missing");
+        await reviveDeadLetter(tx, row.id, REVIVER, at("2026-10-02T08:00:00Z"));
+        await claimBatch(tx, TENANT, "worker-1", 10, at("2026-10-02T08:01:00Z"));
+        await markDead(tx, row.id, at("2026-10-02T09:00:00Z"), "period locked");
+
+        // Nothing prunes this table today, so the only way a row goes is by hand — and
+        // that is the case a ring would make routine. `attempt` survives the loss, so the
+        // count does too, which is what makes the ring a safe retention answer where a
+        // cascade was not.
+        await tx.query("DELETE FROM crm.outbox_dead_letter WHERE outbox_id = $1 AND attempt = 1", [
+          row.id,
+        ]);
+
+        const history = await attemptHistory(tx, row.id);
+        expect(history).toHaveLength(1);
+        const summary = summariseAttemptHistory(history);
+        expect(summary.deaths).toBe(1);
+        expect(summary.deathsEverRecorded).toBe(2);
+        expect(summary.episodesMissing).toBe(1);
+      });
+    });
+
     it("compares against the real previous episode even outside the page", async () => {
       await inTenant(async (tx) => {
         const row = await queued(tx);
@@ -386,6 +473,114 @@ describe("a dead letter's per-attempt history", () => {
         expect(page).toHaveLength(1);
         expect(page[0]!.attempt).toBe(2);
         expect(page[0]!.is_repeat_of_previous).toBe(true);
+      });
+    });
+  });
+
+  // ---- the listing's order and its page size ------------------------------
+
+  describe("the listing has a total order", () => {
+    it("ties on died_at, which is why the sort cannot end there", async () => {
+      // Two rows dead-lettered with ONE clock reading — the real shape of a batch that
+      // dies before any ERP round trip (`UnknownOperationError` is refused by
+      // `parseOperation`, so a whole batch of them settles inside one millisecond).
+      await inTenant(async (tx) => {
+        const a = await queued(tx, { entity: "Expense" });
+        const b = await queued(tx, { entity: "JournalEntry" });
+        const oneClockReading = at("2026-10-01T10:00:00Z");
+        await markDead(tx, a.id, oneClockReading, "unknown outbox operation");
+        await markDead(tx, b.id, oneClockReading, "unknown outbox operation");
+
+        const { rows } = await tx.query<{ n: string }>(
+          "SELECT count(DISTINCT died_at) AS n FROM crm.outbox_dead_letter WHERE tenant_id = $1",
+          [TENANT],
+        );
+        expect(Number(rows[0]!.n)).toBe(1);
+      });
+    });
+
+    /**
+     * A tie that the OLD sort key cannot resolve and resolves DIFFERENTLY.
+     *
+     * Three deaths at one instant across two outbox rows, arranged so that `attempt`
+     * disagrees with `outbox_id`: the row with the LARGER uuid is the one that died twice.
+     * The old `ORDER BY died_at DESC, attempt DESC` then leads with that row's second
+     * episode, and the new key leads with the smaller uuid's first — so the two orders
+     * differ in position 0 whatever plan Postgres picks.
+     *
+     * Arranged rather than assumed, because the naive version of this test passed against
+     * the broken sort: with every key tied, a small sort preserves its input and that
+     * input happened to arrive in index order, which IS uuid order. A tie that only
+     * agrees by accident proves nothing, which is the whole reason this file exists.
+     */
+    const tiedAcrossTwoRows = async (
+      tx: PoolClient,
+    ): Promise<{ readonly smaller: string; readonly larger: string }> => {
+      const one = await queued(tx, { entity: "Expense" });
+      const two = await queued(tx, { entity: "JournalEntry" });
+      const [smaller, larger] = [one.id, two.id].sort() as [string, string];
+      const t = at("2026-10-01T10:00:00Z");
+
+      await markDead(tx, smaller, t, "403 forbidden");
+      await markDead(tx, larger, t, "403 forbidden");
+      await reviveDeadLetter(tx, larger, REVIVER, t);
+      await claimBatch(tx, TENANT, "worker-1", 10, t);
+      await markDead(tx, larger, t, "403 forbidden, again");
+      return { smaller, larger };
+    };
+
+    it("breaks a died_at tie on the key that is actually unique", async () => {
+      await inTenant(async (tx) => {
+        const { smaller, larger } = await tiedAcrossTwoRows(tx);
+        const got = await recentDeaths(tx, { limit: 50 });
+        expect(got.map((r) => [r.outbox_id, r.attempt])).toEqual([
+          [smaller, 1],
+          [larger, 2],
+          [larger, 1],
+        ]);
+      });
+    });
+
+    it("gives the same answer twice, and pages that nest", async () => {
+      await inTenant(async (tx) => {
+        await tiedAcrossTwoRows(tx);
+        const first = await recentDeaths(tx, { limit: 50 });
+        const second = await recentDeaths(tx, { limit: 50 });
+        expect(first.map((r) => r.id)).toEqual(second.map((r) => r.id));
+        // A short page is a prefix of a long one. That is the property a listing needs and
+        // the one a non-total sort cannot promise.
+        expect((await recentDeaths(tx, { limit: 2 })).map((r) => r.id)).toEqual(
+          first.slice(0, 2).map((r) => r.id),
+        );
+        expect(new Set(first.map((r) => r.id)).size).toBe(3);
+      });
+    });
+
+    it("still puts the newest episode of one row first", async () => {
+      await inTenant(async (tx) => {
+        const row = await queued(tx);
+        await markDead(tx, row.id, at("2026-10-01T10:00:00Z"), "first");
+        await reviveDeadLetter(tx, row.id, REVIVER, at("2026-10-02T08:00:00Z"));
+        await claimBatch(tx, TENANT, "worker-1", 10, at("2026-10-02T08:01:00Z"));
+        await markDead(tx, row.id, at("2026-10-02T09:00:00Z"), "second");
+        expect((await recentDeaths(tx)).map((r) => r.attempt)).toEqual([2, 1]);
+      });
+    });
+
+    it("binds the page size, so a fractional one is a number and not a syntax error", async () => {
+      await inTenant(async (tx) => {
+        for (const entity of ["Expense", "JournalEntry", "Item"]) {
+          const row = await queued(tx, { entity });
+          await markDead(tx, row.id, at("2026-10-01T10:00:00Z"), "403");
+        }
+        // `LIMIT ${1.9}` reached Postgres verbatim and errored; the floor is a page.
+        expect(await recentDeaths(tx, { limit: 1.9 })).toHaveLength(1);
+        // `Math.min(Math.max(NaN, 1), 500)` is NaN, which interpolated as the identifier
+        // `NaN` and took the whole listing down. It now falls back to the default.
+        expect(await recentDeaths(tx, { limit: Number.NaN })).toHaveLength(3);
+        // Below the floor and above the ceiling both clamp rather than refuse.
+        expect(await recentDeaths(tx, { limit: 0 })).toHaveLength(1);
+        expect(await recentDeaths(tx, { limit: 10_000 })).toHaveLength(3);
       });
     });
   });
@@ -547,8 +742,51 @@ describe("a dead letter's per-attempt history", () => {
       expect(rows).toEqual([]);
     });
 
+    it("accepts a reviver from ANOTHER tenant, and resolves no name for them", async () => {
+      // The consequence of carrying `revived_by` with no reference at all, stated as a
+      // test rather than left to the header. 0035 made every rep reference composite
+      // because a referential check runs with row security disabled, so a single-column
+      // FK lets one tenant name another tenant's row — and NO foreign key is exactly as
+      // permissive on that property, in the one place `composite-fk.contract.test.ts`
+      // cannot see it ("a column with no reference is outside what this guard can see").
+      //
+      // What it does NOT do is leak: `revived_by_name` is resolved by a LEFT JOIN inside
+      // `crm.outbox_dead_letter_history`, which is SECURITY INVOKER, so the join is
+      // RLS-filtered and a foreign rep reads as a recorded uuid beside a null name —
+      // indistinguishable from an id that never existed, so there is no oracle either.
+      const FOREIGN_REP = "e4100000-0000-4000-8000-0000000000f1";
+      await withTenantContext(client, OTHER_TENANT, async (other) => {
+        await other.query(
+          `INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name)
+           VALUES ($1,$2,'ah-foreign','AH-F','SHOULD NOT BE READABLE') ON CONFLICT DO NOTHING`,
+          [FOREIGN_REP, OTHER_TENANT],
+        );
+      });
+      try {
+        await inTenant(async (tx) => {
+          const outboxId = randomUUID();
+          await tx.query(
+            `INSERT INTO crm.outbox_dead_letter
+               (tenant_id, outbox_id, attempt, revive_count_at_death, dispatch_attempts,
+                died_at, reason, entity, operation, target_record_id, source_table, source_id,
+                revived_at, revived_by)
+             VALUES ($1,$2,1,0,1,now(),'r','Expense','create','AH-T','crm.expense_claim',$3,
+                     now(),$4)`,
+            [TENANT, outboxId, randomUUID(), FOREIGN_REP],
+          );
+          const [entry] = await attemptHistory(tx, outboxId);
+          expect(entry!.revived_by).toBe(FOREIGN_REP);
+          expect(entry!.revived_by_name).toBeNull();
+        });
+      } finally {
+        await withTenantContext(client, OTHER_TENANT, async (other) => {
+          await other.query("DELETE FROM crm.rep_profile WHERE id = $1", [FOREIGN_REP]);
+        });
+      }
+    });
+
     it("keeps a reviver's id after their profile is gone, with a null name beside it", async () => {
-      const GHOST = "e2dd0000-0000-4000-8000-0000000000ee";
+      const GHOST = "e4100000-0000-4000-8000-0000000000ae";
       const outboxId = await inTenant(async (tx) => {
         await tx.query(
           `INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name)
@@ -600,6 +838,8 @@ describe("a dead letter's per-attempt history", () => {
     it("says nothing happened for an empty history", () => {
       expect(summariseAttemptHistory([])).toEqual({
         deaths: 0,
+        deathsEverRecorded: 0,
+        episodesMissing: 0,
         revives: 0,
         distinctReasons: 0,
         repeatedReasons: [],
@@ -607,6 +847,7 @@ describe("a dead letter's per-attempt history", () => {
         alwaysTheSameReason: false,
         neverTheSameReason: false,
         unaccountedRevivals: 0,
+        impossibleRevivals: 0,
         latestReason: null,
       });
     });
@@ -662,6 +903,59 @@ describe("a dead letter's per-attempt history", () => {
       ]);
       expect(s.revives).toBe(2);
       expect(s.unaccountedRevivals).toBe(0);
+    });
+
+    it("reads the true death count off the newest episode, not off the list length", () => {
+      // A page that starts at episode 3 — what a trimmed history, or a page boundary,
+      // hands this function. `deaths` is what is in hand; `deathsEverRecorded` is what
+      // happened; the difference is what is not being shown.
+      const s = summariseAttemptHistory([
+        entry({ attempt: 3, reason: "third" }),
+        entry({ attempt: 4, reason: "fourth" }),
+      ]);
+      expect(s.deaths).toBe(2);
+      expect(s.deathsEverRecorded).toBe(4);
+      expect(s.episodesMissing).toBe(2);
+    });
+
+    it("never reports a negative shortfall", () => {
+      // `attempt` is allocated per outbox row, so a list spanning two rows can hold more
+      // entries than the highest `attempt` in it. The shortfall clamps rather than going
+      // negative and reading as a surplus of episodes.
+      const s = summariseAttemptHistory([
+        entry({ attempt: 1, outbox_id: "o1" }),
+        entry({ attempt: 1, outbox_id: "o2" }),
+      ]);
+      expect(s.deathsEverRecorded).toBe(1);
+      expect(s.episodesMissing).toBe(0);
+    });
+
+    it("counts an episode that ended before it began", () => {
+      const s = summariseAttemptHistory([
+        entry({
+          attempt: 1,
+          died_at: at("2026-10-02T09:00:00Z"),
+          revived_at: at("2026-10-02T08:00:00Z"),
+        }),
+        entry({
+          attempt: 2,
+          died_at: at("2026-10-03T09:00:00Z"),
+          revived_at: at("2026-10-03T10:00:00Z"),
+        }),
+        entry({ attempt: 3, died_at: at("2026-10-04T09:00:00Z") }),
+      ]);
+      expect(s.impossibleRevivals).toBe(1);
+      expect(s.revives).toBe(2);
+    });
+
+    it("does not call a same-instant revive impossible", () => {
+      // A revive stamped with the death's own timestamp is odd and not contradictory, and
+      // the test exists because `<=` here would report every such row as corrupt.
+      const t = at("2026-10-02T09:00:00Z");
+      expect(
+        summariseAttemptHistory([entry({ attempt: 1, died_at: t, revived_at: t })])
+          .impossibleRevivals,
+      ).toBe(0);
     });
 
     it("counts every death whose numbering disagrees with the revive bookkeeping", () => {

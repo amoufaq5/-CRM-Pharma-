@@ -1,5 +1,8 @@
 import type { PoolClient } from "pg";
 
+/** The four states `crm.outbox.state`'s CHECK constraint admits. */
+export type OutboxState = "pending" | "in_flight" | "delivered" | "dead";
+
 export interface OutboxRow {
   readonly id: string;
   readonly tenant_id: string;
@@ -105,13 +108,45 @@ export async function reclaimStale(
   return rowCount ?? 0;
 }
 
+/**
+ * A SETTLEMENT RACE THE THREE FUNCTIONS BELOW HAVE TO SURVIVE.
+ *
+ * `reclaimStale` exists so a worker killed mid-dispatch does not strand its rows, and it
+ * necessarily creates an overlap: worker A claims a row, its lease expires, the row goes
+ * back to `pending`, worker B claims it — and A is still alive, still waiting on the ERP,
+ * and will settle when it returns. Two workers then settle the same row, in whichever
+ * order their round trips finish, and `WHERE id = $1` accepted every ordering.
+ *
+ * Two of the four orderings are wrong in a way that is visible to a rep, and both write a
+ * falsehood into `crm.outbox_dead_letter`, because the trigger there records whatever the
+ * state change says:
+ *
+ *   * B delivers, then A dead-letters. The write DID reach the ERP, and the rep is told
+ *     urgently that it did not (`raiseDeadLetterAlarm`, in the same transaction), while
+ *     the history gains a death that never happened — permanently, since nothing prunes
+ *     it. Guarded: a delivered row is not killed.
+ *   * A dead-letters, then B retries. The row goes `dead -> pending` with `revive_count`
+ *     untouched, so the trigger closes the episode as a revive nobody performed and the
+ *     queue picks the row back up with the rep already notified it failed. That is
+ *     precisely the hand-written path the history exists to EXPOSE, manufactured by the
+ *     relay itself. Guarded: a dead row is not retried. Its one way back is
+ *     `reviveDeadLetter`, deliberately, because that path carries an actor (rule 31).
+ *
+ * The remaining ordering — A dead-letters, then B delivers — is left alone. The write
+ * landed, the episode ended, and `revived_at` is documented as "when this episode ended,
+ * whether or not an actor was recorded for it", which is exactly true here.
+ *
+ * The guard is a predicate in the UPDATE rather than a read-then-write, so the row's own
+ * lock decides and two workers cannot both pass it. Each returns whether it applied; the
+ * relay ignores that today and should not — see the follow-up.
+ */
 export async function markDelivered(
   tx: PoolClient,
   id: string,
   now: Date,
   response: unknown,
-): Promise<void> {
-  await tx.query(
+): Promise<boolean> {
+  const { rowCount } = await tx.query(
     `UPDATE crm.outbox
         SET state = 'delivered', delivered_at = $2, last_error = NULL,
             claimed_at = NULL, claimed_by = NULL,
@@ -119,6 +154,7 @@ export async function markDelivered(
       WHERE id = $1`,
     [id, now, JSON.stringify(response ?? null)],
   );
+  return (rowCount ?? 0) > 0;
 }
 
 export async function markRetry(
@@ -126,14 +162,15 @@ export async function markRetry(
   id: string,
   nextAttemptAt: Date,
   reason: string,
-): Promise<void> {
-  await tx.query(
+): Promise<boolean> {
+  const { rowCount } = await tx.query(
     `UPDATE crm.outbox
         SET state = 'pending', next_attempt_at = $2, last_error = $3,
             claimed_at = NULL, claimed_by = NULL
-      WHERE id = $1`,
+      WHERE id = $1 AND state <> 'dead'`,
     [id, nextAttemptAt, reason.slice(0, 2000)],
   );
+  return (rowCount ?? 0) > 0;
 }
 
 export async function markDead(
@@ -141,14 +178,15 @@ export async function markDead(
   id: string,
   now: Date,
   reason: string,
-): Promise<void> {
-  await tx.query(
+): Promise<boolean> {
+  const { rowCount } = await tx.query(
     `UPDATE crm.outbox
         SET state = 'dead', dead_at = $2, dead_reason = $3, last_error = $3,
             claimed_at = NULL, claimed_by = NULL
-      WHERE id = $1`,
+      WHERE id = $1 AND state <> 'delivered'`,
     [id, now, reason.slice(0, 2000)],
   );
+  return (rowCount ?? 0) > 0;
 }
 
 export interface OutboxLag {
@@ -227,18 +265,31 @@ export interface EnqueueInput {
  * detected — so a collapsed duplicate burns a sequence value and leaves a gap.
  * Routine rather than exceptional here, since a replayed offline batch is a
  * normal day: nothing may read `seq` as a count or infer a missing row from one.
+ *
+ * RETURNS THE EXISTING ROW'S STATE, because `enqueued: false` had two meanings and
+ * callers could only act on one. "Already queued" is the ordinary double-tap and is a
+ * no-op worth nothing further. "Already DEAD" is the same request collapsing onto a
+ * write the ERP has permanently refused: the intent is dropped, the rep's app says
+ * recorded for the second time, and the only way back is a revive by a person
+ * (rule 31) — which is exactly the shape rule 30 forbids failing quietly. The caller
+ * is handed the state rather than a boolean, so it can say which of the two happened
+ * instead of assuming the harmless one.
  */
 export async function enqueueOutbox(
   tx: PoolClient,
   tenantId: string,
   input: EnqueueInput,
-): Promise<{ readonly enqueued: boolean; readonly id: string }> {
-  const { rows } = await tx.query<{ id: string }>(
+): Promise<{
+  readonly enqueued: boolean;
+  readonly id: string;
+  readonly state: OutboxState;
+}> {
+  const { rows } = await tx.query<{ id: string; state: OutboxState }>(
     `INSERT INTO crm.outbox
        (tenant_id, entity, operation, payload, target_record_id, source_table, source_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (tenant_id, entity, operation, target_record_id) DO NOTHING
-     RETURNING id`,
+     RETURNING id, state`,
     [
       tenantId,
       input.entity,
@@ -249,12 +300,16 @@ export async function enqueueOutbox(
       input.sourceId,
     ],
   );
-  if (rows[0] !== undefined) return { enqueued: true, id: rows[0].id };
+  const inserted = rows[0];
+  if (inserted !== undefined) {
+    return { enqueued: true, id: inserted.id, state: inserted.state };
+  }
 
-  const { rows: existing } = await tx.query<{ id: string }>(
-    `SELECT id FROM crm.outbox
+  const { rows: existing } = await tx.query<{ id: string; state: OutboxState }>(
+    `SELECT id, state FROM crm.outbox
       WHERE tenant_id = $1 AND entity = $2 AND operation = $3 AND target_record_id = $4`,
     [tenantId, input.entity, input.operation, input.targetRecordId],
   );
-  return { enqueued: false, id: existing[0]!.id };
+  const row = existing[0]!;
+  return { enqueued: false, id: row.id, state: row.state };
 }

@@ -37,3 +37,18 @@ export {
   type DeadLetter,
   type DeadLetterAlarm,
 } from "./dead-letters.js";
+export {
+  attemptHistory,
+  recentDeaths,
+  summariseAttemptHistory,
+  type AttemptHistorySummary,
+  type DeadLetterAttempt,
+} from "./attempt-history.js";
+export {
+  PROBE_TIMEOUT_MS,
+  probeTargetRecord,
+  type ProbeOptions,
+  type ProbeReader,
+  type ProbeTarget,
+  type ProbeVerdict,
+} from "./probe.js";

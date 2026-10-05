@@ -279,6 +279,12 @@ export function toProblem(err: unknown): ApiError {
     case "InvalidCategoryError":
       return new ApiError("validation_failed", message);
 
+    // @crm/relay. Exported from its barrel and mapped nowhere until now, so it fell
+    // through to a 500 — and escaped the structural test below only because `@crm/relay`
+    // was missing from that test's module list. Both are fixed together; mapping the class
+    // without adding the package would leave the next one free to do the same.
+    case "DeadLetterNotFoundError":
+      return new ApiError("not_found", message);
     case "ErpError":
       return new ApiError("upstream_unavailable", "the ERP could not be reached");
     default:

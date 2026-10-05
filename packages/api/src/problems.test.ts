@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as callplan from "@crm/callplan";
 import * as expense from "@crm/expense";
 import * as notify from "@crm/notify";
+import * as relay from "@crm/relay";
 import * as role from "@crm/role";
 import * as sample from "@crm/sample";
 
@@ -59,6 +60,10 @@ describe("toProblem covers every domain error", () => {
     InvalidSmtpRelayError: "boot-time relay configuration; the scheduler must fail to start, not answer a request",
     SmtpProtocolError: "the relay spoke something that is not SMTP; becomes a dead SendOutcome",
     SmtpTimeoutError: "a relay stopped answering; becomes a retry SendOutcome",
+    UnknownOperationError:
+      "an outbox row carries an operation the dispatcher cannot parse — written by our own " +
+      "producers, never by a request, so a client cannot provoke it and can do nothing " +
+      "with it. The relay dead-letters the row with this sentence, which is where it belongs",
     ClientAlreadyInTenantContextError:
       "a caller handed the expense sweep a client already inside withTenantContext — a " +
       "programming error in the scheduler, not something a request can provoke or a client act on",
@@ -74,6 +79,11 @@ describe("toProblem covers every domain error", () => {
     // dependency rests on. A new domain package is exactly what this test is for, and it
     // only works if the package is in this list.
     ["@crm/expense", expense as unknown as Record<string, unknown>, 10],
+    // Added after `DeadLetterNotFoundError` was found exported and unmapped — a 500 for a
+    // refusal, hidden for as long as this package was absent from the list. The whole
+    // point of this test is that a domain package's errors cannot fall through, and it can
+    // only do that for packages it is given.
+    ["@crm/relay", relay as unknown as Record<string, unknown>, 1],
   ] as const) {
     it(`maps every error exported by ${moduleName}`, () => {
       const classes = errorClasses(mod);
