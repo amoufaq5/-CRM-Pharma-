@@ -258,6 +258,30 @@ export class ErpClient {
     )) as T;
   }
 
+  /**
+   * Reads a tenant's deletion receipts — `GET /v1/platform/tenants/{id}/tombstones`.
+   *
+   * The ONE platform-scoped route this client speaks to, and the one read the CRM makes about
+   * a tenant rather than about its records. It is here rather than behind a generic
+   * "GET any path" because knowing the ERP's URLs is this package's whole job: a caller that
+   * could name its own path could name an entity table, which ADR-0001 forbids.
+   *
+   * Returns the parsed body and throws `ErpError` on anything else, exactly like every other
+   * method — the classifier in `tombstones.ts` is what turns both outcomes into a verdict,
+   * because "the ERP refused to tell us" is an answer the caller has to handle and not an
+   * exception it should swallow.
+   *
+   * No `Idempotency-Key`: this is a GET, so the replay path the other methods guard against
+   * cannot apply, and sending one would put a read into a store that never evicts.
+   */
+  async tenantTombstones(tenantId: string): Promise<unknown> {
+    return await this.request(
+      tenantId,
+      "GET",
+      `/v1/platform/tenants/${encodeURIComponent(tenantId)}/tombstones`,
+    );
+  }
+
   /** Builds and validates the query string. Throws before sending on a bad filter. */
   private buildListQuery(schema: TenantSchema, entity: string, options: ListOptions): string {
     const params = new URLSearchParams();

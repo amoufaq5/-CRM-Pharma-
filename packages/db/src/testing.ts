@@ -220,3 +220,13 @@ export const TENANT_DELIVERY_RETENTION_OTHER = "e8100000-0000-4000-8000-00000000
  * would make one file's refusals the other file's missing rows.
  */
 export const TENANT_ENDPOINT_RULES = "e9490000-0000-4000-8000-00000000001c";
+
+/**
+ * packages/sync — tenant-deletion.contract (migration 0050).
+ *
+ * Two, and they are not interchangeable: this suite MARKS a tenant `erp_deleted`, which 0050
+ * makes terminal, so the tenant it stops can never be reused by a later test in the same
+ * database. The second is the one that must stay alive, to prove the mark is per tenant.
+ */
+export const TENANT_DELETION_STOPPED = "ea500000-0000-4000-8000-00000000001d";
+export const TENANT_DELETION_LIVE = "eb500000-0000-4000-8000-00000000001e";

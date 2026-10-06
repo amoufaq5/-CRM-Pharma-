@@ -30,6 +30,13 @@ export const PROBLEM_TYPES = {
   lot_expired: "lot-expired",
   insufficient_stock: "insufficient-stock",
   last_administrator: "last-administrator",
+  // ITS OWN TYPE, not `forbidden`, and the reason is what a client does with it. Every other
+  // 403 here is about this caller — wrong role, wrong territory, suspended profile — and the
+  // remedy is to ask an administrator. This one says the tenant itself is gone: the ERP
+  // dropped its schema and signed a tombstone for it (0050), there is no administrator left
+  // to ask, and an offline client holding a queue of unsent visits needs to stop retrying
+  // and say so rather than spin on a refusal it reads as transient permissions.
+  tenant_deleted: "tenant-deleted",
   unmapped_category: "unmapped-category",
   // A cooldown is rate limiting, and 429 is the status for it. 409 was the alternative
   // and is wrong in a way a client acts on: a conflict says "the state refuses this", a
@@ -68,6 +75,11 @@ const STATUS: Readonly<Record<ProblemKind, number>> = {
   // without reading prose: a client can say "appoint a successor first" and offer the
   // grant form, where a bare 409 would just look like a failed request.
   last_administrator: 409,
+  // 403 and not 410. `410 Gone` is about the REQUESTED RESOURCE having been removed, and the
+  // resource here is whatever route they called, which is still perfectly present for every
+  // other tenant. The fact is about the caller's authorisation to use it at all, which is a
+  // 403 — and the type above is what tells a client which 403 this is.
+  tenant_deleted: 403,
   // Its own type because it is the one expense refusal a client must ACT on rather than
   // merely report: the claim is correct and nothing is wrong with it, Finance simply has
   // not said which ledger account the category posts to. A bare 409 would read as "your
@@ -95,6 +107,7 @@ const TITLE: Readonly<Record<ProblemKind, string>> = {
   lot_expired: "Lot is expired or withdrawn",
   insufficient_stock: "Not enough stock on hand",
   last_administrator: "Last administrator",
+  tenant_deleted: "Tenant deleted",
   unmapped_category: "Category not mapped to an account",
   signature_mismatch: "Signature does not match the ledger commitment",
   too_many_requests: "Too many requests",
@@ -145,6 +158,19 @@ export class ApiError extends Error {
 /** Shorthands, so a handler reads as prose. */
 export const unauthenticated = (d?: string): ApiError => new ApiError("unauthenticated", d);
 export const forbidden = (d?: string): ApiError => new ApiError("forbidden", d);
+
+/**
+ * The tenant's ERP presence is gone, so this CRM has stopped working it.
+ *
+ * Names the tenant id, which is not a leak: the caller's own token carries it, and the whole
+ * point is that an operator reading a support ticket can match it against `crm.tenant`.
+ */
+export const tenantDeleted = (tenantId: string): ApiError =>
+  new ApiError(
+    "tenant_deleted",
+    `tenant ${tenantId} has been deleted at the ERP, and this CRM has stopped processing its data. ` +
+      `No request for this tenant will be served.`,
+  );
 export const notFound = (d?: string): ApiError => new ApiError("not_found", d);
 export const validationFailed = (d?: string, e?: Record<string, string>): ApiError =>
   new ApiError("validation_failed", d, e);

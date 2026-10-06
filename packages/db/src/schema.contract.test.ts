@@ -110,12 +110,42 @@ describe("CRM schema invariants", () => {
     // The exemption is only defensible while the table stays a registry. If
     // someone adds a column that belongs to a tenant, this fails and the
     // exemption has to be re-argued rather than quietly inherited.
+    //
+    // IT HAS BEEN RE-ARGUED ONCE, by migration 0050, and the argument is recorded here
+    // rather than in the commit that widened the list. 0050 adds the receipt for an ERP
+    // tenant deletion — the tombstone id, kind, timestamp, proof hash, chain hash and when
+    // we observed it — beside the `status` that the receipt is the only way to reach.
+    //
+    // Why these belong on the registry: they are facts about whether the TENANT exists at
+    // the ERP, which is the same category as `status` and `display_name` and not the same
+    // category as a rep, an account, a visit or an amount. No tenant's users can read them:
+    // `crm.tenant` is read in exactly three places, all server-side — the scheduler's
+    // `activeTenants`, `tenantRegistryStatus`, and a join in `resolvePrincipal` keyed on the
+    // caller's OWN tenant_id that surfaces nothing but a 403-or-not decision. No route
+    // returns a row from this table.
+    //
+    // And why the exemption is not materially wider for it: what the exemption costs is
+    // cross-tenant visibility, and `display_name` already exposes every tenant's NAME to a
+    // connection in any tenant's context. A tombstone id and a sha256 add nothing a
+    // deployment operator could not already see, and the status they pair with has to live
+    // here regardless, because `WHERE status = 'active'` is the single enumeration point that
+    // makes the mark stop every job at once.
+    //
+    // What would NOT survive this argument: a contact email, a billing amount, a plan name, a
+    // seat count — anything belonging to a person or to money. The second assertion below is
+    // the cheap guard for exactly that, in the idiom the `service_key` test below uses.
     const ALLOWED_REGISTRY_COLUMNS = new Set([
       "tenant_id",
       "display_name",
       "status",
       "created_at",
       "updated_at",
+      "erp_tombstone_id",
+      "erp_tombstone_kind",
+      "erp_tombstone_deleted_at",
+      "erp_tombstone_proof_sha256",
+      "erp_tombstone_chain_entry_hash",
+      "erp_tombstone_observed_at",
     ]);
     for (const table of Object.keys(RLS_EXEMPT)) {
       const { rows } = await client.query<{ attname: string }>(
@@ -127,6 +157,18 @@ describe("CRM schema invariants", () => {
       );
       const unexpected = rows.map((r) => r.attname).filter((c) => !ALLOWED_REGISTRY_COLUMNS.has(c));
       expect(unexpected, `crm.${table} is RLS-exempt (${RLS_EXEMPT[table]}) and must stay a registry`).toEqual([]);
+
+      // The allow-list is a list, so it can be extended by anybody willing to type a name.
+      // This cannot: a column on an RLS-exempt table whose name belongs to a person, a
+      // contact detail or money is the thing the exemption must never cover, and no argument
+      // in a comment makes it safe. Adding one has to fail a test that says why.
+      for (const name of rows.map((r) => r.attname)) {
+        expect(
+          name,
+          `crm.${table}.${name} is on an RLS-EXEMPT table and reads like personal or financial data, ` +
+            `which every tenant's connection could then see`,
+        ).not.toMatch(/email|phone|address|contact|person|amount|price|fee|cost|seat|plan|card|iban|salary/i);
+      }
     }
   });
 

@@ -38,3 +38,12 @@ export {
   type RejectedRecord,
   type SnapshotRefresherOptions,
 } from "./refresh.js";
+
+export {
+  TenantNotRegisteredError,
+  recordTenantDeletionCheck,
+  summariseTenantDeletionWatch,
+  tenantRegistryStatus,
+  watchTenantDeletion,
+  type TenantDeletionWatchResult,
+} from "./tenant-deletion.js";

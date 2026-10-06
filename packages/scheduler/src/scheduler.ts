@@ -3,7 +3,12 @@ import type { OutboxRelay } from "@crm/relay";
 import { pruneNotifications, type EndpointProbeRunner, type NotificationDispatcher } from "@crm/notify";
 import { sweepExpiredStock } from "@crm/sample";
 import { summariseExpensePostSweep, sweepApprovedExpenseClaims } from "@crm/expense";
-import type { SnapshotRefresher } from "@crm/sync";
+import {
+  summariseTenantDeletionWatch,
+  watchTenantDeletion,
+  type SnapshotRefresher,
+} from "@crm/sync";
+import type { TombstoneReader } from "@crm/acl";
 import type { Pool, PoolClient } from "pg";
 
 import type { JobName } from "./jobs.js";
@@ -51,6 +56,23 @@ export interface SchedulerOptions {
    * test drive the transition rather than build endpoints.
    */
   readonly channelCoverage?: (tenantId: string) => Promise<ChannelCoverageAnswer>;
+  /**
+   * Optional: reads the ERP's tenant-deletion receipts, so `tenant_deletion_watch` can ask.
+   *
+   * Optional for the reason `notifications` is, and the reason matters more here. The route
+   * it reads exists only when the ERP runs `--tenant-deletion-routes`, and is readable only
+   * by a role an operator put in `--tenant-tombstone-read-role` — neither of which this
+   * process can arrange. A deployment missing either would otherwise have a job that fails
+   * on every tick forever, which is how a real signal becomes a line nobody reads. So
+   * without it the job reports itself unconfigured, and with it a 403 or a 404 is recorded
+   * as `unknown` WITH its reason rather than thrown: `packages/acl`'s classifier never
+   * infers a deletion, and never reports a refusal as a clean bill of health either.
+   *
+   * An `ErpClient` satisfies this. Taken as the narrow reader interface so a test can supply
+   * four lines instead of a server, and so the Scheduler depends on the answer rather than on
+   * how it is obtained — `channelCoverage`'s precedent.
+   */
+  readonly tombstones?: TombstoneReader;
   /** How often to look for due work. Not the job cadence — that is per job. */
   readonly tickIntervalMs?: number;
   readonly now?: () => Date;
@@ -353,6 +375,24 @@ export class Scheduler {
               ? ` REFUSED: ${r.delivery.refusalReason ?? "over the ceiling"}`
               : "")
           );
+        } finally {
+          client.release();
+        }
+      }
+      case "tenant_deletion_watch": {
+        const tombstones = this.options.tombstones;
+        if (tombstones === undefined) {
+          // Not a failure. See the option's doc: the route may not exist and the read may not
+          // be granted, and a job that failed on every tick for a deployment that cannot fix
+          // it would bury the tenants that CAN be watched.
+          return "unconfigured: no tombstone reader (the ERP needs --tenant-deletion-routes and a --tenant-tombstone-read-role this credential holds)";
+        }
+        // A plain pool client: `watchTenantDeletion` opens its own tenant context, and the
+        // registry read it may do afterwards is of the RLS-exempt `crm.tenant` and must not
+        // be inside one.
+        const client = await this.options.pool.connect();
+        try {
+          return summariseTenantDeletionWatch(await watchTenantDeletion(client, tombstones, tenantId));
         } finally {
           client.release();
         }

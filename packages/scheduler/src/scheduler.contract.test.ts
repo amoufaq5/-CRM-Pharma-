@@ -776,19 +776,35 @@ describe("recordResult", () => {
    * the code knows about can have one.
    */
   it("every job the code runs is a job the database accepts", async () => {
+    // This used to read the accepted set by pattern-matching `'...'::text` out of the
+    // deparsed CHECK, and migration 0050 broke it — correctly, and for the second time this
+    // repository has made this repair. The list now lives in `crm.scheduled_jobs()` and the
+    // CHECK calls it, so there are no literals to match and the test saw a constraint that
+    // accepted nothing. Both directions are now asked of something that cannot drift:
+    // forwards by handing the deparsed predicate back to Postgres to EVALUATE, backwards by
+    // reading the single declaration the predicate calls.
     const { rows } = await admin.query<{ def: string }>(
       `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
         WHERE conrelid = 'crm.scheduled_job'::regclass AND conname = 'scheduled_job_job_check'`,
     );
-    const accepted = new Set(
-      [...(rows[0]?.def ?? "").matchAll(/'([a-z_]+)'::text/g)].map((m) => m[1]!),
+    const def = rows[0]?.def ?? "";
+    expect(def, "scheduled_job_job_check must exist to be evaluated").toMatch(/^CHECK\s*\(/);
+    // Safe to interpolate: `pg_get_constraintdef` of one constraint found by name.
+    const predicate = def.replace(/^CHECK\s*\(/, "").replace(/\)\s*$/, "");
+    const { rows: refused } = await admin.query<{ job: string }>(
+      `SELECT job FROM unnest($1::text[]) AS t(job) WHERE NOT (${predicate})`,
+      [[...JOB_NAMES]],
     );
-    expect([...JOB_NAMES].filter((j) => !accepted.has(j)), "jobs the CHECK would refuse").toEqual([]);
-    // And the other way: a value the CHECK admits that nothing runs is a job that was
+    expect(refused.map((r) => r.job), "jobs the CHECK would refuse").toEqual([]);
+
+    // And the other way: a value the database admits that nothing runs is a job that was
     // renamed or removed and left behind in a migration.
+    const { rows: declared } = await admin.query<{ jobs: string[] }>(
+      "SELECT crm.scheduled_jobs() AS jobs",
+    );
     expect(
-      [...accepted].filter((j) => !(JOB_NAMES as readonly string[]).includes(j)),
-      "jobs the CHECK admits that no code runs",
+      declared[0]!.jobs.filter((j) => !(JOB_NAMES as readonly string[]).includes(j)),
+      "jobs the database admits that no code runs",
     ).toEqual([]);
   });
 

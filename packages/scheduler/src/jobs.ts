@@ -1,4 +1,13 @@
-/** The jobs the scheduler runs. Mirrors the CHECK on `crm.scheduled_job.job`. */
+/**
+ * The jobs the scheduler runs.
+ *
+ * Since migration 0050 the database's copy of this list is `crm.scheduled_jobs()`, a single
+ * declaration the CHECK calls — because this list had been restated in four migrations by
+ * then (0009, 0022, 0024, 0031), which is the lockstep 0049 removed for the notification
+ * kinds. This union cannot go the same way: a `switch` needs the names at compile time. So
+ * the two copies stay and a test asserts they agree, which is the arrangement 0049 left
+ * behind for `NOTIFICATION_KINDS`.
+ */
 export const JOB_NAMES = [
   "relay_drain",
   "snapshot_incremental",
@@ -7,6 +16,7 @@ export const JOB_NAMES = [
   "notify_dispatch",
   "notify_prune",
   "expense_post",
+  "tenant_deletion_watch",
 ] as const;
 export type JobName = (typeof JOB_NAMES)[number];
 
@@ -40,6 +50,19 @@ export type JobName = (typeof JOB_NAMES)[number];
  *   can do anything about it. It is not daily, because a rep who is owed money should not
  *   wait for a night to pass. Five minutes matches the snapshot: long enough to be a
  *   separate act, short enough that nobody plans around it.
+ * - **tenant_deletion_watch (24h).** Asks the ERP whether a tenant has been deleted
+ *   (`GET /v1/platform/tenants/{id}/tombstones`), and on a `tenant_deletion` tombstone marks
+ *   the tenant `erp_deleted`, which removes it from every job above. Daily, and the interval
+ *   is an argument rather than a default: a tenant deletion is a deliberate, four-eyes,
+ *   human act at the other end, not an event that arrives in bursts, so there is nothing a
+ *   tighter cadence would catch sooner than the next working day. Against that, every tick
+ *   is one HTTP round trip per tenant to a route that answers an empty list almost always,
+ *   and a process that asked every thirty seconds would spend most of its ERP budget
+ *   confirming that nothing happened. What a day really costs is bounded and worth stating:
+ *   up to 24 hours in which this CRM keeps serving reps, pushing webhooks and polling
+ *   snapshots for a tenant whose controller has ended the relationship. If that window ever
+ *   needs to be minutes, the answer is not a tighter poll — it is the webhook producer the
+ *   ADR's Q9 is waiting on, which would make this job the fallback rather than the signal.
  */
 export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   relay_drain: 30_000,
@@ -49,6 +72,7 @@ export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   notify_dispatch: 30_000,
   notify_prune: 24 * 60 * 60_000,
   expense_post: 5 * 60_000,
+  tenant_deletion_watch: 24 * 60 * 60_000,
 };
 
 /**

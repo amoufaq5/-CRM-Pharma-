@@ -724,6 +724,68 @@ It needs a credential for the ERP. In production that is a CRM-minted Ed25519 se
 token; `ERP_TOKEN` is a development-only static credential and the process refuses to start
 with it under `NODE_ENV=production`.
 
+## When the ERP deletes a tenant, this CRM stops
+
+CrossEngin can now really delete a tenant. Its ADR-0316 to ADR-0320 give a tenant serving
+its own activated manifest a Postgres schema of its own, drop that schema on a GDPR
+Article 17 deletion, and compose a tombstone from per-subsystem attestations anchored in the
+forensic chain — all in one transaction. ADR-0316 says what it was closing: the flow used to
+issue a signed `TombstoneRecord` while "every row of the tenant's actual business data
+survived", so the tombstone "was not incomplete. It was false, and it was cryptographically
+signed."
+
+The CRM holds that tenant's product, rep and account snapshots, its queued ERP writes, its
+expense claims with their ledger account codes, its notifications and its attachments.
+Nothing listened. So the ERP's proof became true about the ERP and false about a system
+holding copies of the same personal data — the same defect, one system over, and not one the
+ERP can close for us.
+
+**The signal is an affirmative read, never an inference.** `tenant_deletion_watch` (daily)
+asks `GET /v1/platform/tenants/{id}/tombstones` and gets one of exactly three answers:
+
+| Verdict | What the ERP said |
+|---|---|
+| `deleted` | a `tenant_deletion` tombstone naming this tenant — the only thing that stops anything |
+| `live` | 200, and no such tombstone. An **affirmative** not-deleted |
+| `unknown` | anything else — 403, 404, 503, a timeout, a body we could not parse |
+
+Nothing ever concludes a deletion from an empty entity list, a 401, a timeout, or the
+tenant's schema having vanished. The inverse matters as much: an `unknown` is not a quiet
+pass. A deployment whose role was never added to the ERP's `--tenant-tombstone-read-role`
+gets 403 forever, and a signal that silently never fires is worse than no signal because the
+deployment believes it is watching — so every check is recorded in
+`crm.tenant_deletion_check` **with its reason**, and the ERP's own 503 says in as many words
+"do not treat this as an absence".
+
+**The kind filter is the sharpest line in it.** That route returns both kinds the ERP
+stores, and a `data_subject_erasure` tombstone is *one person* exercising Article 17 inside a
+tenant that is otherwise entirely alive. Reacting to whatever is in the list would take a
+working tenant's whole field force offline the first time an employee asked to be forgotten.
+So the classifier filters on kind, and a CHECK on the receipt column refuses the wrong kind
+as a second layer — because a rule that lives only in the code that happens to call it is one
+refactor from gone.
+
+**Stopping is one word, in the one place that matters.** A confirmed tombstone marks
+`crm.tenant.status = 'erp_deleted'`, and the scheduler's `WHERE status = 'active'` is the
+single point where it decides whose work to do — so the mark removes the tenant from the ERP
+relay, both snapshots, the expiry sweep, notification dispatch and pruning, and the expense
+posting, at once rather than in seven places that each remember to ask. The API refuses too,
+in `resolvePrincipal`, which every route passes through: `403 tenant-deleted`, its own
+problem type rather than a bare `forbidden`, because an offline client holding unsent visits
+needs to stop retrying rather than spin on what it reads as transient permissions.
+
+The status cannot be typed without the receipt — a CHECK pairs them, so no `psql` prompt can
+quarantine a tenant's field force with one word — and once set it is terminal, with the
+evidence write-once. Reinstating a tenant is deliberately a migration, as 0044's lifecycle
+escape hatch is.
+
+**It does not erase anything, and that is a decision rather than an omission.** Some of the
+CRM's copies may be records a jurisdiction requires us to keep; a deletion that destroys an
+expense claim is as wrong as one that keeps everything. The ERP's own vocabulary for this is
+`retentionObligation` on an attestation — "we did not delete this, and here is the law that
+says so" — and the CRM has no equivalent yet. Keeping-while-stopped is the half that is
+defensible today. The open items are in the ADR.
+
 ## Verified against a running ERP
 
 ```bash

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createHash, createSign, generateKeyPairSync, randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
@@ -3316,6 +3316,120 @@ describe("the API, end to end", () => {
         });
         expect((await call("POST", `/v1/admin/roles/${foreign}/revoke`)).status).toBe(404);
       });
+    });
+  });
+
+  /**
+   * The ERP deleted the tenant, so this API serves nothing for it (migration 0050).
+   *
+   * These tests register and then DELETE the `crm.tenant` row rather than leaving it marked,
+   * because 0050 makes `erp_deleted` terminal and its receipt write-once — there is no
+   * transition back, by design. A `DELETE` is outside the trigger's remit (it guards UPDATE),
+   * which is what lets this suite's own tenant be borrowed for one test and handed back.
+   */
+  describe("a tenant the ERP has deleted", () => {
+    const TOMB = "tomb_0123456789abcdef0123456789abcdef";
+
+    const register = (): Promise<unknown> =>
+      admin.query(
+        `INSERT INTO crm.tenant (tenant_id, display_name) VALUES ($1, 'Under Test')
+         ON CONFLICT (tenant_id) DO NOTHING`,
+        [TENANT],
+      );
+    const markDeleted = (): Promise<unknown> =>
+      admin.query(
+        `UPDATE crm.tenant
+            SET status = 'erp_deleted', erp_tombstone_id = $2, erp_tombstone_kind = 'tenant_deletion',
+                erp_tombstone_deleted_at = now(), erp_tombstone_proof_sha256 = $3,
+                erp_tombstone_observed_at = now()
+          WHERE tenant_id = $1`,
+        [TENANT, TOMB, "a".repeat(64)],
+      );
+    const unregister = (): Promise<unknown> =>
+      admin.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [TENANT]);
+
+    afterEach(async () => {
+      await unregister();
+    });
+
+    /**
+     * THE FAIL-OPEN DEFAULT, asserted first because it is the risky half. `crm.tenant` is the
+     * scheduler's list of whose background work to do, not an authorisation list: it is empty
+     * in every test database and a deployment may never have populated it while serving this
+     * API perfectly well. So an unlisted tenant is served, and only an EXPLICIT `erp_deleted`
+     * refuses. Without this test the next person to "tighten" the join would lock out every
+     * deployment that never filled the registry.
+     */
+    it("is served normally when the registry does not list it at all", async () => {
+      expect((await admin.query("SELECT 1 FROM crm.tenant WHERE tenant_id = $1", [TENANT])).rowCount).toBe(0);
+      expect((await call("GET", "/v1/me")).status).toBe(200);
+    });
+
+    it("is served normally while the registry says active", async () => {
+      await register();
+      expect((await call("GET", "/v1/me")).status).toBe(200);
+    });
+
+    it("refuses every request once the tenant is marked erp_deleted", async () => {
+      await register();
+      await markDeleted();
+      const res = await call("GET", "/v1/me");
+      expect(res.status).toBe(403);
+      expect(res.body.type).toContain("tenant-deleted");
+      expect(res.body.title).toBe("Tenant deleted");
+      expect(res.body.detail).toContain(TENANT);
+      expect(res.body.detail).toContain("stopped processing its data");
+    });
+
+    /** Not one route — the refusal is in `resolvePrincipal`, which every route goes through. */
+    it("refuses the routes a rep uses, not just one", async () => {
+      await register();
+      await markDeleted();
+      for (const [method, path] of [
+        ["GET", "/v1/me"],
+        ["GET", "/v1/accounts"],
+        ["GET", "/v1/visits"],
+        ["GET", "/v1/notifications"],
+        ["POST", "/v1/expenses"],
+      ] as const) {
+        const res = await call(method, path, { body: method === "POST" ? {} : undefined });
+        expect(res.status, `${method} ${path}`).toBe(403);
+        expect(res.body.type, `${method} ${path}`).toContain("tenant-deleted");
+      }
+    });
+
+    /**
+     * The tenant fact wins over the rep fact, which is the point of asking it first: telling
+     * a rep their profile is inactive sends them to an administrator who no longer exists.
+     */
+    it("says the tenant is deleted rather than that the rep is suspended", async () => {
+      await register();
+      await markDeleted();
+      await withTenantContext(admin, TENANT, (tx) =>
+        tx.query("UPDATE crm.rep_profile SET status = 'suspended' WHERE tenant_id = $1 AND subject = $2", [
+          TENANT,
+          "idp|rep1",
+        ]),
+      );
+      try {
+        const res = await call("GET", "/v1/me");
+        expect(res.status).toBe(403);
+        expect(res.body.type).toContain("tenant-deleted");
+      } finally {
+        await withTenantContext(admin, TENANT, (tx) =>
+          tx.query("UPDATE crm.rep_profile SET status = 'active' WHERE tenant_id = $1 AND subject = $2", [
+            TENANT,
+            "idp|rep1",
+          ]),
+        );
+      }
+    });
+
+    /** Public routes are unaffected: they resolve no principal, so there is no tenant to refuse. */
+    it("leaves /healthz alone", async () => {
+      await register();
+      await markDeleted();
+      expect((await call("GET", "/healthz", { auth: null, tenant: null })).status).toBe(200);
     });
   });
 });

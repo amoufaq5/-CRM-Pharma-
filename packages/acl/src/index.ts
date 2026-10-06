@@ -8,6 +8,15 @@ export {
 } from "./problems.js";
 export { entityCamel, operationId, resourceSlug } from "./slugs.js";
 export { ErpDecimalError, erpDecimal } from "./values.js";
+export {
+  TENANT_DELETION_TOMBSTONE_KIND,
+  classifyTombstonePayload,
+  classifyTombstoneRefusal,
+  readTenantDeletionVerdict,
+  type TenantDeletionVerdict,
+  type TenantTombstone,
+  type TombstoneReader,
+} from "./tombstones.js";
 export type { ChangeBatch, ChangeMode, ChangedRecord, ChangeSource } from "./change-source.js";
 export {
   TenantSchema,

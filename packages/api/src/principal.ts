@@ -1,7 +1,7 @@
 import { withTenantContext } from "@crm/db";
 import { rolesNow, type Role } from "@crm/role";
 import type { PoolClient } from "pg";
-import { forbidden, unauthenticated } from "./problems.js";
+import { forbidden, tenantDeleted, unauthenticated } from "./problems.js";
 import type { JwtClaims } from "./jwt.js";
 
 export interface Principal {
@@ -61,9 +61,27 @@ export async function resolvePrincipal(
       display_name: string;
       status: string;
       erp_employee_id: string | null;
+      tenant_status: string | null;
     }>(
-      `SELECT id, display_name, status, erp_employee_id
-         FROM crm.rep_profile WHERE tenant_id = $1 AND subject = $2`,
+      // `crm.tenant` joined here rather than read separately, and LEFT rather than INNER.
+      //
+      // It is the deliberately RLS-exempt registry, so joining it inside the tenant context
+      // is free and costs no second round trip on a path every request takes.
+      //
+      // LEFT, and `tenant_status IS NULL` meaning "not listed" must NOT refuse — which is a
+      // fail-OPEN decision in a file whose whole argument is fail-closed, so it needs the
+      // reason stated. `crm.tenant` is the SCHEDULER's list of whose background work to do,
+      // not an authorisation list: it is empty in every test database (0035's pre-flight
+      // found that the hard way) and a deployment may never have populated it while serving
+      // the API perfectly well. Refusing unregistered tenants would be a different and much
+      // larger change — a real one, and arguably right — but making it a side effect of
+      // adding a deletion signal would lock out every such deployment on upgrade. So this
+      // refuses exactly one thing: an EXPLICIT `erp_deleted`, which 0050 lets nothing write
+      // without a tombstone in hand.
+      `SELECT r.id, r.display_name, r.status, r.erp_employee_id, t.status AS tenant_status
+         FROM crm.rep_profile r
+         LEFT JOIN crm.tenant t ON t.tenant_id = r.tenant_id
+        WHERE r.tenant_id = $1 AND r.subject = $2`,
       [tenantId, claims.sub],
     );
     const found = rows[0];
@@ -80,6 +98,13 @@ export async function resolvePrincipal(
     throw forbidden("this identity is not a rep in that tenant");
   }
   const { row, roles } = resolved;
+
+  // Asked BEFORE the rep's own status, because it is the stronger fact and the better-aimed
+  // sentence: a rep of a deleted tenant is not a suspended rep, and telling them their
+  // profile is inactive would send them to an administrator who no longer exists.
+  if (row.tenant_status === "erp_deleted") {
+    throw tenantDeleted(tenantId);
+  }
   if (row.status !== "active") {
     throw forbidden(`this rep profile is ${row.status}`);
   }
