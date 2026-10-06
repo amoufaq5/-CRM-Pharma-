@@ -9,6 +9,8 @@ export {
   type Migration,
   type MigrationResult,
   MigrationChangedError,
+  SupersedeDeclarationError,
+  supersededFiles,
   applyMigrations,
   loadMigrations,
   sha256,

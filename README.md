@@ -256,15 +256,19 @@ check that never reads `Employee.manager_id` — so four-eyes is enforced here o
 
 **Four eyes covers the three decisions a person makes — approve, reject and reimburse — and
 `post` only when a person does it.** It covered none of them, and the way it failed is worth
-keeping: `crm.rep_can_supervise` answers *yes* for the
-and the way it failed is worth keeping: `crm.rep_can_supervise` answers *yes* for the
-caller themselves, which is correct for a read (a rep may always see their own work, and it
-is why one helper serves "mine" and "my team's"), and every write transition gated on
-supervision alone. `expense_claim_four_eyes` caught the approve in the database and
+keeping: `crm.rep_can_supervise` answers *yes* for the caller themselves, which is correct
+for a read (a rep may always see their own work, and it is why one helper serves "mine" and
+"my team's"), and every write transition gated on supervision alone. `expense_claim_four_eyes` caught the approve in the database and
 `expense_claim_reject_four_eyes` the reject — but `post` and `reimburse` record no actor,
 so no constraint could ever have caught those. A rep could hand their own claim to the
 ledger and mark it paid. The rule is now in the route, once, for all four, as a 403 that
 names which rule was broken rather than a constraint violation with no explanation.
+
+A rep who is neither the claimant nor a supervisor gets a **404 naming the claim** —
+`no expense claim <id> on your team` — and not the `no rep <id> on your team` the
+supervision helper answers with. That sentence handed a caller who held a claim id the
+owner's `rep_profile` id, which is the identifier the 404 exists to conceal; every expense
+route that reached for the supervision helper had it.
 
 **And `post` is no longer only a route, which weakens the check there to a formality.**
 Migration 0031 added the `expense_post` sweep, which hands every approved claim to the ERP
@@ -563,8 +567,11 @@ PGUSER=… PGHOST=… ./scripts/verify-live-erp.sh
 ```
 
 Boots a real `operate-server` over a real Postgres, points it at the CRM's own JWKS, and
-runs **60 checks** through the shipped `dist` of `@crm/acl`, `@crm/credential` and
-`@crm/relay`. Everything the integration assumes had previously been read out of the ERP's
+runs **90 checks** through the shipped `dist` of `@crm/acl`, `@crm/credential` and
+`@crm/relay`. The CRM's own database is dropped and rebuilt from empty each run — it used to
+be required to exist already, which made the gate's schema whatever was lying around, and
+that is how a check came to fail with `column "seq" does not exist` against a database three
+migrations behind. Everything the integration assumes had previously been read out of the ERP's
 source and a captured schema; this is the first time a socket answered. The gate
 fingerprints every file in the ERP checkout before the run and diffs after — that repo is
 read-only this phase and the check proves it.
@@ -589,6 +596,15 @@ exists:
   dead-lettered with `dead_reason = "validation_failed: write guard refused"` and nothing an
   operator could act on. Invisible offline because every fixture supplied a `detail` the
   real server never sends. Fixed; the reason now names the field.
+
+A fourth, found later and in the same class: **a revived write re-asked under the key the
+gateway had already answered.** The in-memory idempotency store keeps a reply's status
+without its body, so a replayed 422 came back bodiless and the death history recorded
+`rejected: unrecognised_error_shape` where the first episode had the ERP's own sentence — the
+operator who pressed retry was told *less* than before they pressed it, and the history
+called an identical cause a new one. The `Idempotency-Key` is now per dispatch episode,
+`crm-<row id>-r<revive count>`. No offline test could have caught it: the fake ERP answers
+every request it is given and has no memory to replay from.
 
 ## The ERP credential
 
@@ -621,6 +637,26 @@ first migration. `0001` checks and fails with a message naming the real cause.
 admin for the two DBA files — `CREATE ROLE`, `CREATE EXTENSION` — then `SET ROLE crm_app`
 for the rest, so the tables come out owned by the role that is *subject* to RLS. Getting
 this wrong is silent: migration `0010` did, once.
+
+**A migration that cannot succeed used to block its own repair, and no longer does.** The
+runner halts on the first failure and records nothing, so a database stuck on a defective
+file retried it on every deploy and every migration after it — including the one written to
+fix that state — was unreachable forever. `0032_prune_floor_cap.sql` was that file: its
+clamp is DML on an RLS-FORCEd table with no tenant context, so it updates zero rows, and the
+validated `CHECK` two statements later is not blind and refuses. A later migration can now
+retire it:
+
+```sql
+-- @supersedes: 0032_prune_floor_cap.sql
+```
+
+The named file is **recorded without being run** — with its real hash, so editing an applied
+migration is refused exactly as before, and a database that *did* run it is untouched. The
+declaration lives in the file rather than in a deploy-script list, for the same reason
+`@requires: dba` does, and it is validated: a name matching no migration, or one that does
+not sort before the declaring file, is refused by `apply` and by `--dry-run`. Both report
+every retired file, as a warning, every run. `scripts/setup-test-db.sh` honours it too, so a
+test database matches a migrated one.
 
 ```bash
 pnpm db:migrate:dry      # what a real run would do; exit 1 if an applied file was edited

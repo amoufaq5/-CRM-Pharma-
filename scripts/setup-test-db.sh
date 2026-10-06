@@ -22,11 +22,23 @@ psql -v ON_ERROR_STOP=1 -q -f "$ROOT/db/migrations/0002_crm_schema.sql"
 # Iterate every migration in order and skip the two DBA files by name rather than
 # globbing a numeric range — a glob like 00[3-9]* silently misses 0003 and leaves
 # the schema empty, which is how this script shipped broken the first time.
+# Files a later migration retires with `-- @supersedes:` are not executed here either, so a
+# database this script builds matches one the runner builds. Without this the two diverge:
+# 0032 happens to SUCCEED on an empty database (its clamp finds no rows to fail on), so this
+# script would run a file the runner records without running.
+retired="$(grep -ho '^--[[:space:]]*@supersedes:[[:space:]]*[^[:space:]]*' "$ROOT"/db/migrations/*.sql |
+            sed 's/.*@supersedes:[[:space:]]*//' || true)"
+
 applied=0
 for f in "$ROOT"/db/migrations/*.sql; do
-  case "$(basename "$f")" in
+  base="$(basename "$f")"
+  case "$base" in
     0001_*|0002_*) continue ;;
   esac
+  if [ -n "$retired" ] && printf '%s\n' "$retired" | grep -qxF "$base"; then
+    echo "skipping $base — retired by a later migration"
+    continue
+  fi
   psql -v ON_ERROR_STOP=1 -q -c "SET ROLE crm_app" -f "$f"
   applied=$((applied + 1))
 done

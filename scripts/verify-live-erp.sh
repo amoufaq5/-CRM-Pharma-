@@ -149,8 +149,29 @@ echo "--- 4. the CRM's side: a service principal for this tenant ---"
 # the scheduler does, so the row has to exist and RLS has to admit it. Seeded via
 # withTenantContext as crm_app would see it — a privileged INSERT with no tenant
 # context is exactly the blind spot ADR-0001 item 14 records.
+# THE CRM DATABASE IS REBUILT HERE, every run.
+#
+# It used to be required to exist already ("run the CRM migrations first"), which made the
+# gate's schema whatever happened to be lying around — and that is not a hypothetical sharp
+# edge: this check failed with `column "seq" does not exist` because `crm_live1` predated
+# migration 0041, so section 6i read a function the database held an older signature for. A
+# gate whose schema is stale proves something about a database nobody has.
+#
+# Built by `scripts/setup-test-db.sh` and NOT by the migration runner, deliberately. That
+# script applies the files through psql and leaves `crm._migrations` empty by design (its own
+# header says so), which is exactly why a database it built cannot then be handed to the
+# runner — the runner would find an empty ledger over a full schema and refuse on 0003. The
+# runner has its own gate in `scripts/verify-migration-runner.sh`; this one needs a current
+# schema, and the cheapest way to be sure it is current is to not keep the old one.
+dropdb --if-exists "$CRM_DB" || fail "could not drop $CRM_DB"
+createdb "$CRM_DB" || fail "createdb $CRM_DB failed"
+PGDATABASE="$CRM_DB" "$ROOT/scripts/setup-test-db.sh" > "$WORK/crm-migrate.log" 2>&1 \
+  || { tail -30 "$WORK/crm-migrate.log" >&2; fail "the CRM migrations failed against $CRM_DB"; }
+ok "$CRM_DB rebuilt from empty ($(grep -c '^applied' "$WORK/crm-migrate.log" >/dev/null 2>&1; \
+     sed -n 's/^applied \([0-9]*\) application.*/\1/p' "$WORK/crm-migrate.log") migrations)"
+
 psql -d "$CRM_DB" -At -c "SELECT 1 FROM crm.outbox LIMIT 0" >/dev/null 2>&1 \
-  || fail "$CRM_DB has no crm.outbox — run the CRM migrations first"
+  || fail "$CRM_DB has no crm.outbox after migrating"
 PGPASSWORD="${CRM_PGPASSWORD:-crm_app}" psql -h "$PGHOST" -U "${CRM_PGUSER:-crm_app}" -d "$CRM_DB" \
   -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL || fail "could not seed crm.erp_service_principal"
 BEGIN;

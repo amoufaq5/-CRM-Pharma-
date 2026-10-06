@@ -1,6 +1,12 @@
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { loadMigrations, MigrationChangedError, sha256 } from "./migrate.js";
+import {
+  loadMigrations,
+  MigrationChangedError,
+  sha256,
+  supersededFiles,
+  type Migration,
+} from "./migrate.js";
 
 describe("sha256", () => {
   it("is stable and content-addressed", () => {
@@ -65,5 +71,56 @@ describe("loadMigrations", () => {
     const lastDba = all.findLastIndex((m) => m.requiresDba);
     const firstApp = all.findIndex((m) => !m.requiresDba);
     expect(lastDba).toBeLessThan(firstApp);
+  });
+});
+
+describe("supersededFiles", () => {
+  const DIR = fileURLToPath(new URL("../../../db/migrations", import.meta.url));
+  const m = (filename: string, supersedes: readonly string[] = []): Migration => ({
+    filename,
+    sql: "SELECT 1",
+    sha256: sha256(filename),
+    requiresDba: false,
+    supersedes,
+  });
+
+  /**
+   * The escape hatch for the one failure the hash ledger cannot survive: a migration that
+   * CANNOT succeed. `applyMigrations` halts on the first failure and records nothing, so a
+   * database stuck on such a file retries it forever and every migration after it — the one
+   * written to repair it included — is unreachable. 0032 was that file and 0039 was that
+   * repair.
+   */
+  it("reads the declaration out of the real migrations", async () => {
+    const all = await loadMigrations(DIR);
+    expect([...supersededFiles(all).entries()]).toEqual([
+      ["0032_prune_floor_cap.sql", "0042_retire_0032.sql"],
+    ]);
+  });
+
+  it("refuses a name that matches no migration, because a typo would be silent", () => {
+    // The whole failure mode: a mistyped target leaves the dead file running, and failing,
+    // with nothing to say the declaration did not take.
+    expect(() => supersededFiles([m("0001_a.sql"), m("0002_b.sql", ["0001_typo.sql"])])).toThrow(
+      /not a migration/,
+    );
+  });
+
+  it("refuses a target that does not come before the declaring file", () => {
+    // "This earlier thing is dead" is the only claim the declaration can make. A later
+    // target would retire something that has not happened yet; itself would never run at all.
+    expect(() => supersededFiles([m("0001_a.sql", ["0002_b.sql"]), m("0002_b.sql")])).toThrow(
+      /does not come before it/,
+    );
+    expect(() => supersededFiles([m("0001_a.sql", ["0001_a.sql"])])).toThrow(/does not come before it/);
+  });
+
+  it("is computed over every file, so a declaration reaches back past the dead one", async () => {
+    // The property that makes the mechanism work at all: the declaration lives in a file
+    // numbered AFTER the one it retires, so the runner has to know before the loop gets
+    // there. 0042 is ten files past 0032.
+    const all = await loadMigrations(DIR);
+    const names = all.map((x) => x.filename);
+    expect(names.indexOf("0042_retire_0032.sql")).toBeGreaterThan(names.indexOf("0032_prune_floor_cap.sql"));
   });
 });

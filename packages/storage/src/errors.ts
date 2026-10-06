@@ -138,6 +138,33 @@ export class AttachmentSubjectMismatchError extends Error {
   }
 }
 
+/**
+ * The expense claim is at a point in its lifecycle that will not accept this receipt.
+ *
+ * Raised by `crm.attachment_validate_receipt_claim_state` (0040), in two tiers: a FIRST
+ * receipt is admitted while the claim is `draft` or `submitted`, because evidence
+ * legitimately arrives while an approver is already looking at the claim; a REPLACEMENT —
+ * either half of one, the stand-down UPDATE as well as the successor INSERT — is admitted
+ * in `draft` only, because an approver may be reading receipt A at the moment it becomes B
+ * and would then approve B having reviewed A.
+ *
+ * ITS OWN CLASS RATHER THAN ANOTHER `AttachmentSupersessionError`, because the remedy is
+ * not that one's. A supersession error says the chain does not hold together and means
+ * "re-read the current attachment and start again"; this one says the chain is fine and the
+ * claim has moved on, and the only way forward is a new claim. The two would otherwise be
+ * one 409 with two unrelated next steps.
+ *
+ * The route `POST /v1/expenses/:id/receipt` checks the same rule before a body crosses the
+ * wire and keeps the friendlier sentence; this is what holds when nothing routes through it
+ * — an offline flush, or a psql prompt. The rule is stated once, in SQL.
+ */
+export class ReceiptClaimStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReceiptClaimStateError";
+  }
+}
+
 /** A signature cannot be replaced. See `SUPERSEDABLE_PURPOSES` for why. */
 export class AttachmentNotSupersedableError extends Error {
   constructor(message: string) {
@@ -317,6 +344,18 @@ export function translateAttachmentError(err: unknown): Error {
     );
   }
 
+  // A STABLE MARKER, NOT PROSE, and that is the whole reason this arm is safe to put first.
+  // Every arm below matches a sentence, so each one is one re-wording away from claiming a
+  // neighbour's message — the mistake `translateSampleError` records having made and the
+  // reason two of the arms below carry an explicit ordering comment. 0040 raises
+  // `receipt-claim-state:` as a prefix, the way 0034's probe triggers raise
+  // `probe-foreign-endpoint:` and `probe-transition:`, so this match does not depend on the
+  // wording of a refusal a rep reads — and placing it ahead of the prose arms means a future
+  // sentence cannot quietly take it.
+  if (message.includes("receipt-claim-state:")) {
+    return new ReceiptClaimStateError(message);
+  }
+
   if (message.includes("has no branch for subject table")) {
     return new UnknownAttachmentSubjectError(message);
   }
@@ -400,6 +439,7 @@ const TRANSLATED_NAMES: ReadonlySet<string> = new Set([
   "InvalidAttachmentContentError",
   "MissingAttachmentBlobError",
   "MissingSignatureCommitmentError",
+  "ReceiptClaimStateError",
   "SignatureCommitmentMismatchError",
   "UnknownAttachmentSubjectError",
   "UnsupportedAttachmentTypeError",

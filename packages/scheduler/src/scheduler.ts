@@ -203,6 +203,13 @@ export class Scheduler {
         return (
           `claimed=${r.claimed} delivered=${r.delivered} retried=${r.retried} dead=${r.dead} ` +
           `alarmed=${r.alarmed} unattributed=${r.unattributed} ` +
+          // A refused settlement means two workers raced the same row — which `reclaimStale`
+          // makes possible by design — and the loser's outcome was discarded rather than
+          // written. The counter existed and no deployed process could see it: this line was
+          // the operator's only view of a drain, and a race read exactly like a quiet one.
+          // Prefixed rather than folded in, so a non-zero value is legible at a glance in a
+          // line that is otherwise all zeroes on a healthy tenant.
+          `${r.settleLost > 0 ? `LOST=${r.settleLost} ` : ""}` +
           `pending=${r.lag.pending} oldest=${r.lag.oldestPendingAgeSeconds ?? "-"}s`
         );
       }

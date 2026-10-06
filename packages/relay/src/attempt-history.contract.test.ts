@@ -500,18 +500,19 @@ describe("a dead letter's per-attempt history", () => {
     });
 
     /**
-     * A tie that the OLD sort key cannot resolve and resolves DIFFERENTLY.
+     * A tie that neither `died_at` nor `attempt` can resolve, with the WRITE ORDER known.
      *
-     * Three deaths at one instant across two outbox rows, arranged so that `attempt`
-     * disagrees with `outbox_id`: the row with the LARGER uuid is the one that died twice.
-     * The old `ORDER BY died_at DESC, attempt DESC` then leads with that row's second
-     * episode, and the new key leads with the smaller uuid's first — so the two orders
-     * differ in position 0 whatever plan Postgres picks.
+     * Three deaths at one instant across two outbox rows, arranged so that write order
+     * disagrees with uuid order: the row with the LARGER uuid dies SECOND and then dies
+     * again. So `ORDER BY seq DESC` (0041) leads with the larger uuid's second episode,
+     * where the uuid tie-break this listing used before 0041 led with the smaller uuid's
+     * first — the two orders differ in position 0 whatever plan Postgres picks, and only
+     * one of them is what happened.
      *
      * Arranged rather than assumed, because the naive version of this test passed against
-     * the broken sort: with every key tied, a small sort preserves its input and that
-     * input happened to arrive in index order, which IS uuid order. A tie that only
-     * agrees by accident proves nothing, which is the whole reason this file exists.
+     * a sort that could not discriminate: with every key tied, a small sort preserves its
+     * input and that input happened to arrive in index order. A tie that only agrees by
+     * accident proves nothing, which is the whole reason this file exists.
      */
     const tiedAcrossTwoRows = async (
       tx: PoolClient,
@@ -529,15 +530,55 @@ describe("a dead letter's per-attempt history", () => {
       return { smaller, larger };
     };
 
-    it("breaks a died_at tie on the key that is actually unique", async () => {
+    it("breaks a died_at tie on the order the rows were actually written", async () => {
       await inTenant(async (tx) => {
         const { smaller, larger } = await tiedAcrossTwoRows(tx);
         const got = await recentDeaths(tx, { limit: 50 });
+        // Latest write first. Not `[[smaller,1],[larger,2],[larger,1]]`, which is what the
+        // uuid tie-break produced and which puts the FIRST of the three deaths at the top
+        // of a listing whose contract is "latest first".
         expect(got.map((r) => [r.outbox_id, r.attempt])).toEqual([
-          [smaller, 1],
           [larger, 2],
           [larger, 1],
+          [smaller, 1],
         ]);
+        // And the key the order came from is on the row, so a reader can see it rather
+        // than infer it: strictly decreasing down the page, three consecutive values.
+        const seqs = got.map((r) => Number(r.seq));
+        expect(seqs[0]! > seqs[1]! && seqs[1]! > seqs[2]!).toBe(true);
+        expect(seqs[0]! - seqs[2]!).toBe(2);
+      });
+    });
+
+    it("hands the ordering key back on both reads, as text", async () => {
+      await inTenant(async (tx) => {
+        const row = await queued(tx);
+        await markDead(tx, row.id, at("2026-10-01T10:00:00Z"), "403");
+        const [listed] = await recentDeaths(tx, { limit: 1 });
+        const [historic] = await attemptHistory(tx, row.id);
+        // Text, not a number: a bigint past 2^53 that arrives as a JavaScript number is a
+        // bigint that silently rounds, and `pg` returns one as a string for that reason.
+        expect(typeof listed!.seq).toBe("string");
+        expect(listed!.seq).toMatch(/^[0-9]+$/);
+        expect(historic!.seq).toBe(listed!.seq);
+      });
+    });
+
+    it("refuses a hand-written seq outright, which is why no unique index guards it", async () => {
+      // GENERATED ALWAYS, not a DEFAULT: 0036 part 1 needed `uq_disposal_obligation_seq` to
+      // DETECT a hand-written value on a `DEFAULT nextval` column. Here the column type
+      // rejects one before it reaches the heap, so an index could only catch an impossible
+      // row — on a table the ring now DELETEs from on every death.
+      await inTenant(async (tx) => {
+        await expect(
+          tx.query(
+            `INSERT INTO crm.outbox_dead_letter
+               (tenant_id, outbox_id, attempt, revive_count_at_death, dispatch_attempts,
+                died_at, entity, operation, target_record_id, source_table, source_id, seq)
+             VALUES ($1,$2,1,0,1,now(),'Expense','create','AH-T','crm.expense_claim',$3, 999)`,
+            [TENANT, randomUUID(), randomUUID()],
+          ),
+        ).rejects.toThrow(/identity column|non-DEFAULT value/);
       });
     });
 
@@ -581,6 +622,244 @@ describe("a dead letter's per-attempt history", () => {
         // Below the floor and above the ceiling both clamp rather than refuse.
         expect(await recentDeaths(tx, { limit: 0 })).toHaveLength(1);
         expect(await recentDeaths(tx, { limit: 10_000 })).toHaveLength(3);
+      });
+    });
+  });
+
+  // ---- the ring -----------------------------------------------------------
+
+  /**
+   * The history of ONE outbox row is bounded, and the bound costs reasons, never the count.
+   *
+   * 0036 recorded against itself that nothing prunes this table and argued that what bounds
+   * it is the thing being counted — a row appears only when a write is permanently refused.
+   * True of the table, false of a row: an ERP-side cause nobody fixes, with a revive pressed
+   * each time, grows ONE row's history without limit. 0041 made the recording trigger a
+   * ring.
+   *
+   * Driven through the real writers (`markDead`, `reviveDeadLetter`), never by inserting
+   * history rows by hand, for the reason the rest of this file is: the trim lives in the
+   * trigger, so a test that wrote the rows itself would be testing nothing at all.
+   */
+  describe("the ring", () => {
+    /** Kill and revive one outbox row `n` times, through the paths the relay uses. */
+    const diedNTimes = async (tx: PoolClient, n: number): Promise<string> => {
+      const row = await queued(tx);
+      for (let i = 1; i <= n; i += 1) {
+        const t = new Date(Date.UTC(2026, 9, 1, 10, 0, 0) + i * 60_000);
+        expect(await markDead(tx, row.id, t, `refusal ${i}`)).toBe(true);
+        if (i < n) {
+          expect(
+            await reviveDeadLetter(tx, row.id, REVIVER, new Date(t.getTime() + 30_000)),
+          ).toBe(true);
+        }
+      }
+      return row.id;
+    };
+
+    /** The ring's own number, read from the database so this file holds no second copy. */
+    const ringSize = async (tx: PoolClient): Promise<number> => {
+      const { rows } = await tx.query<{ n: number }>(
+        "SELECT crm.outbox_dead_letter_ring_size() AS n",
+      );
+      return rows[0]!.n;
+    };
+
+    it("keeps the newest episodes and still reports every one that happened", async () => {
+      await inTenant(async (tx) => {
+        const size = await ringSize(tx);
+        const deaths = size + 10;
+        const outboxId = await diedNTimes(tx, deaths);
+
+        const history = await attemptHistory(tx, outboxId);
+        expect(history).toHaveLength(size);
+
+        // THE PROPERTY THAT MAKES A RING ACCEPTABLE. `attempt` is allocated past every
+        // episode ever recorded, so the newest surviving row carries the true count and
+        // the summary can say how much it is not showing.
+        const summary = summariseAttemptHistory(history);
+        expect(summary.deaths).toBe(size);
+        expect(summary.deathsEverRecorded).toBe(deaths);
+        expect(summary.episodesMissing).toBe(deaths - size);
+
+        // The newest are what survived, not the oldest, and they are contiguous.
+        expect(history.map((h) => h.attempt)).toEqual(
+          Array.from({ length: size }, (_, i) => deaths - size + 1 + i),
+        );
+        expect(history[0]!.reason).toBe(`refusal ${deaths - size + 1}`);
+        expect(history[history.length - 1]!.reason).toBe(`refusal ${deaths}`);
+        // Episode 1's reason is gone and is not recoverable. That is the stated cost.
+        expect(history.some((h) => h.reason === "refusal 1")).toBe(false);
+      });
+    });
+
+    it("trims nothing until the ring is actually full", async () => {
+      await inTenant(async (tx) => {
+        const size = await ringSize(tx);
+        const outboxId = await diedNTimes(tx, size);
+        const history = await attemptHistory(tx, outboxId);
+        expect(history).toHaveLength(size);
+        // The boundary, not just "fewer than the ring": a trim one episode early would
+        // report a shortfall over a history that is complete.
+        expect(summariseAttemptHistory(history).episodesMissing).toBe(0);
+        expect(history[0]!.attempt).toBe(1);
+      });
+    });
+
+    it("bounds each outbox row on its own, not the tenant", async () => {
+      await inTenant(async (tx) => {
+        const size = await ringSize(tx);
+        const a = await diedNTimes(tx, size + 5);
+        const b = await diedNTimes(tx, 3);
+        // `b` is untouched by `a` filling its ring: the trim is scoped to `NEW.id`.
+        expect(await attemptHistory(tx, a)).toHaveLength(size);
+        expect(await attemptHistory(tx, b)).toHaveLength(3);
+        const { rows } = await tx.query<{ n: string }>(
+          "SELECT count(*) AS n FROM crm.outbox_dead_letter WHERE tenant_id = $1",
+          [TENANT],
+        );
+        expect(Number(rows[0]!.n)).toBe(size + 3);
+      });
+    });
+
+    it("leaves the open episode and its revive bookkeeping alone", async () => {
+      await inTenant(async (tx) => {
+        const size = await ringSize(tx);
+        const outboxId = await diedNTimes(tx, size + 3);
+        const history = await attemptHistory(tx, outboxId);
+        const newest = history[history.length - 1]!;
+        // The highest-numbered episode is the one row the ring can never discard, which is
+        // what keeps the trigger's revive branch able to find it.
+        expect(newest.attempt).toBe(size + 3);
+        expect(newest.revived_at).toBeNull();
+        expect(await reviveDeadLetter(tx, outboxId, REVIVER, at("2027-01-01T08:00:00Z"))).toBe(
+          true,
+        );
+        const after = await attemptHistory(tx, outboxId);
+        expect(after).toHaveLength(size);
+        expect(after[after.length - 1]!.revived_at).toEqual(at("2027-01-01T08:00:00Z"));
+        expect(after[after.length - 1]!.revived_by).toBe(REVIVER);
+      });
+    });
+
+    it("trims under FORCE RLS on the relay's own path, and reaches no other tenant", async () => {
+      // THE HAZARD THIS GUARDS. DML as `crm_app` under FORCE ROW LEVEL SECURITY with no
+      // tenant context matches zero rows and reports success — how 0032 shipped broken.
+      // The trim is a DELETE, so getting it wrong is either a ring that never trims or a
+      // delete that is not confined to one tenant, and the two failures look nothing alike.
+      //
+      // Driven end to end through `markDead` and `reviveDeadLetter` inside
+      // `withTenantContext`, which is the relay's own path, with a second tenant holding
+      // history of its own across the same transaction boundary.
+      const size = await inTenant(ringSize);
+      const FOREIGN_OUTBOX = randomUUID();
+
+      try {
+        await withTenantContext(client, OTHER_TENANT, async (other) => {
+          for (let i = 1; i <= 5; i += 1) {
+            await other.query(
+              `INSERT INTO crm.outbox_dead_letter
+                 (tenant_id, outbox_id, attempt, revive_count_at_death, dispatch_attempts,
+                  died_at, reason, entity, operation, target_record_id, source_table, source_id)
+               VALUES ($1,$2,$3,$4,1,now(),$5,'Expense','create','AH-R','crm.expense_claim',$6)`,
+              [OTHER_TENANT, FOREIGN_OUTBOX, i, i - 1, `seeded ${i}`, randomUUID()],
+            );
+          }
+        });
+
+        // One committed transaction per death, so the trim is exercised the way the relay
+        // reaches it — a fresh tenant context each time, not one long open transaction.
+        const outboxId = await inTenant(async (tx) => (await queued(tx)).id);
+        for (let i = 1; i <= size + 2; i += 1) {
+          const t = new Date(Date.UTC(2026, 9, 2, 10, 0, 0) + i * 60_000);
+          await inTenant(async (tx) => {
+            expect(await markDead(tx, outboxId, t, `real ${i}`)).toBe(true);
+            if (i < size + 2) {
+              expect(
+                await reviveDeadLetter(tx, outboxId, REVIVER, new Date(t.getTime() + 1_000)),
+              ).toBe(true);
+            }
+          });
+        }
+
+        await inTenant(async (tx) => {
+          // The trim ran. A trim that matched zero rows — the 0032 shape — leaves
+          // `size + 2` here, so this number IS the assertion that RLS did not blind it.
+          expect(await attemptHistory(tx, outboxId)).toHaveLength(size);
+        });
+
+        // And it stopped at its own tenant and its own outbox row. A DELETE that had lost
+        // either predicate, or had escaped the policy under definer's rights, would have
+        // taken these five with it: they are the only other rows in the table.
+        await withTenantContext(client, OTHER_TENANT, async (other) => {
+          const theirs = await attemptHistory(other, FOREIGN_OUTBOX);
+          expect(theirs.map((h) => h.reason)).toEqual([
+            "seeded 1",
+            "seeded 2",
+            "seeded 3",
+            "seeded 4",
+            "seeded 5",
+          ]);
+        });
+      } finally {
+        await withTenantContext(client, OTHER_TENANT, async (other) => {
+          await other.query("DELETE FROM crm.outbox_dead_letter WHERE tenant_id = $1", [
+            OTHER_TENANT,
+          ]);
+        });
+      }
+    });
+
+    it("cannot be reached at all without a tenant context, so it cannot trim blindly", async () => {
+      // The structural half of the argument, and the reason the trim does not have to lift
+      // FORCE the way 0027's and 0041's own backfills do. With no `app.current_tenant_id`
+      // the UPDATE that fires the trigger matches no row of `crm.outbox` in the first
+      // place, so the trigger never runs — there is no path on which the trim executes
+      // against an unscoped view of the table.
+      const outboxId = await inTenant(async (tx) => {
+        const row = await queued(tx);
+        await markDead(tx, row.id, at("2026-10-01T10:00:00Z"), "first");
+        return row.id;
+      });
+
+      const bare = await pool.connect();
+      try {
+        // Not `withTenantContext`: the point is a connection that never set the GUC.
+        const { rowCount } = await bare.query(
+          "UPDATE crm.outbox SET state = 'pending', dead_at = NULL WHERE id = $1",
+          [outboxId],
+        );
+        expect(rowCount).toBe(0);
+      } finally {
+        bare.release();
+      }
+
+      await inTenant(async (tx) => {
+        // Still dead, still one episode, still open. Nothing happened.
+        const history = await attemptHistory(tx, outboxId);
+        expect(history).toHaveLength(1);
+        expect(history[0]!.revived_at).toBeNull();
+      });
+    });
+
+    it("states the ring's size once, in the database", async () => {
+      // The constant is a function and not a literal in the trigger, so there is one
+      // definition to read and one to change. A test that hardcoded 50 would keep passing
+      // after the first copy moved, which is the failure this assertion exists to prevent.
+      await inTenant(async (tx) => {
+        expect(await ringSize(tx)).toBe(50);
+        const { rows } = await tx.query<{ n: string }>(
+          `SELECT count(*) AS n FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace
+            WHERE s.nspname = 'crm' AND p.proname = 'outbox_dead_letter_ring_size'`,
+        );
+        expect(Number(rows[0]!.n)).toBe(1);
+        // And the trigger reads it rather than restating it.
+        const { rows: src } = await tx.query<{ src: string }>(
+          `SELECT p.prosrc AS src FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace
+            WHERE s.nspname = 'crm' AND p.proname = 'outbox_dead_letter_record'`,
+        );
+        expect(src[0]!.src).toContain("crm.outbox_dead_letter_ring_size()");
+        expect(src[0]!.src).not.toMatch(/\b50\b/);
       });
     });
   });
@@ -657,8 +936,11 @@ describe("a dead letter's per-attempt history", () => {
       await inTenant(async (tx) => {
         const outboxId = randomUUID();
         await insertHistory(tx, { outbox_id: outboxId, attempt: 2 });
+        // 0043 renamed the key with its columns: `(tenant_id, outbox_id, attempt)`, because
+        // a unique index is enforced with row security disabled and the two-column form was
+        // therefore cross-tenant.
         await expect(insertHistory(tx, { outbox_id: outboxId, attempt: 2 })).rejects.toThrow(
-          /uq_outbox_dead_letter_attempt/,
+          /uq_outbox_dead_letter_tenant_attempt/,
         );
       });
     });
@@ -704,6 +986,67 @@ describe("a dead letter's per-attempt history", () => {
           ),
         ).rejects.toThrow(/row-level security/);
       });
+    });
+
+    /**
+     * THE EPISODE KEY IS TENANT-SCOPED, because a unique index is not confined by RLS.
+     *
+     * This schema records two halves of that asymmetry already — a foreign key's
+     * referential check runs with row security disabled (0035, 0037), and a CHECK's
+     * validation scan sees every row (0032, 0039). A UNIQUE INDEX is the same kind of
+     * thing, and `uq_outbox_dead_letter_attempt (outbox_id, attempt)` was cross-tenant
+     * while the trigger allocating `attempt` was confined. Two consequences: the index
+     * answered "does another tenant hold history under this id", and the refusal took the
+     * `UPDATE crm.outbox` that fired the trigger down with it — so a death could not be
+     * recorded at all, in the table whose only purpose is to be the record of a death.
+     *
+     * Reachable by hand rather than by accident (`crm.outbox.id` is `gen_random_uuid()`),
+     * which is not hypothetical in this table: 0036 gave it no foreign key on purpose and
+     * reasons about hand-written rows throughout, and 0038 exists because one of them
+     * recorded an episode as having ended before it began.
+     */
+    it("lets two tenants hold episode 1 under the same outbox id", async () => {
+      const shared = randomUUID();
+      const episode = (tenantId: string, marker: string) =>
+        [tenantId, shared, 1, 0, 1, "Expense", "create", marker, "crm.expense_claim", randomUUID()] as const;
+      const insert = `INSERT INTO crm.outbox_dead_letter
+          (tenant_id, outbox_id, attempt, revive_count_at_death, dispatch_attempts,
+           died_at, entity, operation, target_record_id, source_table, source_id)
+        VALUES ($1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10)`;
+
+      await inTenant((tx) => tx.query(insert, [...episode(TENANT, "AH-SHARED-A")]));
+      // Committed, and invisible to the other tenant — which is exactly the state in which
+      // the old index refused: the policy hides the row, so nothing here could have known.
+      await withTenantContext(client, OTHER_TENANT, async (other) => {
+        const { rows } = await other.query<{ n: string }>(
+          "SELECT count(*)::text AS n FROM crm.outbox_dead_letter WHERE outbox_id = $1",
+          [shared],
+        );
+        expect(rows[0]?.n).toBe("0");
+        await other.query(insert, [...episode(OTHER_TENANT, "AH-SHARED-B")]);
+      });
+
+      // Each tenant sees its own episode 1 and nothing else.
+      await inTenant(async (tx) => {
+        const mine = await attemptHistory(tx, shared);
+        expect(mine).toHaveLength(1);
+        expect(mine[0]?.target_record_id).toBe("AH-SHARED-A");
+      });
+      await withTenantContext(client, OTHER_TENANT, async (other) => {
+        const theirs = await attemptHistory(other, shared);
+        expect(theirs).toHaveLength(1);
+        expect(theirs[0]?.target_record_id).toBe("AH-SHARED-B");
+      });
+    });
+
+    it("keys episodes on (tenant_id, outbox_id, attempt), not on (outbox_id, attempt)", async () => {
+      const { rows } = await client.query<{ indexdef: string }>(
+        `SELECT indexdef FROM pg_indexes
+          WHERE schemaname = 'crm' AND tablename = 'outbox_dead_letter' AND indexname LIKE 'uq_%'`,
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.indexdef).toMatch(/UNIQUE INDEX uq_outbox_dead_letter_tenant_attempt/);
+      expect(rows[0]?.indexdef).toMatch(/\(tenant_id, outbox_id, attempt\)/);
     });
 
     it("enables and FORCES row level security, because crm_app owns the table", async () => {
@@ -818,6 +1161,10 @@ describe("a dead letter's per-attempt history", () => {
   describe("summariseAttemptHistory", () => {
     const entry = (over: Partial<DeadLetterAttempt> & { attempt: number }): DeadLetterAttempt => ({
       id: randomUUID(),
+      // Deliberately NOT derived from `attempt`: nothing in the summary may read `seq`, so
+      // a constant here is the assertion. `attempt` is the only key these answers rest on,
+      // which is what lets them survive the ring trimming rows out from under them.
+      seq: "1",
       outbox_id: "o",
       revive_count_at_death: over.attempt - 1,
       dispatch_attempts: 1,

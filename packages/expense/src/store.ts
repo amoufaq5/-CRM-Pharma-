@@ -334,7 +334,14 @@ export async function rejectClaim(
 
 export interface PostResult {
   readonly claim: ExpenseClaim;
-  /** False when the outbox already held this write — a replay, not a second ERP record. */
+  /**
+   * False when the outbox already held this write — a replay, not a second ERP record.
+   *
+   * Only ever reported for a row that is still LIVE (`pending`, `in_flight` or
+   * `delivered`). A replay that collapses onto a `dead` row does not come back as `false`:
+   * it refuses with `ErpWriteDeadLetteredError`, because there is no live write behind it
+   * for the replay to have collapsed into.
+   */
   readonly enqueued: boolean;
 }
 
@@ -351,6 +358,14 @@ export interface PostResult {
  *
  * `erp_journal_entry_id` stays null, and will until the GL posting has an account id to
  * debit and a credit account to name — see the header of `posting.ts`.
+ *
+ * REFUSES rather than posting when the outbox already holds this claim's `Expense` create
+ * as a DEAD row. The claim then stays `approved`, which is the only state from which
+ * anything retries it: the `expense_post` sweep looks at `approved` claims, and
+ * `crm.notification_subject_open` treats an `approved` claim as the open thing a blocked
+ * notification is about (0031). Marking it `posted` instead would settle it in the CRM
+ * against a write the ERP will never hold, and `unpostedApprovedClaims` would never show
+ * it again. See `ErpWriteDeadLetteredError`.
  */
 export async function postClaim(
   tx: PoolClient,
@@ -397,6 +412,11 @@ export async function postClaim(
  * `seq` rather than a shared `created_at` — so both of the original hazards are closed at
  * their source. The rule stays because it is still the right shape: one row cannot be out
  * of order with itself, and that holds without depending on either fix.
+ *
+ * Refuses on a dead `transition:reimburse` row, as `postClaim` does on a dead create, and
+ * the claim stays `posted`. Nothing sweeps reimbursements, so this refusal is the only
+ * thing between a dead transition and a claim that is terminal in the CRM while the ERP's
+ * `Expense` sits in `approved` forever.
  */
 export async function reimburseClaim(
   tx: PoolClient,

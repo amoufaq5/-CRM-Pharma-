@@ -192,6 +192,50 @@ export class MissingErpExpenseIdError extends Error {
 }
 
 /**
+ * The outbox already holds this write, and the ERP refused it permanently.
+ *
+ * THE SECOND COLLAPSE IS NOT THE FIRST. `enqueueOutbox` is unique on
+ * `(tenant_id, entity, operation, target_record_id)`, so a repeated posting intent
+ * collapses onto the row already there — which is the whole point of the key, and
+ * harmless while that row is `pending`, `in_flight` or `delivered`. It is not harmless
+ * when the row is `dead`: the relay has stopped retrying it, nothing else ever will, and
+ * the enqueue that "collapsed" achieved literally nothing. Reading that as the ordinary
+ * duplicate would move the claim to `posted` — settled in the CRM, absent from the ERP,
+ * and out of `unpostedApprovedClaims`, so no later sweep would look at it again.
+ *
+ * Refused instead, which leaves the claim `approved`: the sweep retries it every pass,
+ * `crm.notification_subject_open` keeps the `expense_post_blocked` signal alive while it
+ * stays that way (0031), and a revive of the dead letter (rule 31 — it carries an actor)
+ * unblocks it without anyone touching the claim.
+ *
+ * Carries `reviveCount` because a row that has died twice is different news from one that
+ * has died once, and the notification's dedup key says so.
+ */
+export class ErpWriteDeadLetteredError extends Error {
+  constructor(
+    readonly claimId: string,
+    readonly outboxId: string,
+    readonly entity: string,
+    readonly operation: string,
+    readonly deadReason: string | null,
+    readonly reviveCount: number,
+  ) {
+    super(
+      `the ${operation} ${entity} for expense claim ${claimId} is already in crm.outbox as ` +
+        `row ${outboxId}, and the ERP refused it permanently` +
+        (deadReason !== null ? `: ${deadReason.slice(0, 300)}` : "") +
+        `. Enqueuing it again does nothing — a dead row is never retried — so the claim is ` +
+        `left approved rather than marked posted against a write the ERP will never have. ` +
+        `Fix the cause at the ERP, then retry the write (POST /v1/erp-writes/${outboxId}/retry` +
+        `); the next expense_post sweep will post the claim` +
+        (reviveCount > 0 ? ` (already retried ${reviveCount}×)` : "") +
+        `.`,
+    );
+    this.name = "ErpWriteDeadLetteredError";
+  }
+}
+
+/**
  * An account or cost-centre code that could not be an ERP one.
  *
  * `LedgerAccount.account_code` and `CostCenter.code` are both `text` with

@@ -2,7 +2,7 @@
 import { resolve } from "node:path";
 import { Pool, type PoolClient } from "pg";
 
-import { applyMigrations, loadMigrations, type Migration } from "../migrate.js";
+import { applyMigrations, loadMigrations, supersededFiles, type Migration } from "../migrate.js";
 
 /**
  * Applies the CRM's schema.
@@ -113,11 +113,18 @@ async function main(): Promise<number> {
     await client.query("RESET ROLE");
 
     for (const filename of result.applied) log({ type: "applied", filename });
+    // A warning and not an `info`, deliberately: a file the repository contains and the
+    // database never executed is something an operator should have to read past, once per
+    // deploy, rather than something they could only learn by reading the migration source.
+    for (const detail of result.superseded) {
+      log({ type: "warning", detail: `recorded WITHOUT running: ${detail}` });
+    }
     log({
       type: "done",
       dbaApplied: dba.length,
       applied: result.applied.length,
       alreadyApplied: result.skipped.length,
+      superseded: result.superseded.length,
     });
     return 0;
   } finally {
@@ -145,11 +152,20 @@ async function reportPending(
 
   for (const m of dba) log({ type: "would_apply_dba", filename: m.filename, note: "runs every deploy" });
 
+  // Validated here too, so `--dry-run` refuses a bad declaration rather than reporting a
+  // plan the real run will reject.
+  const dead = supersededFiles(app);
+
   let pending = 0;
   let changed = 0;
+  let superseded = 0;
   for (const m of app) {
     const was = recorded.get(m.filename);
-    if (was === undefined) {
+    const retiredBy = dead.get(m.filename);
+    if (was === undefined && retiredBy !== undefined) {
+      log({ type: "would_record_without_running", filename: m.filename, detail: `superseded by ${retiredBy}` });
+      superseded += 1;
+    } else if (was === undefined) {
       log({ type: "would_apply", filename: m.filename });
       pending += 1;
     } else if (was !== m.sha256) {
@@ -158,7 +174,7 @@ async function reportPending(
       changed += 1;
     }
   }
-  log({ type: "dry_run_done", pending, changedAfterApply: changed });
+  log({ type: "dry_run_done", pending, superseded, changedAfterApply: changed });
   return changed > 0 ? 1 : 0;
 }
 

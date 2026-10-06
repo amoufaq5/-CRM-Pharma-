@@ -2,7 +2,11 @@ import { withTenantContext } from "@crm/db";
 import { raiseForSupervisors, raiseNotification, type NotificationKind } from "@crm/notify";
 import type { PoolClient } from "pg";
 
-import { ExpenseClaimNotFoundError, RepNotMappedToEmployeeError } from "./errors.js";
+import {
+  ErpWriteDeadLetteredError,
+  ExpenseClaimNotFoundError,
+  RepNotMappedToEmployeeError,
+} from "./errors.js";
 import { InvalidExpenseClaimTransitionError } from "./states.js";
 import { postClaim, unpostedApprovedClaims, type ExpenseClaim } from "./store.js";
 
@@ -49,6 +53,17 @@ export const EXPENSE_POST_BLOCKED_KIND: NotificationKind = "expense_post_blocked
 
 export type ExpensePostStatus = "posted" | "skipped" | "blocked" | "failed";
 
+/**
+ * Why a claim can never post on its own, and therefore what somebody has to do.
+ *
+ * Both causes are permanent until a person acts, which is what makes them `blocked` rather
+ * than `failed`, and they are not the same job: `unmapped_rep` is reconciling
+ * `crm.rep_profile` against the ERP's `Employee` records, `erp_write_dead` is fixing
+ * whatever the ERP refused and then retrying the dead letter. The summary line names
+ * which, because "blocked" alone sends the reader to the wrong place half the time.
+ */
+export type ExpensePostBlockedCause = "unmapped_rep" | "erp_write_dead";
+
 interface OutcomeBase {
   readonly claimId: string;
   readonly repProfileId: string;
@@ -65,7 +80,14 @@ export type ExpensePostOutcome =
   /** The row moved between the listing and the posting: a concurrent approver or the button. */
   | (OutcomeBase & { readonly status: "skipped"; readonly reason: string })
   /** Refused for something no later pass will fix on its own. Somebody has been told. */
-  | (OutcomeBase & { readonly status: "blocked"; readonly reason: string; readonly notified: number })
+  | (OutcomeBase & {
+      readonly status: "blocked";
+      readonly cause: ExpensePostBlockedCause;
+      readonly reason: string;
+      readonly notified: number;
+      /** The dead `crm.outbox` row to retry. Null for every cause but `erp_write_dead`. */
+      readonly outboxId: string | null;
+    })
   /** Refused for something that may not recur. Retried on the next pass. */
   | (OutcomeBase & { readonly status: "failed"; readonly reason: string });
 
@@ -175,7 +197,26 @@ async function postOne(
     };
   } catch (err) {
     if (err instanceof RepNotMappedToEmployeeError) {
-      return await blockedOutcome(client, tenantId, claim, err, base);
+      return await blockedOutcome(client, tenantId, claim, base, {
+        cause: "unmapped_rep",
+        reason: trim(err.message),
+        outboxId: null,
+        tell: (tx) => raiseUnmappedRep(tx, tenantId, claim),
+      });
+    }
+    // The posting intent collapsed onto a row the ERP refused permanently. `postClaim`
+    // rolled back rather than marking the claim posted, so the claim is still `approved`
+    // and this pass will repeat identically until the dead letter is retried — which is
+    // exactly the shape `blocked` describes, and exactly what nothing else in the system
+    // would ever report: `enqueueOutbox` used to answer `false`, the sweep counted it as a
+    // replay, and the summary read `posted=1 replayed=1`.
+    if (err instanceof ErpWriteDeadLetteredError) {
+      return await blockedOutcome(client, tenantId, claim, base, {
+        cause: "erp_write_dead",
+        reason: trim(err.message),
+        outboxId: err.outboxId,
+        tell: (tx) => raiseDeadErpWrite(tx, tenantId, claim, err),
+      });
     }
     // The row moved under the listing. Not a failure: the claim is posted, or was
     // rejected, and either way this pass had nothing left to do with it.
@@ -203,15 +244,18 @@ async function blockedOutcome(
   client: PoolClient,
   tenantId: string,
   claim: ExpenseClaim,
-  err: RepNotMappedToEmployeeError,
   base: { readonly claimId: string; readonly repProfileId: string },
+  block: {
+    readonly cause: ExpensePostBlockedCause;
+    readonly reason: string;
+    readonly outboxId: string | null;
+    readonly tell: (tx: PoolClient) => Promise<number>;
+  },
 ): Promise<ExpensePostOutcome> {
-  const reason = trim(err.message);
+  const { cause, reason, outboxId } = block;
   try {
-    const notified = await withTenantContext(client, tenantId, (tx) =>
-      raiseBlockedClaim(tx, tenantId, claim),
-    );
-    return { ...base, status: "blocked", reason, notified };
+    const notified = await withTenantContext(client, tenantId, block.tell);
+    return { ...base, status: "blocked", cause, reason, notified, outboxId };
   } catch (tellErr) {
     // A blocked claim nobody was told about must not read as handled. Reported as a plain
     // failure so the next pass refuses it again and tries the telling again.
@@ -223,17 +267,32 @@ async function blockedOutcome(
   }
 }
 
-async function raiseBlockedClaim(
-  tx: PoolClient,
-  tenantId: string,
+/**
+ * What every `expense_post_blocked` signal carries, whatever blocked it.
+ *
+ * `subjectTable` is `crm.expense_claim` and not `crm.outbox` even for a dead write, and
+ * that is the load-bearing choice rather than a convenience: 0031 taught the retention
+ * prune that an `approved` claim is the open thing one of these notifications is about, so
+ * the signal lives exactly as long as the block does and goes once the claim posts. The
+ * dead row's id travels in the payload, where a client can turn it into the retry link.
+ *
+ * The dedup key takes no date and no attempt count. The sweep runs every five minutes and
+ * has to tell somebody once, not 288 times a day.
+ */
+function blockedDetail(
   claim: ExpenseClaim,
-): Promise<number> {
-  const money = `${claim.currency} ${claim.amount}`;
-  const detail = {
+  dedupKey: string,
+  extra: Readonly<Record<string, unknown>> = {},
+): {
+  readonly kind: NotificationKind;
+  readonly dedupKey: string;
+  readonly subjectTable: string;
+  readonly subjectId: string;
+  readonly payload: Readonly<Record<string, unknown>>;
+} {
+  return {
     kind: EXPENSE_POST_BLOCKED_KIND,
-    // Scoped to the claim and the reason, with no date and no attempt count in it: the
-    // sweep runs every five minutes and must tell them once, not 288 times a day.
-    dedupKey: `expense-post:${claim.id}:unmapped-rep`,
+    dedupKey,
     subjectTable: "crm.expense_claim",
     subjectId: claim.id,
     payload: {
@@ -243,8 +302,91 @@ async function raiseBlockedClaim(
       crmCategory: claim.crm_category,
       erpLedgerAccountCode: claim.erp_ledger_account_code,
       repProfileId: claim.rep_profile_id,
+      ...extra,
     },
-  } as const;
+  };
+}
+
+/**
+ * The claim whose ERP write is already dead.
+ *
+ * `expense_post_blocked` and not `erp_write_failed`, which is the near-enough kind and is
+ * refused here for the reason 0031 refused it for the unmapped rep — measured against the
+ * three things that kind asserts, two are false now. A row DID reach `crm.outbox` and the
+ * ERP did refuse it permanently, so that half holds. But the claim is still `approved`, so
+ * the rep's app shows it as not yet sent and nobody is being told that something they
+ * believe happened did not; and the POSTING will be retried on every pass, as soon as the
+ * dead letter is. `erp_write_failed` was already raised by `raiseDeadLetterAlarm` the
+ * moment the row died, deep-linked to the outbox row — this is the separate fact that a
+ * claim, and a rep's money, is now waiting behind it.
+ *
+ * `reviveCount` is in the dedup key for the same reason `raiseDeadLetterAlarm` puts it in
+ * its own: a row that was retried and died again is news, and without it the second block
+ * would dedupe against the first and read as handled.
+ */
+async function raiseDeadErpWrite(
+  tx: PoolClient,
+  tenantId: string,
+  claim: ExpenseClaim,
+  err: ErpWriteDeadLetteredError,
+): Promise<number> {
+  const money = `${claim.currency} ${claim.amount}`;
+  const why = err.deadReason !== null ? ` Reason: ${err.deadReason.slice(0, 300)}` : "";
+  const detail = blockedDetail(
+    claim,
+    `expense-post:${claim.id}:erp-write-dead:${err.outboxId}:${err.reviveCount}`,
+    {
+      outboxId: err.outboxId,
+      erpEntity: err.entity,
+      erpOperation: err.operation,
+      deadReason: err.deadReason,
+      reviveCount: err.reviveCount,
+    },
+  );
+
+  const told = await raiseNotification(tx, tenantId, {
+    ...detail,
+    recipientRepProfileId: claim.rep_profile_id,
+    // WARNING, not urgent, and for the same reason as the unmapped rep: retrying the write
+    // before the ERP-side cause is fixed only kills it again, so the rep's one useful move
+    // is to wait for whoever fixes it. Note `raiseDeadLetterAlarm` sends the rep URGENT for
+    // the same dead row — correctly, because that signal is about a write they believe
+    // landed. This one is about a claim they know is only approved.
+    severity: "warning",
+    subject: `Approved expense still not sent to the ERP: ${money}`,
+    body:
+      `Your ${money} claim from ${claim.incurred_on} is approved and nothing is lost, but the ` +
+      `${err.operation} ${err.entity} it needs was refused by the ERP and will not be retried ` +
+      `on its own.${why} Your manager has been told. Once the write is retried the claim will ` +
+      `be sent automatically.`,
+  });
+
+  const escalations = await raiseForSupervisors(tx, tenantId, claim.rep_profile_id, {
+    ...detail,
+    // URGENT up the chain: this is where the fix is and it is blocking a payment — and
+    // unlike the unmapped rep, this one will not resolve by reconciling a column. Somebody
+    // has to fix the ERP side and then press retry.
+    severity: "urgent",
+    subject: `Reimbursement blocked by a dead ERP write (${money})`,
+    body:
+      `An approved ${money} expense claim from ${claim.incurred_on} cannot be posted: its ` +
+      `${err.operation} ${err.entity} is in crm.outbox as row ${err.outboxId} and the ERP ` +
+      `refused it permanently.${why} The claim stays approved, so it is not lost and no later ` +
+      `sweep will mark it sent. Fix the cause at the ERP, then retry the write ` +
+      `(POST /v1/erp-writes/${err.outboxId}/retry, or GET /v1/team/erp-writes/failed to find ` +
+      `it); the next sweep posts the claim with nobody pressing anything else.`,
+  });
+
+  return (told.created ? 1 : 0) + escalations.filter((e) => e.created).length;
+}
+
+async function raiseUnmappedRep(
+  tx: PoolClient,
+  tenantId: string,
+  claim: ExpenseClaim,
+): Promise<number> {
+  const money = `${claim.currency} ${claim.amount}`;
+  const detail = blockedDetail(claim, `expense-post:${claim.id}:unmapped-rep`);
 
   const told = await raiseNotification(tx, tenantId, {
     ...detail,
@@ -290,7 +432,9 @@ export function summariseExpensePostSweep(result: ExpensePostSweepResult): strin
   const named = result.outcomes
     .filter((o) => o.status === "blocked" || o.status === "failed")
     .slice(0, 5)
-    .map((o) => `${o.claimId}:${o.status}`);
+    // The cause is named for a blocked claim, because the two causes are different jobs
+    // for different people: reconcile a rep profile, or retry a dead ERP write.
+    .map((o) => (o.status === "blocked" ? `${o.claimId}:blocked(${o.cause})` : `${o.claimId}:${o.status}`));
   return (
     `considered=${result.considered} posted=${result.posted} replayed=${result.replayed} ` +
     `skipped=${result.skipped} blocked=${result.blocked} failed=${result.failed} ` +

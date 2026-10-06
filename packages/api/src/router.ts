@@ -134,7 +134,19 @@ export async function dispatch<P>(
   res: ServerResponse,
   options: DispatchOptions<P>,
 ): Promise<void> {
-  const correlationId = (req.headers["x-correlation-id"] as string | undefined) ?? randomUUID();
+  // A BLANK HEADER IS NOT AN ID. `??` covers an absent header and not an empty one, so
+  // `x-correlation-id:` with no value became the request's id — echoed as `""`, printed as
+  // `""`, and written into `crm.attachment_access.correlation_id`, whose CHECK is
+  // `length BETWEEN 1 AND 64`. That turned every attachment byte-read into a 500, and
+  // because the access row is written before the bytes are served, into a refusal.
+  //
+  // Not truncated here, deliberately: the echoed id stays byte-identical to what the
+  // caller sent, which is what the caller's own tracing joins on. The 64-character ceiling
+  // is the storage column's, and `normaliseCorrelationId` applies it where that column is
+  // written — a stored prefix still joins, a 500 serves nobody.
+  const header = req.headers["x-correlation-id"];
+  const supplied = typeof header === "string" ? header.trim() : "";
+  const correlationId = supplied === "" ? randomUUID() : (header as string);
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
 

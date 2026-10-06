@@ -15,6 +15,7 @@ import {
   InvalidAttachmentContentError,
   MissingAttachmentBlobError,
   MissingSignatureCommitmentError,
+  ReceiptClaimStateError,
   SignatureCommitmentMismatchError,
   UnknownAttachmentSubjectError,
   UnsupportedAttachmentTypeError,
@@ -53,6 +54,7 @@ describe("translateAttachmentError", () => {
       new InvalidAttachmentContentError("m"),
       new UnsupportedAttachmentTypeError("x"),
       new MissingAttachmentBlobError("a", "postgres"),
+      new ReceiptClaimStateError("m"),
     ];
     for (const instance of instances) {
       expect(instance.name, instance.constructor.name).toBe(instance.constructor.name);
@@ -205,6 +207,50 @@ describe("translateAttachmentError", () => {
     }
   });
 
+  /**
+   * 0040's three refusals, verbatim, and the arm that reads them.
+   *
+   * The match is on the `receipt-claim-state:` MARKER rather than on any of these
+   * sentences, which is the point of having one — 0034's probe triggers do the same thing
+   * and for the same reason. The sentences are still copied in full, because what this test
+   * has to catch is a marker that was reworded on one side only.
+   */
+  it("maps every claim-state refusal to its own class, by the marker and not by the prose", () => {
+    for (const message of [
+      "receipt-claim-state: expense claim A is not visible in tenant T, so there is no claim state that could admit this receipt",
+      "receipt-claim-state: expense claim A is approved, so the receipt standing on it cannot be stood down — standing it down is the first half of a replacement, and it would leave a claim that has left draft with no current receipt at all",
+      "receipt-claim-state: expense claim A is submitted, so its receipt is fixed and may no longer be replaced — an approver may be reading this image at the moment it changes, and a decision taken against evidence it never saw is corrected by a new claim, not by a new photograph",
+      "receipt-claim-state: expense claim A is posted, and a receipt may be attached only while a claim is draft or submitted — after that the decision has been taken, or there is nothing left to evidence",
+    ]) {
+      expect(translateAttachmentError(pg(message)), message).toBeInstanceOf(ReceiptClaimStateError);
+    }
+  });
+
+  /**
+   * NOT a supersession error, and this is the assertion that keeps it that way.
+   *
+   * The replacement refusals talk about a receipt that "may no longer be replaced" and
+   * about standing one down, which is a hair away from the sentences
+   * `AttachmentSupersessionError` claims. If the marker arm were ever moved below those, two
+   * refusals with completely different remedies — "re-read and start again" versus "file a
+   * new claim" — would collapse into one.
+   */
+  it("keeps a claim-state refusal out of the supersession arm, whose remedy is a different one", () => {
+    const err = translateAttachmentError(
+      pg(
+        "receipt-claim-state: expense claim A is submitted, so its receipt is fixed and may no longer be replaced — an approver may be reading this image at the moment it changes, and a decision taken against evidence it never saw is corrected by a new claim, not by a new photograph",
+      ),
+    );
+    expect(err.name).toBe("ReceiptClaimStateError");
+    expect(err).not.toBeInstanceOf(AttachmentSupersessionError);
+    expect(err).not.toBeInstanceOf(AttachmentImmutableError);
+  });
+
+  it("does not re-translate a claim-state refusal on a second pass", () => {
+    const once = translateAttachmentError(pg("receipt-claim-state: expense claim A is posted, and a receipt may be attached only while a claim is draft or submitted — after that the decision has been taken, or there is nothing left to evidence"));
+    expect(translateAttachmentError(once)).toBe(once);
+  });
+
   it("passes an unrecognised Error through untouched", () => {
     const original = new Error("connection terminated unexpectedly");
     expect(translateAttachmentError(original)).toBe(original);
@@ -264,6 +310,6 @@ describe("translateAttachmentError", () => {
     // Every class in the barrel, not all but one: `translateAttachmentError` also ends in
     // "Error" and is excluded by the name check rather than by throwing, exactly as it is
     // over there.
-    expect(found).toHaveLength(17);
+    expect(found).toHaveLength(18);
   });
 });

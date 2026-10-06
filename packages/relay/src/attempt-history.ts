@@ -17,14 +17,38 @@ import type { PoolClient } from "pg";
  *
  * The trigger records whatever the state change says, which puts the other half of the
  * guarantee in `store.ts`: a settlement that arrives after another worker has already
- * settled the row would otherwise write a death that never happened, permanently, into a
- * table nothing prunes. See the note above `markDelivered` there.
+ * settled the row would otherwise write a death that never happened into this table. See
+ * the note above `markDelivered` there. "Permanently" is now almost true rather than
+ * entirely: 0041 made the same trigger a RING, keeping the newest
+ * `crm.outbox_dead_letter_ring_size()` episodes per outbox row and discarding older ones,
+ * so a false death would be aged out after fifty more real ones. That is no comfort and
+ * `markDelivered`'s guard is still the thing that prevents it.
  */
 
 export interface DeadLetterAttempt {
   readonly id: string;
+  /**
+   * bigint, as text. The real write order (0041), and the key `recentDeaths` sorts on.
+   *
+   * Exposed because a reader that cannot see the ordering key cannot page by it — which
+   * makes keyset paging possible (`WHERE seq < <last seen> ORDER BY seq DESC`) and is
+   * deliberately not built: nothing asks for a second page, and a paging API nobody calls
+   * is a surface to maintain for a reader that does not exist.
+   *
+   * Text rather than a number for the reason `ProbeRow.seq` is: a bigint that arrives as a
+   * JavaScript number is a bigint that silently rounds. It HAS GAPS and is not a count —
+   * identity allocation does not roll back, and the ring (0041 part 2) deletes rows, so a
+   * gap here is the normal case. `deathsEverRecorded` is read off `attempt` and nothing
+   * else.
+   */
+  readonly seq: string;
   readonly outbox_id: string;
-  /** Which death this was for that outbox row, from 1. The table's ordering key. */
+  /**
+   * Which death this was for that outbox row, from 1. This table's per-row ordering key,
+   * and the one the ring cannot disturb: the trigger allocates it as one past the highest
+   * already recorded, so the newest surviving row carries the true count however many older
+   * episodes were trimmed.
+   */
   readonly attempt: number;
   /**
    * `crm.outbox.revive_count` as it stood at this death. Equals `attempt - 1` for every
@@ -51,9 +75,9 @@ export interface DeadLetterAttempt {
 }
 
 const HISTORY_COLUMNS =
-  "id, outbox_id, attempt, revive_count_at_death, dispatch_attempts, died_at, reason, " +
-  "entity, operation, target_record_id, source_table, source_id, revived_at, revived_by, " +
-  "revived_by_name, is_repeat_of_previous";
+  "id, seq::text AS seq, outbox_id, attempt, revive_count_at_death, dispatch_attempts, " +
+  "died_at, reason, entity, operation, target_record_id, source_table, source_id, " +
+  "revived_at, revived_by, revived_by_name, is_repeat_of_previous";
 
 /**
  * One outbox row's death history, oldest first.
@@ -69,6 +93,19 @@ const HISTORY_COLUMNS =
  * an empty history rather than an error, which is the fail-closed reading and not
  * distinguishable from "nothing ever died". Callers that need the difference must look the
  * outbox row up first.
+ *
+ * STILL ORDERED BY `attempt`, NOT BY `seq`, and the burden was on changing it rather than on
+ * keeping it. `attempt` is UNIQUE per `outbox_id` so it cannot tie, it is declared rather
+ * than temporal so it orders correctly however many rows share a transaction, and it is the
+ * number every answer in `summariseAttemptHistory` is computed from. For every row this
+ * schema writes `seq` would give the identical order anyway — the trigger allocates
+ * `attempt` as one past the highest recorded, inside the transaction that killed the row, so
+ * a higher `attempt` always carries a later `seq`. The one case where they disagree is a
+ * history row inserted by hand with an out-of-order `attempt`, and switching would make it
+ * WORSE: the list would be ordered by `seq` while still being numbered by `attempt`, so
+ * `is_repeat_of_previous` — computed with `lag(reason) OVER (ORDER BY attempt)` in the
+ * database — would describe a different neighbour than the one printed above it. `seq` is
+ * returned on the row (0041) so a reader can see the listing's key; it is not the key here.
  */
 export async function attemptHistory(
   tx: PoolClient,
@@ -89,42 +126,57 @@ export async function attemptHistory(
  * revived and then delivered has left it — and so has one whose queue row was deleted.
  * This reads the history table alone, so neither disappears.
  *
- * ORDERING. `died_at` DOES tie, and the earlier claim here that it could not — "the relay
- * settles each row in its own transaction, so each death carries its own clock reading" —
- * was wrong twice over. `died_at` is not `now()`: the trigger copies `crm.outbox.dead_at`,
- * which `markDead` receives as a caller-supplied `Date`, so a separate transaction buys
- * nothing. And a `Date` has millisecond resolution, where the one path that dead-letters
- * without an ERP round trip in between — `UnknownOperationError`, refused before any HTTP
- * call — settles a whole batch inside one millisecond. Two rows in one drain therefore
- * share `died_at` exactly, and `attempt` is no tie-break at all across different outbox
- * rows, because both are 1. That is Part 1 of 0036's own lesson, in Part 2's read side.
+ * ORDERING. `seq DESC` — the real write order, since 0041 gave this table one.
  *
- * So the sort ends on `(outbox_id, attempt)`, which is UNIQUE and therefore makes the
- * order total: within one outbox row the newest episode first, and between rows a uuid,
- * which is meaningless as an ordering and is the point — where the data cannot say, pick
- * once and keep picking the same way (0027, and 0036's own backfill). What it buys is a
- * page boundary that does not drop or duplicate a row between two identical requests.
- * Recovering the real write order needs a `seq` on this table; see the follow-up.
+ * WHY IT HAD TO EXIST, because the lesson is the reason and not a footnote. `died_at` TIES.
+ * It is not `now()`: the trigger copies `crm.outbox.dead_at`, which `markDead` receives as a
+ * caller-supplied `Date`, so settling each row in its own transaction buys nothing — and a
+ * `Date` has millisecond resolution, where the one path that dead-letters without an ERP
+ * round trip in between (`UnknownOperationError`, refused before any HTTP call) settles a
+ * whole batch inside one millisecond. Two rows in one drain therefore share `died_at`
+ * exactly. `attempt` is no tie-break at all across different outbox rows either, because
+ * for two rows dying for the first time both are 1. So this sort used to end on `outbox_id`
+ * — a uuid, meaningless as an ordering, chosen only to make the order TOTAL so a page
+ * boundary could not drop or duplicate a row. It bought a stable page and reported a
+ * fiction: the leading row was whichever uuid sorted smallest, not the row that died last.
+ *
+ * `seq` is allocated at INSERT time, so it records the order the INSERTs ran, and it is
+ * GENERATED ALWAYS so no writer can supply one. It is unique, so the order is still total
+ * and a short page is still a prefix of a long one. The difference is that the order is now
+ * the truth for anything written after 0041 — the backfilled prefix is a chosen order
+ * (`died_at, outbox_id, attempt`, which is this function's own former key, so nothing an
+ * operator has already read was reshuffled), because history's real write order was never
+ * recorded and cannot be recovered, only chosen.
+ *
+ * It does NOT order concurrent enqueues across transactions, and it has gaps: identity
+ * allocation is outside transaction control and the ring (0041 part 2) deletes rows. Nothing
+ * here reads `seq` as a count.
  */
 export async function recentDeaths(
   tx: PoolClient,
   opts: { readonly limit?: number } = {},
 ): Promise<readonly DeadLetterAttempt[]> {
   const { rows } = await tx.query<DeadLetterAttempt>(
-    `SELECT d.id, d.outbox_id, d.attempt, d.revive_count_at_death, d.dispatch_attempts,
+    `SELECT d.id, d.seq::text AS seq, d.outbox_id, d.attempt, d.revive_count_at_death,
+            d.dispatch_attempts,
             d.died_at, d.reason, d.entity, d.operation, d.target_record_id::text AS target_record_id,
             d.source_table, d.source_id, d.revived_at, d.revived_by, rp.display_name AS revived_by_name,
             -- Window functions are evaluated before LIMIT, so this compares against the
             -- real previous episode even when that episode is not one of the rows
             -- returned. The flag therefore means the same thing here as in the per-row
             -- history: a page boundary cannot turn a repeat into a first occurrence.
+            -- A TRIM can, and that is the one thing the ring costs this flag: once the
+            -- previous episode has been discarded (0041 part 2) the lag is NULL and the
+            -- oldest surviving death reads as a first occurrence. Under-claiming
+            -- repetition, never asserting it -- the same conservative direction that
+            -- comparing reasons as bytes already errs in.
             d.reason IS NOT NULL
               AND d.reason IS NOT DISTINCT FROM
                   lag(d.reason) OVER (PARTITION BY d.outbox_id ORDER BY d.attempt)
               AS is_repeat_of_previous
        FROM crm.outbox_dead_letter d
        LEFT JOIN crm.rep_profile rp ON rp.id = d.revived_by
-      ORDER BY d.died_at DESC, d.outbox_id, d.attempt DESC
+      ORDER BY d.seq DESC
       LIMIT $1`,
     [clampLimit(opts.limit)],
   );
@@ -163,9 +215,13 @@ export interface AttemptHistorySummary {
   /**
    * Episodes that happened and are not here — `deathsEverRecorded - deaths`.
    *
-   * Non-zero today means a history row was deleted by hand, since nothing prunes this
-   * table yet; under a ring it means the oldest episodes were trimmed. Either way a
-   * reader is told rather than shown a short list that looks complete.
+   * Non-zero means the oldest episodes were trimmed by the ring (0041 part 2: the newest
+   * `crm.outbox_dead_letter_ring_size()` survive per outbox row), or a history row was
+   * deleted by hand, or this is a page rather than a history. Either way a reader is told
+   * rather than shown a short list that looks complete — which is the property that makes a
+   * ring an acceptable answer to retention where a cascade is not. The trim discards
+   * reasons; it cannot touch the count, because `attempt` is allocated past every episode
+   * ever recorded.
    */
   readonly episodesMissing: number;
   /** Episodes that ended — the row left `dead`, by a revive or otherwise. */
@@ -188,10 +244,18 @@ export interface AttemptHistorySummary {
   readonly neverTheSameReason: boolean;
   /*
    * Both shapes above compare the entries IN HAND from the second onward, so they describe
-   * a page rather than a history whenever `episodesMissing` is non-zero. The first entry's
-   * own `is_repeat_of_previous` is deliberately not folded in: for a complete history it is
-   * always false, since episode 1 has no predecessor, and counting it would make
-   * `alwaysTheSameReason` unreachable.
+   * a page rather than a history whenever `episodesMissing` is non-zero — and under the ring
+   * (0041 part 2) that is no longer only a paging artefact: for an outbox row that has died
+   * more than `crm.outbox_dead_letter_ring_size()` times, both flags describe THE NEWEST
+   * FIFTY EPISODES and not the history, because the older ones no longer exist to compare.
+   * Neither flag changes; the scope of the claim does, and `episodesMissing` is how a reader
+   * knows which they are being given.
+   *
+   * The first entry's own `is_repeat_of_previous` is deliberately not folded in: for a
+   * complete history it is always false, since episode 1 has no predecessor, and counting it
+   * would make `alwaysTheSameReason` unreachable. That exclusion also absorbs the trim —
+   * the oldest SURVIVING entry has lost its predecessor, so its flag is false whether or not
+   * it repeated one, and it is the entry these two skip.
    */
   /**
    * Deaths whose `attempt` and `revive_count_at_death` disagree: the row was put back in

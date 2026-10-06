@@ -781,6 +781,118 @@ describe("a cross-tenant reference is refused by the database", () => {
     // would be passing because the insert is broken rather than because the tenant is wrong.
     await expect(grant(B.rep1)).rejects.toBeInstanceOf(Accepted);
   });
+
+  /**
+   * `crm.attachment_access`, WITH NOTHING DISABLED — because the backlog said it had a hole.
+   *
+   * 0033 gave this table no insert-time guard, and 0037's own header calls that out: "It
+   * carries NO insert-time guard at all, so these two are the clearest case in this file —
+   * nothing but RLS was between an access record and another tenant's attachment, and
+   * referential checks bypass RLS." The note left over from that reading was that the table
+   * still needs a trigger in the shape of `attachment_blob_verify`, which refuses
+   * `att.tenant_id <> NEW.tenant_id` in so many words.
+   *
+   * IT DOES NOT, and the two composite foreign keys 0037 installed are why. The probes in
+   * `PROBES` above already say so, but they say it with `DISABLE TRIGGER USER` in force,
+   * which is right for testing a constraint in isolation and is exactly the wrong evidence
+   * for "does this table need a trigger": a reader cannot tell from them whether the refusal
+   * survives the live table. These three run with every trigger enabled, as `crm_app`, under
+   * FORCE ROW LEVEL SECURITY, which is the arrangement a request actually meets — so a
+   * future migration that drops a composite key and adds a verify trigger instead, or drops
+   * one and adds nothing, fails here rather than in production.
+   *
+   * WHY A FOREIGN KEY CAN DO THIS JOB AT ALL is the asymmetry 0035, 0037 and 0039 all turn
+   * on, and it is worth restating where it is being relied upon: a referential check runs
+   * with row security DISABLED, so it sees the parent that RLS hides and answers "same
+   * tenant?" at the same moment as "does it exist?". The bulk `VALIDATE` scan of a NEWLY
+   * ADDED key is an ordinary query and sees nothing under FORCE RLS with no tenant context,
+   * which is why 0037 opens with a per-tenant pre-flight — but that is a statement about
+   * adopting a key, not about enforcing one, and these inserts are enforcement.
+   */
+  it("attachment_access refuses another tenant's attachment with every trigger live", async () => {
+    const record = async (attachment: string): Promise<void> => {
+      await withTenantContext(client, TENANT_FK_B, async (tx) => {
+        await tx.query(
+          "INSERT INTO crm.attachment_access (tenant_id, attachment_id, read_by) VALUES ($1, $2, $3)",
+          [TENANT_FK_B, attachment, B.rep1],
+        );
+        // Never keep it: the table is append-only (0033), so a committed probe row could not
+        // be removed afterwards without lifting the guard that makes it an audit trail.
+        throw new Accepted("attachment_access_attachment_id_fkey");
+      });
+    };
+
+    await expect(record(A.att)).rejects.toMatchObject({
+      code: "23503",
+      constraint: "attachment_access_attachment_id_fkey",
+    });
+    // The same statement against this tenant's own attachment must reach the Accepted
+    // throw, or the refusal above would be about a broken insert rather than about tenancy.
+    await expect(record(B.att)).rejects.toBeInstanceOf(Accepted);
+  });
+
+  it("attachment_access refuses another tenant's reader with every trigger live", async () => {
+    const record = async (reader: string): Promise<void> => {
+      await withTenantContext(client, TENANT_FK_B, async (tx) => {
+        await tx.query(
+          "INSERT INTO crm.attachment_access (tenant_id, attachment_id, read_by) VALUES ($1, $2, $3)",
+          [TENANT_FK_B, B.att, reader],
+        );
+        throw new Accepted("attachment_access_read_by_fkey");
+      });
+    };
+
+    await expect(record(A.rep1)).rejects.toMatchObject({
+      code: "23503",
+      constraint: "attachment_access_read_by_fkey",
+    });
+    await expect(record(B.rep1)).rejects.toBeInstanceOf(Accepted);
+  });
+
+  /**
+   * And with no tenant context at all, the policy refuses the row before a key is consulted.
+   *
+   * `crm.apply_tenant_isolation` creates its policy with a `USING` clause and no
+   * `WITH CHECK`, so Postgres uses the same expression for writes — and `NULLIF(…, '')::uuid`
+   * is NULL on a connection that never set the GUC and on a pooled one that reset it, so the
+   * predicate is NULL and the INSERT is refused outright. That is the 42501 below. It is the
+   * first thing a psql prompt meets, which is why the foreign keys above had to be probed
+   * from INSIDE a tenant: without a context there is nothing for them to refuse.
+   */
+  it("attachment_access refuses any row at all with no tenant context, before a key is reached", async () => {
+    await client.query("BEGIN");
+    try {
+      await client.query("SELECT set_config('app.current_tenant_id', '', true)");
+      await expect(
+        client.query(
+          "INSERT INTO crm.attachment_access (tenant_id, attachment_id, read_by) VALUES ($1, $2, $3)",
+          [TENANT_FK_B, A.att, B.rep1],
+        ),
+      ).rejects.toMatchObject({ code: "42501" });
+    } finally {
+      await client.query("ROLLBACK");
+    }
+  });
+
+  /**
+   * The shape of the answer, pinned: the guard is the two keys and NOT a trigger.
+   *
+   * `attachment_blob_verify` is a BEFORE INSERT trigger that compares the parent's tenant
+   * itself, and it is the shape the backlog note asked for here. This table has no
+   * INSERT-time trigger and does not need one, so the absence is asserted rather than left
+   * to be rediscovered: if someone adds one, this test says where the rule already lives,
+   * and if someone drops a key believing a trigger covers it, the two tests above fail.
+   */
+  it("has no insert-time trigger on attachment_access, because the two composite keys are the guard", async () => {
+    const { rows } = await client.query<{ tgname: string; on_insert: boolean }>(
+      `SELECT tgname, (tgtype & 4) <> 0 AS on_insert
+         FROM pg_trigger
+        WHERE tgrelid = 'crm.attachment_access'::regclass AND NOT tgisinternal
+        ORDER BY tgname`,
+    );
+    expect(rows.map((r) => r.tgname)).toEqual(["attachment_access_append_only"]);
+    expect(rows.every((r) => !r.on_insert)).toBe(true);
+  });
 });
 
 describe("no reference in crm escapes its tenant", () => {

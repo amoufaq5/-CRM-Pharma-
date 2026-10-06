@@ -456,6 +456,37 @@ export async function listAttachmentsForSubject(
  * A metadata listing is NOT logged. It carries no personal data, and logging every list
  * would bury the reads that matter under the reads that do not.
  */
+/**
+ * The request's correlation id, as a value the COLUMN can hold.
+ *
+ * `crm.attachment_access.correlation_id` is `CHECK (… length BETWEEN 1 AND 64)` and the id
+ * arriving here originates in a CLIENT HEADER: `dispatch` reads `x-correlation-id` and
+ * only falls back to a fresh uuid when the header is *absent*, so an empty header value
+ * reached the INSERT as `''` and a long one — AWS X-Ray's `Root=…;Parent=…;Sampled=1` is
+ * about seventy characters, and composite ingress request ids are routinely longer — reached
+ * it whole. Either violated the CHECK, nothing translated a `23514` on that constraint, and
+ * the whole read became a 500.
+ *
+ * That was not a logging failure but a REFUSAL: the access row is written before the bytes
+ * are returned, deliberately (an unrecordable privileged read is refused, not served
+ * unaudited), so a tracing header the deployment happened to set made every signature in
+ * the system unreadable — including to the rep who has to produce it in an audit.
+ *
+ * Normalised here rather than by relaxing the CHECK, because 64 characters is enough for
+ * every id anyone should be joining on, and rather than only in the route, because this is
+ * the one function that writes the column and the scheduler reaches it too. Blank becomes
+ * absent — `''` is not an id and a null says "no request behind this read", which is the
+ * truth. Over-long is TRUNCATED rather than refused: a correlation id is for joining a log
+ * line to a row, and a prefix still joins, where a 500 serves nobody. Same reasoning as
+ * `attachmentAccessLog`'s clamp of `limit` — a read is not the place to invent a 400.
+ */
+export function normaliseCorrelationId(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  return trimmed.slice(0, 64);
+}
+
 export async function readAttachmentContent(
   tx: PoolClient,
   tenantId: string,
@@ -468,7 +499,7 @@ export async function readAttachmentContent(
     await tx.query(
       `INSERT INTO crm.attachment_access (tenant_id, attachment_id, read_by, correlation_id)
        VALUES ($1, $2, $3, $4)`,
-      [tenantId, attachment.id, input.readBy, input.correlationId ?? null],
+      [tenantId, attachment.id, input.readBy, normaliseCorrelationId(input.correlationId)],
     );
   } catch (err) {
     throw translateAttachmentError(err);

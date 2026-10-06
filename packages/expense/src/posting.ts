@@ -2,6 +2,8 @@ import type { PoolClient } from "pg";
 import type { Expense } from "@crm/acl";
 import { enqueueOutbox } from "@crm/relay";
 
+import { ErpWriteDeadLetteredError } from "./errors.js";
+
 /**
  * What a settled expense claim becomes at the ERP.
  *
@@ -243,44 +245,32 @@ export function buildExpenseReimburse(erpExpenseId: string): ErpExpenseTransitio
 }
 
 /**
- * Appends the `Expense` create to the outbox inside the caller's transaction.
+ * Enqueues one of this claim's ERP writes, or refuses because the last one is dead.
  *
- * One transaction with the claim's own state change is the whole reason the outbox
- * exists: a claim that committed as `posted` without its outbox row would be a
- * reimbursement the ERP never hears about, and an outbox row without the state change
- * would post the same claim again on the next sweep.
+ * THE DISTINCTION THIS EXISTS FOR. `enqueueOutbox` reports the state of the row a
+ * duplicate collapsed ONTO, and three of the four states mean the intent is alive:
+ * `pending` is queued, `in_flight` is being dispatched now, `delivered` is already at the
+ * ERP. All three are the ordinary double-tap the idempotency key is for, and all three
+ * stay silent — returning `false` exactly as before, because nothing has gone wrong.
  *
- * Returns false when the row was already there — a double-tap, or a replayed offline
- * batch. `crm.outbox` is unique on `(tenant_id, entity, operation, target_record_id)` and
- * `enqueueOutbox` reads that conflict as a no-op.
+ * `dead` is the fourth and it is not a duplicate in any useful sense. The relay has
+ * stopped retrying that row, nothing else ever will, and this enqueue changed nothing at
+ * all. Reported as a refusal rather than as `false`, because the caller's next act is to
+ * mark the claim handed over — see `ErpWriteDeadLetteredError` for why that must not
+ * happen. Refusing HERE rather than at each caller is deliberate: both callers must
+ * refuse, and a single `boolean` return for both outcomes is how the distinction was lost
+ * in the first place.
+ *
+ * The extra SELECT runs only on the dead path, where one more round trip is free and the
+ * reason is what somebody needs in order to act.
  */
-export async function enqueueExpenseCreate(
-  tx: PoolClient,
-  tenantId: string,
-  claim: PostableClaim,
-  erpEmployeeId: string,
-): Promise<boolean> {
-  const row = buildExpenseCreate(claim, erpEmployeeId);
-  const { enqueued } = await enqueueOutbox(tx, tenantId, {
-    entity: row.entity,
-    operation: row.operation,
-    payload: { ...row.payload },
-    targetRecordId: row.targetRecordId,
-    sourceTable: EXPENSE_SOURCE_TABLE,
-    sourceId: claim.id,
-  });
-  return enqueued;
-}
-
-/** Appends the `reimburse` transition, in the transaction that marks the claim reimbursed. */
-export async function enqueueExpenseReimburse(
+async function enqueueClaimWrite(
   tx: PoolClient,
   tenantId: string,
   claimId: string,
-  erpExpenseId: string,
+  row: ErpExpenseCreate | ErpExpenseTransition,
 ): Promise<boolean> {
-  const row = buildExpenseReimburse(erpExpenseId);
-  const { enqueued } = await enqueueOutbox(tx, tenantId, {
+  const { enqueued, id, state } = await enqueueOutbox(tx, tenantId, {
     entity: row.entity,
     operation: row.operation,
     payload: { ...row.payload },
@@ -288,5 +278,58 @@ export async function enqueueExpenseReimburse(
     sourceTable: EXPENSE_SOURCE_TABLE,
     sourceId: claimId,
   });
-  return enqueued;
+  if (state !== "dead") return enqueued;
+
+  const { rows } = await tx.query<{ dead_reason: string | null; revive_count: number }>(
+    `SELECT dead_reason, revive_count FROM crm.outbox WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, id],
+  );
+  throw new ErpWriteDeadLetteredError(
+    claimId,
+    id,
+    row.entity,
+    row.operation,
+    rows[0]?.dead_reason ?? null,
+    rows[0]?.revive_count ?? 0,
+  );
+}
+
+/**
+ * Appends the `Expense` create to the outbox inside the caller's transaction.
+ *
+ * One transaction with the claim's own state change is the whole reason the outbox
+ * exists: a claim that committed as `posted` without its outbox row would be a
+ * reimbursement the ERP never hears about, and an outbox row without the state change
+ * would post the same claim again on the next sweep.
+ *
+ * Returns false when the row was already there and still live — a double-tap, or a
+ * replayed offline batch. `crm.outbox` is unique on
+ * `(tenant_id, entity, operation, target_record_id)` and `enqueueOutbox` reads that
+ * conflict as a no-op. THROWS `ErpWriteDeadLetteredError` when the row it collapsed onto
+ * is dead, which is the one case where a no-op is not harmless.
+ */
+export async function enqueueExpenseCreate(
+  tx: PoolClient,
+  tenantId: string,
+  claim: PostableClaim,
+  erpEmployeeId: string,
+): Promise<boolean> {
+  return enqueueClaimWrite(tx, tenantId, claim.id, buildExpenseCreate(claim, erpEmployeeId));
+}
+
+/**
+ * Appends the `reimburse` transition, in the transaction that marks the claim reimbursed.
+ *
+ * Refuses on a dead collapse for the same reason the create does, and the consequence is
+ * sharper: nothing sweeps reimbursements. A claim marked `reimbursed` against a dead
+ * transition would be terminal in the CRM — `reimbursed` has no outgoing transition — with
+ * the ERP's `Expense` left in `approved` forever and no job that would ever notice.
+ */
+export async function enqueueExpenseReimburse(
+  tx: PoolClient,
+  tenantId: string,
+  claimId: string,
+  erpExpenseId: string,
+): Promise<boolean> {
+  return enqueueClaimWrite(tx, tenantId, claimId, buildExpenseReimburse(erpExpenseId));
 }

@@ -97,6 +97,11 @@ describe("dead letters", () => {
         await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [TENANT]);
+        // `crm.outbox_dead_letter` has NO foreign key to `crm.outbox` on purpose (0036) —
+        // a death has to outlive its queue row — so deleting the queue leaves every
+        // previous run's episodes in this tenant. Nothing here counts them today, which is
+        // the only reason it has not flaked; one count-based assertion away from doing so.
+        await tx.query("DELETE FROM crm.outbox_dead_letter WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_holding WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_lot WHERE tenant_id = $1", [TENANT]);

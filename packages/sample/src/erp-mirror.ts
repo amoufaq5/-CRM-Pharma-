@@ -90,22 +90,87 @@ function truncate(value: string, max: number): string {
 }
 
 /**
+ * The four states `crm.outbox.state` admits, taken from `enqueueOutbox` itself.
+ *
+ * Derived rather than re-listed: `@crm/relay`'s barrel does not export its `OutboxState`,
+ * and a second hand-written copy of the four values is a list that can fall behind the
+ * CHECK constraint without anything failing.
+ */
+export type ErpMirrorOutboxState = Awaited<ReturnType<typeof enqueueOutbox>>["state"];
+
+/**
+ * What enqueuing a mirror did, in enough detail to answer the rep honestly.
+ *
+ * `enqueued` is the old boolean and means exactly what it used to: THIS call wrote the
+ * row. Everything else is what `enqueueOutbox`'s state made askable.
+ */
+export interface ErpMirrorResult {
+  /**
+   * False when there was nothing to mirror: seven of the nine movement kinds never cross
+   * the ERP stock boundary, and a receipt or return carrying no `erp_warehouse_id` has no
+   * warehouse to name. `erpMirrorFor` is the one that decides.
+   */
+  readonly applicable: boolean;
+  /** True only when this call wrote the outbox row. */
+  readonly enqueued: boolean;
+  /** Null when there was nothing to mirror. */
+  readonly outboxId: string | null;
+  /** The state of the row this movement's mirror is, or collapsed onto. */
+  readonly state: ErpMirrorOutboxState | null;
+  /**
+   * The ERP will never hear about this movement without a person.
+   *
+   * The one outcome a caller must not read as a harmless duplicate. See
+   * `enqueueErpMirror`.
+   */
+  readonly deadLettered: boolean;
+  /** Why the ERP refused it, when it did. */
+  readonly deadReason: string | null;
+}
+
+const NOT_APPLICABLE: ErpMirrorResult = {
+  applicable: false,
+  enqueued: false,
+  outboxId: null,
+  state: null,
+  deadLettered: false,
+  deadReason: null,
+};
+
+/**
  * Enqueues the mirror in the same transaction that recorded the movement.
  *
  * One transaction is the whole reason the outbox exists: a movement that committed
  * without its mirror would leave the ERP's warehouse balance permanently overstated,
- * and a mirror that committed without its movement would understate it. Returns
- * false when there was nothing to mirror or the row was already enqueued.
+ * and a mirror that committed without its movement would understate it.
+ *
+ * WHY THIS NO LONGER RETURNS A BARE BOOLEAN. A movement id is device-minted, and
+ * `insertMovement` collapses a redelivered offline movement onto the row already there —
+ * so a replayed receipt reaches here a second time and `enqueueOutbox` collapses onto the
+ * outbox row already there too. That is the designed path and `enqueued: false` is the
+ * honest answer for it, while the queued write is still alive. It is NOT the honest answer
+ * when that row is `dead`: the relay stopped retrying it, the warehouse balance at the ERP
+ * is overstated and will stay overstated, and the rep has now recorded the same hand-over
+ * twice and been told `201 Created` twice. `deadLettered` is that case, and it is the only
+ * new thing a caller has to do anything about.
+ *
+ * NOTHING IS NOTIFIED FROM HERE, deliberately. `raiseDeadLetterAlarm` already told the rep
+ * (urgently — they believe that write landed) and their supervisors the moment the row
+ * died, keyed on `revive_count` so a second death is news and a second mention of the same
+ * death is not. Raising another signal for the same dead row on every replay is precisely
+ * the noise that key exists to prevent. The way back is unchanged:
+ * `GET /v1/erp-writes/failed` then `POST /v1/erp-writes/{id}/retry`.
  */
 export async function enqueueErpMirror(
   tx: PoolClient,
   tenantId: string,
   transaction: SampleTransaction,
   lot: SampleLot,
-): Promise<boolean> {
+): Promise<ErpMirrorResult> {
   const mirror = erpMirrorFor(transaction, lot);
-  if (mirror === null) return false;
-  const { enqueued } = await enqueueOutbox(tx, tenantId, {
+  if (mirror === null) return NOT_APPLICABLE;
+
+  const { enqueued, id, state } = await enqueueOutbox(tx, tenantId, {
     entity: mirror.entity,
     operation: mirror.operation,
     payload: { ...mirror.payload },
@@ -113,5 +178,30 @@ export async function enqueueErpMirror(
     sourceTable: "crm.sample_transaction",
     sourceId: transaction.id,
   });
-  return enqueued;
+
+  if (state !== "dead") {
+    return {
+      applicable: true,
+      enqueued,
+      outboxId: id,
+      state,
+      deadLettered: false,
+      deadReason: null,
+    };
+  }
+
+  // Only on the dead path, where one more round trip is free and the reason is the thing
+  // somebody acts on.
+  const { rows } = await tx.query<{ dead_reason: string | null }>(
+    `SELECT dead_reason FROM crm.outbox WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, id],
+  );
+  return {
+    applicable: true,
+    enqueued,
+    outboxId: id,
+    state,
+    deadLettered: true,
+    deadReason: rows[0]?.dead_reason ?? null,
+  };
 }

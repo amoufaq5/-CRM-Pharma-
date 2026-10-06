@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
 import { TENANT_EXPENSE_STORE as TENANT, appPool } from "@crm/db/testing";
+import { claimBatch, markDead } from "@crm/relay";
 
 import { upsertAccountMapping } from "./accounts.js";
 import {
@@ -11,6 +12,7 @@ import {
   InvalidCategoryError,
   InvalidCurrencyError,
   InvalidDateError,
+  ErpWriteDeadLetteredError,
   ExpenseClaimNotFoundError,
   MissingErpExpenseIdError,
   RepNotMappedToEmployeeError,
@@ -60,6 +62,15 @@ describe("expense claims", () => {
   const inTenant = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> =>
     withTenantContext(client, TENANT, fn);
 
+  /**
+   * The relay's clock, for the cases that kill a queued write.
+   *
+   * Later than the rows' own `now()` default on purpose: `claimBatch` only takes rows whose
+   * `next_attempt_at` has passed, so a date in the past would claim nothing and the test
+   * would pass for the wrong reason.
+   */
+  const DISPATCH_CLOCK = new Date("2027-01-01T09:00:00Z");
+
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
@@ -93,6 +104,8 @@ describe("expense claims", () => {
 
   const clear = async (): Promise<void> => {
     await inTenant(async (tx) => {
+      // No FK to crm.outbox (0036), so the death episodes outlive the queue rows.
+      await tx.query("DELETE FROM crm.outbox_dead_letter WHERE tenant_id = $1", [TENANT]);
       await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1 AND source_table = $2", [
         TENANT,
         "crm.expense_claim",
@@ -686,6 +699,76 @@ describe("expense claims", () => {
       });
     });
 
+    /**
+     * The same collapse, onto a row the ERP has permanently refused.
+     *
+     * `enqueueOutbox` answers `enqueued: false` for both, and for one of them that is the
+     * whole point of the idempotency key while for the other it is the loss of the write.
+     * Killed through the relay's own `claimBatch` + `markDead` so the row is genuinely
+     * dead — state, `dead_at`, `dead_reason` and the `crm.outbox_dead_letter` episode the
+     * trigger writes — rather than by setting a column.
+     */
+    it("refuses the re-enqueue when the row it would collapse onto is dead", async () => {
+      const id = await approved();
+      await inTenant((tx) => postClaim(tx, TENANT, id, new Date()));
+      await inTenant(async (tx) => {
+        const [row] = await claimBatch(tx, TENANT, "worker-a", 10, DISPATCH_CLOCK);
+        expect(
+          await markDead(tx, row!.id, DISPATCH_CLOCK, "403 forbidden for the service user"),
+        ).toBe(true);
+      });
+
+      await inTenant(async (tx) => {
+        const claim = await requireClaim(tx, TENANT, id);
+        const err = await enqueueExpenseCreate(tx, TENANT, claim, "emp-expst-1").catch(
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(ErpWriteDeadLetteredError);
+        const dead = err as ErpWriteDeadLetteredError;
+        expect(dead.claimId).toBe(id);
+        expect(dead.entity).toBe("Expense");
+        expect(dead.operation).toBe("create");
+        // The reason is what somebody acts on, so it travels with the refusal.
+        expect(dead.deadReason).toBe("403 forbidden for the service user");
+        expect(dead.reviveCount).toBe(0);
+        expect(dead.message).toContain(dead.outboxId);
+      });
+    });
+
+    it("leaves the claim and the queue untouched when it refuses", async () => {
+      const id = await approved();
+      await inTenant((tx) => postClaim(tx, TENANT, id, new Date()));
+      await inTenant(async (tx) => {
+        const [row] = await claimBatch(tx, TENANT, "worker-a", 10, DISPATCH_CLOCK);
+        await markDead(tx, row!.id, DISPATCH_CLOCK, "unbalanced_journal_entry");
+      });
+      // Put the claim back the way an operator repairing it by hand would — the only
+      // reachable way a second posting attempt happens at all, since `postClaim` enqueues
+      // and transitions in one transaction and `posted -> approved` is not a transition.
+      await inTenant((tx) =>
+        tx.query(
+          `UPDATE crm.expense_claim SET state = 'approved', posted_at = NULL, erp_expense_id = NULL
+            WHERE tenant_id = $1 AND id = $2`,
+          [TENANT, id],
+        ),
+      );
+
+      await inTenant(async (tx) => {
+        await expect(postClaim(tx, TENANT, id, new Date())).rejects.toBeInstanceOf(
+          ErpWriteDeadLetteredError,
+        );
+      });
+
+      const claim = await inTenant((tx) => getClaim(tx, TENANT, id));
+      expect(claim?.state).toBe("approved");
+      expect(claim?.erp_expense_id).toBeNull();
+      await inTenant(async (tx) => {
+        const statuses = await claimPostingStatus(tx, TENANT, id);
+        expect(statuses).toHaveLength(1);
+        expect(statuses[0]?.state).toBe("dead");
+      });
+    });
+
     it("attributes the outbox row to the rep, so a dead letter reaches them (0022)", async () => {
       const id = await approved();
       await inTenant((tx) => postClaim(tx, TENANT, id, new Date()));
@@ -754,6 +837,40 @@ describe("expense claims", () => {
           MissingErpExpenseIdError,
         );
       });
+    });
+
+    /**
+     * The sharper half of the same rule.
+     *
+     * Nothing sweeps reimbursements — there is no `expense_reimburse` job — so a claim
+     * marked `reimbursed` against a dead transition would be terminal in the CRM with the
+     * ERP's `Expense` left in `approved` forever and no pass that would ever look again.
+     */
+    it("refuses to mark a claim reimbursed when its reimburse transition is dead", async () => {
+      const id = await approved();
+      await inTenant((tx) => postClaim(tx, TENANT, id, new Date()));
+      await inTenant((tx) => reimburseClaim(tx, TENANT, id));
+      // Kill the transition row, not the create.
+      await inTenant(async (tx) => {
+        const claimed = await claimBatch(tx, TENANT, "worker-a", 10, DISPATCH_CLOCK);
+        const transition = claimed.find((r) => r.operation === "transition:reimburse");
+        expect(transition).toBeDefined();
+        expect(await markDead(tx, transition!.id, DISPATCH_CLOCK, "invalid_transition")).toBe(true);
+      });
+      // An operator repair again: `reimbursed` is terminal, so nothing else re-attempts it.
+      await inTenant((tx) =>
+        tx.query("UPDATE crm.expense_claim SET state = 'posted' WHERE tenant_id = $1 AND id = $2", [
+          TENANT,
+          id,
+        ]),
+      );
+
+      await inTenant(async (tx) => {
+        const err = await reimburseClaim(tx, TENANT, id).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(ErpWriteDeadLetteredError);
+        expect((err as ErpWriteDeadLetteredError).operation).toBe("transition:reimburse");
+      });
+      expect((await inTenant((tx) => getClaim(tx, TENANT, id)))?.state).toBe("posted");
     });
 
     it("is terminal", async () => {

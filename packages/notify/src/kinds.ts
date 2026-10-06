@@ -36,9 +36,16 @@ export const NOTIFICATION_KINDS = [
    * An approved claim could not be handed to the ERP, and a human has to unblock it.
    *
    * Raised by the `expense_post` sweep (0031), which is the one scheduled job that acts on
-   * money. It fires for the two refusals the sweep cannot resolve on its own — the rep has
-   * no `erp_employee_id`, or the claim's category snapshot names no ledger account — and
-   * not for a transport failure, which the outbox retries without anyone's help.
+   * money. It fires for the refusals the sweep cannot resolve on its own — the rep has no
+   * `erp_employee_id`, or the claim's queued ERP write is already dead-lettered and only a
+   * revive will move it — and not for a transport failure, which the outbox retries without
+   * anyone's help.
+   *
+   * This sentence used to name a second case that cannot happen: "the claim's category
+   * snapshot names no ledger account". That refusal is `UnmappedCategoryError` at
+   * `submitClaim`, so such a claim never reaches `approved` and the sweep never sees it.
+   * The sweep only ever caught `RepNotMappedToEmployeeError` until the dead-write block
+   * above joined it.
    */
   "expense_post_blocked",
 ] as const;

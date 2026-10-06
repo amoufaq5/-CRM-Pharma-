@@ -89,6 +89,7 @@ import {
   attachmentAccessLog,
   attachmentSubjectOwner,
   decodeAttachmentContent,
+  getAttachment,
   listAttachmentsForSubject,
   putAttachment,
   readAttachmentContent,
@@ -360,6 +361,32 @@ async function requireSupervision(tx: PoolClient, p: Principal, repProfileId: st
 }
 
 /**
+ * Refuses a CLAIM the caller may neither own nor supervise, without naming its owner.
+ *
+ * `requireSupervision` is the obvious call and leaks: its sentence is
+ * `no rep <id> on your team`, so a caller holding a claim id they should not — from a
+ * screenshot, a support ticket, a shared spreadsheet, or a period when they did supervise
+ * that rep — is handed the owner's `rep_profile` id, which is the identifier the 404 exists
+ * to conceal. The disbursement-signature route next door avoids it by answering about the
+ * SUBJECT; every expense route that reached for `requireSupervision` did not, and this is
+ * the same leak the repo already records as shipped once.
+ *
+ * So the refusal names the claim the caller already had and nothing else. It stays a 404
+ * rather than a 403 for the reason every scoped record here does: whether another rep's
+ * claim exists is information about their work.
+ */
+async function requireClaimOnMyTeam(
+  tx: PoolClient,
+  p: Principal,
+  claimId: string,
+  repProfileId: string,
+): Promise<void> {
+  if (!(await canSupervise(tx, p.repProfileId, repProfileId))) {
+    throw notFound(`no expense claim ${claimId} on your team`);
+  }
+}
+
+/**
  * Supervision AND four-eyes, for a privileged act on somebody else's expense claim.
  *
  * `canSupervise` answers yes for the caller themselves. That is right for a read — a rep
@@ -377,13 +404,14 @@ async function requireSupervision(tx: PoolClient, p: Principal, repProfileId: st
 async function requireExpenseApprover(
   tx: PoolClient,
   p: Principal,
+  claimId: string,
   claim: { readonly rep_profile_id: string },
   verb: string,
 ): Promise<void> {
   if (claim.rep_profile_id === p.repProfileId) {
     throw forbidden(`a claim may not be ${verb} by the rep who filed it`);
   }
-  await requireSupervision(tx, p, claim.rep_profile_id);
+  await requireClaimOnMyTeam(tx, p, claimId, claim.rep_profile_id);
 }
 
 /**
@@ -514,15 +542,20 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     pattern: "/.well-known/jwks.json",
     public: true,
     handler: async (): Promise<HandlerResult> => {
-      let keys;
       try {
-        keys = await new PostgresServiceKeyRegistry({ pool: deps.pool }).verifiableKeys();
+        const keys = await new PostgresServiceKeyRegistry({ pool: deps.pool }).verifiableKeys();
+        // RENDERING IS INSIDE THE TRY, and it has to be. `buildJwksDocument` throws
+        // `JwkError` when a registry row's `kid` is not the thumbprint of its own key — a
+        // row the read itself cannot refuse. Outside the try that escaped as a 500, which
+        // is non-200 and so still fail-closed (every verifier keeps its last good key set),
+        // but it is the wrong answer to the same question the catch below already answers.
+        return jwksResponse(keys);
       } catch {
-        // A failed read must not become an empty key set. 503 keeps every verifier
-        // on its last good document.
+        // A failed read, or a document that cannot be built, must not become an empty key
+        // set. 503 keeps every verifier on its last good document; a 200 would replace it
+        // with whatever arrived, which is how an empty answer disarms a verifier.
         return jwksResponse([]);
       }
-      return jwksResponse(keys);
     },
   });
 
@@ -1078,8 +1111,16 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           occurredAt: new Date(input.occurredAt),
           erpWarehouseId: input.erpWarehouseId,
         });
-        const mirrored = await enqueueErpMirror(tx, ctx.principal.tenantId, row, lot);
-        return { ...row, erpMirrorEnqueued: mirrored };
+        const mirror = await enqueueErpMirror(tx, ctx.principal.tenantId, row, lot);
+        // `erpMirrorEnqueued` is the old field, unchanged. `erpMirror` is the rest, and the
+        // reason it exists: a replayed movement that collapsed onto a DEAD outbox row is not
+        // the harmless duplicate `enqueued: false` used to imply — the ERP will never hear
+        // about this movement until somebody retries the write
+        // (`GET /v1/erp-writes/failed`, then `POST /v1/erp-writes/:id/retry`). Still a 201,
+        // and deliberately: the movement IS recorded here, the ledger is append-only, and a
+        // 4xx would tell the rep their hand-over was not written when it was — which is the
+        // lie, and the one that makes a device retry forever.
+        return { ...row, erpMirrorEnqueued: mirror.enqueued, erpMirror: mirror };
       });
       return { status: 201, body };
     },
@@ -1648,8 +1689,16 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           erpWarehouseId: input.erpWarehouseId,
           reason: input.reason ?? null,
         });
-        const mirrored = await enqueueErpMirror(tx, p.tenantId, row, lot);
-        return { ...row, erpMirrorEnqueued: mirrored };
+        const mirror = await enqueueErpMirror(tx, p.tenantId, row, lot);
+        // `erpMirrorEnqueued` is the old field, unchanged. `erpMirror` is the rest, and the
+        // reason it exists: a replayed movement that collapsed onto a DEAD outbox row is not
+        // the harmless duplicate `enqueued: false` used to imply — the ERP will never hear
+        // about this movement until somebody retries the write
+        // (`GET /v1/erp-writes/failed`, then `POST /v1/erp-writes/:id/retry`). Still a 201,
+        // and deliberately: the movement IS recorded here, the ledger is append-only, and a
+        // 4xx would tell the rep their hand-over was not written when it was — which is the
+        // lie, and the one that makes a device retry forever.
+        return { ...row, erpMirrorEnqueued: mirror.enqueued, erpMirror: mirror };
       });
       return { status: 201, body };
     },
@@ -2228,11 +2277,29 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       const body = await inTenant(deps, ctx.principal, async (tx) => {
         const claim = await requireClaim(tx, ctx.principal.tenantId, subjectId);
         if (claim.rep_profile_id !== ctx.principal.repProfileId) {
-          await requireSupervision(tx, ctx.principal, claim.rep_profile_id);
+          await requireClaimOnMyTeam(tx, ctx.principal, subjectId, claim.rep_profile_id);
         }
+        // A REPLAY IS NOT A WRITE, so it does not meet this gate.
+        //
+        // `putAttachment` has an explicit retry path: same id, same bytes, same subject and
+        // purpose returns the stored row and writes nothing. That is what README rule 7's
+        // device-minted ids are for — an offline client re-sends a capture it is not sure
+        // landed. Checking the claim's state first refused that replay with a 409 whenever
+        // the claim had moved on since the original upload, even though no INSERT or UPDATE
+        // would occur and 0040's trigger therefore never fires. The route was stricter than
+        // the database it fronts, on the one path built to be repeated.
+        //
+        // So the gate is skipped when an attachment under this id is already here, and
+        // `putAttachment` decides: a true replay is answered with the stored row, and a
+        // DIFFERENT capture under a reused id is refused by `AttachmentIdReusedError`, which
+        // is the right sentence for it and not this one. Deliberately not a comparison of
+        // bytes here — duplicating `putAttachment`'s four-way check is how the two drift.
+        const alreadyHere =
+          (await getAttachment(tx, ctx.principal.tenantId, input.id, ctx.principal.repProfileId)) !==
+          null;
         const replacing = input.supersedes !== undefined;
         const allowed = replacing ? ["draft"] : ["draft", "submitted"];
-        if (!allowed.includes(claim.state)) {
+        if (!alreadyHere && !allowed.includes(claim.state)) {
           throw new ApiError(
             "conflict",
             replacing
@@ -2784,7 +2851,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         const id = parse(UUID, ctx.params["id"]);
         const body = await inTenant(deps, ctx.principal, async (tx) => {
           const claim = await requireClaim(tx, ctx.principal.tenantId, id);
-          await requireExpenseApprover(tx, ctx.principal, claim, past);
+          await requireExpenseApprover(tx, ctx.principal, id, claim, past);
           return past === "approved"
             ? approveClaim(tx, ctx.principal.tenantId, id, ctx.principal.repProfileId, now())
             : rejectClaim(tx, ctx.principal.tenantId, id, ctx.principal.repProfileId, now());
@@ -2815,7 +2882,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           // Neither act records who performed it, so this is the only four-eyes check
           // there is: a rep who reached `approved` with a colleague's blessing could
           // otherwise hand their own claim to the ledger and mark it paid alone.
-          await requireExpenseApprover(tx, ctx.principal, claim, past);
+          await requireExpenseApprover(tx, ctx.principal, id, claim, past);
           return past === "posted"
             ? postClaim(tx, ctx.principal.tenantId, id, now())
             : reimburseClaim(tx, ctx.principal.tenantId, id);
@@ -2834,7 +2901,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       const data = await inTenant(deps, ctx.principal, async (tx) => {
         const claim = await requireClaim(tx, ctx.principal.tenantId, id);
         if (claim.rep_profile_id !== ctx.principal.repProfileId) {
-          await requireSupervision(tx, ctx.principal, claim.rep_profile_id);
+          await requireClaimOnMyTeam(tx, ctx.principal, id, claim.rep_profile_id);
         }
         return claimPostingStatus(tx, ctx.principal.tenantId, id);
       });

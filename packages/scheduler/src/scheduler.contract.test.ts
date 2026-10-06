@@ -380,6 +380,48 @@ describe("scheduler against a real database", () => {
     expect(health.find((h) => h.job === "relay_drain")?.consecutive_failures).toBe(0);
   });
 
+  /**
+   * A REFUSED SETTLEMENT HAS TO REACH THE OPERATOR.
+   *
+   * `settleLost` counts settlements the database refused because another worker got there
+   * first — a race `reclaimStale` makes possible by design. It was counted and then dropped:
+   * this summary line is production's only view of a drain, `settleLost` was not in it, and
+   * the deployed relay was constructed with no `onEvent` either, so a race read exactly like
+   * a quiet tenant.
+   */
+  it("names a lost settlement in the drain summary, and stays quiet when there are none", async () => {
+    const result = (settleLost: number) =>
+      ({
+        drainTenant: async () => ({
+          claimed: 3,
+          delivered: 2,
+          retried: 0,
+          dead: 0,
+          alarmed: 0,
+          unattributed: 0,
+          settleLost,
+          lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null },
+        }),
+      }) as unknown as OutboxRelay;
+    const { refresher } = stubRefresher();
+
+    const lost: SchedulerEvent[] = [];
+    await new Scheduler({ pool: p, relay: result(2), refresher, random: () => 0.5, onEvent: (e) => lost.push(e) }).tick();
+    const lostLine = lost.find((e) => e.type === "job_ok" && e.job === "relay_drain") as { detail: string };
+    expect(lostLine.detail).toContain("LOST=2");
+
+    await withTenantContext(admin, TENANT, (tx) =>
+      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [TENANT]),
+    );
+    const clean: SchedulerEvent[] = [];
+    await new Scheduler({ pool: p, relay: result(0), refresher, random: () => 0.5, onEvent: (e) => clean.push(e) }).tick();
+    const cleanLine = clean.find((e) => e.type === "job_ok" && e.job === "relay_drain") as { detail: string };
+    // Absent rather than `LOST=0`: a healthy line is read a thousand times for every
+    // unhealthy one, and a zero that is always there is a zero nobody sees.
+    expect(cleanLine.detail).not.toContain("LOST");
+    expect(cleanLine.detail).toContain("claimed=3");
+  });
+
   it("isolates one tenant's failure from the others", async () => {
     // A tenant whose ERP credential expired must not stop everyone else's relay.
     const seen: string[] = [];

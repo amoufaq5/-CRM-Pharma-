@@ -1380,4 +1380,303 @@ describe("attachments", () => {
     expect(after.metadata).toBeNull();
     expect(after.bytes).toBe(false);
   });
+
+  // -------------------------------------------------------------------------
+  // 0040: the claim state a receipt may be attached, replaced or stood down at.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The rule the route used to be the only holder of.
+   *
+   * `POST /v1/expenses/:id/receipt` still checks it — it is the sentence a rep reads and it
+   * runs before half a megabyte crosses the wire — but every assertion below goes through
+   * this package or through raw SQL, with no router anywhere, which is the point: what 0040
+   * moved into the database is what an offline flush and a psql prompt meet.
+   *
+   * EVERY CLAIM IS BUILT BY ADVANCING A REAL ONE. A predecessor receipt cannot be attached
+   * to an `approved` claim at all once 0040 is in place, so the fixture does what a rep
+   * does: files a draft, attaches the receipt, and the claim then moves. That is also the
+   * exact sequence the rule exists for — the swap happens to a receipt that was legitimately
+   * attached, after the decision was taken against it.
+   */
+  describe("the claim state a receipt may be attached, replaced or stood down at", () => {
+    /** Every state 0006's CHECK admits, so a state added later fails this suite. */
+    const CLAIM_STATES = ["draft", "submitted", "approved", "rejected", "posted", "reimbursed"] as const;
+    type ClaimState = (typeof CLAIM_STATES)[number];
+
+    /** A first receipt: evidence legitimately arrives while an approver is already looking. */
+    const FIRST_RECEIPT_ADMITS: readonly ClaimState[] = ["draft", "submitted"];
+    /** A replacement, either half: an approver may be reading A at the moment it becomes B. */
+    const REPLACEMENT_ADMITS: readonly ClaimState[] = ["draft"];
+
+    const newDraftClaim = async (tx: PoolClient): Promise<string> => {
+      const id = randomUUID();
+      await tx.query(
+        `INSERT INTO crm.expense_claim
+           (id, tenant_id, rep_profile_id, crm_category, amount, currency, incurred_on)
+         VALUES ($1,$2,$3,'congress', 95.00, 'EUR', CURRENT_DATE)`,
+        [id, TENANT, REP],
+      );
+      return id;
+    };
+
+    /**
+     * Moves a claim, setting exactly the columns 0006's and 0030's CHECKs pair with each
+     * state — the snapshotted account code for anything past draft, `approved_at` for the
+     * three states that imply a decision, `rejected_at` for the one that implies the other.
+     * BOSS is the approver and rejecter because `expense_claim_four_eyes` and
+     * `expense_claim_reject_four_eyes` forbid the claimant being either.
+     */
+    const setClaimState = async (tx: PoolClient, claim: string, state: ClaimState): Promise<void> => {
+      await tx.query(
+        `UPDATE crm.expense_claim
+            SET state = $3::text,
+                erp_ledger_account_code = CASE WHEN $3::text = 'draft' THEN NULL ELSE '6000' END,
+                submitted_at = CASE WHEN $3::text = 'draft' THEN NULL ELSE now() END,
+                approved_at  = CASE WHEN $3::text IN ('approved','posted','reimbursed') THEN now() END,
+                approved_by  = CASE WHEN $3::text IN ('approved','posted','reimbursed') THEN $4::uuid END,
+                rejected_at  = CASE WHEN $3::text = 'rejected' THEN now() END,
+                rejected_by  = CASE WHEN $3::text = 'rejected' THEN $4::uuid END
+          WHERE tenant_id = $1 AND id = $2`,
+        [TENANT, claim, state, BOSS],
+      );
+      const { rows } = await tx.query<{ state: string }>(
+        "SELECT state FROM crm.expense_claim WHERE tenant_id = $1 AND id = $2",
+        [TENANT, claim],
+      );
+      // The fixture asserts itself: a CHECK this helper failed to satisfy would otherwise
+      // leave the claim in `draft` and every refusal below would pass for the wrong reason.
+      expect(rows[0]?.state, `claim could not be moved to ${state}`).toBe(state);
+    };
+
+    const receiptOn = (
+      tx: PoolClient,
+      claim: string,
+      over: Partial<{ content: Buffer; supersedes: { attachmentId: string; reason: string } }> = {},
+    ) =>
+      putAttachment(tx, TENANT, store, {
+        id: randomUUID(),
+        purpose: "expense_receipt",
+        subjectId: claim,
+        contentType: "image/jpeg",
+        content: over.content ?? jpeg("the taxi"),
+        uploadedBy: REP,
+        ...(over.supersedes !== undefined ? { supersedes: over.supersedes } : {}),
+      });
+
+    for (const state of CLAIM_STATES) {
+      const admitted = FIRST_RECEIPT_ADMITS.includes(state);
+
+      it(`${admitted ? "attaches" : "refuses"} a first receipt to a ${state} claim`, async () => {
+        const outcome = await inTenant(async (tx) => {
+          const claim = await newDraftClaim(tx);
+          await setClaimState(tx, claim, state);
+          if (admitted) return { row: await receiptOn(tx, claim) };
+          return { err: await refuses(tx, () => receiptOn(tx, claim)) };
+        });
+        if (admitted) {
+          expect(outcome.row?.status).toBe("current");
+        } else {
+          expect(outcome.err?.name).toBe("ReceiptClaimStateError");
+          // The state is NAMED, because "refused" without it sends a rep to the wrong
+          // screen: the remedy for `rejected` is not the remedy for `posted`.
+          expect(outcome.err?.message).toContain(state);
+          expect(outcome.err?.message).toContain("receipt-claim-state:");
+        }
+      });
+
+      const canReplace = REPLACEMENT_ADMITS.includes(state);
+
+      it(`${canReplace ? "replaces" : "refuses to replace"} the receipt on a ${state} claim`, async () => {
+        const outcome = await inTenant(async (tx) => {
+          const claim = await newDraftClaim(tx);
+          // Attached while the claim is still a draft, as a rep would, and the claim moves
+          // around it afterwards.
+          const first = await receiptOn(tx, claim);
+          await setClaimState(tx, claim, state);
+          const replace = () =>
+            receiptOn(tx, claim, {
+              content: jpeg("a different taxi"),
+              supersedes: { attachmentId: first.id, reason: "photographed the wrong receipt" },
+            });
+          if (canReplace) return { first, row: await replace() };
+          return { first, err: await refuses(tx, replace) };
+        });
+        if (canReplace) {
+          expect(outcome.row?.supersedes_attachment_id).toBe(outcome.first.id);
+        } else {
+          expect(outcome.err?.name).toBe("ReceiptClaimStateError");
+          expect(outcome.err?.message).toContain(state);
+        }
+      });
+    }
+
+    /**
+     * The hole that made this an UPDATE trigger and not an arm in `attachment_validate`.
+     *
+     * Superseding is two statements and the predecessor is marked FIRST, so the stand-down
+     * can be run ALONE — and it commits: `attachment_append_only` admits `current ->
+     * superseded`, the pair and reason CHECKs are satisfied, and the DEFERRABLE back link
+     * finds a real row at COMMIT as long as it names any attachment of the tenant. The claim
+     * is then approved with NO current receipt at all, which is worse than the swap this rule
+     * is about and needed one statement.
+     */
+    it("refuses the stand-down half on its own, which would leave an approved claim with no receipt", async () => {
+      const err = await inTenant(async (tx) => {
+        const claim = await newDraftClaim(tx);
+        const receipt = await receiptOn(tx, claim);
+        // Any other attachment of this tenant satisfies the deferred back link, so the
+        // statement below is not refused for naming a successor that does not exist.
+        const decoy = await putSignature(tx);
+        await setClaimState(tx, claim, "approved");
+        return refuses(tx, () =>
+          tx.query(
+            `UPDATE crm.attachment
+                SET status = 'superseded',
+                    superseded_by_attachment_id = $3,
+                    superseded_reason = 'standing it down on its own'
+              WHERE tenant_id = $1 AND id = $2`,
+            [TENANT, receipt.id, decoy.id],
+          ),
+        );
+      });
+      expect(err.name).toBe("ReceiptClaimStateError");
+      expect(err.message).toContain("cannot be stood down");
+      expect(err.message).toContain("approved");
+    });
+
+    /** And the same statement is fine while the claim is still a draft. */
+    it("admits the stand-down half on a draft claim, because that is the first half of a legal replacement", async () => {
+      const after = await inTenant(async (tx) => {
+        const claim = await newDraftClaim(tx);
+        const receipt = await receiptOn(tx, claim);
+        const decoy = await putSignature(tx);
+        await tx.query(
+          `UPDATE crm.attachment
+              SET status = 'superseded',
+                  superseded_by_attachment_id = $3,
+                  superseded_reason = 'the first half of a replacement'
+            WHERE tenant_id = $1 AND id = $2`,
+          [TENANT, receipt.id, decoy.id],
+        );
+        const { rows } = await tx.query<{ status: string }>(
+          "SELECT status FROM crm.attachment WHERE tenant_id = $1 AND id = $2",
+          [TENANT, receipt.id],
+        );
+        return rows[0]?.status;
+      });
+      expect(after).toBe("superseded");
+    });
+
+    /**
+     * The path with no TypeScript in it at all.
+     *
+     * `putAttachment` is one writer of this table and the route is one caller of it. This is
+     * the INSERT a psql prompt or a future offline flush would run, and it meets the same
+     * refusal — which is the whole reason the rule was moved out of the handler.
+     */
+    it("refuses a raw INSERT on a posted claim, with no store and no route in the way", async () => {
+      const err = await inTenant(async (tx) => {
+        const claim = await newDraftClaim(tx);
+        await setClaimState(tx, claim, "posted");
+        return refuses(tx, () =>
+          tx.query(
+            `INSERT INTO crm.attachment
+               (id, tenant_id, purpose, subject_table, subject_id, content_type, byte_size,
+                content_sha256, uploaded_by)
+             VALUES ($1,$2,'expense_receipt','crm.expense_claim',$3,'image/jpeg',8,$4,$5)`,
+            [randomUUID(), TENANT, claim, sha256Hex(jpeg("smuggled in")), REP],
+          ),
+        );
+      });
+      expect(err.name).toBe("ReceiptClaimStateError");
+      expect(err.message).toContain("posted");
+    });
+
+    /**
+     * A receipt whose claim has been deleted cannot be moved, and the refusal says so.
+     *
+     * `crm.attachment.subject_id` is deliberately not a foreign key (0033: a column cannot
+     * reference two tables), so nothing stops a claim being deleted under its receipts. On
+     * INSERT this case is unreachable — `attachment_validate` refuses a missing subject
+     * first, with a better sentence — so the stand-down is the only way to observe the arm,
+     * and the fail-closed direction is 0033's: an attachment nobody is accountable for is
+     * not one to be moved around.
+     */
+    it("refuses to stand down a receipt whose claim has been deleted", async () => {
+      const err = await inTenant(async (tx) => {
+        const claim = await newDraftClaim(tx);
+        const receipt = await receiptOn(tx, claim);
+        const decoy = await putSignature(tx);
+        await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1 AND id = $2", [TENANT, claim]);
+        return refuses(tx, () =>
+          tx.query(
+            `UPDATE crm.attachment
+                SET status = 'superseded', superseded_by_attachment_id = $3,
+                    superseded_reason = 'the claim is gone'
+              WHERE tenant_id = $1 AND id = $2`,
+            [TENANT, receipt.id, decoy.id],
+          ),
+        );
+      });
+      expect(err.name).toBe("ReceiptClaimStateError");
+      expect(err.message).toContain("is not visible in tenant");
+    });
+
+    /**
+     * The other purpose is untouched, and could not be governed this way.
+     *
+     * A signature hangs off `crm.sample_transaction`, which has no state column and could
+     * not have one — 0018 makes the ledger append-only, so a hand-over has no lifecycle to
+     * be at the wrong point of.
+     */
+    it("leaves a disbursement signature alone, because its subject has no state to be at", async () => {
+      const row = await inTenant(async (tx) => putSignature(tx));
+      expect(row.purpose).toBe("disbursement_signature");
+      expect(row.status).toBe("current");
+    });
+
+    /**
+     * THE TRIGGER ORDER, pinned from this side, because 0040's name is load-bearing.
+     *
+     * Postgres fires same-event triggers in alphabetical order by name, and 0033 records
+     * that the ORDER of its own arms was a finding: a `disbursement_signature` pointed at an
+     * expense claim used to be refused with "records no signature_sha256", a true sentence
+     * about the wrong question. A claim-state trigger sorting BEFORE `attachment_validate`
+     * would reintroduce exactly that — a mispaired receipt would be told its claim is
+     * missing. Renaming it has to break a test rather than quietly reorder two refusals.
+     */
+    it("fires after both of 0033's triggers, so each event's better-aimed refusal still speaks first", async () => {
+      const names = await inTenant(async (tx) => {
+        const { rows } = await tx.query<{ tgname: string }>(
+          `SELECT tgname FROM pg_trigger
+            WHERE tgrelid = 'crm.attachment'::regclass AND NOT tgisinternal
+            ORDER BY tgname`,
+        );
+        return rows.map((r) => r.tgname);
+      });
+      expect(names).toEqual([
+        "attachment_append_only",
+        "attachment_validate",
+        "attachment_validate_receipt_claim_state",
+      ]);
+    });
+
+    /** And the consequence of that order: a mispaired row still gets 0033's sentence. */
+    it("still answers a mispaired receipt with the pairing refusal, not with a missing claim", async () => {
+      const err = await inTenant(async (tx) =>
+        refuses(tx, () =>
+          tx.query(
+            `INSERT INTO crm.attachment
+               (id, tenant_id, purpose, subject_table, subject_id, content_type, byte_size,
+                content_sha256, uploaded_by)
+             VALUES ($1,$2,'expense_receipt','crm.sample_transaction',$3,'image/jpeg',8,$4,$5)`,
+            [randomUUID(), TENANT, disbursementId, sha256Hex(jpeg("mispaired")), REP],
+          ),
+        ),
+      );
+      expect(err).toBeInstanceOf(AttachmentSubjectMismatchError);
+      expect(err.message).not.toContain("receipt-claim-state:");
+    });
+  });
 });

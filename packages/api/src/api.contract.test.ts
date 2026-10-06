@@ -278,6 +278,33 @@ describe("the API, end to end", () => {
       expect(res.body.keys[0]).toMatchObject({ kty: "OKP", crv: "Ed25519", kid: a.kid, x: a.jwk.x });
       await admin.query("DELETE FROM crm.service_key");
     });
+
+    /**
+     * A row the READ cannot refuse, and the document cannot be built from.
+     *
+     * `crm.service_key.kid` is documented as the RFC 7638 thumbprint of the key it names,
+     * and nothing in the schema derives it — a hand-written row can disagree, and
+     * `buildJwksDocument` then throws `JwkError`. The rendering used to sit outside the
+     * handler's try, so that escaped as a 500: still fail-closed, since the ERP keeps its
+     * last good key set on any non-200, and still the wrong answer to the question the
+     * catch beside it already answers correctly.
+     */
+    it("answers 503, not 500, for a published key whose kid is not its own thumbprint", async () => {
+      const { generateServiceKeyPair } = await import("@crm/credential");
+      await admin.query("DELETE FROM crm.service_key");
+      const k = generateServiceKeyPair();
+      await admin.query(
+        "INSERT INTO crm.service_key (kid, public_jwk_x, status) VALUES ($1, $2, 'published')",
+        ["not-the-thumbprint-of-this-key", k.jwk.x],
+      );
+      try {
+        const res = await call("GET", "/.well-known/jwks.json", { auth: null, tenant: null });
+        expect(res.status).toBe(503);
+        expect(JSON.stringify(res.body)).not.toContain('"keys"');
+      } finally {
+        await admin.query("DELETE FROM crm.service_key");
+      }
+    });
   });
 
   describe("authentication", () => {
@@ -2471,6 +2498,101 @@ describe("the API, end to end", () => {
           body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
         });
         expect(res.status).toBe(409);
+      });
+
+      /**
+       * README RULE 7's RETRY, which the route used to refuse.
+       *
+       * `putAttachment` has an explicit replay path — same id, same bytes, same subject and
+       * purpose returns the stored row and writes nothing — because an offline client
+       * re-sends a capture it is not sure landed, under an id it minted itself. The route
+       * checked the claim's state BEFORE looking for that row, so a replay arriving after
+       * the claim had been submitted and approved got a 409 for a request that would not
+       * have written anything and would never have reached 0040's trigger. The route was
+       * stricter than the database it fronts, on the one path built to be repeated.
+       */
+      it("admits a byte-identical replay after the claim has moved on, because it writes nothing", async () => {
+        const id = await aClaim();
+        const attachmentId = randomUUID();
+        const body = { id: attachmentId, contentType: "image/png", contentBase64: pngBase64 };
+        const first = await call("POST", `/v1/expenses/${id}/receipt`, { body });
+        expect(first.status).toBe(201);
+
+        // The claim leaves the states the route admits a receipt in.
+        expect((await call("POST", `/v1/expenses/${id}/submit`)).status).toBe(200);
+        expect(
+          (await call("POST", `/v1/expenses/${id}/approve`, { auth: token({ sub: "idp|mgr", tenant: TENANT }) }))
+            .status,
+        ).toBe(200);
+
+        const replay = await call("POST", `/v1/expenses/${id}/receipt`, { body });
+        expect(replay.status).toBe(201);
+        expect(replay.body.id).toBe(attachmentId);
+        // Nothing was written: one row, and it is the one from before the claim moved.
+        expect(replay.body.content_sha256).toBe(first.body.content_sha256);
+        const listed = await call("GET", `/v1/expenses/${id}/receipts`);
+        expect(listed.body.data).toHaveLength(1);
+      });
+
+      /**
+       * And the skip is narrow. A DIFFERENT capture under a reused id is still refused —
+       * by `AttachmentIdReusedError`, which is the right sentence for it, and not by the
+       * claim-state 409, which would be a true sentence about the wrong question.
+       */
+      it("still refuses a different capture under a reused id, with the id's own refusal", async () => {
+        const id = await aClaim();
+        const attachmentId = randomUUID();
+        expect(
+          (
+            await call("POST", `/v1/expenses/${id}/receipt`, {
+              body: { id: attachmentId, contentType: "image/png", contentBase64: pngBase64 },
+            })
+          ).status,
+        ).toBe(201);
+        const reused = await call("POST", `/v1/expenses/${id}/receipt`, {
+          body: {
+            id: attachmentId,
+            contentType: "image/jpeg",
+            contentBase64: Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex").toString("base64"),
+          },
+        });
+        expect(reused.status).toBe(409);
+        expect(reused.body.detail).toMatch(/reused id/);
+      });
+
+      /**
+       * THE LEAK, on the route that had it.
+       *
+       * `requireSupervision`'s sentence is `no rep <id> on your team`, so a caller holding
+       * a claim id they should not — a screenshot, a support ticket, a spreadsheet, or a
+       * period when they did supervise that rep — was handed the owner's rep id: the one
+       * identifier the 404 exists to conceal, and a leak this repo has already shipped once.
+       * Every expense route that reached for `requireSupervision` had it; they now answer
+       * about the CLAIM the caller already had.
+       */
+      it("names the claim and never its owner when refusing a peer", async () => {
+        const id = await aClaim();
+        const peer = token({ sub: "idp|rep2", tenant: TENANT });
+        for (const call_ of [
+          () => call("POST", `/v1/expenses/${id}/receipt`, {
+            auth: peer,
+            body: { id: randomUUID(), contentType: "image/png", contentBase64: pngBase64 },
+          }),
+          () => call("GET", `/v1/expenses/${id}/erp`, { auth: peer }),
+          () => call("POST", `/v1/expenses/${id}/approve`, { auth: peer }),
+          () => call("POST", `/v1/expenses/${id}/reject`, { auth: peer }),
+          () => call("POST", `/v1/expenses/${id}/post`, { auth: peer }),
+          () => call("POST", `/v1/expenses/${id}/reimburse`, { auth: peer }),
+        ]) {
+          const res = await call_();
+          expect(res.status).toBe(404);
+          expect(res.body.detail).toContain(id);
+          expect(res.body.detail).not.toContain(rep);
+          // Not merely "the id is absent": the shape that leaked is gone too, so a future
+          // author reaching for `requireSupervision` here fails this rather than passing
+          // because the fixture's rep id happened not to appear.
+          expect(res.body.detail).not.toMatch(/no rep /);
+        }
       });
 
       it("lets a rep attach their OWN receipt — four eyes must not apply here", async () => {

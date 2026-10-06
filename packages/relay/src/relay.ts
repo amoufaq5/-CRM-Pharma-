@@ -132,6 +132,13 @@ export class OutboxRelay {
           switch (outcome.kind) {
             case "delivered":
             case "already_delivered": {
+              // THE ONE GUARD HERE THAT IS NOT A LIVE RACE. `markDelivered` is deliberately
+              // the only settle with no state predicate — `store.ts`'s header argues why:
+              // `A dead-letters → B delivers` has to be allowed, because the write really
+              // did land. So this branch can only fire if the outbox row was DELETED under
+              // the drain. Kept for the shape (every settlement is guarded, and a reader
+              // should not have to remember which one is exempt) and noted so nobody takes
+              // it for the race the other three answer.
               if (!(await markDelivered(tx, row.id, this.now(), outcome.response))) {
                 lost += 1;
                 this.options.onEvent?.({ type: "settle_lost", row, outcome });

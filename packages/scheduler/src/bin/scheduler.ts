@@ -16,7 +16,7 @@ import {
   type SmtpRelayConfig,
   type SmtpTransport,
 } from "@crm/notify";
-import { OutboxRelay } from "@crm/relay";
+import { OutboxRelay, type RelayEvent } from "@crm/relay";
 import { SnapshotRefresher } from "@crm/sync";
 
 import { Scheduler, type SchedulerEvent } from "../scheduler.js";
@@ -85,6 +85,37 @@ function log(event: SchedulerEvent): void {
   const line = { ts: new Date().toISOString(), ...event };
   const stream = event.type === "job_error" || event.type === "tick_error" ? console.error : console.log;
   stream(JSON.stringify(line));
+}
+
+/**
+ * The relay's per-row events, filtered to the two an aggregate cannot replace.
+ *
+ * `OutboxRelay` was constructed with no `onEvent` at all, so every `RelayEvent` went
+ * nowhere outside the tests and the per-tenant summary line was production's whole view of
+ * the queue. That made `settle_lost` — added precisely so a refused settlement stops
+ * reading as a settlement — invisible in the only place it matters.
+ *
+ * `delivered` and `retry` are deliberately NOT logged: a drain of two hundred rows would
+ * emit two hundred lines to say what `claimed=/delivered=/retried=` already says, and a log
+ * nobody can read is not observability. `dead` and `settle_lost` are the two where the ROW
+ * is the information — which write will never land, and which settlement was discarded — and
+ * no count can reconstruct either afterwards. Both go to stderr: one is a rep's write lost
+ * permanently, the other is two workers racing.
+ */
+function logRelayEvent(event: RelayEvent): void {
+  if (event.type !== "dead" && event.type !== "settle_lost") return;
+  console.error(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      type: `relay_${event.type}`,
+      outboxId: event.row.id,
+      tenantId: event.row.tenant_id,
+      entity: event.row.entity,
+      operation: event.row.operation,
+      targetRecordId: event.row.target_record_id,
+      reason: event.outcome.reason,
+    }),
+  );
 }
 
 async function main(): Promise<void> {
@@ -200,7 +231,13 @@ async function main(): Promise<void> {
   const workerId = `${process.env["HOSTNAME"] ?? "local"}-${process.pid}`;
   const scheduler = new Scheduler({
     pool,
-    relay: new OutboxRelay({ pool, client, workerId }),
+    // `onEvent` is what makes a `RelayEvent` exist in a deployed process at all. Without
+    // it every per-row event the relay emits — `delivered`, `dead`, `retry`, `reclaimed`
+    // and `settle_lost` — went nowhere outside the tests, so the per-tenant summary line
+    // was the whole of production's view of the queue. `settle_lost` is the one that made
+    // that a defect rather than a choice: it names a row whose settlement was discarded,
+    // which no aggregate can reconstruct afterwards.
+    relay: new OutboxRelay({ pool, client, workerId, onEvent: logRelayEvent }),
     refresher: new SnapshotRefresher({ pool, client }),
     // Both senders read each endpoint's secret from the environment by name, so nothing
     // secret is in the database and the process needs no configuration beyond the

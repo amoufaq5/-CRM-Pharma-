@@ -278,6 +278,12 @@ export function toProblem(err: unknown): ApiError {
     case "ApprovalFieldsError":
     case "RejectionFieldsError":
     case "MissingErpExpenseIdError":
+    // The claim's ERP write is in `crm.outbox` and the ERP refused it permanently, so the
+    // posting is refused rather than marked done against a write that will never land. A
+    // conflict and not an upstream failure: the request is well formed, the ERP answered
+    // definitively, and a 503 would invite exactly the retry that cannot work. The message
+    // names the outbox row and the route that re-queues it, so it travels intact.
+    case "ErpWriteDeadLetteredError":
       return new ApiError("conflict", message);
     case "InvalidAmountError":
     case "InvalidCurrencyError":
@@ -309,6 +315,10 @@ export function toProblem(err: unknown): ApiError {
     case "AttachmentSupersessionError":
     case "AttachmentIdReusedError":
     case "AttachmentImmutableError":
+    // 0040. A 409 like its neighbours, and its own case so the sentence survives: the
+    // remedy is not a supersession error's "re-read the current attachment and start
+    // again" but "file a new claim", and the message names the state the claim is in.
+    case "ReceiptClaimStateError":
       return new ApiError("conflict", message);
     // The request's own fields contradict each other — declared size, digest or type
     // against the bytes actually sent — which is what a 422 with `errors` renders inline.

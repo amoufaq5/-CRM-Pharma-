@@ -65,6 +65,12 @@ const ALREADY_EXISTS = /duplicate key|already exists|unique constraint|idempoten
  * 500 that says nothing about the record; this says something about the record,
  * which is why it exists as a distinct type rather than as a synthesised 409 —
  * nothing here should pretend the platform answered something it did not.
+ *
+ * PACKAGE-PRIVATE, and absent from the barrel on purpose: it and
+ * `TargetConfirmedAbsentError` are minted by `dispatch` and consumed by `classify` in this
+ * file, and neither is ever thrown past the relay's edge. So neither has a problem mapping,
+ * and `problems.test.ts` asserts they stay unexported rather than merely noticing they are
+ * — exporting one would force the mapping decision instead of silently becoming a 500.
  */
 export class TargetAlreadyPresentError extends Error {
   constructor(

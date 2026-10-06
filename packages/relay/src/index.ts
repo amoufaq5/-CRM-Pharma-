@@ -25,6 +25,11 @@ export {
   type EnqueueInput,
   type OutboxLag,
   type OutboxRow,
+  // Part of `enqueueOutbox`'s public return type, so a consumer that has to branch on it
+  // can name it. Without this export the only way to say "the state the enqueue reported"
+  // was `Awaited<ReturnType<typeof enqueueOutbox>>["state"]`, which is how `packages/sample`
+  // had to spell it.
+  type OutboxState,
 } from "./store.js";
 export { OutboxRelay, type RelayEvent, type RelayOptions, type RelayResult } from "./relay.js";
 export {

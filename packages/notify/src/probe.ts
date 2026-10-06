@@ -405,9 +405,17 @@ function translateProbeError(err: unknown, endpointId: string): Error {
   // The trigger's sentence first, because it runs BEFORE the constraint and is the one a
   // caller normally gets. A bare 23503 is the backstop, and since 0037 it must be
   // discriminated: both of this table's references are composite `(tenant_id, …)`, so a
-  // `requested_by` naming a rep in another tenant now raises the same code as a foreign
-  // endpoint and was being reported as a missing endpoint — sending an administrator to
-  // look at the endpoint they had just successfully selected.
+  // `requested_by` the registry cannot resolve raises the same code as a foreign endpoint,
+  // and was being reported as a missing endpoint — sending an administrator to look at the
+  // endpoint they had just successfully selected.
+  //
+  // NOT reachable through the API, and the earlier version of this comment claimed it was.
+  // `POST /v1/admin/notification-endpoints/:id/test` always passes the authenticated
+  // principal's own `repProfileId`, resolved from `crm.rep_profile.subject` inside the
+  // request's tenant, so there is no route that can name a rep in another tenant. What is
+  // left is a profile deleted between principal resolution and this insert, and a psql
+  // prompt. The discrimination is still right — a 23503 on `requested_by` is not a missing
+  // endpoint whatever produced it — but it is a backstop, not a defect being fixed.
   if (message.includes("probe-foreign-endpoint")) {
     return new EndpointNotFoundError(
       `notification endpoint ${endpointId} does not exist in this tenant, so there is nothing to probe`,
