@@ -85,18 +85,46 @@ describe("erpMirrorFor", () => {
     const mirror = erpMirrorFor(tx("receipt"), LOT)!;
     expect(mirror.payload["item_id"]).toBe("ITEM-7");
     expect(mirror.payload["warehouse_id"]).toBe("WH-1");
-    expect(mirror.payload["quantity"]).toBe("25.000");
+    expect(mirror.payload["quantity"]).toBe(25);
     expect(mirror.payload["occurred_at"]).toBe("2026-10-05T09:00:00.000Z");
     expect(mirror.payload["reference"]).toBe(tx("receipt").id);
   });
 
   /**
-   * The quantity stays a string all the way through. `StockMovement.quantity` is a
-   * decimal(16,3) at the far end too, and a float64 round trip is how a quantity
-   * arrives as 24.999999999999996.
+   * A NUMBER, and the test this replaces kept it a string on two claims, both wrong.
+   *
+   * "`StockMovement.quantity` is a decimal(16,3) at the far end too" — the captured schema
+   * says `{"name":"quantity","input":"number","required":true}` and nothing about precision,
+   * because the deployed ERP runs `--store pg`: one JSONB table, no typed column at the far
+   * end at all. And "a float64 round trip is how a quantity arrives as 24.999999999999996"
+   * confuses a round trip with arithmetic — `JSON.stringify(Number("25.000"))` is `"25"`, and
+   * for any value within 15 significant digits the JSON that crosses names the same decimal
+   * the database holds.
+   *
+   * What a string actually bought was a decimal field holding text, which the ERP's validator
+   * accepts and stores uncoerced. Correct only while it stays lenient.
    */
-  it("keeps the quantity as a string", () => {
-    expect(typeof erpMirrorFor(tx("receipt", { quantity: "0.001" }), LOT)!.payload["quantity"]).toBe("string");
+  it("sends the quantity as a NUMBER, down to the column's smallest step", () => {
+    const small = erpMirrorFor(tx("receipt", { quantity: "0.001" }), LOT)!;
+    expect(small.payload["quantity"]).toBe(0.001);
+    expect(typeof small.payload["quantity"]).toBe("number");
+    // The crossing, not the value in memory: `0.001` is not representable in binary, and the
+    // JSON still says what the column says.
+    expect(JSON.stringify(small.payload["quantity"])).toBe("0.001");
+  });
+
+  /**
+   * AND THE BAND THIS COLUMN HAS THAT A JSON NUMBER DOES NOT.
+   *
+   * `crm.sample_transaction.quantity` is `numeric(16,3)` — 16 significant digits — where a
+   * double names 15 unambiguously. So the top of that column is refused rather than sent
+   * approximately. Reachable from our own schema, not hypothetical, and a data-entry error
+   * long before it is a shipment: the point is that it fails where somebody sees it.
+   */
+  it("refuses a quantity past what a JSON number can name, rather than rounding it", () => {
+    expect(() => erpMirrorFor(tx("receipt", { quantity: "1234567890123.456" }), LOT)).toThrow(
+      /quantity has 16 significant digits/,
+    );
   });
 
   /**

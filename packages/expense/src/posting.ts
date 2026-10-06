@@ -1,3 +1,4 @@
+import { erpDecimal } from "@crm/acl";
 import type { PoolClient } from "pg";
 import type { Expense } from "@crm/acl";
 import { enqueueOutbox } from "@crm/relay";
@@ -217,10 +218,20 @@ export function buildExpenseCreate(
     payload: {
       employee_id: erpEmployeeId,
       category: erpExpenseCategory(claim.crm_category),
-      // A string, never a number: float64 cannot represent every NUMERIC(14,2) the
-      // column admits, and a rounded amount in an expense claim reads as authoritative
-      // (README rule 4).
-      amount: claim.amount,
+      // A NUMBER, and the comment this replaces cited README rule 4 for the opposite —
+      // which is rule 4 applied in the wrong direction. Rule 4 is about money coming FROM
+      // the ERP: there the destination is a `NUMERIC` column of arbitrary precision and a
+      // double in between can only lose, so the text never gets converted. Here the
+      // destination is a field the ERP's own schema calls a `decimal`, and
+      // `operate-runtime/src/validation.ts` stores what it was SENT without coercing — so a
+      // string lands in a numeric field and stays there, correct only while that validator
+      // keeps accepting one.
+      //
+      // `erpDecimal` is where the precision argument is actually answered: `JSON.stringify`
+      // writes the shortest decimal that parses back to the same double, so every value a
+      // `numeric(14,2)` column admits crosses exactly, and anything that would not is
+      // refused by name rather than rounded.
+      amount: erpDecimal("amount", claim.amount),
       currency: claim.currency,
       incurred_on: claim.incurred_on,
       state: "approved",

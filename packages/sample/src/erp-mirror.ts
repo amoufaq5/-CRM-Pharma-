@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg";
+import { erpDecimal } from "@crm/acl";
 import { enqueueOutbox,
   type OutboxState,
 } from "@crm/relay";
@@ -68,7 +69,12 @@ export function erpMirrorFor(transaction: SampleTransaction, lot: SampleLot): Er
       item_id: lot.erp_item_id,
       warehouse_id: transaction.erp_warehouse_id,
       movement_type: movementType,
-      quantity: transaction.quantity,
+      // A NUMBER. node-postgres hands this over as text (`quantity::text` in the store,
+      // because `NUMERIC` is arbitrary precision), and sending that text put the string
+      // "12.000" into a field the ERP's own schema calls a decimal — which it accepts and
+      // stores uncoerced, so it is correct only while that validator stays lenient. See
+      // `erpDecimal`.
+      quantity: erpDecimal("quantity", transaction.quantity),
       occurred_at: transaction.occurred_at.toISOString(),
       reference: transaction.id,
       // The lot and expiry have nowhere structured to go: StockMovement has

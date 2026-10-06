@@ -187,6 +187,15 @@ export function toProblem(err: unknown): ApiError {
       return new ApiError("not_found", message);
     case "InvalidDateRangeError":
       return new ApiError("validation_failed", message);
+    // A value this CRM's own column admits and a JSON number cannot name: reachable from
+    // `crm.sample_transaction.quantity`, which is `numeric(16,3)` where a double carries 15
+    // significant digits. 422 and at the point of entry, deliberately — the alternative is
+    // recording custody of a quantity that can never be mirrored, and the rep who typed it
+    // is the one person who can fix it. Unreachable from `crm.expense_claim.amount`
+    // (`numeric(14,2)`), and mapped anyway, because an unreachable path that answers 500 is
+    // just a 500 nobody has met yet.
+    case "ErpDecimalError":
+      return new ApiError("validation_failed", message);
     case "OverlappingAssignmentError":
       return new ApiError("conflict", message);
     case "TerritoryCycleError":

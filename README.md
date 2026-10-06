@@ -683,8 +683,8 @@ PGUSER=… PGHOST=… ./scripts/verify-live-erp.sh
 ```
 
 Boots a real `operate-server` over a real Postgres, points it at the CRM's own JWKS, and
-runs **124 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
-`@crm/relay` as a library, and 34 through the CRM's own `api` and `scheduler` **binaries**,
+runs **125 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
+`@crm/relay` as a library, and 35 through the CRM's own `api` and `scheduler` **binaries**,
 started as processes exactly as `deploy/docker-compose.yml` starts them. The CRM's own
 database is dropped and rebuilt from empty each run — it used to
 be required to exist already, which made the gate's schema whatever was lying around, and
@@ -843,10 +843,22 @@ filter and sort is a *text* comparison: `?total[gte]=1000` returns 999, and `?so
 orders 100, 20, 9. Numeric filters, sorts and aggregations read the typed snapshot tables.
 Pinned by test, so it cannot quietly become folklore.
 
-Money stays a **string** all the way from the ERP into `NUMERIC`. float64 cannot represent
-`1234567890.12`, and a rounded price in a typed column reads as authoritative. A value that
-will not coerce rejects the record by name — it is never nulled, because a null price makes
-a product look free.
+Money stays a **string** all the way from the ERP into `NUMERIC`. A value that will not
+coerce rejects the record by name — it is never nulled, because a null price makes a product
+look free.
+
+**This rule is about the INBOUND direction only, and it was applied outbound twice.** Coming
+from the ERP the destination is a `NUMERIC` column of arbitrary precision, so there is
+nothing to gain by converting and a wide enough price to lose. Going the other way the
+destination is a field the ERP's own schema calls a `decimal`, and
+`operate-runtime/src/validation.ts` validates one with `Number(value)` and then stores what it
+was **sent**, uncoerced — so the CRM's strings sat in the ERP's numeric fields, correct only
+while that validator kept accepting them. `erpDecimal` sends a number and refuses what it
+cannot name: `JSON.stringify` writes the shortest decimal that parses back to the same
+double, so every value within 15 significant digits crosses exactly, and
+`crm.sample_transaction.quantity` — `numeric(16,3)` — has a top band that does not, which is
+refused rather than rounded. The live gate asserts `typeof` at the ERP's own storage, because
+a check that coerced passed just as happily on `"12.000"`.
 
 **5. Authorisation for "my accounts" lives here, in SQL.** The ERP has no row-level
 scoping at all — `requiresAbac` is computed and discarded, so any role sees every row in

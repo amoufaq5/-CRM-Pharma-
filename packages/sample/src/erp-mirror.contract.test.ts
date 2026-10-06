@@ -142,7 +142,11 @@ describe("mirroring sample movements to the ERP", () => {
 
       const payload = row["payload"] as Record<string, unknown>;
       expect(payload["movement_type"]).toBe("issue");
-      expect(payload["quantity"]).toBe("40.000");
+      // A number since the `erpDecimal` change. `quantity::text` is how the store reads a
+      // `NUMERIC` out of Postgres, and sending that text verbatim put the string "40.000"
+      // into a field the ERP's own schema calls a decimal.
+      expect(payload["quantity"]).toBe(40);
+      expect(typeof payload["quantity"]).toBe("number");
     });
   });
 

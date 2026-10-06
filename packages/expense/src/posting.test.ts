@@ -168,14 +168,40 @@ describe("buildExpenseCreate", () => {
     expect(row.payload["employee_id"]).toBe("emp-77");
   });
 
-  it("keeps the amount a STRING — float64 cannot hold every NUMERIC(14,2)", () => {
-    expect(row.payload["amount"]).toBe("1234.50");
-    expect(typeof row.payload["amount"]).toBe("string");
+  /**
+   * A NUMBER, and the test this replaces asserted a string "because float64 cannot hold
+   * every NUMERIC(14,2)". That reasoning is README rule 4 applied in the wrong direction.
+   *
+   * Rule 4 is about money coming FROM the ERP, where the destination is a `NUMERIC` column
+   * of arbitrary precision and a double in between can only lose. Going the other way the
+   * destination is a field the ERP's own schema calls a `decimal`, and its validator stores
+   * what it was sent WITHOUT coercing — so a string sat in a numeric field, correct only
+   * while that validator kept accepting one. Tighten it to `typeof value === "number"` and
+   * every posted claim 422s and dead-letters.
+   *
+   * The precision worry is answered rather than dismissed: see the round-trip tests on
+   * `erpDecimal`, and the one below.
+   */
+  it("sends the amount as a NUMBER, because that is what the ERP field is", () => {
+    expect(row.payload["amount"]).toBe(1234.5);
+    expect(typeof row.payload["amount"]).toBe("number");
   });
 
-  it("does not round a long amount", () => {
+  it("does not round a long amount, and the JSON that crosses says so", () => {
     const big = buildExpenseCreate({ ...CLAIM, amount: "999999999999.99" }, "emp-77");
-    expect(big.payload["amount"]).toBe("999999999999.99");
+    expect(big.payload["amount"]).toBe(999999999999.99);
+    // The assertion that actually matters: JSON is what reaches the ERP, and
+    // `JSON.stringify` writes the shortest decimal that parses back to the same double — so
+    // the digits the database holds are the digits that cross.
+    expect(JSON.stringify(big.payload["amount"])).toBe("999999999999.99");
+  });
+
+  it("refuses an amount it cannot carry, rather than sending one that is nearly right", () => {
+    // Beyond a numeric(14,2), so unreachable from this column today — the guard is for the
+    // day somebody widens it without reading `erpDecimal`.
+    expect(() => buildExpenseCreate({ ...CLAIM, amount: "12345678901234.56" }, "emp-77")).toThrow(
+      /significant digits/,
+    );
   });
 
   it("sends the date as the ISO day it was incurred, with no time", () => {

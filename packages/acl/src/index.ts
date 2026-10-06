@@ -7,6 +7,7 @@ export {
   toErpError,
 } from "./problems.js";
 export { entityCamel, operationId, resourceSlug } from "./slugs.js";
+export { ErpDecimalError, erpDecimal } from "./values.js";
 export type { ChangeBatch, ChangeMode, ChangedRecord, ChangeSource } from "./change-source.js";
 export {
   TenantSchema,

@@ -17,6 +17,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@crm/acl": "workspace:*",
     "@crm/db": "workspace:*",
     "@crm/notify": "workspace:*",
     "@crm/relay": "workspace:*",

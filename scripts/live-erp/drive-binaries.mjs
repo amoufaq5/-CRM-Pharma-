@@ -422,6 +422,19 @@ if (PHASE === "drain") {
     "the mirrored StockMovement is at the live ERP, built by the CRM and sent by the scheduler",
     `${landed.status} type=${landed.body?.movement_type} qty=${landed.body?.quantity} wh=${landed.body?.warehouse_id}`,
   );
+  // AND IT IS STORED AS A NUMBER. The check above coerces, so it passed just as happily on
+  // the string "12.000" the CRM used to send — node-postgres returns `NUMERIC` as text and
+  // that text went into the payload verbatim. `operate-runtime/src/validation.ts` validates
+  // a `decimal` with `Number(value)` and then stores what it was SENT, uncoerced, so the ERP
+  // held a string in a field its own schema calls a number: correct only while that
+  // validator stays lenient, and 422 for every movement the day it tightens. This is the
+  // assertion that could not have passed before, and the only place it can be made — the
+  // ERP's own storage is the thing being claimed.
+  expect(
+    typeof landed.body?.quantity === "number",
+    "and the ERP holds the quantity as a NUMBER, not as the text node-postgres handed us",
+    `typeof quantity = ${typeof landed.body?.quantity} (${JSON.stringify(landed.body?.quantity)})`,
+  );
   expect(
     typeof landed.body?.reason === "string" && landed.body.reason.includes("lot LOT-LIVE-1"),
     "carrying the lot in `reason`, the only place the ERP's StockMovement can hold it",

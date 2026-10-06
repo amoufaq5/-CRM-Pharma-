@@ -648,7 +648,12 @@ describe("expense claims", () => {
         expect(rows[0]!.payload).toMatchObject({
           employee_id: "emp-expst-1",
           category: "other",
-          amount: "1234.50",
+          // A number since the `erpDecimal` change: the ERP's `Expense.amount` is a
+          // `decimal` and its validator stores what it is sent uncoerced, so a string sat
+          // in a numeric field. Asserted here too, and not only in `posting.test.ts`,
+          // because this is the row that is really in `crm.outbox` — the JSONB the relay
+          // will actually send.
+          amount: 1234.5,
           currency: "GBP",
           incurred_on: "2026-09-01",
           state: "approved",

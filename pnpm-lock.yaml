@@ -162,6 +162,9 @@ importers:
 
   packages/sample:
     dependencies:
+      '@crm/acl':
+        specifier: workspace:*
+        version: link:../acl
       '@crm/db':
         specifier: workspace:*
         version: link:../db
