@@ -5,6 +5,7 @@ import {
   PrivilegedConnectionError,
   ROLE_PRIVILEGE_SQL,
   SET_TENANT_CONTEXT_SQL,
+  TransactionAlreadyOpenError,
   withTenantContext,
 } from "./tenant-context.js";
 
@@ -21,11 +22,22 @@ import {
  * name would share an answer and the second would assert nothing.
  */
 function fakeClient(
-  session: { role?: string; bypassesRls?: boolean } | "silent" | "no-verdict" = {},
+  session: { role?: string; bypassesRls?: boolean; txStatus?: "I" | "T" | "E" | null } | "silent" | "no-verdict" = {},
 ): PoolClient & { calls: Array<{ sql: string; params?: unknown[] }> } {
   const calls: Array<{ sql: string; params?: unknown[] }> = [];
   const client = {
     calls,
+    /**
+     * ANSWERED, deliberately, even though the wrapper proceeds when it is absent.
+     *
+     * node-postgres's `Client` has this method and these values (`I` idle, `T` in a
+     * transaction, `E` failed); the wrapper's absent-means-proceed branch exists so a fake
+     * without it still works, and a fake that USES it is what gives the nesting guard unit
+     * coverage instead of leaving it to the live suite alone. `txStatus: null` models a client
+     * that has the method and no answer yet, which a fresh connection does.
+     */
+    getTransactionStatus: () =>
+      typeof session === "string" ? "I" : session.txStatus === undefined ? "I" : session.txStatus,
     query: (sql: string, params?: unknown[]) => {
       calls.push(params === undefined ? { sql } : { sql, params });
       if (session === "silent") return Promise.resolve({ rows: [] });
@@ -167,5 +179,93 @@ describe("withTenantContext", () => {
       InvalidTenantIdError,
     );
     expect(c.calls).toHaveLength(0);
+  });
+
+  /**
+   * The bug this guard exists for. Without it the `COMMIT` below ends the caller's
+   * transaction, their later `ROLLBACK` undoes nothing, and everything they thought was
+   * provisional is committed — which is exactly how migration 0051's contract suite silently
+   * redecided nineteen retention dispositions while staying green.
+   */
+  it("refuses a connection already inside a transaction", async () => {
+    const c = fakeClient({ txStatus: "T" });
+    await expect(
+      withTenantContext(c, "11111111-1111-4111-8111-111111111111", async () => "never"),
+    ).rejects.toThrow(TransactionAlreadyOpenError);
+  });
+
+  /** And issues NOTHING first: a refusal that had already sent BEGIN would be the same bug. */
+  it("sends no statement at all when it refuses a nested call", async () => {
+    const c = fakeClient({ txStatus: "T" });
+    await withTenantContext(c, "11111111-1111-4111-8111-111111111111", async () => "never").catch(
+      () => undefined,
+    );
+    expect(c.calls).toEqual([]);
+  });
+
+  it("names the remedy rather than the symptom", async () => {
+    const c = fakeClient({ txStatus: "T" });
+    const err = await withTenantContext(c, "11111111-1111-4111-8111-111111111111", async () => 1).catch(
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toContain("would end YOUR transaction");
+    expect((err as Error).message).toContain("move the surrounding work into the callback");
+  });
+
+  /**
+   * A failed transaction gets its own sentence. Every statement on such a connection is
+   * rejected until it is rolled back, so the catalog read for the RLS verdict would be
+   * answered by the failure — and the user would be told their role might bypass RLS.
+   */
+  it("refuses a connection whose transaction has already failed, and says so", async () => {
+    const c = fakeClient({ txStatus: "E" });
+    const err = await withTenantContext(c, "11111111-1111-4111-8111-111111111111", async () => 1).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(TransactionAlreadyOpenError);
+    expect((err as Error).message).toContain("already failed");
+    expect((err as Error).message).toContain("ROLLBACK first");
+    expect(c.calls).toEqual([]);
+  });
+
+  it("proceeds on an idle connection", async () => {
+    const c = fakeClient({ txStatus: "I", role: "tx_idle_role" });
+    await expect(
+      withTenantContext(c, "11111111-1111-4111-8111-111111111111", async () => "ok"),
+    ).resolves.toBe("ok");
+    expect(c.calls[0]?.sql).toBe("BEGIN");
+  });
+
+  /**
+   * A client that has no such method is a fake, not a node-postgres `Client`, so it has no
+   * backend and no transaction to clobber. Proceeding is a fail-OPEN branch and is argued in
+   * the source; this pins it so a later "tighten this" has to argue back.
+   */
+  it("proceeds when the client cannot be asked at all", async () => {
+    const c = fakeClient({ role: "tx_unaskable_role" });
+    delete (c as unknown as { getTransactionStatus?: unknown }).getTransactionStatus;
+    await expect(
+      withTenantContext(c, "11111111-1111-4111-8111-111111111111", async () => "ok"),
+    ).resolves.toBe("ok");
+  });
+
+  /** And when it has the method but no answer yet, which a fresh connection does. */
+  it("proceeds when the status is not yet known", async () => {
+    const c = fakeClient({ txStatus: null, role: "tx_unknown_role" });
+    await expect(
+      withTenantContext(c, "11111111-1111-4111-8111-111111111111", async () => "ok"),
+    ).resolves.toBe("ok");
+  });
+
+  /**
+   * Order: the pure check first, so a malformed tenant id is reported as one even on a
+   * connection that is also mid-transaction. Two things wrong, and the one the caller can fix
+   * without understanding transactions is named.
+   */
+  it("reports a malformed tenant id ahead of an open transaction", async () => {
+    const c = fakeClient({ txStatus: "T" });
+    await expect(withTenantContext(c, "not-a-uuid", async () => 1)).rejects.toThrow(
+      InvalidTenantIdError,
+    );
   });
 });

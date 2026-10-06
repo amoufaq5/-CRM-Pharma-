@@ -124,6 +124,12 @@ describe("toProblem covers every domain error", () => {
     ClientAlreadyInTenantContextError:
       "a caller handed the expense sweep a client already inside withTenantContext — a " +
       "programming error in the scheduler, not something a request can provoke or a client act on",
+    TransactionAlreadyOpenError:
+      "a caller handed withTenantContext a client already inside a transaction, so the " +
+      "wrapper's COMMIT would have ended theirs. The generalisation of the entry above: that " +
+      "one asks whether the client is in a TENANT context, this one asks the backend whether " +
+      "it is in any transaction at all. Both are programming errors no request can provoke, " +
+      "and this one names a Postgres transaction status, which is nothing a client can act on",
 
     // @crm/acl. Both are raised inside `ErpClient`, and @crm/api imports no part of
     // @crm/acl at all: the client runs in the scheduler's refresher and in the relay.

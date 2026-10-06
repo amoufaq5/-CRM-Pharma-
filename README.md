@@ -1000,6 +1000,41 @@ naming the role — a rollout that would have gone live and then 500ed never goe
 The contract tests connect as `crm_app` for the same reason, which is what makes their
 tenant-isolation assertions mean anything.
 
+**And it refuses a connection that is already inside a transaction**, which is the fourth
+fail-closed check and the one found by a test that *passed*. The wrapper issues `BEGIN` and
+`COMMIT`; Postgres makes a nested `BEGIN` a no-op with `WARNING 25001`, so the `COMMIT`
+ended the **caller's** transaction and their later `ROLLBACK` undid nothing. Migration
+0051's contract suite wrapped its mutations in a transaction for isolation, and that
+rollback silently committed instead — redeciding nineteen retention dispositions for every
+test that ran afterwards, while the suite stayed green because the tests that would have
+noticed ran earlier.
+
+It asks node-postgres's `getTransactionStatus()` (`I` idle, `T` in a transaction, `E`
+failed), before issuing any statement — including the catalog read for the role check,
+because a connection in a failed transaction answers every query with the failure, and the
+remedy you need to hear is "roll back", not "your role might bypass RLS". A client that
+cannot be asked at all is a hand-written fake with no backend and no transaction to clobber,
+so it proceeds; the unit-test fakes answer the question anyway, which is what gives the
+guard coverage there as well as live.
+
+**It refuses rather than nesting with a `SAVEPOINT`**, and that is the design decision. The
+tenant GUC is set with `is_local = true`, so it lives for the *transaction* — nested, it
+would still be set after the inner block returned, and every later statement the caller
+believed was unscoped would be silently confined to that tenant, or on a write attributed to
+it. Wrong rows instead of a wrong commit. And the guarantee would change meaning: callers
+read this function as "my work committed under this tenant's RLS", where nested it could
+only promise "staged in somebody else's transaction, which may yet roll it back".
+
+The uncomfortable part is that the mechanism was already written down here.
+`ClientAlreadyInTenantContextError` in the expense sweeper describes it exactly — "Postgres
+answers a nested `BEGIN` with a warning and the first `COMMIT` would end the caller's
+transaction" — and has since that sweep was built. It guarded one caller. The function that
+issues the `BEGIN` and the `COMMIT` had no guard at all. Both stay: the sweeper asks whether
+`app.current_tenant_id` is set, which is a proxy for "inside a `withTenantContext`
+transaction" and answers before any work with a better-aimed sentence; this asks the backend
+whether there is *any* open transaction, which catches a caller's own `BEGIN` that no GUC
+reveals.
+
 **2. Never write an ERP table over SQL.** Writes go through the ERP's HTTP API via the
 outbox, so its RBAC, write-guards, period locks, sequences, audit and double-entry GL
 effects all still run. The database permits a direct write; the design does not.

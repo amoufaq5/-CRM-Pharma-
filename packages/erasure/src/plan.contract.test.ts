@@ -62,14 +62,19 @@ describe("retention dispositions and the erasure plan (0051)", () => {
   /**
    * Mutates the register, runs `fn`, and puts every row back exactly as it was.
    *
-   * NOT `BEGIN` / `ROLLBACK` around `fn`, and the reason is a sharp edge this file found the
-   * hard way. `withTenantContext` issues a bare `BEGIN` and a bare `COMMIT`; Postgres makes a
-   * `BEGIN` inside an open transaction a no-op with a warning, so the inner `COMMIT` commits
-   * the CALLER'S transaction. The first version of this file wrapped these tests in an explicit
+   * NOT `BEGIN` / `ROLLBACK` around `fn`, and the reason is the sharp edge this file found.
+   * `withTenantContext` issued a bare `BEGIN` and a bare `COMMIT`; Postgres makes a `BEGIN`
+   * inside an open transaction a no-op with a warning, so the inner `COMMIT` committed the
+   * CALLER'S transaction. The first version of this file wrapped these tests in an explicit
    * transaction and the `ROLLBACK` in its `finally` had nothing left to roll back — the
    * mutation was already committed, and it silently redecided all nineteen undecided tables
-   * for every test that ran afterwards. `planTenantErasure` counts rows through
-   * `withTenantContext`, so no test that calls it can use an outer transaction for isolation.
+   * for every test that ran afterwards.
+   *
+   * `withTenantContext` now REFUSES that, with `TransactionAlreadyOpenError`, so the trap is
+   * loud rather than silent — but `planTenantErasure` counts rows through it, so a test that
+   * called it inside an outer transaction would now fail instead of lying. Snapshot and restore
+   * either way: it is what this needs, and it cannot be defeated by what the code under test
+   * does with transactions.
    */
   const aroundRegister = async <T>(mutate: string, fn: () => Promise<T>): Promise<T> => {
     await client.query("DROP TABLE IF EXISTS _dd_backup");

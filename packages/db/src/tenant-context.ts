@@ -82,21 +82,108 @@ export class PrivilegedConnectionError extends Error {
 }
 
 /**
+ * The connection is already inside a transaction, so this wrapper would commit it.
+ *
+ * FOUND BY A TEST THAT PASSED. Migration 0051's contract suite wrapped its mutations in an
+ * explicit transaction for isolation and rolled back in a `finally`. Postgres makes a `BEGIN`
+ * inside an open transaction a no-op with `WARNING 25001: there is already a transaction in
+ * progress`, so the `COMMIT` below ended the CALLER'S transaction and the rollback had nothing
+ * left to undo: the mutation was committed, nineteen retention dispositions were silently
+ * redecided for every test that ran afterwards, and the suite stayed green because the tests
+ * that would have noticed ran earlier.
+ *
+ * WHY THIS REFUSES RATHER THAN NESTING WITH A SAVEPOINT, which is the obvious alternative and
+ * is wrong for two reasons:
+ *
+ *   * `SET_TENANT_CONTEXT_SQL` sets the GUC with `is_local = true`, so it lives for the
+ *     TRANSACTION. Nested in a caller's transaction it would still be set after this block
+ *     returned, and every later statement the caller believes is unscoped would be silently
+ *     confined to that tenant — or, on a write, attributed to it. That is a worse version of
+ *     the bug being fixed: wrong rows instead of a wrong commit.
+ *   * The guarantee would change meaning. Every caller reads this function as "my work
+ *     committed under this tenant's RLS". Nested, it can only promise "staged in somebody
+ *     else's transaction, which may yet roll it back". Silently weakening that for one call
+ *     shape is the same class of trap.
+ *
+ * So the remedy is the caller's: hand this wrapper a client that is not mid-transaction, or do
+ * the surrounding work inside `fn`. No production caller does either today — every one takes a
+ * pool client and hands it straight over — which is why this never bit outside a test.
+ *
+ * THE MECHANISM WAS ALREADY WRITTEN DOWN IN THIS REPOSITORY, which is the uncomfortable part.
+ * `ClientAlreadyInTenantContextError` in `@crm/expense`'s sweeper says it exactly — "Postgres
+ * answers a nested `BEGIN` with a warning and the first `COMMIT` would end the caller's
+ * transaction, committing whatever it had done so far and leaving the rest of its work
+ * unwrapped" — and has since the sweep was built. It guarded ONE caller. The function that
+ * issues the `BEGIN` and the `COMMIT` had no guard at all.
+ *
+ * Both stay. They ask different questions and the sweeper's is the better-aimed one for its
+ * caller: it asks whether `app.current_tenant_id` is set, which is a proxy for "you are inside
+ * a `withTenantContext` transaction", and it answers before any work with a sentence naming the
+ * sweep and the tenant. This asks the backend whether the connection is in ANY transaction,
+ * which is strictly more general — it catches a caller's own `BEGIN`, which no GUC reveals —
+ * but it can only fire on the first wrapped call, which for a per-claim loop is later and less
+ * useful. A layered rule, in the shape this schema's four-eyes checks already use.
+ */
+export class TransactionAlreadyOpenError extends Error {
+  constructor(readonly status: "T" | "E") {
+    super(
+      status === "E"
+        ? `refusing to set tenant context on a connection whose transaction has already failed ` +
+          `(status E) — every statement on it will be rejected until it is rolled back. ROLLBACK first.`
+        : `refusing to set tenant context on a connection that is already inside a transaction ` +
+          `(status T) — this wrapper issues BEGIN and COMMIT, and Postgres treats a nested BEGIN ` +
+          `as a no-op, so the COMMIT would end YOUR transaction and a later ROLLBACK would undo ` +
+          `nothing. Pass a client that is not mid-transaction, or move the surrounding work into ` +
+          `the callback.`,
+    );
+    this.name = "TransactionAlreadyOpenError";
+  }
+}
+
+/**
+ * What the backend last said about this connection's transaction, or null when we cannot ask.
+ *
+ * `getTransactionStatus()` is a public method on node-postgres's `Client` (pg 8.23,
+ * `lib/client.js`) returning the status byte from the last `ReadyForQuery` message: `I` idle,
+ * `T` in a transaction, `E` in a failed one. It is not in `@types/pg`, which is the only reason
+ * this needs a cast — measured rather than assumed, with every value above observed against a
+ * real connection.
+ *
+ * ABSENT MEANS PROCEED, which is a fail-OPEN branch in a file whose argument is fail-closed, so
+ * it needs its reason: a client without this method is not a node-postgres `Client` — it is a
+ * hand-written fake, and a fake has no backend and therefore no transaction to clobber.
+ * Refusing instead would turn every unit test in this package into a failure without making one
+ * real deployment safer. The fakes in `tenant-context.test.ts` answer it anyway, so the guard
+ * below is exercised by the unit tests and not only by the live suite.
+ */
+function transactionStatus(client: PoolClient): "I" | "T" | "E" | null {
+  const ask = (client as unknown as { getTransactionStatus?: () => unknown }).getTransactionStatus;
+  if (typeof ask !== "function") return null;
+  const status = ask.call(client);
+  return status === "T" || status === "E" || status === "I" ? status : null;
+}
+
+/**
  * Runs `fn` inside a transaction with the tenant RLS context established, and
  * is the ONLY sanctioned way to reach a `crm.*` table. Rolls back on throw.
  *
- * Fails closed three times over:
+ * Fails closed four times over:
  *
  *  1. a malformed tenant id throws before any statement runs;
- *  2. a connection whose role is exempt from RLS is REFUSED, because setting tenant
+ *  2. a connection ALREADY inside a transaction is REFUSED, because the COMMIT below would
+ *     end the caller's — see `TransactionAlreadyOpenError`;
+ *  3. a connection whose role is exempt from RLS is REFUSED, because setting tenant
  *     context on one is theatre — see `PrivilegedConnectionError`;
- *  3. a query issued without this wrapper sees `current_setting(..., true)` return NULL,
+ *  4. a query issued without this wrapper sees `current_setting(..., true)` return NULL,
  *     making the policy predicate NULL — which returns no rows rather than all of them.
  *
- * All three are verified live in `rls.contract.test.ts`.
+ * All four are verified live in `rls.contract.test.ts`.
  *
- * The order of (1) and (2) is deliberate: the pure check runs first, so a malformed
- * tenant id is reported as one whatever connection it arrives on.
+ * The order is deliberate throughout. (1) is pure, so a malformed tenant id is reported as one
+ * whatever connection it arrives on. (2) comes before (3) because asking the catalog for the
+ * role's privileges is itself a query, and issuing one on a connection whose transaction has
+ * already failed would be answered by the failure rather than by the catalog — so the
+ * better-aimed sentence would be lost to a confusing one.
  */
 export async function withTenantContext<T>(
   client: PoolClient,
@@ -104,6 +191,11 @@ export async function withTenantContext<T>(
   fn: (tx: PoolClient) => Promise<T>,
 ): Promise<T> {
   if (!TENANT_ID_RE.test(tenantId)) throw new InvalidTenantIdError(tenantId);
+
+  // Before any statement, including the catalog read below: see the order argument above.
+  const status = transactionStatus(client);
+  if (status === "T" || status === "E") throw new TransactionAlreadyOpenError(status);
+
   await client.query("BEGIN");
   try {
     const { rows } = await client.query<{ effective_role: string }>(SET_TENANT_CONTEXT_SQL, [

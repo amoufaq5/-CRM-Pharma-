@@ -1,7 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { testPool, TENANT_A, TENANT_B } from "./testing.js";
-import { PrivilegedConnectionError, withTenantContext } from "./tenant-context.js";
+import {
+  PrivilegedConnectionError,
+  TransactionAlreadyOpenError,
+  withTenantContext,
+} from "./tenant-context.js";
 
 /**
  * Contract tests against a REAL Postgres.
@@ -248,6 +252,86 @@ describe("row-level security contract", () => {
       await client.query("RESET ROLE");
       await client.query("DROP TABLE IF EXISTS erp_policy_probe");
     }
+  });
+
+  /**
+   * The fourth fail-closed check, against a REAL connection — which is the only place it can
+   * be proved, because the thing being guarded against is what Postgres does with a nested
+   * `BEGIN` and a fake has no Postgres.
+   *
+   * The bug it closes was found by a test that passed. Migration 0051's contract suite wrapped
+   * its mutations in an explicit transaction and rolled back in a `finally`; the `COMMIT`
+   * inside `withTenantContext` ended that transaction instead, so the rollback undid nothing
+   * and nineteen retention dispositions were silently redecided for every later test.
+   */
+  describe("a connection already inside a transaction", () => {
+    it("is refused, and the caller's transaction is left open and intact", async () => {
+      await client.query("SET ROLE rls_reader");
+      try {
+        await client.query("BEGIN");
+        await client.query("CREATE TEMP TABLE tx_guard_probe (x int)");
+        await client.query("INSERT INTO tx_guard_probe VALUES (1)");
+
+        await expect(
+          withTenantContext(client, TENANT_A, async () => "never"),
+        ).rejects.toThrow(TransactionAlreadyOpenError);
+
+        // STILL IN THE TRANSACTION. Before the guard this read 'I': the refused call had
+        // already committed everything above.
+        expect((client as unknown as { getTransactionStatus(): string }).getTransactionStatus()).toBe(
+          "T",
+        );
+
+        // And the rollback still means something, which is the whole point.
+        await client.query("ROLLBACK");
+        await expect(client.query("SELECT * FROM tx_guard_probe")).rejects.toThrow(
+          /relation "tx_guard_probe" does not exist/,
+        );
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined);
+        await client.query("RESET ROLE");
+      }
+    });
+
+    /**
+     * And it refuses BEFORE issuing anything, proved by the one observable that cannot be
+     * faked: a connection whose transaction has already FAILED rejects every statement, so if
+     * the guard ran a query first the error would come from Postgres rather than from us.
+     */
+    it("refuses a failed transaction without touching it, naming the rollback", async () => {
+      await client.query("SET ROLE rls_reader");
+      try {
+        await client.query("BEGIN");
+        await client.query("SELECT 1/0").catch(() => undefined);
+        expect((client as unknown as { getTransactionStatus(): string }).getTransactionStatus()).toBe(
+          "E",
+        );
+
+        const err = await withTenantContext(client, TENANT_A, async () => 1).catch(
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(TransactionAlreadyOpenError);
+        expect((err as Error).message).toContain("ROLLBACK first");
+        // Not a Postgres error about the aborted transaction: our sentence, not theirs.
+        expect((err as Error).message).not.toContain("current transaction is aborted");
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined);
+        await client.query("RESET ROLE");
+      }
+    });
+
+    /** A plain pool client is idle, so the ordinary path is untouched. */
+    it("leaves an idle connection alone", async () => {
+      await client.query("SET ROLE rls_reader");
+      try {
+        expect((client as unknown as { getTransactionStatus(): string }).getTransactionStatus()).toBe(
+          "I",
+        );
+        await expect(withTenantContext(client, TENANT_A, async () => "ok")).resolves.toBe("ok");
+      } finally {
+        await client.query("RESET ROLE");
+      }
+    });
   });
 });
 

@@ -3,6 +3,7 @@ export {
   ROLE_PRIVILEGE_SQL,
   SET_TENANT_CONTEXT_SQL,
   InvalidTenantIdError,
+  TransactionAlreadyOpenError,
   withTenantContext,
 } from "./tenant-context.js";
 export {
