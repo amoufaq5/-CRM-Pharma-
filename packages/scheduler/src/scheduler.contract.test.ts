@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Pool, type PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
 import type { OutboxRelay } from "@crm/relay";
+import type { NotificationDispatcher } from "@crm/notify";
 import type { SnapshotRefresher } from "@crm/sync";
 
 import { Scheduler, type SchedulerEvent } from "./scheduler.js";
@@ -420,6 +421,109 @@ describe("scheduler against a real database", () => {
     // unhealthy one, and a zero that is always there is a zero nobody sees.
     expect(cleanLine.detail).not.toContain("LOST");
     expect(cleanLine.detail).toContain("claimed=3");
+  });
+
+  /**
+   * THE CHECK THAT ONLY RAN AT BOOT.
+   *
+   * An `email` endpoint created a minute after a webhook-only scheduler started was not
+   * noticed until the next restart: its deliveries retry with a readable reason and nobody
+   * is told. ADR-0001 recorded running the check per tick as a one-line change and declined
+   * it, on the grounds that a check per tick is a log line every thirty seconds — so what
+   * is reported here is the TRANSITION, which makes a stable deployment silent and the
+   * moment of change loud.
+   */
+  describe("channel coverage, per tick", () => {
+    const dispatcher = {
+      drainTenant: async () => ({ claimed: 0, delivered: 0, retried: 0, dead: 0, pending: 0 }),
+    } as unknown as NotificationDispatcher;
+
+    /**
+     * ONE Scheduler across every tick, which is the whole point: the dedup state is
+     * per-process, so a fresh instance per tick would forget the previous verdict and
+     * report every tick as a change — the exact behaviour this is meant to avoid.
+     *
+     * And the answer is keyed on the tenant, because `tick()` processes every registered
+     * tenant: a single queue of answers would be consumed by whichever tenant ran first,
+     * which is how the first version of this test reported a change on tick one.
+     */
+    const run = async (
+      answers: readonly { verdict: string; lines: readonly string[] }[],
+    ): Promise<string[]> => {
+      let i = 0;
+      const details: string[] = [];
+      const { relay } = stubRelay();
+      const { refresher } = stubRefresher();
+      const scheduler = new Scheduler({
+        pool: p,
+        relay,
+        refresher,
+        notifications: dispatcher,
+        channelCoverage: async (tenantId) =>
+          tenantId === TENANT ? answers[i++]! : { verdict: "covered", lines: [] },
+        random: () => 0.5,
+        onEvent: (e) => {
+          if (e.type === "job_ok" && e.job === "notify_dispatch" && e.tenantId === TENANT) {
+            details.push(e.detail);
+          }
+        },
+      });
+      for (const _ of answers) {
+        await withTenantContext(admin, TENANT, (tx) =>
+          tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [TENANT]),
+        );
+        await scheduler.tick();
+      }
+      return details;
+    };
+
+    it("says nothing while the verdict holds, and names the moment it changes", async () => {
+      const covered = { verdict: "covered", lines: [] as readonly string[] };
+      const broken = { verdict: "unsendable", lines: ["no sender registered for channel email"] };
+      const [first, second, third, fourth] = await run([covered, covered, broken, broken]);
+
+      // Absent is treated as `covered`, so a deployment that boots covered and stays
+      // covered never mentions it — the binary already logged the boot verdict.
+      expect(first).not.toContain("coverage");
+      expect(second).not.toContain("coverage");
+      // The tick that notices says so, once, with the reason.
+      expect(third).toContain("coverage covered -> unsendable");
+      expect(third).toContain("no sender registered for channel email");
+      // And then stops saying it.
+      expect(fourth).not.toContain("coverage");
+    });
+
+    it("reports a recovery too, because that is also news", async () => {
+      const broken = { verdict: "unsendable", lines: ["no sender registered for channel email"] };
+      const covered = { verdict: "covered", lines: [] as readonly string[] };
+      const [, back] = await run([broken, covered]);
+      expect(back).toContain("coverage unsendable -> covered");
+    });
+
+    it("does not fail the dispatch when the check itself cannot be asked", async () => {
+      // The same rule the probe runner follows: the notifications went out, and an
+      // unanswerable diagnostic must not engage the job's failure backoff.
+      const { relay } = stubRelay();
+      const { refresher } = stubRefresher();
+      const events: SchedulerEvent[] = [];
+      await withTenantContext(admin, TENANT, (tx) =>
+        tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [TENANT]),
+      );
+      await new Scheduler({
+        pool: p,
+        relay,
+        refresher,
+        notifications: dispatcher,
+        channelCoverage: () => Promise.reject(new Error("pool exhausted")),
+        random: () => 0.5,
+        onEvent: (e) => events.push(e),
+      }).tick();
+      const ok = events.find(
+        (e) => e.type === "job_ok" && e.job === "notify_dispatch" && e.tenantId === TENANT,
+      ) as { detail: string } | undefined;
+      expect(ok?.detail).toContain("coverage UNKNOWN: pool exhausted");
+      expect(events.some((e) => e.type === "job_error" && e.job === "notify_dispatch")).toBe(false);
+    });
   });
 
   it("isolates one tenant's failure from the others", async () => {

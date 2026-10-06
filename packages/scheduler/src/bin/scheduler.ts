@@ -244,6 +244,18 @@ async function main(): Promise<void> {
     // variables those endpoints point at.
     notifications: new NotificationDispatcher({ pool, senders }),
     endpointProbes: new EndpointProbeRunner({ pool, probers, workerId }),
+    // The same check the boot block above ran, asked again per tenant per dispatch tick.
+    // One tenant at a time rather than the whole report: the Scheduler dedupes per tenant,
+    // and a report over every tenant would make one tenant's change look like everyone's.
+    // `unreadable` is folded into the lines because a tenant this process cannot ask about
+    // is not a tenant it can promise anything for.
+    channelCoverage: async (tenantId: string) => {
+      const r = await checkChannelCoverage(pool, [tenantId], senders);
+      return {
+        verdict: r.verdict,
+        lines: r.unreadable.length > 0 ? [...r.lines, `unreadable: ${r.unreadable.join(", ")}`] : r.lines,
+      };
+    },
     ...(process.env["TICK_INTERVAL_MS"] !== undefined
       ? { tickIntervalMs: Number(process.env["TICK_INTERVAL_MS"]) }
       : {}),

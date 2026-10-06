@@ -30,6 +30,27 @@ export interface SchedulerOptions {
    * check in the API would answer confidently about the wrong one.
    */
   readonly endpointProbes?: EndpointProbeRunner;
+  /**
+   * Optional: asks, per tenant, whether every channel its endpoints name has a sender in
+   * THIS process.
+   *
+   * The same question the binary answers once at boot, asked again on each `notify_dispatch`
+   * tick — because an `email` endpoint created a minute after a webhook-only scheduler
+   * started was not noticed until the next restart. Its deliveries retry with a readable
+   * reason (a missing sender is a fact about the binary, not the destination) and nobody is
+   * told, which is the gap.
+   *
+   * The reason this is a verdict and not a log line is the objection the ADR raised against
+   * doing it at all: a check per tick is a line every thirty seconds, and a line that is
+   * always there is a line nobody reads. So the Scheduler remembers the last verdict per
+   * tenant and reports only a CHANGE — a deployment that boots covered and stays covered
+   * says nothing more, and the moment a channel becomes unsendable it says so once.
+   *
+   * Injected as a function rather than taken as the notify module's checker, so the
+   * Scheduler depends on the answer and not on how it is obtained; that is also what lets a
+   * test drive the transition rather than build endpoints.
+   */
+  readonly channelCoverage?: (tenantId: string) => Promise<ChannelCoverageAnswer>;
   /** How often to look for due work. Not the job cadence — that is per job. */
   readonly tickIntervalMs?: number;
   readonly now?: () => Date;
@@ -37,6 +58,17 @@ export interface SchedulerOptions {
   readonly onEvent?: (event: SchedulerEvent) => void;
   /** Injected so tests drive time instead of waiting for it. */
   readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+/**
+ * What a coverage check answers. Structural on purpose — see `channelCoverage`.
+ *
+ * `verdict` is the whole of the dedup key: `covered`, `dormant` (a channel with no sender
+ * here, but every endpoint on it disabled, so nothing is late yet) or `unsendable`.
+ */
+export interface ChannelCoverageAnswer {
+  readonly verdict: string;
+  readonly lines: readonly string[];
 }
 
 export type SchedulerEvent =
@@ -98,6 +130,16 @@ export class Scheduler {
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   private controller: AbortController | null = null;
   private running: Promise<void> | null = null;
+  /**
+   * The last channel-coverage verdict per tenant, so only a change is reported.
+   *
+   * Absent means `covered`, deliberately: the binary already logs the boot verdict, so a
+   * deployment that starts unsendable has been told once and does not need telling again
+   * every thirty seconds. What that costs is stated rather than hidden — this is
+   * per-process state, so a restart forgets it and a still-unsendable tenant is reported
+   * again by the boot check, which is the right surface for it anyway.
+   */
+  private readonly coverage = new Map<string, string>();
 
   constructor(private readonly options: SchedulerOptions) {
     this.tickIntervalMs = options.tickIntervalMs ?? DEFAULT_TICK_MS;
@@ -195,6 +237,39 @@ export class Scheduler {
     }
   }
 
+  /**
+   * The channel-coverage verdict for this tenant, but ONLY when it has changed.
+   *
+   * Returns a fragment to append to the job's summary line, or an empty string — which is
+   * the whole design. A check per tick with a line per tick would be a line every thirty
+   * seconds per tenant, and the ADR's objection to running this check at all was precisely
+   * that. Reporting the transition instead gives the thing the boot check cannot: the
+   * moment an endpoint appears on a channel this process has no sender for.
+   *
+   * A failure to ASK is swallowed, like the probe runner's below and for the same reason:
+   * the notifications went out, and an unanswerable diagnostic is not a reason to engage
+   * the job's failure backoff and stop delivering for this tenant. It is reported in the
+   * line rather than thrown.
+   */
+  private async coverageChange(tenantId: string): Promise<string> {
+    const check = this.options.channelCoverage;
+    if (check === undefined) return "";
+    let answer: ChannelCoverageAnswer;
+    try {
+      answer = await check(tenantId);
+    } catch (err) {
+      return ` | coverage UNKNOWN: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    // Absent means `covered`: see the field's comment. So a boot that is already
+    // unsendable is reported by the binary and not again here, and a tenant that becomes
+    // unsendable later is reported once, at the tick that notices.
+    const previous = this.coverage.get(tenantId) ?? "covered";
+    if (answer.verdict === previous) return "";
+    this.coverage.set(tenantId, answer.verdict);
+    const detail = answer.lines.length > 0 ? `: ${answer.lines.join("; ")}` : "";
+    return ` | coverage ${previous} -> ${answer.verdict}${detail}`;
+  }
+
   /** Dispatches to the thing that actually does the work. Returns a one-line summary. */
   private async execute(tenantId: string, job: JobName): Promise<string> {
     switch (job) {
@@ -276,8 +351,16 @@ export class Scheduler {
         }
       }
       case "notify_dispatch": {
+        // Asked FIRST, and outside the dispatcher guard, because the answer is about this
+        // process's senders rather than about anything the dispatcher does — a deployment
+        // with no dispatcher configured at all is exactly one that wants to hear that an
+        // endpoint has appeared on a channel it cannot send.
+        const coverage = await this.coverageChange(tenantId);
+
         const dispatcher = this.options.notifications;
-        if (dispatcher === undefined) return "no dispatcher configured; in-app notifications unaffected";
+        if (dispatcher === undefined) {
+          return `no dispatcher configured; in-app notifications unaffected${coverage}`;
+        }
         const r = await dispatcher.drainTenant(tenantId);
         const line =
           `claimed=${r.claimed} delivered=${r.delivered} retried=${r.retried} ` +
@@ -287,17 +370,20 @@ export class Scheduler {
         // going unanswered is not a reason to engage the job's failure backoff and stop
         // delivering for this tenant.
         const probes = this.options.endpointProbes;
-        if (probes === undefined) return line;
+        if (probes === undefined) return `${line}${coverage}`;
         try {
           const p = await probes.runTenant(tenantId);
-          if (p.claimed === 0) return line;
+          if (p.claimed === 0) return `${line}${coverage}`;
           const verdicts = Object.entries(p.byVerdict)
             .filter(([, n]) => n > 0)
             .map(([v, n]) => `${v}=${String(n)}`)
             .join(" ");
-          return `${line} | probes=${p.claimed} ${verdicts}${p.abandoned > 0 ? ` abandoned=${String(p.abandoned)}` : ""}`;
+          return (
+            `${line} | probes=${p.claimed} ${verdicts}` +
+            `${p.abandoned > 0 ? ` abandoned=${String(p.abandoned)}` : ""}${coverage}`
+          );
         } catch (err) {
-          return `${line} | probes FAILED: ${err instanceof Error ? err.message : String(err)}`;
+          return `${line} | probes FAILED: ${err instanceof Error ? err.message : String(err)}${coverage}`;
         }
       }
       case "snapshot_incremental":

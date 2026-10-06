@@ -487,6 +487,18 @@ necessarily: the table is RLS-forced and boot precedes any tenant context, so a 
 cross-tenant `SELECT` returns zero rows — correctly, silently, and reporting every
 deployment clean.
 
+**And then again on every dispatch tick, but only when the answer changes.** Coverage is a
+statement about tenant data, so a boot-time verdict goes stale the moment an administrator
+adds an endpoint: an `email` endpoint created a minute after a webhook-only scheduler
+started was not noticed until the next restart. Re-checking per tick is the obvious fix and
+the obvious objection is that it is a log line every thirty seconds per tenant — so the
+scheduler remembers the last verdict and appends to the `notify_dispatch` summary only on a
+transition (`coverage covered -> unsendable: no sender registered for channel email`). A
+recovery is reported too. A verdict that cannot be obtained becomes `coverage UNKNOWN: …` in
+the line rather than a job failure, because the notifications went out and an unanswerable
+diagnostic must not engage the job's backoff. The dedup is per-process, so a restart
+re-reports a standing gap through the boot check above — which is the right surface for it.
+
 ## Tenant isolation is structural, not just a policy
 
 Every foreign key in `crm.*` into a tenant-scoped table is **composite** —
