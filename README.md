@@ -518,9 +518,15 @@ and exactly the mojibake the check exists to prevent. Verified against a real SM
 conversation: an ASCII body for `أحمد الموفق` goes out as `8bit` with the name intact, and
 `base64` to a relay that does not offer 8BITMIME.
 
-It has **never spoken to a real mail server**: it is verified end to end against a sink
-written alongside it, which is faithful to RFC 5321/3207/4616 as far as it goes and is not
-Postfix. It does no DKIM signing. Both are in the ADR's open table.
+It has **never spoken to a production relay**, and to exactly one third-party server.
+`scripts/crosscheck-smtp.sh` drives it against **aiosmtpd** — delivery, dot-stuffing, an
+RFC 2047 subject that Python's own parser decodes back byte-identical, AUTH, and a wrong
+password that goes `dead` rather than retrying forever — which rules out a mistake the
+client and our own sink share. Deliberately a cross-check a reviewer or an operator runs
+and not a CI gate: making the suite depend on an undeclared Python package would trade a
+real verification for a brittle one, so it skips loudly with a zero exit when aiosmtpd
+cannot be had. Neither that nor the in-repo sink is Postfix, Exchange or SES, and it does
+no DKIM signing. Both are in the ADR's open table.
 
 ## Testing an endpoint, and knowing a channel can be sent
 
@@ -638,7 +644,7 @@ returned `0`, because RLS then hides the damage. That is the shipped bug
 `crm.revoke_rep_role` had — fixed once, in one function, which is exactly the kind of fix the
 next function forgets.
 
-`packages/db/src/composite-fk.contract.test.ts` probes all 46 individually, asserting both
+`packages/db/src/composite-fk.contract.test.ts` probes each of the 44 that remain individually, asserting both
 `23503` **and** the constraint name, so a CHECK that fired first or a trigger fails the test
 rather than passing for it. It carries a `pg_constraint` drift guard too: a table added next
 month by someone who does not know this rule fails a test instead of quietly reopening the
