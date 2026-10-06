@@ -142,6 +142,10 @@ export async function createEndpoint(
  * place would carry its delivery history onto a different destination, so the honest
  * record of "these notifications went there" would start describing somewhere else.
  * Moving a destination is: disable the old endpoint, create a new one.
+ *
+ * Since 0049 that is a rule and not just an omission: `notification_endpoint_freeze_destination`
+ * refuses a change to `channel`, `url` or `secret_env` from any writer, so this UPDATE's
+ * silence about those columns is the database's answer too and not merely this function's.
  */
 export async function updateEndpoint(
   tx: PoolClient,
@@ -175,11 +179,12 @@ export async function updateEndpoint(
 /**
  * Validates and narrows the kind allow-list.
  *
- * Done here as well as in the database because `crm.notification_endpoint.kinds` is a
- * bare text[] with no CHECK against the kind vocabulary — a kind that does not exist
- * would be accepted and then match nothing, so the endpoint would be silently dead.
- * That asymmetry with `crm.notification.kind` (which does have the CHECK) is noted in
- * ADR-0001; this is the guard until the array has one of its own.
+ * `notification_endpoint_kinds_known` (0049) is the real rule — the array is checked
+ * against `crm.notification_kinds()`, the one place the vocabulary is now declared, so a
+ * kind that does not exist is refused by the database rather than accepted and then
+ * matching nothing. This stays in front of it for two things the constraint cannot do:
+ * it dedups and sorts, so two spellings of the same allow-list store identically; and it
+ * names every unknown kind at once, where the constraint can only say the array failed.
  */
 function normaliseKinds(kinds: readonly string[] | null | undefined): string[] | null {
   if (kinds === null || kinds === undefined) return null;
@@ -228,6 +233,14 @@ function translateEndpointError(err: unknown, channel: string): Error {
   }
   if (constraint === "notification_endpoint_kinds_not_empty") {
     return new InvalidEndpointError("kinds must be a non-empty array, or null for every kind");
+  }
+  if (constraint === "notification_endpoint_kinds_known") {
+    // Reachable only from SQL or from a kind this build does not know about: `normaliseKinds`
+    // refuses an unknown kind first and names it. The sentence is therefore the general one.
+    return new InvalidEndpointError(
+      `kinds must be drawn from: ${NOTIFICATION_KINDS.join(", ")}. ` +
+        `An endpoint filtered to a kind that does not exist receives nothing.`,
+    );
   }
   return err instanceof Error ? err : new Error(String(err));
 }

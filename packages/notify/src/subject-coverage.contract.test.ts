@@ -145,9 +145,17 @@ describe("notification subject coverage", () => {
 
   /**
    * And the vocabulary the other way: every kind in `NOTIFICATION_KINDS` must be legal in
-   * the database. 0021 put a CHECK on `crm.notification.kind` and every later migration
-   * has had to re-state the whole list; one forgotten value means a raise that throws at
+   * the database. 0021 put a CHECK on `crm.notification.kind` and every migration up to
+   * 0031 had to re-state the whole list; one forgotten value means a raise that throws at
    * runtime, which is the kind of thing that only shows up on the night the signal fires.
+   *
+   * This used to read the list by pattern-matching `'...'::text` out of the deparsed CHECK,
+   * and 0049 broke it — correctly. The list now lives in `crm.notification_kinds()` and the
+   * CHECK calls it, so there are no literals to match and the test saw a constraint that
+   * accepted nothing. The replacement does not look at the CHECK's SPELLING at all: it
+   * takes the deparsed predicate and ASKS POSTGRES TO EVALUATE IT against every kind the
+   * code can raise. That is stronger than the string match was and it is indifferent to
+   * where the vocabulary is declared, so the next move of it will not break this again.
    */
   it("every notification kind the code can raise is accepted by the database", async () => {
     const kinds: readonly string[] = NOTIFICATION_KINDS;
@@ -157,11 +165,26 @@ describe("notification subject coverage", () => {
       `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
         WHERE conrelid = 'crm.notification'::regclass AND conname = 'notification_kind_check'`,
     );
-    const accepted = new Set(
-      [...(rows[0]?.def ?? "").matchAll(/'([a-z_]+)'::text/g)].map((m) => m[1]!),
+    const def = rows[0]?.def ?? "";
+    expect(def, "notification_kind_check must exist to be evaluated").toMatch(/^CHECK\s*\(/);
+    // Safe to interpolate: this string is `pg_get_constraintdef` of one constraint found by
+    // name, not anything a caller supplied.
+    const predicate = def.replace(/^CHECK\s*\(/, "").replace(/\)\s*$/, "");
+    const { rows: refused } = await client.query<{ kind: string }>(
+      `SELECT kind FROM unnest($1::text[]) AS t(kind) WHERE NOT (${predicate})`,
+      [kinds],
     );
-    expect([...kinds].filter((k) => !accepted.has(k)), "kinds the CHECK would refuse").toEqual([]);
-    expect([...accepted].filter((k) => !kinds.includes(k)), "kinds the CHECK admits that no code can raise").toEqual([]);
+    expect(refused.map((r) => r.kind), "kinds the CHECK would refuse").toEqual([]);
+
+    // The other direction cannot be asked of a predicate — nothing enumerates what an
+    // arbitrary expression accepts — so it is asked of the declaration the predicate reads.
+    const { rows: declared } = await client.query<{ kinds: string[] }>(
+      "SELECT crm.notification_kinds() AS kinds",
+    );
+    expect(
+      declared[0]!.kinds.filter((k) => !kinds.includes(k)),
+      "kinds the database admits that no code can raise",
+    ).toEqual([]);
   });
 
   /** A sanity check that the source tree is where this test thinks it is. */

@@ -210,3 +210,13 @@ export const TENANT_EXPENSE_LIFECYCLE = "e6440000-0000-4000-8000-00000000001a";
 /** packages/notify — delivery retention, and the tenant it must not reach (0046). */
 export const TENANT_DELIVERY_RETENTION = "e7100000-0000-4000-8000-00000000001a";
 export const TENANT_DELIVERY_RETENTION_OTHER = "e8100000-0000-4000-8000-00000000001b";
+
+/**
+ * packages/notify — endpoint-rules.contract (migration 0049).
+ *
+ * Derived from the migration number, as 0044's is, and separate from `TENANT_ENDPOINTS`
+ * because this suite's whole subject is UPDATEs that must be refused: a failed statement
+ * aborts the transaction, and sharing a tenant with a suite that reads endpoints back
+ * would make one file's refusals the other file's missing rows.
+ */
+export const TENANT_ENDPOINT_RULES = "e9490000-0000-4000-8000-00000000001c";

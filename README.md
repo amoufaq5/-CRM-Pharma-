@@ -118,6 +118,7 @@ authorisation on its own.
 | `POST /v1/admin/notification-endpoints/:id/test` | ask the scheduler to probe it; `202`, because it is queued, not answered |
 | `GET /v1/admin/notification-endpoints/:id/test` | the verdict the scheduler recorded |
 | `GET /v1/admin/notification-endpoints/:id/tests` | the last twenty, newest first |
+| `GET\|PUT /v1/admin/notifications/probe-limits` | the probe cooldown and the hourly budget, read and set together (**administrator**) |
 | `GET /v1/admin/notifications/retention` | how long inboxes keep things — readable by every rep |
 | `PUT /v1/admin/notifications/retention` | the two horizons (**administrator**) |
 | `GET /v1/admin/notifications/prune-candidates` | what tonight's prune would take, what it would hold back, and whether it would be refused |
@@ -283,6 +284,39 @@ delivery — which is also why the sender still joins the live endpoint, and the
 `claimDue` requires **both** parents to exist before it will claim a row. An orphan of either
 kind is settled `dead` with a reason that says which: a missing notification means the
 payload cannot be rebuilt, a missing endpoint means the secret cannot be read.
+
+**0049 made the repointing rule a rule** rather than an omission. 0048 described the hole and
+could only half-close it: a delivery row now carries its own copy of where it went, so
+history written *after* 0048 survives a hand-written `UPDATE` — and every row written before
+it still read its destination through the foreign key, so the schema would have held two
+indistinguishable populations of delivery records, one of them naming the wrong host.
+`channel`, `url` and `secret_env` are frozen for the life of the endpoint by a trigger, the
+list is published as a SQL function and asserted against the table's real columns (0047's
+shape: a frozen column whose name is misspelled freezes nothing and fails nothing), and
+moving a destination is still what `updateEndpoint` always said it was — disable the old
+endpoint, create a new one. `secret_env` is in the frozen list even though 0048 argued
+rotating it is legitimate, and the distinction is which rotation: pointing an endpoint at a
+*different* variable changes which secret signs its pushes, where changing the *value* the
+variable holds does not touch the row at all. The knobs — `min_severity`, `kinds`,
+`enabled`, `description` — stay turnable, because they change what will be sent and never
+what was.
+
+**The same migration gave `kinds` the check it never had.** An endpoint's allow-list was a
+bare `text[]`: `['call_plan_submited']` was accepted, matched nothing, and left an endpoint
+that was enabled, probe-able and subscribed to silence — the exact dead endpoint 0034's
+probe exists to expose, with no probe failure to expose it, because the transport was fine.
+`normaliseKinds` had guarded it in TypeScript and said so, ending "this is the guard until
+the array has one of its own".
+
+Adding it meant answering an objection 0046 had already raised against a different copy of
+the same list: the kind vocabulary has been widened three times (0022, 0029, 0031), each
+time by restating all of it, and a fourth copy would have to be widened in lockstep — a
+migration that forgot would refuse an administrator the ability to subscribe to a kind the
+system was already raising. So the list moved into **`crm.notification_kinds()`** and both
+CHECKs call it. Widening is now one `CREATE OR REPLACE FUNCTION`. Narrowing is not, and the
+migration says so where someone will read it: replacing the function does not revalidate the
+constraints that call it, so removing a kind goes through `DROP CONSTRAINT` + `ADD
+CONSTRAINT` as all three widenings did, and the scan names the rows.
 
 `notify_prune` gained a second **phase** rather than a second job: same pass, same
 transaction, same ceiling, same floor, same break-glass override — but measured against its
@@ -540,6 +574,14 @@ per-endpoint rates therefore had no ceiling at all — five endpoints at the def
 already exceed it, and a fifty-endpoint tenant could emit 1,500 an hour), and `requested_at`
 **overwritten by the trigger**, because a caller who could supply it could backdate one probe
 and make the next legal immediately.
+
+Both numbers are settable over HTTP, as one route. They are two rules, applied in order, that
+answer one question — *may I test this endpoint, and when?* — and an administrator who finds
+the cooldown too slow is not going to guess that the budget is a different page. `PUT` takes
+any subset and reads the current state first, so changing the window does not silently reset
+the count; the legal ranges are **not** restated in the route, because the setters own them
+and a second copy is a second thing to widen — a test asserts the refusal carries the
+schema's own sentence.
 
 Both limits answer `429` and not `409` — this is rate limiting, the state of the system is
 fine and only the pace is not — and both messages name the moment a retry becomes legal. The

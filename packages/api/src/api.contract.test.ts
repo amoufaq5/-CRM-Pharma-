@@ -1974,6 +1974,115 @@ describe("the API, end to end", () => {
    * whole point of the migration, and before it the cascade took the record with the
    * message.
    */
+  /**
+   * The two limits on probing, which were settable only at a psql prompt.
+   *
+   * `probe_cooldown_seconds` has been a tenant parameter since 0034 and the budget since
+   * 0045, and neither had a route — README rule 29's definition of not shipped. They decide
+   * how much real traffic this deployment sends to somebody else's server.
+   */
+  describe("the probe limits", () => {
+    const asAdmin = (): string => token({ sub: "idp|rep2", tenant: TENANT });
+    const grantAdmin = (): Promise<unknown> =>
+      withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+           VALUES ($1,$2,'administrator',$3,CURRENT_DATE)`,
+          [TENANT, otherRep, manager],
+        ),
+      );
+
+    it("refuses both verbs without the administrator role", async () => {
+      expect((await call("GET", "/v1/admin/notifications/probe-limits")).status).toBe(403);
+      expect(
+        (await call("PUT", "/v1/admin/notifications/probe-limits", { body: { cooldownSeconds: 60 } })).status,
+      ).toBe(403);
+    });
+
+    it("reads the cooldown and the budget together, with what the budget has spent", async () => {
+      await grantAdmin();
+      const res = await call("GET", "/v1/admin/notifications/probe-limits", { auth: asAdmin() });
+      expect(res.status).toBe(200);
+      expect(res.body.cooldownSeconds).toBe(120);
+      expect(res.body.budget).toMatchObject({ used: 0, maxProbes: 120, windowSeconds: 3600 });
+      // `nextSlotAt` is null while there is room — the moment only exists once there is not.
+      expect(res.body.budget.nextSlotAt).toBeNull();
+    });
+
+    it("sets either, and leaves the other alone", async () => {
+      await grantAdmin();
+      const cooled = await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { cooldownSeconds: 600 },
+      });
+      expect(cooled.status).toBe(200);
+      expect(cooled.body.cooldownSeconds).toBe(600);
+      expect(cooled.body.budget.maxProbes).toBe(120);
+
+      const budgeted = await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { maxProbes: 50 },
+      });
+      expect(budgeted.body.budget).toMatchObject({ maxProbes: 50, windowSeconds: 3600 });
+      expect(budgeted.body.cooldownSeconds).toBe(600);
+    });
+
+    /**
+     * The budget is ONE rule with two numbers, so a partial change has to read the other
+     * from the CURRENT state. Taking a default instead would silently reset the window to an
+     * hour every time somebody raised the count.
+     */
+    it("keeps the half of the budget it was not given", async () => {
+      await grantAdmin();
+      await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { maxProbes: 30, windowSeconds: 7200 },
+      });
+      const after = await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { maxProbes: 31 },
+      });
+      expect(after.body.budget).toMatchObject({ maxProbes: 31, windowSeconds: 7200 });
+    });
+
+    /**
+     * The ranges are the notify module's and are not restated in the route, so this asserts
+     * the refusal arrives with ITS sentence — a zod schema carrying its own copy of the
+     * numbers would pass this test while being the second opinion that drifts.
+     */
+    it("refuses a value out of range with the reason the schema gives", async () => {
+      await grantAdmin();
+      const zero = await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { maxProbes: 0 },
+      });
+      expect(zero.status).toBe(422);
+      expect(zero.body.detail).toMatch(/between 1 and 3600/);
+
+      const tooLong = await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { cooldownSeconds: 86_401 },
+      });
+      expect(tooLong.status).toBe(422);
+      expect(tooLong.body.detail).toMatch(/86400/);
+    });
+
+    it("refuses an empty body and an unknown field", async () => {
+      await grantAdmin();
+      expect(
+        (await call("PUT", "/v1/admin/notifications/probe-limits", { auth: asAdmin(), body: {} })).status,
+      ).toBe(422);
+      expect(
+        (
+          await call("PUT", "/v1/admin/notifications/probe-limits", {
+            auth: asAdmin(),
+            body: { cooldownSecond: 60 },
+          })
+        ).status,
+      ).toBe(422);
+    });
+  });
+
   describe("where a signal was pushed", () => {
     const admin1 = (): string => token({ sub: "idp|rep2", tenant: TENANT });
 

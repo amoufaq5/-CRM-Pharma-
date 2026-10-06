@@ -36,6 +36,8 @@ import {
   markRead,
   deliveryHistory,
   notificationDeliveryRetention,
+  probeBudget,
+  probeCooldownSeconds,
   notificationPolicy,
   notificationPruneGuard,
   recentDeliveries,
@@ -43,6 +45,8 @@ import {
   prunePreview,
   revokePruneGuardOverride,
   setNotificationDeliveryRetention,
+  setProbeBudget,
+  setProbeCooldownSeconds,
   setNotificationPolicy,
   setNotificationPruneGuard,
   unreadCount,
@@ -2657,6 +2661,91 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           ...(input.retainUnreadDays !== undefined ? { retainUnreadDays: input.retainUnreadDays } : {}),
         }),
       );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * The two limits on probing, readable and settable — which until now they were not.
+   *
+   * `probeCooldownSeconds` has been a tenant parameter since 0034 and `probeBudget` since
+   * 0045, and NEITHER had a route: both were changeable only at a psql prompt, which by
+   * README rule 29 means they were not shipped. They are the parameters that decide how much
+   * real traffic this deployment sends to somebody else's server, so an administrator who
+   * cannot see them cannot answer for them.
+   *
+   * Read together, in one response, because they are one question — "may I test this
+   * endpoint, and when?" — answered by two rules that apply in order: the cooldown is per
+   * endpoint and the budget is per tenant across all of them. Two routes would make a
+   * reader believe they were independent.
+   *
+   * `used` and `nextSlotAt` come from the budget's own function, so the numbers an
+   * administrator sees before pressing test are the numbers the trigger will use — the
+   * `prune-candidates` precedent, where a dry run that disagreed with the pass would be
+   * worse than no dry run.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notifications/probe-limits",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const body = await inTenant(deps, ctx.principal, async (tx) => ({
+        cooldownSeconds: await probeCooldownSeconds(tx, ctx.principal.tenantId),
+        budget: await probeBudget(tx, ctx.principal.tenantId),
+      }));
+      return { status: 200, body };
+    },
+  });
+
+  router.add({
+    method: "PUT",
+    pattern: "/v1/admin/notifications/probe-limits",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      // The RANGES are the notify module's and are deliberately not restated here: both
+      // setters refuse out of range with a sentence naming the bound and why it exists, and
+      // a zod schema with its own numbers would be a second opinion that drifts. What is
+      // parsed here is the shape — which fields, and that they are whole numbers at all.
+      const input = parse(
+        z
+          .object({
+            cooldownSeconds: z.number().int().optional(),
+            maxProbes: z.number().int().optional(),
+            windowSeconds: z.number().int().optional(),
+          })
+          .strict(),
+        ctx.body,
+      );
+      if (
+        input.cooldownSeconds === undefined &&
+        input.maxProbes === undefined &&
+        input.windowSeconds === undefined
+      ) {
+        throw validationFailed("nothing to change", {
+          _: "supply cooldownSeconds, maxProbes, windowSeconds, or any combination",
+        });
+      }
+      // The budget is ONE rule with two numbers, so changing either means writing both —
+      // and the one not supplied has to come from the current state rather than a default,
+      // or raising the count would silently reset the window to an hour.
+      const body = await inTenant(deps, ctx.principal, async (tx) => {
+        if (input.cooldownSeconds !== undefined) {
+          await setProbeCooldownSeconds(tx, ctx.principal.tenantId, input.cooldownSeconds);
+        }
+        if (input.maxProbes !== undefined || input.windowSeconds !== undefined) {
+          const now = await probeBudget(tx, ctx.principal.tenantId);
+          await setProbeBudget(
+            tx,
+            ctx.principal.tenantId,
+            input.maxProbes ?? now.maxProbes,
+            input.windowSeconds ?? now.windowSeconds,
+          );
+        }
+        return {
+          cooldownSeconds: await probeCooldownSeconds(tx, ctx.principal.tenantId),
+          budget: await probeBudget(tx, ctx.principal.tenantId),
+        };
+      });
       return { status: 200, body };
     },
   });
