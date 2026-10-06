@@ -257,7 +257,7 @@ describe("delivery retention", () => {
       expect(row?.recipient_display_name).toBeNull();
     });
 
-    it("declares no foreign key from the delivery row to the notification", async () => {
+    it("declares no foreign key to EITHER parent", async () => {
       // The structural claim behind every test above, asserted from the catalog rather than
       // from the migration text: what matters is the constraint the database enforces.
       const { rows } = await client.query<{ conname: string }>(
@@ -268,8 +268,12 @@ describe("delivery retention", () => {
           WHERE con.contype = 'f' AND child.relname = 'notification_delivery'
           ORDER BY con.conname`,
       );
-      // The endpoint reference survives 0046 untouched; the notification one does not exist.
-      expect(rows.map((r) => r.conname)).toEqual(["notification_delivery_endpoint_id_fkey"]);
+      // 0046 dropped the notification's; 0048 dropped the endpoint's, for the same reasons —
+      // its `ON DELETE CASCADE` erased the record of everything ever sent to a destination
+      // somebody tidied up. Both tenant guards moved into the context trigger, which is
+      // tighter than either key: a referential check runs with row security disabled and
+      // would have found another tenant's parent.
+      expect(rows.map((r) => r.conname)).toEqual([]);
     });
   });
 
@@ -529,6 +533,88 @@ describe("delivery retention", () => {
         await c.query("DELETE FROM crm.notification WHERE id = $1", [n]);
       });
       expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(0);
+    });
+  });
+
+  /**
+   * 0048 — THE SECOND PARENT.
+   *
+   * `notification_delivery_endpoint_id_fkey` was `ON DELETE CASCADE`, so deleting an
+   * endpoint erased the record of everything ever sent to it: the same defect 0046 fixed on
+   * the notification side, which 0046's own header named as "still open". Dropping it brings
+   * the same hazard with it — `claimDue`'s endpoint join is inner, and `secret_env` is
+   * deliberately NOT copied — so the same two answers apply: the `due` CTE requires the
+   * endpoint, and `settleOrphanedDeliveries` gives an orphan an outcome.
+   */
+  describe("an unsettled delivery whose ENDPOINT is gone", () => {
+    const orphanByEndpoint = async (state = "pending"): Promise<string> =>
+      inTenant(async (c) => {
+        const ep = await endpoint(c, TENANT);
+        const n = await notify(c, TENANT, REP);
+        await deliver(c, TENANT, n, ep, { state });
+        await c.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [ep]);
+        return n;
+      });
+
+    it("survives the endpoint's deletion at all, which the cascade did not allow", async () => {
+      const n = await orphanByEndpoint("delivered");
+      const [row] = await inTenant((c) => deliveryHistory(c, n));
+      expect(row).toBeDefined();
+      // And it still says WHERE it went — which is why 0048 copies these two, where 0046
+      // deliberately joined them: that reasoning expired the moment the row could outlive
+      // the endpoint.
+      expect(row?.endpoint_channel).toBe("webhook");
+      expect(row?.endpoint_url).toMatch(/^https:/);
+      expect(row?.endpoint_present).toBe(false);
+      expect(row?.notification_present).toBe(true);
+    });
+
+    it("is never claimed", async () => {
+      await orphanByEndpoint();
+      expect(await inTenant((c) => claimDue(c, TENANT, NOW, 10, () => 0.5))).toEqual([]);
+      const { attempts, state } = await inTenant(async (c) => {
+        const { rows } = await c.query<{ attempts: number; state: string }>(
+          "SELECT attempts, state FROM crm.notification_delivery WHERE tenant_id = $1",
+          [TENANT],
+        );
+        return rows[0]!;
+      });
+      expect({ attempts, state }).toEqual({ attempts: 0, state: "pending" });
+    });
+
+    it("is recorded as undeliverable, naming the ENDPOINT and not the notification", async () => {
+      await orphanByEndpoint();
+      expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(1);
+      const row = await inTenant(async (c) => {
+        const { rows } = await c.query<{ state: string; last_error: string }>(
+          "SELECT state, last_error FROM crm.notification_delivery WHERE tenant_id = $1",
+          [TENANT],
+        );
+        return rows[0]!;
+      });
+      expect(row.state).toBe("dead");
+      // The two orphan kinds are different stories and the reason has to say which: a
+      // missing notification means the payload cannot be rebuilt, a missing endpoint means
+      // the secret it names cannot be read.
+      expect(row.last_error).toContain("endpoint this push was addressed to");
+      expect(row.last_error).not.toContain("payload cannot be rebuilt");
+    });
+
+    it("refuses a delivery row naming an endpoint this tenant cannot see", async () => {
+      // The guard that replaces the dropped key, with nothing disabled. A referential check
+      // runs with row security disabled and would have FOUND the other tenant's endpoint;
+      // resolving it under the caller's own policy makes it read as absent.
+      const foreign = await withTenantContext(client, OTHER_TENANT, (c) => endpoint(c, OTHER_TENANT));
+      await expect(
+        inTenant(async (c) => {
+          const n = await notify(c, TENANT, REP);
+          await c.query(
+            `INSERT INTO crm.notification_delivery (tenant_id, notification_id, endpoint_id)
+             VALUES ($1, $2, $3)`,
+            [TENANT, n, foreign],
+          );
+        }),
+      ).rejects.toThrow(/delivery-foreign-endpoint/);
     });
   });
 

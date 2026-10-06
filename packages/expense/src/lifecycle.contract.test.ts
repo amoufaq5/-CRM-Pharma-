@@ -37,16 +37,6 @@ import { upsertAccountMapping } from "./accounts.js";
  * the mistake `composite-fk.contract.test.ts` documents for its own probes.
  */
 
-/**
- * This file's reserved tenant.
- *
- * `@crm/db/testing` hands these out one block per test file, and it is orchestrator-owned
- * this round — so the constant is declared here and the block to move into `testing.ts` is
- * handed over with the change. The id is derived from this migration's number rather than
- * continued from the sequence there, because four agents are adding files at once and
- * "the next one" is not a safe thing for any of us to guess.
- */
-
 const REP = "e6441111-0000-4000-8000-000000000001";
 const MGR = "e6442222-0000-4000-8000-000000000002";
 
@@ -504,11 +494,19 @@ describe("0044 — the expense claim lifecycle is in the database", () => {
         await tx.query(`ALTER TABLE crm.expense_claim ENABLE TRIGGER ${TRIGGER}`);
       });
       // With the guard live again, an ordinary touch of that row is accepted.
+      //
+      // `updated_at` and not `description`, which this used to write: 0047 freezes a claim's
+      // SUBSTANCE once it leaves draft, and `description` is in that set — it is part of what
+      // an approver read, and the repo's answer to annotating a decided record is an
+      // append-only note beside it (0030's disposal reason), not rewriting the field the
+      // decision was given against. The premise here was never about `description` anyway:
+      // it is that a non-state UPDATE does not trip the required-field check, and
+      // `updated_at` says that without borrowing a column whose editability was incidental.
       await inTenant((tx) =>
-        tx.query("UPDATE crm.expense_claim SET description = $3 WHERE tenant_id = $1 AND id = $2", [
+        tx.query("UPDATE crm.expense_claim SET updated_at = $3 WHERE tenant_id = $1 AND id = $2", [
           TENANT,
           id,
-          "an inspector added a note",
+          AT,
         ]),
       );
       const claim = await inTenant((tx) => getClaim(tx, TENANT, id));
@@ -770,6 +768,198 @@ describe("0044 — the expense claim lifecycle is in the database", () => {
       // the three approved-ish states — so the row is refused by the CHECK with the trigger
       // standing down.
       expect(message).toContain("expense_claim_approved_fields");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 0047 — what a claim SAYS is frozen once it has left draft.
+  //
+  // 0044 closed the lifecycle and left this open, deliberately: a claim approved for 120.50
+  // could be edited to 1,205.00 and posted, with the approval still on the row attesting to
+  // a number nobody ever saw. The same hole let an approved claim be re-pointed at a
+  // different rep — 0016's call-plan defect, in the expense table.
+  // -------------------------------------------------------------------------
+
+  describe("0047 — the substance is frozen once a claim leaves draft", () => {
+    const FREEZE_TRIGGER = "expense_claim_freeze_substance";
+
+    /** A plausible NEW value per frozen column, so each probe actually changes something. */
+    const CHANGED: Readonly<Record<string, string>> = {
+      rep_profile_id: MGR,
+      crm_category: "detailing",
+      amount: "1205.00",
+      currency: "USD",
+      incurred_on: "2026-09-02",
+      description: "edited after the fact",
+      receipt_url: "https://example.test/other.png",
+      erp_ledger_account_code: "9999",
+      erp_cost_center_code: "CC-OTHER",
+    };
+
+    const frozenColumns = (): Promise<readonly string[]> =>
+      inTenant(async (tx) => {
+        const { rows } = await tx.query<{ cols: string[] }>(
+          "SELECT crm.expense_claim_frozen_columns() AS cols",
+        );
+        return rows[0]!.cols;
+      });
+
+    /**
+     * THE LIST IS ASKED OF THE DATABASE AND CHECKED AGAINST THE TABLE.
+     *
+     * A typo'd column name in that array would not fail anything: `to_jsonb(OLD) ->> 'amont'`
+     * is null on both sides, so the comparison is silently always equal and the column is
+     * simply never frozen. The guard would still pass every test that probes a DIFFERENT
+     * column, which is the shape of a rule that protects nothing.
+     */
+    it("names only real columns of crm.expense_claim, and covers the ones that matter", async () => {
+      const frozen = await frozenColumns();
+      const actual = await inTenant(async (tx) => {
+        const { rows } = await tx.query<{ column_name: string }>(
+          `SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'crm' AND table_name = 'expense_claim'`,
+        );
+        return new Set(rows.map((r) => r.column_name));
+      });
+      for (const col of frozen) expect(actual.has(col), `${col} is not a column`).toBe(true);
+      // The money and the ownership, explicitly: this is the list's reason for existing and
+      // a future edit that drops one of them should fail here.
+      for (const col of ["amount", "currency", "incurred_on", "crm_category", "rep_profile_id"]) {
+        expect(frozen, `${col} must be frozen`).toContain(col);
+      }
+      // Every probe below must actually change its column, or the test is vacuous.
+      for (const col of frozen) expect(Object.keys(CHANGED), `${col} has no probe value`).toContain(col);
+    });
+
+    /**
+     * DISJOINT FROM 0044's SEALED SET, asked of the database rather than asserted in prose.
+     *
+     * The sealed columns are the decision RECORD and 0044 holds them write-once. Two
+     * constraints with an opinion about one column is how they come to disagree, and the only
+     * thing that could claim these two SQL arrays do not overlap is a comment — which is why
+     * both are published as functions.
+     */
+    it("does not overlap the lifecycle's write-once columns", async () => {
+      const overlap = await inTenant(async (tx) => {
+        const { rows } = await tx.query<{ col: string }>(
+          `SELECT unnest(crm.expense_claim_frozen_columns()) AS col
+           INTERSECT
+           SELECT unnest(crm.expense_claim_sealed_columns())`,
+        );
+        return rows.map((r) => r.col);
+      });
+      expect(overlap).toEqual([]);
+    });
+
+    it("admits every edit while the claim is still a draft", async () => {
+      const id = await draftClaim();
+      for (const [col, value] of Object.entries(CHANGED)) {
+        expect(
+          await refusal(
+            `UPDATE crm.expense_claim SET ${col} = ${literal(value)} WHERE tenant_id = $1 AND id = $2`,
+            [TENANT, id],
+          ),
+          `a draft refused a change to ${col}`,
+        ).toBeNull();
+      }
+    });
+
+    it("refuses every frozen column in every state past draft", async () => {
+      const frozen = await frozenColumns();
+      const past = EXPENSE_CLAIM_STATES.filter((s) => s !== "draft");
+      for (const state of past) {
+        for (const col of frozen) {
+          const id = await draftClaim();
+          await park(id, state);
+          const err = await refusal(
+            `UPDATE crm.expense_claim SET ${col} = ${literal(CHANGED[col]!)}
+              WHERE tenant_id = $1 AND id = $2`,
+            [TENANT, id],
+          );
+          expect(err, `${state}: ${col} was editable`).not.toBeNull();
+          // The TRIGGER's refusal, not some CHECK that happened to fire — the mistake this
+          // file's own header warns about.
+          expect(err?.message, `${state}: ${col}`).toContain("expense-claim-substance");
+          expect(err?.message).toContain(col);
+          expect(err?.code).toBe("23514");
+        }
+      }
+    });
+
+    /**
+     * The one legitimate writer of the account codes, and why the rule is keyed on OLD.state.
+     *
+     * `submitClaim` stamps `erp_ledger_account_code` in the SAME statement as
+     * `draft -> submitted`, so `OLD.state` is still `draft` when the trigger looks. A
+     * write-once rule would have refused exactly this — and `erp_cost_center_code` is
+     * legitimately null, so write-once would have left it settable forever, which is the
+     * opposite of the guarantee.
+     */
+    it("lets submitClaim stamp the account snapshot on the way out of draft", async () => {
+      await inTenant((tx) =>
+        upsertAccountMapping(tx, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6100",
+          erpCostCenterCode: "CC-SM",
+        }),
+      );
+      const id = await draftClaim();
+      const submitted = await inTenant((tx) => submitClaim(tx, TENANT, id, new Date("2026-09-10T08:00:00Z")));
+      expect(submitted.state).toBe("submitted");
+      expect(submitted.erp_ledger_account_code).toBe("6100");
+      expect(submitted.erp_cost_center_code).toBe("CC-SM");
+      // And now it is fixed.
+      const err = await refusal(
+        "UPDATE crm.expense_claim SET erp_ledger_account_code = '9999' WHERE tenant_id = $1 AND id = $2",
+        [TENANT, id],
+      );
+      expect(err?.message).toContain("expense-claim-substance");
+    });
+
+    it("still lets the lifecycle move a claim, and still lets updated_at move", async () => {
+      const id = await draftClaim();
+      await park(id, "approved");
+      expect(
+        await refusal(
+          `UPDATE crm.expense_claim
+              SET state = 'posted', posted_at = ${literal("2026-09-20T08:00:00Z")},
+                  erp_expense_id = ${literal(`crm-exp-${id}`)}, updated_at = now()
+            WHERE tenant_id = $1 AND id = $2`,
+          [TENANT, id],
+        ),
+      ).toBeNull();
+    });
+
+    /**
+     * TRIGGER ORDER IS LOAD-BEARING. Postgres fires same-event triggers alphabetically, and
+     * `check_lifecycle` sorts before `freeze_substance` — so an UPDATE that is BOTH an
+     * illegal transition and a substance edit is reported as the illegal transition, which is
+     * the better-aimed sentence. Renaming either trigger breaks this rather than quietly
+     * reordering two refusals.
+     */
+    it("reports an illegal transition as a transition, even when the substance also changed", async () => {
+      const id = await draftClaim();
+      await park(id, "reimbursed");
+      const err = await refusal(
+        `UPDATE crm.expense_claim SET state = 'draft', amount = '1.00' WHERE tenant_id = $1 AND id = $2`,
+        [TENANT, id],
+      );
+      expect(err?.message).toContain("expense-claim-lifecycle");
+      expect(err?.message).not.toContain("expense-claim-substance");
+    });
+
+    it("fires both triggers, in the order their names imply", async () => {
+      const names = await inTenant(async (tx) => {
+        const { rows } = await tx.query<{ tgname: string }>(
+          `SELECT tgname FROM pg_trigger t
+             JOIN pg_class c ON c.oid = t.tgrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'crm' AND c.relname = 'expense_claim' AND NOT t.tgisinternal
+            ORDER BY t.tgname`,
+        );
+        return rows.map((r) => r.tgname);
+      });
+      expect(names).toEqual([TRIGGER, FREEZE_TRIGGER]);
     });
   });
 });

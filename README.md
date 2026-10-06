@@ -263,11 +263,26 @@ raised, and whose data left the tenant — and it has a **third horizon**,
 because a delivery record is evidence about a third party's endpoint *and* about a disclosure
 of a named employee to it, and that is audited on a different clock from an inbox badge.
 
+**0048 did the same for the other parent**, which 0046 had named as the identical defect
+still open: `notification_delivery_endpoint_id_fkey` was `ON DELETE CASCADE`, so deleting an
+endpoint erased the record of everything ever sent to it. So the row copies the destination
+too — `endpoint_channel` and `endpoint_url`, which 0046 deliberately *joined* on the grounds
+that the endpoint was still readable from a live row. That reasoning expired the moment the
+row could outlive it. It closes a second thing on the way: `updateEndpoint` refuses to
+repoint a url, arguing that doing so would carry the delivery history onto a different
+destination — and nothing in the schema said so, so a hand-written `UPDATE` silently
+re-attributed every record that endpoint ever had. A copy taken at enqueue time cannot be
+re-attributed by anything.
+
 It copies no `subject`, `body` or `payload`, deliberately: the delivery table must not become
 a second, longer-retained copy of the inbox, or `retain_delivery_days` silently becomes the
 real retention period for notification prose and the two horizons above stop meaning
-anything. It copies nothing from the endpoint either, because the endpoint is still joinable
-— copying a fact readable from a live row is how two sources of one truth start to disagree.
+anything. And it does not copy `secret_env`, because that names an environment variable and
+rotating which one an endpoint reads is a legitimate change that must not be frozen per
+delivery — which is also why the sender still joins the live endpoint, and therefore why
+`claimDue` requires **both** parents to exist before it will claim a row. An orphan of either
+kind is settled `dead` with a reason that says which: a missing notification means the
+payload cannot be rebuilt, a missing endpoint means the secret cannot be read.
 
 `notify_prune` gained a second **phase** rather than a second job: same pass, same
 transaction, same ceiling, same floor, same break-glass override — but measured against its
@@ -304,6 +319,14 @@ for a read (a rep may always see their own work, and it is why one helper serves
 so no constraint could ever have caught those. A rep could hand their own claim to the
 ledger and mark it paid. The rule is now in the route, once, for all four, as a 403 that
 names which rule was broken rather than a constraint violation with no explanation.
+
+**And what a claim says is frozen once it leaves draft** (0047). The amount, the currency,
+the date, the category, the account snapshot, the description and the rep it belongs to are
+all fixed from the first transition out — because a claim approved for 120.50 could otherwise
+be edited to 1,205.00 and posted, with the approval still on the row, with its approver and
+its timestamp, attesting to a number nobody ever saw. Keyed on the state the row was
+*already* in rather than write-once, which is what keeps the one legitimate writer legal:
+`submitClaim` stamps the account snapshot in the same statement as `draft → submitted`.
 
 A rep who is neither the claimant nor a supervisor gets a **404 naming the claim** —
 `no expense claim <id> on your team` — and not the `no rep <id> on your team` the
@@ -559,7 +582,7 @@ re-reports a standing gap through the boot check above — which is the right su
 ## Tenant isolation is structural, not just a policy
 
 Every foreign key in `crm.*` into a tenant-scoped table is **composite** —
-`(tenant_id, ref_id) → (tenant_id, id)`, **all 45 of them, with none left single-column**,
+`(tenant_id, ref_id) → (tenant_id, id)`, **all 44 of them, with none left single-column**,
 and with constraint names and every `ON DELETE`, `ON UPDATE`, deferrability and match type
 preserved byte for byte (measured against the catalog before and after, not asserted by
 eye).
@@ -579,14 +602,15 @@ rather than passing for it. It carries a `pg_constraint` drift guard too: a tabl
 month by someone who does not know this rule fails a test instead of quietly reopening the
 class.
 
-0046 dropped one of the original 46 — `notification_delivery.notification_id` — on
-retention grounds, and did not weaken the rule: a reference that *exists* in `crm.*` is still
-composite, and that one's tenant guard moved into a `BEFORE INSERT` trigger that resolves the
-parent under the caller's own row security. That is **tighter** than the key it replaced,
-because a referential check runs with row security disabled and would have accepted another
-tenant's notification as existing, where an invisible row reads as absent. The drift guard
-cannot see a column with no reference, so `composite-fk.contract.test.ts` asserts the
-replacement live instead.
+0046 and 0048 dropped two of the original 46 — **both** of `crm.notification_delivery`'s —
+on retention grounds, and did not weaken the rule: a reference that *exists* in `crm.*` is
+still composite, and both tenant guards moved into one `BEFORE INSERT` trigger that resolves
+each parent under the caller's own row security. That is **tighter** than the keys it
+replaced, because a referential check runs with row security disabled and would have
+accepted another tenant's parent as existing, where an invisible row reads as absent. The
+drift guard cannot see a column with no reference, so `composite-fk.contract.test.ts`
+asserts both replacements live instead, and asserts the absence itself — this is the one
+table in `crm.*` with no foreign key at all, which is a choice rather than an oversight.
 
 **The pre-flight those migrations open with has now been seen to work.** A composite key's
 bulk `VALIDATE` is an ordinary query, so as `crm_app` with no tenant context it validates

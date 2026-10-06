@@ -16,12 +16,12 @@ import type { NotificationKind, Severity } from "./kinds.js";
 /**
  * One recorded push.
  *
- * The four `notification_*`/`recipient_*` fields are COPIES taken when the push was
- * enqueued, so they are still here when the notification is not. `endpoint_channel` and
- * `endpoint_url` are JOINED and therefore nullable: the endpoint reference survives 0046
- * untouched, so there is nothing to copy — but its own `ON DELETE CASCADE` means a deleted
- * endpoint would take this row with it, which is recorded as the remaining half of the
- * problem rather than worked around here.
+ * Every `notification_*`, `recipient_*` and `endpoint_*` field is a COPY taken when the push
+ * was enqueued, so all of them are still here when the parent is not — the notification's
+ * four since 0046, the endpoint's two since 0048, which dropped that cascade too. They are
+ * NOT NULL in the table and therefore not nullable here: a row that reached this table went
+ * through the trigger that makes the copies, and a path that bypassed it would have written
+ * nothing at all rather than a row with no context.
  */
 export interface DeliveryRecord {
   readonly id: string;
@@ -29,8 +29,8 @@ export interface DeliveryRecord {
   readonly seq: string;
   readonly notification_id: string;
   readonly endpoint_id: string;
-  readonly endpoint_channel: string | null;
-  readonly endpoint_url: string | null;
+  readonly endpoint_channel: string;
+  readonly endpoint_url: string;
   readonly notification_kind: NotificationKind;
   readonly notification_severity: Severity;
   readonly notification_created_at: Date;
@@ -51,6 +51,15 @@ export interface DeliveryRecord {
    * showing a dead link to a notification that has been pruned.
    */
   readonly notification_present: boolean;
+  /**
+   * Whether the endpoint this was addressed to still exists (0048).
+   *
+   * Separate from `notification_present` because the two answer different questions and a
+   * reader acts on them differently: the inbox copy being gone is retention working, where
+   * the destination being gone means nobody can resend this and the url beside it is the
+   * only record of where it went.
+   */
+  readonly endpoint_present: boolean;
 }
 
 /**

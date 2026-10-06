@@ -69,8 +69,17 @@ export interface ClaimedDelivery {
  *
  * It takes a prune's hold with it: a `dead` delivery is never pruned at any horizon, so an
  * orphan settled this way is retained indefinitely. That is acceptable because the only way
- * to reach it is a hand-written DELETE of a notification with a live delivery — the prune
- * itself cannot, since an unsettled delivery holds its notification back (0024).
+ * to reach it is a hand-written DELETE of a parent with a live delivery — the prune itself
+ * cannot, since an unsettled delivery holds its notification back (0024).
+ *
+ * TWO PARENTS SINCE 0048, which dropped the endpoint's cascade for the same reasons. A
+ * missing ENDPOINT is the same hazard and not quite the same story, so the two are reported
+ * separately: the notification's payload cannot be rebuilt, where a deleted endpoint's
+ * `secret_env` cannot be read — and `secret_env` is deliberately not copied, because it
+ * names an environment variable and rotating which one an endpoint reads is a legitimate
+ * change that must not be frozen per delivery. Either way the push cannot be made, and
+ * either way the row keeps saying what it was for: 0048 copies the channel and the url, so
+ * an orphan of this second kind still records where it was going.
  */
 export async function settleOrphanedDeliveries(
   tx: PoolClient,
@@ -79,12 +88,21 @@ export async function settleOrphanedDeliveries(
   const { rowCount } = await tx.query(
     `UPDATE crm.notification_delivery d
         SET state = 'dead',
-            last_error = left('the notification this push describes no longer exists, so its '
-                              || 'payload cannot be rebuilt — recorded as undeliverable', 2000)
+            last_error = left(
+              CASE
+                WHEN NOT EXISTS (SELECT 1 FROM crm.notification n
+                                  WHERE n.tenant_id = d.tenant_id AND n.id = d.notification_id)
+                THEN 'the notification this push describes no longer exists, so its '
+                     || 'payload cannot be rebuilt — recorded as undeliverable'
+                ELSE 'the endpoint this push was addressed to no longer exists, so the '
+                     || 'secret it names cannot be read — recorded as undeliverable'
+              END, 2000)
       WHERE d.tenant_id = $1
         AND d.state IN ('pending', 'in_flight')
-        AND NOT EXISTS (SELECT 1 FROM crm.notification n
-                         WHERE n.tenant_id = d.tenant_id AND n.id = d.notification_id)`,
+        AND (NOT EXISTS (SELECT 1 FROM crm.notification n
+                          WHERE n.tenant_id = d.tenant_id AND n.id = d.notification_id)
+             OR NOT EXISTS (SELECT 1 FROM crm.notification_endpoint e
+                             WHERE e.tenant_id = d.tenant_id AND e.id = d.endpoint_id))`,
     [tenantId],
   );
   return rowCount ?? 0;
@@ -105,11 +123,11 @@ export async function settleOrphanedDeliveries(
  * were arbitrary among tied rows. `seq` is the insert order, which is what "oldest push
  * first" was always supposed to mean.
  *
- * The `due` CTE also requires the notification to still exist, so an orphan is never
- * claimed-and-lost by the inner join below. `settleOrphanedDeliveries` is what gives those
- * rows an outcome; this predicate is what stops them being consumed silently in the
- * meantime, and the two are deliberately separate — a claim must not be the thing that
- * dead-letters.
+ * The `due` CTE also requires BOTH parents to still exist — the notification since 0046 and
+ * the endpoint since 0048 — so an orphan is never claimed-and-lost by the inner joins below.
+ * `settleOrphanedDeliveries` is what gives those rows an outcome; these predicates are what
+ * stop them being consumed silently in the meantime, and the two are deliberately separate:
+ * a claim must not be the thing that dead-letters.
  */
 export async function claimDue(
   tx: PoolClient,
@@ -127,6 +145,11 @@ export async function claimDue(
           AND d.next_attempt_at <= $2
           AND EXISTS (SELECT 1 FROM crm.notification n
                        WHERE n.tenant_id = d.tenant_id AND n.id = d.notification_id)
+          -- 0048: and the ENDPOINT, for the same reason. Both joins below are inner, so a
+          -- row whose parent is gone would be claimed by the CTE above and then dropped —
+          -- consumed on every tick, never delivered, never counted.
+          AND EXISTS (SELECT 1 FROM crm.notification_endpoint e
+                       WHERE e.tenant_id = d.tenant_id AND e.id = d.endpoint_id)
         ORDER BY d.next_attempt_at, d.seq
         LIMIT $3
         FOR UPDATE SKIP LOCKED
