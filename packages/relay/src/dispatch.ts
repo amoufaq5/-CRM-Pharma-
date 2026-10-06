@@ -80,9 +80,25 @@ export function parseOperation(operation: string): ParsedOperation {
  *
  * A revive is a request for the ERP's answer NOW, on the premise that the cause was fixed.
  * Replaying the old answer makes that unanswerable, so each episode asks in its own name.
- * Nothing is risked by it: if the earlier attempt actually landed, the collision is on the
+ * Nothing is risked by that: if the earlier attempt actually landed, the collision is on the
  * record id and `classify` settles it `already_delivered` — proved against the live server
- * with the driver message removed (6h). The key only ever saved a round trip.
+ * with the driver message removed (6h).
+ *
+ * THIS WAS HALF A FIX, and an earlier version of this comment ended "the key only ever saved
+ * a round trip", which was false. `attempts` is deliberately NOT in the key, so every retry
+ * INSIDE an episode still re-asks under a key the gateway has already answered — and the
+ * relay retries on every transient refusal, sixty times over for a locked fiscal period. The
+ * replay is the status without the body, so a bodiless 422 dead-lettered a correct write and
+ * a bodiless 409 marked a never-applied transition delivered. Both were found by an
+ * adversarial review of the commit that wrote this comment.
+ *
+ * The key is not what fixes that, and must not be: a per-attempt key would stop the gateway
+ * deduping a worker that died after sending and before settling, which is the one thing the
+ * header is here for. The fix is in `ErpClient`, which now recognises a replay by the
+ * gateway's own `x-idempotent-replay` header and asks again under a fresh key — once, and
+ * only for a 4xx/5xx, where the stored outcome means the handler refused and nothing was
+ * written. See the long comment on `request` there; this comment's job is to say that the
+ * episode key does not stand alone.
  */
 export function idempotencyKeyFor(row: OutboxRow): string {
   return `crm-${row.id}-r${row.revive_count}`;

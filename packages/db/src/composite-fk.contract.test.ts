@@ -13,7 +13,10 @@ import { withTenantContext } from "./tenant-context.js";
  * grant in another. The fix was `AND tenant_id = p_tenant_id` in one function, which is a
  * fix the next function forgets. Migrations 0035 and 0037 made the whole class impossible
  * instead: every reference inside `crm.*` is now `(tenant_id, <ref>_id) REFERENCES
- * <target>(tenant_id, id)` — all 46 of them, with nothing left behind.
+ * <target>(tenant_id, id)` — all 46 of them, with nothing left behind. 0046 dropped one of
+ * the 46 (`notification_delivery.notification_id`) on retention grounds and replaced its
+ * tenant guard with a trigger, so 45 remain and the rule is unchanged: a reference that
+ * exists is composite.
  *
  * THIS SUITE CONNECTS AS `crm_app`, AND THAT IS THE WHOLE POINT. The original bug survived
  * a green suite because the suite connected as a superuser, so row-level security was off
@@ -43,7 +46,8 @@ import { withTenantContext } from "./tenant-context.js";
  */
 
 /**
- * The 46 references migrations 0035 (38) and 0037 (the last 8) made tenant-scoped, and what
+ * The 45 references migrations 0035 (38) and 0037 (the last 8) made tenant-scoped and 0046
+ * left standing, and what
  * each one must still be.
  */
 interface Hardened {
@@ -111,7 +115,12 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   expense_claim_rejected_by_fkey: { table: "expense_claim", column: "rejected_by", parent: "rep_profile", onDelete: "RESTRICT" },
 
   notification_recipient_rep_profile_id_fkey: { table: "notification", column: "recipient_rep_profile_id", parent: "rep_profile", onDelete: "RESTRICT" },
-  notification_delivery_notification_id_fkey: { table: "notification_delivery", column: "notification_id", parent: "notification", onDelete: "CASCADE" },
+  // `notification_delivery_notification_id_fkey` WAS HERE and is gone as of 0046. The
+  // cascade meant a delivery record could not be retained one day longer than the inbox
+  // entry it described, so the reference was dropped and the facts copied — 0036's shape for
+  // `crm.outbox_dead_letter`. Its tenant guard is not lost, it MOVED: see the live test
+  // "notification_delivery refuses another tenant's notification" below, and the note on
+  // `AWAITING_CONVERSION` about what this guard can and cannot see.
   notification_delivery_endpoint_id_fkey: { table: "notification_delivery", column: "endpoint_id", parent: "notification_endpoint", onDelete: "CASCADE" },
 
   outbox_revived_by_fkey: { table: "outbox", column: "revived_by", parent: "rep_profile", onDelete: "RESTRICT" },
@@ -168,6 +177,15 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
  * never in this list: that table carries `revived_by` with no foreign key at all, by its own
  * argument. A column with no reference is outside what this guard can see — it checks the
  * references that exist, not the ones that should.
+ *
+ * `crm.notification_delivery.notification_id` is the second such column, as of 0046, and it
+ * is the one that makes the blind spot worth stating twice. It was a composite reference and
+ * is now a plain uuid, so it has LEFT this guard's view rather than never having entered it —
+ * which is the shape a future reader should be suspicious of. The guard it lost was replaced,
+ * not dropped: `crm.notification_delivery_context` resolves the notification under the
+ * caller's own row security, which refuses what a referential check would have accepted. That
+ * replacement is asserted live below, because a drift guard that cannot see the column cannot
+ * be the thing that proves it.
  */
 const AWAITING_CONVERSION: Readonly<Record<string, string>> = {};
 
@@ -425,15 +443,24 @@ const PROBES: Readonly<Record<string, Probe>> = {
           VALUES ($1, $2, 'erp_write_failed', 'warning', 'Probe', 'Probe', 'fk-probe')`,
     params: [TENANT_FK_B, A.rep1],
   },
-  notification_delivery_notification_id_fkey: {
-    what: "a delivery attempt for another tenant's notification",
-    sql: `INSERT INTO crm.notification_delivery (tenant_id, notification_id, endpoint_id) VALUES ($1, $2, $3)`,
-    params: [TENANT_FK_B, A.ntf, B.endp],
-  },
+  /**
+   * The four copied columns are supplied by hand HERE AND NOWHERE ELSE, because this probe
+   * runs with `DISABLE TRIGGER USER` in force.
+   *
+   * `crm.notification_delivery_context` (0046) is a BEFORE INSERT trigger that fills them,
+   * and they are NOT NULL — and `ExecConstraints` runs before the AFTER-row referential
+   * trigger, so with the trigger silenced the probe would answer 23502 and this suite would
+   * pass on a not-null violation while believing it had tested a foreign key. Supplying them
+   * is what leaves the endpoint reference as the thing that refuses.
+   */
   notification_delivery_endpoint_id_fkey: {
     what: "a delivery attempt aimed at another tenant's endpoint",
-    sql: `INSERT INTO crm.notification_delivery (tenant_id, notification_id, endpoint_id) VALUES ($1, $2, $3)`,
-    params: [TENANT_FK_B, B.ntf, A.endp],
+    sql: `INSERT INTO crm.notification_delivery
+            (tenant_id, notification_id, endpoint_id,
+             notification_kind, notification_severity, notification_created_at,
+             recipient_rep_profile_id)
+          VALUES ($1, $2, $3, 'erp_write_failed', 'warning', now(), $4)`,
+    params: [TENANT_FK_B, B.ntf, A.endp, B.rep1],
   },
   outbox_revived_by_fkey: {
     what: "a dead letter revived by another tenant's rep",
@@ -883,6 +910,44 @@ describe("a cross-tenant reference is refused by the database", () => {
    * to be rediscovered: if someone adds one, this test says where the rule already lives,
    * and if someone drops a key believing a trigger covers it, the two tests above fail.
    */
+  /**
+   * `crm.notification_delivery`, WITH NOTHING DISABLED — because 0046 dropped a key here.
+   *
+   * The reference to `crm.notification` is gone (see the note in `HARDENED`), so this table
+   * has a tenant-scoped column that this file's drift guard can no longer see. The guard did
+   * not disappear with the key: `crm.notification_delivery_context` is a BEFORE INSERT
+   * trigger that resolves the notification under the CALLER'S row security, which is the
+   * tighter half of the asymmetry — a referential check runs with row security disabled and
+   * would have found the foreign parent and accepted the row, where an invisible row reads as
+   * absent here.
+   *
+   * Every trigger enabled, as `crm_app`, under FORCE ROW LEVEL SECURITY: the arrangement a
+   * request actually meets. A future migration that removes the trigger believing the key
+   * still covers it fails here.
+   */
+  it("notification_delivery refuses another tenant's notification, with every trigger live", async () => {
+    const push = async (notification: string): Promise<void> => {
+      await withTenantContext(client, TENANT_FK_B, async (tx) => {
+        await tx.query(
+          `INSERT INTO crm.notification_delivery (tenant_id, notification_id, endpoint_id)
+           VALUES ($1, $2, $3)`,
+          [TENANT_FK_B, notification, B.endp],
+        );
+        throw new Accepted("notification_delivery_context");
+      });
+    };
+
+    // 23514 is check_violation, which is what the trigger raises — deliberately NOT 23503:
+    // there is no foreign key here any more and reporting one would be a lie about the
+    // mechanism. The message is asserted too, so a CHECK that happened to fire first, or a
+    // unique violation from a badly chosen fixture, fails rather than passes for it.
+    await expect(push(A.ntf)).rejects.toMatchObject({ code: "23514" });
+    await expect(push(A.ntf)).rejects.toThrow(/delivery-foreign-notification/);
+    // The same statement against this tenant's own notification must reach the Accepted
+    // throw, or the refusal above would be about a broken insert rather than about tenancy.
+    await expect(push(B.ntf)).rejects.toBeInstanceOf(Accepted);
+  });
+
   it("has no insert-time trigger on attachment_access, because the two composite keys are the guard", async () => {
     const { rows } = await client.query<{ tgname: string; on_insert: boolean }>(
       `SELECT tgname, (tgtype & 4) <> 0 AS on_insert
@@ -1062,7 +1127,16 @@ describe("no reference in crm escapes its tenant", () => {
     // What makes a composite reference possible at all: Postgres only lets a foreign key
     // name columns covered by a unique index. These are redundant as uniqueness claims —
     // `id` is already a primary key — and exist solely to be referenced.
-    const parents = [...new Set(Object.values(HARDENED).map((h) => h.parent))].sort();
+    //
+    // `crm.notification` is named separately because nothing references it any more: 0046
+    // dropped the one reference there was, deliberately, and the key is KEPT rather than
+    // dropped with it. It is one index on a growing table and it is what any future
+    // composite reference into the inbox would need — dropping and re-adding it would be a
+    // second migration over a large table to get back where this one already is.
+    const UNREFERENCED_TARGETS = ["notification"];
+    const parents = [
+      ...new Set([...Object.values(HARDENED).map((h) => h.parent), ...UNREFERENCED_TARGETS]),
+    ].sort();
     expect(parents.length).toBeGreaterThan(5);
     const { rows } = await client.query<{ relname: string }>(
         `SELECT child.relname

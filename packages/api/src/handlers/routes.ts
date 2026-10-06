@@ -34,11 +34,15 @@ import {
   listEndpoints,
   markAllRead,
   markRead,
+  deliveryHistory,
+  notificationDeliveryRetention,
   notificationPolicy,
   notificationPruneGuard,
+  recentDeliveries,
   prunableNotifications,
   prunePreview,
   revokePruneGuardOverride,
+  setNotificationDeliveryRetention,
   setNotificationPolicy,
   setNotificationPruneGuard,
   unreadCount,
@@ -382,7 +386,13 @@ async function requireClaimOnMyTeam(
   repProfileId: string,
 ): Promise<void> {
   if (!(await canSupervise(tx, p.repProfileId, repProfileId))) {
-    throw notFound(`no expense claim ${claimId} on your team`);
+    // BYTE-IDENTICAL to `ExpenseClaimNotFoundError`'s sentence, and that is the point. The
+    // first version of this said `… on your team`, which removed the rep id and left an
+    // existence oracle in its place: `no expense claim <id> on your team` versus
+    // `no expense claim <id>` told any authenticated rep whether a claim id exists in the
+    // tenant, which is the information this 404 exists to conceal. `requireVisiblePlan`
+    // above already gets this right with one sentence for both cases.
+    throw notFound(`no expense claim ${claimId}`);
   }
 }
 
@@ -2490,9 +2500,14 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
    * partial unique index, so two requests racing cannot both win), a cooldown whose LENGTH
    * is the tenant's and whose SCOPE is one endpoint (`WHERE endpoint_id = …`, because each
    * endpoint is a different third party and a quiet one should not be rationed by a noisy
-   * one — note this bounds the rate per destination, NOT the tenant's total probe volume),
-   * and an endpoint in another tenant. The cooldown answers 429 rather than 409: it is rate
-   * limiting, and its message carries the moment a retry becomes legal.
+   * one — this bounds the rate per destination and says nothing about the tenant's total),
+   * the tenant's TOTAL budget across every endpoint (0045, 120 an hour by default, counted
+   * under a per-tenant advisory lock held to commit, because a count has no partial unique
+   * index available to it and two administrators pressing test at once would otherwise both
+   * pass a check that sees neither other's uncommitted row), and an endpoint in another
+   * tenant. Both limits answer 429 rather than 409: they are rate limiting, and both messages
+   * carry the moment a retry becomes legal. The cooldown is tested first, so the
+   * better-aimed sentence wins when both apply.
    */
   router.add({
     method: "POST",
@@ -2532,11 +2547,14 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
   /**
    * The test history for one endpoint, newest first.
    *
-   * Bounded at twenty by the database, not by this limit: 0034 trims to the newest twenty
-   * complete probes per endpoint on insert. A probe result is operational, not an audit
-   * record — nobody asks which day in March a webhook was tested — and a ring needs no
-   * scheduled job to honour it, where a horizon would have added one more thing somebody
-   * still has to wire.
+   * Bounded by the database, not by this limit: 0034 trims to the newest twenty complete
+   * probes per endpoint on insert, and since 0045 it keeps anything inside the tenant's
+   * budget window as well — so AT LEAST twenty, because the budget is computed from those
+   * rows and a ring that deleted one would hand the slot back. This route still clamps to
+   * twenty, so the extra rows are not reachable here: they exist for the budget, not for a
+   * reader. A probe result is operational, not an audit record — nobody asks which day in
+   * March a webhook was tested — and a ring needs no scheduled job to honour it, where a
+   * horizon would have added one more thing somebody still has to wire.
    */
   router.add({
     method: "GET",
@@ -2640,6 +2658,84 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         }),
       );
       return { status: 200, body };
+    },
+  });
+
+  /**
+   * How long the record of WHERE a signal was pushed is kept (0046).
+   *
+   * ADMINISTRATOR to read, where the two inbox horizons above are readable by every rep —
+   * and the split is the point rather than an inconsistency. A rep whose notification
+   * disappeared is entitled to know it was a rule; a delivery record is evidence about a
+   * third-party endpoint a rep cannot see and has no inbox entry for, so it is not an
+   * answer to that question.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notifications/delivery-retention",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        notificationDeliveryRetention(tx, ctx.principal.tenantId),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  router.add({
+    method: "PUT",
+    pattern: "/v1/admin/notifications/delivery-retention",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const input = parse(
+        z.object({ retainDeliveryDays: z.number().int().min(1).max(3650) }),
+        ctx.body,
+      );
+      // The pairing with `retainUnreadDays` — evidence must outlive the message — is the
+      // database's (0046) and surfaces as a 422 naming which number to raise. Deliberately
+      // not restated here: it is judged against the row as it WILL be, which only the CHECK
+      // can see, and a second opinion about one fact is how two of them come to disagree.
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        setNotificationDeliveryRetention(tx, ctx.principal.tenantId, {
+          retainDeliveryDays: input.retainDeliveryDays,
+        }),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Where one signal was pushed, and whether it landed.
+   *
+   * Takes the NOTIFICATION id and still answers after that notification has been pruned,
+   * which is the whole of 0046: the delivery row copies the four facts that make a push
+   * legible on its own, so `notification_present: false` lets a client say "the inbox copy
+   * is gone" rather than render a dead link.
+   *
+   * No 404 for an unknown id. An empty list is the honest answer, and distinguishing "never
+   * existed" from "pruned" would hand an administrator guessing ids a map of the inbox —
+   * the same existence-oracle rule the expense routes answer to.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notifications/:id/deliveries",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const id = parse(UUID, ctx.params["id"]);
+      const data = await inTenant(deps, ctx.principal, (tx) => deliveryHistory(tx, id));
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /** What this tenant has pushed lately, newest first by WRITE order (0046's `seq`). */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notification-deliveries",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const limit = parse(z.coerce.number().int().min(1).max(500), ctx.query.get("limit") ?? "50");
+      const data = await inTenant(deps, ctx.principal, (tx) => recentDeliveries(tx, { limit }));
+      return { status: 200, body: { data } };
     },
   });
 

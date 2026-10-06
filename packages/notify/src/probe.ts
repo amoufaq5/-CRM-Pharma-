@@ -93,6 +93,46 @@ export const DEFAULT_PROBE_COOLDOWN_SECONDS = 120;
 export const MAX_PROBE_COOLDOWN_SECONDS = 86_400;
 
 /**
+ * The tenant's TOTAL probe budget: a count per rolling window, across every endpoint.
+ *
+ * The cooldown above bounds the rate per DESTINATION, which is the right scope — each
+ * endpoint is a different third party and a quiet one must not be rationed by a noisy one.
+ * But endpoints per tenant are uncapped, so the sum of those per-endpoint rates was
+ * unbounded: at the default cooldown one endpoint emits 30 probes an hour and N endpoints
+ * emit 30N, with nothing capping N. 0045 bounds the sum, in the schema and beside the
+ * cooldown's own length, for the reason every other rule here lives there — a rule a route
+ * applies is a rule the next caller skips.
+ *
+ * 120 an hour by default. It has to clear the worst LEGITIMATE burst by a margin, because a
+ * limit that trips on correct use is one operators learn to raise by reflex: the worst
+ * legitimate burst on this route is a person commissioning a deployment, and every round
+ * trip in that loop costs them a minute of reading a verdict and editing configuration, so
+ * even twenty endpoints over four rounds is eighty probes spread across most of an hour.
+ * 120 is a probe every thirty seconds sustained for a full hour, which no hand produces.
+ * And it bites on the misconfigured case in the dimension that was uncapped — a client
+ * looping this route is held to 30 an hour per endpoint by the cooldown, so the budget
+ * starts refusing at five endpoints and refuses harder with every one after that.
+ *
+ * The floor of the COUNT is 1 and not 0, which is a deliberate divergence from the cooldown.
+ * 0034 lets a tenant disable the cooldown and argues it well: a cooldown protects a third
+ * party, and an endpoint that is a sink on its own loopback has no third party to protect.
+ * A tenant that has done that has given up its only per-destination bound, so this is the
+ * only one left — and a 0 here is the guard-disabled-by-a-value 0026 refuses to ship. A
+ * tenant wanting no practical bound raises the number, which reads as a configured ceiling
+ * and not as an absence.
+ */
+export const DEFAULT_PROBE_BUDGET_MAX_PROBES = 120;
+export const MIN_PROBE_BUDGET_MAX_PROBES = 1;
+/** One a second sustained, past which the number has stopped describing anybody's inbox. */
+export const MAX_PROBE_BUDGET_MAX_PROBES = 3_600;
+
+export const DEFAULT_PROBE_BUDGET_WINDOW_SECONDS = 3_600;
+/** A window shorter than a minute cannot tell a burst from a person, and this must never trip on a person. */
+export const MIN_PROBE_BUDGET_WINDOW_SECONDS = 60;
+/** The cooldown's own ceiling, for the cooldown's own reason: beyond a day a refusal outlives the working day it blocks. */
+export const MAX_PROBE_BUDGET_WINDOW_SECONDS = 86_400;
+
+/**
  * Claims before a probe is abandoned as `unknown`.
  *
  * Not a retry ceiling: a probe is never re-sent after an answer, however bad the answer
@@ -148,6 +188,30 @@ export class InvalidProbeCooldownError extends Error {
   }
 }
 
+/**
+ * The tenant has spent its probe budget for the window.
+ *
+ * Its own class rather than `ProbeCooldownError`, although both map to 429 and both are rate
+ * limiting. The two sentences tell an administrator to do different things — "wait two
+ * minutes and retry THIS endpoint" against "your tenant has probed 120 times this hour, and
+ * the next slot frees at 10:14" — and 0030's rule applies: a refusal that names the wrong
+ * noun sends the reader looking for a problem they do not have. A caller that wants to treat
+ * them alike can; one that wants to show the window cannot recover it from the other class.
+ */
+export class ProbeBudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProbeBudgetExceededError";
+  }
+}
+
+export class InvalidProbeBudgetError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidProbeBudgetError";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The store.
 // ---------------------------------------------------------------------------
@@ -191,9 +255,11 @@ export interface RequestProbeInput {
 /**
  * Queues a probe. Every refusal below is the database's, translated.
  *
- * The rules are enforced by 0034 rather than here precisely so that this function is not
- * the only thing that honours them — a rule a route applies is a rule the next caller
- * skips, and this store is not the only caller a scheduler could grow.
+ * The rules are enforced by 0034 and 0045 rather than here precisely so that this function
+ * is not the only thing that honours them — a rule a route applies is a rule the next caller
+ * skips, and this store is not the only caller a scheduler could grow. Four rules now: the
+ * tenant pairing, one outstanding probe per endpoint, the per-endpoint cooldown, and the
+ * tenant's total budget across every endpoint.
  */
 export async function requestProbe(
   tx: PoolClient,
@@ -390,7 +456,113 @@ export async function setProbeCooldownSeconds(
 }
 
 /**
- * 0034's refusals, as the sentences a 404 or a 409 can carry.
+ * The tenant's total budget, how much of it is spent, and when the next slot frees.
+ *
+ * `nextSlotAt` is null while the tenant is under its ceiling, because a slot is free now and
+ * naming a future moment would read as a refusal that has not happened.
+ *
+ * Readable BEFORE a refusal, which is the point: a limit you can only discover by tripping
+ * it is what `GET /v1/admin/notifications/prune-candidates` exists to avoid. The number
+ * comes out of `crm.notification_probe_budget`, the same function 0045's guard asks, so a
+ * screen and a refusal cannot disagree about how much is left.
+ *
+ * Unlike `probeCooldownSeconds` this does NOT create the policy row on the way past. A read
+ * that writes is a read that fails on a replica and surprises whoever audits the table, and
+ * it is only tolerable there because that function is also the cooldown setter's upsert.
+ * `crm.notification_probe_budget_config` answers for an unconfigured tenant without a row
+ * existing, so there is nothing to create.
+ */
+export interface ProbeBudgetState {
+  readonly used: number;
+  readonly maxProbes: number;
+  readonly windowSeconds: number;
+  readonly nextSlotAt: string | null;
+}
+
+export async function probeBudget(tx: PoolClient, tenantId: string): Promise<ProbeBudgetState> {
+  const { rows } = await tx.query<{
+    used: string;
+    max_probes: number;
+    window_seconds: number;
+    next_slot_at: string | null;
+  }>(
+    `SELECT b.used::text AS used, b.max_probes, b.window_seconds,
+            CASE WHEN b.next_slot_at IS NULL THEN NULL
+                 ELSE to_char(b.next_slot_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') END
+              AS next_slot_at
+       FROM crm.notification_probe_budget($1) b`,
+    [tenantId],
+  );
+  // Non-null: the function LEFT JOINs its configuration off a one-row source, so it answers
+  // for a tenant that has never had a policy row rather than returning nothing.
+  const row = rows[0]!;
+  return {
+    used: Number(row.used),
+    maxProbes: row.max_probes,
+    windowSeconds: row.window_seconds,
+    nextSlotAt: row.next_slot_at,
+  };
+}
+
+/**
+ * Sets both halves of the budget in one call.
+ *
+ * Both are required rather than individually optional, which matches
+ * `setProbeCooldownSeconds` taking its one value: a partial setter would have to decide what
+ * an omitted window means for a count that was just raised, and "keep whatever is there" is
+ * the answer that lets an administrator raise a ceiling without ever seeing the span it
+ * applies over. Read with `probeBudget` first; the admin surface shows both numbers anyway
+ * because neither is readable without the other.
+ *
+ * The range is re-checked here as well as in the CHECK constraints, unlike
+ * `setNotificationPruneGuard` — which deliberately does not, and 0039 records what that
+ * cost when the constraint went missing. A refusal that names the bound is also the only way
+ * a caller learns which of the two numbers was wrong.
+ */
+export async function setProbeBudget(
+  tx: PoolClient,
+  tenantId: string,
+  maxProbes: number,
+  windowSeconds: number,
+): Promise<ProbeBudgetState> {
+  if (
+    !Number.isInteger(maxProbes) ||
+    maxProbes < MIN_PROBE_BUDGET_MAX_PROBES ||
+    maxProbes > MAX_PROBE_BUDGET_MAX_PROBES
+  ) {
+    throw new InvalidProbeBudgetError(
+      `the probe budget must be a whole number of probes between ${String(MIN_PROBE_BUDGET_MAX_PROBES)} and ` +
+        `${String(MAX_PROBE_BUDGET_MAX_PROBES)}, not ${JSON.stringify(maxProbes)}. There is no 0: unlike the ` +
+        `cooldown this is the tenant's only total bound, and a guard disabled by a value does not look like a ` +
+        `disabled guard.`,
+    );
+  }
+  if (
+    !Number.isInteger(windowSeconds) ||
+    windowSeconds < MIN_PROBE_BUDGET_WINDOW_SECONDS ||
+    windowSeconds > MAX_PROBE_BUDGET_WINDOW_SECONDS
+  ) {
+    throw new InvalidProbeBudgetError(
+      `the probe budget window must be a whole number of seconds between ` +
+        `${String(MIN_PROBE_BUDGET_WINDOW_SECONDS)} and ${String(MAX_PROBE_BUDGET_WINDOW_SECONDS)}, not ` +
+        `${JSON.stringify(windowSeconds)}. Shorter than a minute cannot tell a burst from a person; longer than ` +
+        `a day is a refusal that outlives the working day it blocks.`,
+    );
+  }
+  // Creates the policy row at its defaults if the tenant has never had one, exactly as the
+  // cooldown setter does — the absence of a policy must not make a write a no-op.
+  await probeCooldownSeconds(tx, tenantId);
+  await tx.query(
+    `UPDATE crm.notification_policy
+        SET probe_budget_max_probes = $2, probe_budget_window_seconds = $3, updated_at = now()
+      WHERE tenant_id = $1`,
+    [tenantId, maxProbes, windowSeconds],
+  );
+  return await probeBudget(tx, tenantId);
+}
+
+/**
+ * 0034's refusals and 0045's, as the sentences a 404, a 409 or a 429 can carry.
  *
  * Matched on a stable prefix in the message rather than a constraint name, because these
  * come from `RAISE EXCEPTION ... USING ERRCODE = 'check_violation'` in a trigger, which
@@ -444,6 +616,18 @@ function translateProbeError(err: unknown, endpointId: string): Error {
       // it is the actionable half — an administrator needs to know when they may retry.
       `${message.replace(/^.*probe-cooldown: /, "")}. A probe sends real traffic to the destination, so it is ` +
         `rate-limited per tenant (crm.notification_policy.probe_cooldown_seconds).`,
+    );
+  }
+  // 0045's total, which the cooldown's per-endpoint scope deliberately cannot see. Carried
+  // the same way and for the same reason: the database's sentence already names the count,
+  // the window and the moment a retry becomes legal, and that moment is the only actionable
+  // half of a rate-limit refusal. Translated to its own class rather than
+  // `ProbeCooldownError` because the two refusals ask for different actions.
+  if (message.includes("probe-budget")) {
+    return new ProbeBudgetExceededError(
+      `${message.replace(/^.*probe-budget: /, "")}. The cooldown bounds the rate per endpoint; this bounds the ` +
+        `tenant's total across all of them (crm.notification_policy.probe_budget_max_probes over ` +
+        `probe_budget_window_seconds).`,
     );
   }
   return err instanceof Error ? err : new Error(message);

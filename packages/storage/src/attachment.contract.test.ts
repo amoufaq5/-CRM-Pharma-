@@ -1421,32 +1421,62 @@ describe("attachments", () => {
     };
 
     /**
-     * Moves a claim, setting exactly the columns 0006's and 0030's CHECKs pair with each
-     * state — the snapshotted account code for anything past draft, `approved_at` for the
-     * three states that imply a decision, `rejected_at` for the one that implies the other.
-     * BOSS is the approver and rejecter because `expense_claim_four_eyes` and
-     * `expense_claim_reject_four_eyes` forbid the claimant being either.
+     * Walks a claim to `state`, one legal hop at a time.
+     *
+     * It used to write the target state in a single UPDATE, setting whichever of 0006's and
+     * 0030's paired columns that state needs. Migration 0044 refuses that: a claim is born
+     * `draft` and changes state only along an edge of `crm.expense_claim_transitions()`, so
+     * `draft -> posted` is no longer expressible — which is the whole point of 0044 and is
+     * what this file's `refuses a raw INSERT on a posted claim` case was reaching for from
+     * the other direction.
+     *
+     * The walk sets each column on exactly the hop that records it, and never twice: 0044
+     * seals the lifecycle columns write-once, so a helper that re-stamped `submitted_at` on
+     * every hop would be refused by the seal. BOSS is the approver and rejecter because
+     * `expense_claim_four_eyes` and `expense_claim_reject_four_eyes` forbid the claimant
+     * being either, and 0044 now requires the actor on the transition rather than leaving it
+     * to a CHECK that a null satisfies.
+     *
+     * A fixed timestamp rather than `now()`, for the same write-once reason and because
+     * `now()` in a transaction is one instant anyway.
      */
+    const CLAIM_AT = "2026-09-01T09:00:00.000Z";
+
+    /** The hop that reaches each state, as the `SET` list it needs beyond `state`. */
+    const HOP: Readonly<Record<Exclude<ClaimState, "draft">, readonly string[]>> = {
+      submitted: [`submitted_at = '${CLAIM_AT}'`, "erp_ledger_account_code = '6000'"],
+      approved: [`approved_at = '${CLAIM_AT}'`, `approved_by = '${BOSS}'`],
+      rejected: [`rejected_at = '${CLAIM_AT}'`, `rejected_by = '${BOSS}'`],
+      posted: [`posted_at = '${CLAIM_AT}'`, "erp_expense_id = 'rec_attachment_fixture'"],
+      reimbursed: [],
+    };
+
+    /** The one path into each state, from `draft`. `rejected` hangs off `submitted`. */
+    const PATH: Readonly<Record<ClaimState, readonly Exclude<ClaimState, "draft">[]>> = {
+      draft: [],
+      submitted: ["submitted"],
+      rejected: ["submitted", "rejected"],
+      approved: ["submitted", "approved"],
+      posted: ["submitted", "approved", "posted"],
+      reimbursed: ["submitted", "approved", "posted", "reimbursed"],
+    };
+
     const setClaimState = async (tx: PoolClient, claim: string, state: ClaimState): Promise<void> => {
-      await tx.query(
-        `UPDATE crm.expense_claim
-            SET state = $3::text,
-                erp_ledger_account_code = CASE WHEN $3::text = 'draft' THEN NULL ELSE '6000' END,
-                submitted_at = CASE WHEN $3::text = 'draft' THEN NULL ELSE now() END,
-                approved_at  = CASE WHEN $3::text IN ('approved','posted','reimbursed') THEN now() END,
-                approved_by  = CASE WHEN $3::text IN ('approved','posted','reimbursed') THEN $4::uuid END,
-                rejected_at  = CASE WHEN $3::text = 'rejected' THEN now() END,
-                rejected_by  = CASE WHEN $3::text = 'rejected' THEN $4::uuid END
-          WHERE tenant_id = $1 AND id = $2`,
-        [TENANT, claim, state, BOSS],
-      );
+      for (const hop of PATH[state]) {
+        const sets = ["state = $3", ...HOP[hop]];
+        await tx.query(
+          `UPDATE crm.expense_claim SET ${sets.join(", ")} WHERE tenant_id = $1 AND id = $2`,
+          [TENANT, claim, hop],
+        );
+      }
       const { rows } = await tx.query<{ state: string }>(
         "SELECT state FROM crm.expense_claim WHERE tenant_id = $1 AND id = $2",
         [TENANT, claim],
       );
-      // The fixture asserts itself: a CHECK this helper failed to satisfy would otherwise
-      // leave the claim in `draft` and every refusal below would pass for the wrong reason.
-      expect(rows[0]?.state, `claim could not be moved to ${state}`).toBe(state);
+      // The fixture asserts itself: a CHECK or 0044's trigger that this helper failed to
+      // satisfy would otherwise leave the claim short of its target and every refusal below
+      // would pass for the wrong reason.
+      expect(rows[0]?.state, `claim could not be walked to ${state}`).toBe(state);
     };
 
     const receiptOn = (

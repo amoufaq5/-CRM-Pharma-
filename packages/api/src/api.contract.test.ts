@@ -1965,6 +1965,104 @@ describe("the API, end to end", () => {
     });
   });
 
+  /**
+   * 0046's delivery history, over HTTP.
+   *
+   * The reads existed in `@crm/notify` and were reachable from nothing, which is the defect
+   * this repo has shipped five times. These are the routes, and the case that matters is
+   * the last one: a delivery record that has outlived the notification it describes is the
+   * whole point of the migration, and before it the cascade took the record with the
+   * message.
+   */
+  describe("where a signal was pushed", () => {
+    const admin1 = (): string => token({ sub: "idp|rep2", tenant: TENANT });
+
+    const makeAdministrator = async (): Promise<void> => {
+      await withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+           VALUES ($1,$2,'administrator',$3,CURRENT_DATE)`,
+          [TENANT, otherRep, manager],
+        ),
+      );
+    };
+
+    it("reads and sets the delivery horizon, administrator only", async () => {
+      expect((await call("GET", "/v1/admin/notifications/delivery-retention")).status).toBe(403);
+      await makeAdministrator();
+      const read = await call("GET", "/v1/admin/notifications/delivery-retention", { auth: admin1() });
+      expect(read.status).toBe(200);
+      expect(read.body.retain_delivery_days).toBeGreaterThan(0);
+
+      const set = await call("PUT", "/v1/admin/notifications/delivery-retention", {
+        auth: admin1(),
+        body: { retainDeliveryDays: 900 },
+      });
+      expect(set.status).toBe(200);
+      expect(set.body.retain_delivery_days).toBe(900);
+
+      // The pairing is the database's: evidence must outlive the message, so a horizon
+      // under the unread one is refused with a 422 naming which number to raise.
+      const tooShort = await call("PUT", "/v1/admin/notifications/delivery-retention", {
+        auth: admin1(),
+        body: { retainDeliveryDays: 1 },
+      });
+      expect(tooShort.status).toBe(422);
+    });
+
+    it("serves a delivery record that has outlived its notification", async () => {
+      await makeAdministrator();
+      let notificationId = "";
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const ep = await tx.query<{ id: string }>(
+          `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env, min_severity)
+           VALUES ($1,'webhook','https://hooks.example.test/d46','CRM_OPS_WEBHOOK_SECRET','info')
+           RETURNING id`,
+          [TENANT],
+        );
+        const n = await tx.query<{ id: string }>(
+          `INSERT INTO crm.notification
+             (tenant_id, recipient_rep_profile_id, kind, severity, subject, body, dedup_key)
+           VALUES ($1,$2,'erp_write_failed','urgent','s','b',$3) RETURNING id`,
+          [TENANT, rep, `d46:${randomUUID()}`],
+        );
+        notificationId = n.rows[0]!.id;
+        await tx.query(
+          `INSERT INTO crm.notification_delivery (tenant_id, notification_id, endpoint_id, state)
+           VALUES ($1,$2,$3,'delivered')`,
+          [TENANT, notificationId, ep.rows[0]!.id],
+        );
+        // The notification goes; the record of the push does not. Under the old cascade
+        // this DELETE took the delivery row with it.
+        await tx.query("DELETE FROM crm.notification WHERE id = $1", [notificationId]);
+      });
+
+      const byId = await call("GET", `/v1/admin/notifications/${notificationId}/deliveries`, {
+        auth: admin1(),
+      });
+      expect(byId.status).toBe(200);
+      expect(byId.body.data).toHaveLength(1);
+      expect(byId.body.data[0]).toMatchObject({
+        notification_present: false,
+        notification_kind: "erp_write_failed",
+        notification_severity: "urgent",
+        state: "delivered",
+      });
+
+      const listed = await call("GET", "/v1/admin/notification-deliveries?limit=5", { auth: admin1() });
+      expect(listed.status).toBe(200);
+      expect((listed.body.data as { notification_id: string }[]).map((d) => d.notification_id)).toContain(
+        notificationId,
+      );
+      // An unknown id is an empty list, not a 404: the difference between "never existed"
+      // and "pruned" is a map of the inbox.
+      expect(
+        (await call("GET", `/v1/admin/notifications/${randomUUID()}/deliveries`, { auth: admin1() })).body
+          .data,
+      ).toEqual([]);
+    });
+  });
+
   describe("protocol conventions", () => {
     it("uses ONE error shape everywhere", async () => {
       // The ERP emits two on the same API (report R13). Every refusal here is
@@ -2592,7 +2690,27 @@ describe("the API, end to end", () => {
           // author reaching for `requireSupervision` here fails this rather than passing
           // because the fixture's rep id happened not to appear.
           expect(res.body.detail).not.toMatch(/no rep /);
+          // AND the sentence must not distinguish "exists but is not yours" from "does not
+          // exist". The first fix removed the rep id and left ` on your team` behind, which
+          // is an existence oracle for any claim id in the tenant — the very thing this 404
+          // conceals. Byte-identical to `ExpenseClaimNotFoundError`'s sentence.
+          expect(res.body.detail).toBe(`no expense claim ${id}`);
         }
+      });
+
+      /**
+       * And the control the first version of that test lacked: the two 404s must be the
+       * SAME sentence. Asserting only that the owner's id is absent cannot see a suffix
+       * that distinguishes "exists but is not yours" from "no such claim".
+       */
+      it("answers a claim that does not exist exactly as it answers one that is not yours", async () => {
+        const mine = await aClaim();
+        const peer = token({ sub: "idp|rep2", tenant: TENANT });
+        const absent = randomUUID();
+        const notYours = await call("GET", `/v1/expenses/${mine}/erp`, { auth: peer });
+        const nonexistent = await call("GET", `/v1/expenses/${absent}/erp`, { auth: peer });
+        expect(notYours.status).toBe(nonexistent.status);
+        expect(notYours.body.detail.replace(mine, "ID")).toBe(nonexistent.body.detail.replace(absent, "ID"));
       });
 
       it("lets a rep attach their OWN receipt — four eyes must not apply here", async () => {

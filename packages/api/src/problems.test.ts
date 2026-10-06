@@ -135,10 +135,11 @@ describe("toProblem covers every domain error", () => {
       "fail to start rather than answer a request",
     JwkError:
       "a key registry row whose kid is not the thumbprint of its own key — a hand-edited " +
-      "row, which only we can fix. Note that the jwks route renders its document OUTSIDE " +
-      "its own try/catch, so this one does escape; a 500 is still a non-200, so every " +
-      "verifier keeps its last good key set and rule 10 holds, but the designed 503 belongs " +
-      "in that route rather than in a mapping here",
+      "row, which only we can fix. The jwks route now renders its document INSIDE its own " +
+      "try/catch, so this no longer escapes as a 500: it falls to the designed 503, which " +
+      "is where that answer belongs rather than in a mapping here. (An earlier version of " +
+      "this entry described the escape as current; it was fixed in the same commit that " +
+      "wrote the sentence.)",
     KeyRegistryError:
       "the service-key lifecycle, driven by the `key` CLI and the credential's own refresh. " +
       "The jwks route already catches every registry read failure and answers 503",
@@ -197,26 +198,27 @@ describe("toProblem covers every domain error", () => {
 
   /**
    * Error classes declared, used and tested inside a package, and MISSING FROM ITS BARREL —
-   * found by the check above rather than reasoned about here.
+   * found by the check below rather than reasoned about here.
    *
    * These are defects, not exemptions. Each one is `export class`, each is thrown on a path
-   * a request can reach, and neither is reachable from `@crm/api`: the barrel is the only
-   * door, so `toProblem` can never be handed one and the refusal would arrive as "an
-   * unexpected error occurred". That is the "built and unreachable" shape this repo has
-   * shipped three times — the whole reason the gate above exists.
+   * a request can reach, and none is reachable from `@crm/api`: the barrel is the only door,
+   * so `toProblem` can never be handed one and the refusal would arrive as "an unexpected
+   * error occurred". That is the "built and unreachable" shape this repo has now shipped
+   * five times — the whole reason the gate below exists.
    *
-   * Recorded without asserting either way, deliberately. The moment a barrel exports one,
-   * the mapping test below demands a mapping for it, so this list cannot hide the defect
-   * past the day it is half-fixed. The remedy is a mapping in `problems.ts` plus the barrel
-   * export, and then deleting the entry — not leaving it here.
+   * EMPTY, AND IT HAS TO BE ASSERTED EMPTY. The first version of this list skipped its
+   * entries unconditionally, where `PACKAGE_PRIVATE` below ASSERTS the class stays
+   * unexported — so a stale entry there fails loudly and a stale entry here was silent. It
+   * went stale within one commit: the two classes it named were exported and mapped by the
+   * same change that wrote it, and the prose still said "neither is reachable" about one
+   * remaining item. A stale entry is worse than no list: the export test would skip the
+   * class and the mapping test, which iterates barrel exports, would never see it — total
+   * silence, reopening exactly the hole this file exists to close. So the skip is now an
+   * assertion that the barrel really does NOT export it, and the list is empty, which is
+   * the only state it should ever be committed in. The remedy for a new one is a mapping in
+   * `problems.ts` plus the barrel export, in the same change.
    */
-  const UNEXPORTED_AND_UNMAPPED: Readonly<Record<string, string>> = {
-    "@crm/expense.ErpWriteDeadLetteredError":
-      "thrown by `enqueueClaimWrite` when the outbox row a write collapses onto is DEAD, so " +
-      "`postClaim`/`reimburseClaim` — `POST /v1/expenses/:id/post` and `/reimburse` — refuse " +
-      "rather than mark a claim posted against a write the ERP will never have. Needs a 409 " +
-      "and its sentence, which names the dead-letter retry route (rule 31)",
-  };
+  const UNEXPORTED_AND_UNMAPPED: Readonly<Record<string, string>> = {};
 
   /**
    * Arguments for classes whose constructors read their arguments rather than merely
@@ -387,7 +389,16 @@ describe("toProblem covers every domain error", () => {
       const exported = new Set(errorClassNames(mod));
       for (const name of declared) {
         const key = `${moduleName}.${name}`;
-        if (key in UNEXPORTED_AND_UNMAPPED) continue;
+        if (key in UNEXPORTED_AND_UNMAPPED) {
+          // Asserted, not skipped: an entry that has been fixed must fail here rather than
+          // keep exempting the class from both this test and the mapping test.
+          expect(
+            exported.has(name),
+            `${key} is recorded as unexported-and-unmapped and the barrel now exports it; ` +
+              `drop the entry and make sure problems.ts maps it`,
+          ).toBe(false);
+          continue;
+        }
         if (key in PACKAGE_PRIVATE) {
           expect(
             exported.has(name),

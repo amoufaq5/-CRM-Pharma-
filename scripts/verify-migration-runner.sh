@@ -199,5 +199,54 @@ MIGRATIONS_DIR="$MIGRATIONS_DIR" PGDATABASE="$PRE_DB" node packages/db/dist/bin/
   || { cat /tmp/crm-pre-3.log >&2; fail "the same database refused even after the leak was removed"; }
 echo "ok: and the same database migrates once the leak is gone"
 
+echo "--- 6. a retired migration is RECORDED and not RUN ---"
+# `-- @supersedes:` marks a file as applied WITHOUT executing it — the escape hatch for a
+# migration that cannot succeed, and the one addition here that most needs a gate, because
+# it is the only path on which the database never runs a file the repository contains.
+# It had none: neutering the branch left every test green, and so did deleting the
+# declaration, because 0032 happens to SUCCEED on an empty database and the psql path skips
+# it anyway. So this asserts the branch's four observable effects from the FIRST run's log
+# and the ledger it wrote.
+retired_decl="$(for f in "$MIGRATIONS_DIR"/*.sql; do
+                  case "$(basename "$f")" in 0001_*|0002_*) continue ;; esac
+                  grep -hxoE -- '--[[:space:]]*@supersedes:[[:space:]]*[^[:space:]]+' "$f" || true
+                done | sed 's/.*@supersedes:[[:space:]]*//')"
+[ -n "$retired_decl" ] || fail "no migration declares @supersedes; this check has no subject"
+for name in $retired_decl; do
+  grep -q "recorded WITHOUT running: $name" /tmp/crm-run-1.log \
+    || fail "$name was retired and the run did not say so"
+  grep -q "\"superseded\":1" /tmp/crm-run-1.log \
+    || fail "the run did not report a superseded count"
+  # In the ledger, with the file's REAL hash — which is what keeps "an applied migration was
+  # edited" refusable on a retired file exactly as on every other one.
+  recorded="$(q "SELECT sha256 FROM crm._migrations WHERE filename = '$name'")"
+  [ -n "$recorded" ] || fail "$name is not in crm._migrations, so the next deploy will run it"
+  actual="$(sha256sum "$MIGRATIONS_DIR/$name" | cut -d' ' -f1)"
+  [ "$recorded" = "$actual" ] || fail "$name recorded hash $recorded, file hashes $actual"
+  # And NOT run: the `applied` lines are what executed, and it must not be among them.
+  grep -q "\"type\":\"applied\",\"filename\":\"$name\"" /tmp/crm-run-1.log \
+    && fail "$name was reported as applied, so the branch did not take"
+  echo "ok: $name recorded (hash matches) and never executed"
+done
+
+# The complement: a declaration the Node side REFUSES must fail the deploy rather than
+# quietly retiring something. The bash path in setup-test-db.sh validates the same two
+# rules, and these two implementations disagreeing is how a test database comes to differ
+# from a deployed one.
+bad="$MIGRATIONS_DIR/0011_zz_bad_supersede.sql"
+printf -- '-- @supersedes: %s\nSELECT 1;\n' "$(basename "$(ls "$MIGRATIONS_DIR"/*.sql | tail -1)")" > "$bad"
+set +e
+node packages/db/dist/bin/migrate.js --dry-run >/tmp/crm-sup-1.log 2>&1
+bad_dry=$?
+node packages/db/dist/bin/migrate.js >/tmp/crm-sup-2.log 2>&1
+bad_run=$?
+set -e
+rm -f "$bad"
+[ "$bad_dry" != "0" ] || { cat /tmp/crm-sup-1.log >&2; fail "--dry-run ACCEPTED a declaration naming a later file"; }
+[ "$bad_run" != "0" ] || { cat /tmp/crm-sup-2.log >&2; fail "a real run ACCEPTED a declaration naming a later file"; }
+grep -q "does not come before it" /tmp/crm-sup-2.log \
+  || { cat /tmp/crm-sup-2.log >&2; fail "the refusal does not say why"; }
+echo "ok: a declaration naming a later file is refused by both apply and --dry-run"
+
 echo
 echo "migration runner verified against $PGDATABASE"

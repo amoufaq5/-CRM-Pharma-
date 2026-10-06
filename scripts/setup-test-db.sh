@@ -26,8 +26,22 @@ psql -v ON_ERROR_STOP=1 -q -f "$ROOT/db/migrations/0002_crm_schema.sql"
 # database this script builds matches one the runner builds. Without this the two diverge:
 # 0032 happens to SUCCEED on an empty database (its clamp finds no rows to fail on), so this
 # script would run a file the runner records without running.
-retired="$(grep -ho '^--[[:space:]]*@supersedes:[[:space:]]*[^[:space:]]*' "$ROOT"/db/migrations/*.sql |
-            sed 's/.*@supersedes:[[:space:]]*//' || true)"
+# MUST MATCH `supersededFiles` IN packages/db/src/migrate.ts, and three ways it did not.
+# The Node side is /^--\s*@supersedes:\s*(\S+)\s*$/gm over the APPLICATION files only, and
+# it refuses a name that resolves to nothing or does not sort before the declaring file.
+# This grep had no end-of-line anchor, so a prose line that merely QUOTES the syntax —
+# which these headers do to each other constantly — silently retired a live migration here
+# and not in production; it scanned the two DBA files the Node side excludes; and it
+# validated nothing, so a declaration the deploy REFUSES could still leave `pnpm test`
+# green against a database the deploy will not build. `grep -x` anchors both ends.
+retired="$(for f in "$ROOT"/db/migrations/*.sql; do
+             case "$(basename "$f")" in 0001_*|0002_*) continue ;; esac
+             grep -hxoE -- '--[[:space:]]*@supersedes:[[:space:]]*[^[:space:]]+' "$f" || true
+           done | sed 's/.*@supersedes:[[:space:]]*//')"
+for name in $retired; do
+  [ -f "$ROOT/db/migrations/$name" ] \
+    || { echo "@supersedes names $name, which is not a migration" >&2; exit 1; }
+done
 
 applied=0
 for f in "$ROOT"/db/migrations/*.sql; do

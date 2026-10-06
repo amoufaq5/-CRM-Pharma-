@@ -197,3 +197,16 @@ export const TENANT_ATTEMPT_HISTORY = "e4100000-0000-4000-8000-000000000018";
 
 /** packages/relay — the outbox store's settle guards. */
 export const TENANT_RELAY_STORE = "e5100000-0000-4000-8000-000000000019";
+
+/**
+ * packages/expense — lifecycle.contract (migration 0044).
+ *
+ * The id is derived from the migration number rather than continued from the sequence
+ * above: four agents were adding files at once, and "the next one" is not a safe guess for
+ * any of them.
+ */
+export const TENANT_EXPENSE_LIFECYCLE = "e6440000-0000-4000-8000-00000000001a";
+
+/** packages/notify — delivery retention, and the tenant it must not reach (0046). */
+export const TENANT_DELIVERY_RETENTION = "e7100000-0000-4000-8000-00000000001a";
+export const TENANT_DELIVERY_RETENTION_OTHER = "e8100000-0000-4000-8000-00000000001b";

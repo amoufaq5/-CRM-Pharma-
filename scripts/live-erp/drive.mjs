@@ -1126,6 +1126,35 @@ expect(
   "with neither a sentence nor a readable record the row is retried, never dead-lettered on a failure to check",
   `reads=${blind.seen.recordReads.length} state=${blindOut.row.state} dead=${JSON.stringify(blindOut.row.dead_reason)}`,
 );
+// PARK THE (iv) ROW BEFORE ANYTHING ELSE DRAINS.
+//
+// It is deliberately left `pending` — that is what (iv) just asserted — and the
+// first retry's full-jitter backoff is `random(0, 1000)ms`, so it is due again
+// within a second. Every later `drainTenant` in this file claims every due row of
+// the tenant, not just the one it queued, so the row would be retried through the
+// NEXT case's instrumented client and show up in ITS counters. That is not
+// hypothetical: §6(v) failed with `recordReads=["/v1/leave-requests/crm-lr-…-i"]`
+// — the (iv) row's probe, attributed to the transition, reading as the transition
+// having probed when it had not. A gate that flakes like that is worse than no
+// gate, because the first assumption is that the code changed.
+//
+// Pushed out rather than settled, so the row the assertion above is about keeps
+// the exact state it was asserted in.
+await (async () => {
+  const conn = await pool.connect();
+  try {
+    await withTenantContext(conn, TENANT, (tx) =>
+      tx.query(
+        `UPDATE crm.outbox SET next_attempt_at = now() + interval '1 hour'
+          WHERE tenant_id = $1 AND target_record_id = $2 AND state = 'pending'`,
+        [TENANT, blindId],
+      ),
+    );
+  } finally {
+    conn.release();
+  }
+})();
+
 // (i) against (iv) is the proof that the READ is the mechanism, and it needs no
 // string anywhere: the record is already at the ERP in both, the collision is real
 // in both, the stripped 500 is byte-identical in both. The only difference is
@@ -1168,10 +1197,16 @@ const txEnqueued = await enqueue({
 });
 await relayOver(txErp.client, txSink).drainTenant(TENANT);
 const txRow = await outboxState(txEnqueued.id);
+// Scoped to THIS row's target, not to "no read at all". The claim is about the
+// transition's own probe, and a drain that happened to pick up another tenant row
+// would otherwise falsify a rule it says nothing about — which is exactly how this
+// line failed once already.
+const txReads = txErp.seen.recordReads.filter((p) => p.includes(txId));
 expect(
-  txErp.seen.writeBodies.includes(STRIPPED_WRITE_BODY) && txErp.seen.recordReads.length === 0,
+  txErp.seen.writeBodies.includes(STRIPPED_WRITE_BODY) && txReads.length === 0,
   "an ambiguous 500 on a TRANSITION reads nothing back — existence is not the question there",
-  `writes=${txErp.seen.writeBodies.length} recordReads=${JSON.stringify(txErp.seen.recordReads)}`,
+  `writes=${txErp.seen.writeBodies.length} readsOfThisTarget=${JSON.stringify(txReads)}` +
+    ` allReads=${JSON.stringify(txErp.seen.recordReads)}`,
 );
 expect(
   txRow.state === "pending" && txRow.dead_reason === null,

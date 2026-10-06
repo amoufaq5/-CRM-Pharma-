@@ -8,6 +8,10 @@
 //
 // Usage: node jwks-server.mjs <port> <jwk.json>   (jwk.json: {kid, x})
 //        node jwks-server.mjs <port> --empty      (the no-key-published case)
+//
+// Port 0 binds an ephemeral port and the listening line names the one the kernel
+// chose, so a second key set — the stand-in IdP that authenticates humans into the
+// CRM's API — needs no third reserved port of its own.
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 
@@ -40,7 +44,12 @@ const server = createServer((req, res) => {
 });
 
 server.listen(port, "127.0.0.1", () => {
-  process.stdout.write(`jwks listening on ${port} (${keys.length} key(s))\n`);
+  // The BOUND port, not the requested one: with 0 they differ, and the requested
+  // one would send every later fetch to a socket nobody is holding.
+  const bound = server.address();
+  process.stdout.write(
+    `jwks listening on ${typeof bound === "object" && bound !== null ? bound.port : port} (${keys.length} key(s))\n`,
+  );
 });
 
 for (const sig of ["SIGTERM", "SIGINT"]) {

@@ -50,19 +50,62 @@ describe("expense claim constraints", () => {
     });
   }
 
-  const INSERT = `
-    INSERT INTO crm.expense_claim
-      (tenant_id, rep_profile_id, crm_category, amount, currency, incurred_on,
-       erp_ledger_account_code, erp_cost_center_code, state, approved_at, approved_by)
-    VALUES ($1,$2,'conference',100.00,'USD','2026-09-01',$3,$4,$5,$6,$7)`;
+  /**
+   * These are tests of 0006's and 0030's RESTING-state CHECKs, and they used to build their
+   * rows by inserting the state they wanted to be in. Migration 0044 refuses that — a claim
+   * is born `draft` and reaches every other state along an edge its trigger can see — so the
+   * fixtures now WALK to the state under test and put the violation on the last hop.
+   *
+   * That is strictly better evidence than it was. A CHECK asserted against a hand-inserted
+   * row proves it holds for a row that arrived from nowhere; the same CHECK asserted against
+   * a transition proves it holds on the path a claim actually takes. And it is the division
+   * 0044 is built on: the trigger governs the act, these CHECKs govern the row.
+   *
+   * The columns here are exactly the ones each state needs and no more — `submitted_at` and
+   * the snapshot to leave `draft`, the approval pair to reach `approved` — because 0044 seals
+   * them write-once and a helper that re-stamped one on every hop would be refused by the
+   * seal rather than by the constraint the test names.
+   */
+  const AT = "2026-09-01T09:00:00.000Z";
+
+  const draftClaim = (rep: string): Promise<string> =>
+    withTenantContext(client, TENANT_A, async (tx) => {
+      const { rows } = await tx.query<{ id: string }>(
+        `INSERT INTO crm.expense_claim
+           (tenant_id, rep_profile_id, crm_category, amount, currency, incurred_on)
+         VALUES ($1,$2,'conference',100.00,'USD','2026-09-01') RETURNING id`,
+        [TENANT_A, rep],
+      );
+      return rows[0]!.id;
+    });
+
+  /** `draft -> submitted`, snapshotting whatever codes the case wants to test with. */
+  const submit = (id: string, account: string | null, costCentre: string | null): Promise<void> =>
+    withTenantContext(client, TENANT_A, async (tx) => {
+      await tx.query(
+        `UPDATE crm.expense_claim
+            SET state = 'submitted', submitted_at = $3,
+                erp_ledger_account_code = $4, erp_cost_center_code = $5
+          WHERE tenant_id = $1 AND id = $2`,
+        [TENANT_A, id, AT, account, costCentre],
+      );
+    });
+
+  /** `submitted -> approved`. `approvedAt` is a parameter because one case omits it. */
+  const approve = (id: string, approvedBy: string, approvedAt: string | null): Promise<void> =>
+    withTenantContext(client, TENANT_A, async (tx) => {
+      await tx.query(
+        `UPDATE crm.expense_claim SET state = 'approved', approved_at = $3, approved_by = $4
+          WHERE tenant_id = $1 AND id = $2`,
+        [TENANT_A, id, approvedAt, approvedBy],
+      );
+    });
 
   it("refuses a claim approved by the rep who submitted it (four-eyes)", async () => {
     const rep = await repId("exp-rep");
-    await expect(
-      withTenantContext(client, TENANT_A, async (tx) => {
-        await tx.query(INSERT, [TENANT_A, rep, "6200", null, "approved", new Date(), rep]);
-      }),
-    ).rejects.toThrow(/expense_claim_four_eyes/);
+    const id = await draftClaim(rep);
+    await submit(id, "6200", null);
+    await expect(approve(id, rep, AT)).rejects.toThrow(/expense_claim_four_eyes/);
   });
 
   it("refuses leaving draft without a snapshotted S&M account code", async () => {
@@ -70,21 +113,20 @@ describe("expense claim constraints", () => {
     // re-mapping a category later cannot retroactively re-attribute a posted
     // claim. A submitted claim with no account has nothing to post to.
     const rep = await repId("exp-rep");
-    await expect(
-      withTenantContext(client, TENANT_A, async (tx) => {
-        await tx.query(INSERT, [TENANT_A, rep, null, null, "submitted", null, null]);
-      }),
-    ).rejects.toThrow(/expense_claim_snapshot_before_submit/);
+    const id = await draftClaim(rep);
+    await expect(submit(id, null, null)).rejects.toThrow(/expense_claim_snapshot_before_submit/);
   });
 
   it("accepts a claim approved by someone else, with the cost centre hooked", async () => {
     const [rep, mgr] = [await repId("exp-rep"), await repId("exp-mgr")];
+    const id = await draftClaim(rep);
+    await submit(id, "6200", "CC-SM");
+    await approve(id, mgr, AT);
     const state = await withTenantContext(client, TENANT_A, async (tx) => {
-      await tx.query(INSERT, [TENANT_A, rep, "6200", "CC-SM", "approved", new Date(), mgr]);
       const { rows } = await tx.query<{ acct: string; cc: string | null }>(
         `SELECT erp_ledger_account_code AS acct, erp_cost_center_code AS cc
-           FROM crm.expense_claim WHERE tenant_id = $1 AND rep_profile_id = $2`,
-        [TENANT_A, rep],
+           FROM crm.expense_claim WHERE tenant_id = $1 AND id = $2`,
+        [TENANT_A, id],
       );
       return rows[0];
     });
@@ -98,14 +140,13 @@ describe("expense claim constraints", () => {
     // account with no dimension" is a valid posting and the right default until
     // Finance names the cost-centre codes.
     const [rep, mgr] = [await repId("exp-rep"), await repId("exp-mgr")];
-    await withTenantContext(client, TENANT_A, async (tx) => {
-      await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1", [TENANT_A]);
-      await tx.query(INSERT, [TENANT_A, rep, "6200", null, "approved", new Date(), mgr]);
-    });
+    const id = await draftClaim(rep);
+    await submit(id, "6200", null);
+    await approve(id, mgr, AT);
     const cc = await withTenantContext(client, TENANT_A, async (tx) => {
       const { rows } = await tx.query<{ cc: string | null }>(
-        "SELECT erp_cost_center_code AS cc FROM crm.expense_claim WHERE tenant_id = $1",
-        [TENANT_A],
+        "SELECT erp_cost_center_code AS cc FROM crm.expense_claim WHERE tenant_id = $1 AND id = $2",
+        [TENANT_A, id],
       );
       return rows[0]?.cc ?? null;
     });
@@ -114,11 +155,12 @@ describe("expense claim constraints", () => {
 
   it("refuses an approved claim with no approval timestamp", async () => {
     const [rep, mgr] = [await repId("exp-rep"), await repId("exp-mgr")];
-    await expect(
-      withTenantContext(client, TENANT_A, async (tx) => {
-        await tx.query(INSERT, [TENANT_A, rep, "6200", null, "approved", null, mgr]);
-      }),
-    ).rejects.toThrow(/expense_claim_approved_fields/);
+    const id = await draftClaim(rep);
+    await submit(id, "6200", null);
+    // The approver IS named, so 0044's "approving records an approver" rule is satisfied and
+    // the refusal is 0006's pairing of the timestamp to the state — which is the one this
+    // case is about. Omitting both would be answered by the trigger instead.
+    await expect(approve(id, mgr, null)).rejects.toThrow(/expense_claim_approved_fields/);
   });
 
   it("refuses a non-positive amount", async () => {

@@ -1,5 +1,7 @@
 import type { PoolClient } from "pg";
-import { enqueueOutbox } from "@crm/relay";
+import { enqueueOutbox,
+  type OutboxState,
+} from "@crm/relay";
 
 import type { SampleLot, SampleTransaction } from "./store.js";
 
@@ -90,13 +92,14 @@ function truncate(value: string, max: number): string {
 }
 
 /**
- * The four states `crm.outbox.state` admits, taken from `enqueueOutbox` itself.
+ * The four states `crm.outbox.state` admits.
  *
- * Derived rather than re-listed: `@crm/relay`'s barrel does not export its `OutboxState`,
- * and a second hand-written copy of the four values is a list that can fall behind the
- * CHECK constraint without anything failing.
+ * An alias for `@crm/relay`'s own `OutboxState` rather than a second hand-written copy of
+ * the four values, which is a list that can fall behind the CHECK constraint without
+ * anything failing. It used to be spelled `Awaited<ReturnType<typeof enqueueOutbox>>["state"]`
+ * because the relay's barrel did not export the type; it does now.
  */
-export type ErpMirrorOutboxState = Awaited<ReturnType<typeof enqueueOutbox>>["state"];
+export type ErpMirrorOutboxState = OutboxState;
 
 /**
  * What enqueuing a mirror did, in enough detail to answer the rep honestly.

@@ -117,6 +117,34 @@ describe("expense claims", () => {
 
   beforeEach(clear);
 
+  /**
+   * An operator repair, through migration 0044's escape hatch.
+   *
+   * Three cases below manufacture a claim state that the lifecycle cannot produce — two
+   * backwards moves and a `posted` claim with no ERP record id — and each already said in
+   * its own words that it was reproducing "the way an operator repairing it by hand would".
+   * 0044 put the lifecycle in the database, so a hand repair now has to be what the header
+   * of that migration names it: `ALTER TABLE … DISABLE TRIGGER expense_claim_check_lifecycle`
+   * around the statement, by the table's owner, inside one transaction.
+   *
+   * These cases are NOT evidence that the trigger is too strict, and loosening it to admit
+   * them would be the mistake. Each is reaching for a state the production path reaches by a
+   * DIFFERENT route — `postClaim` enqueues and transitions in one transaction, so a collapse
+   * onto a dead outbox row rolls the whole thing back and the claim never leaves `approved`
+   * in the first place — and the rewind is a shortcut to that state, not the state's cause.
+   * Writing them through the hatch keeps the shortcut and makes it visible, and exercises the
+   * hatch on the ordinary suite rather than only in 0044's own file.
+   *
+   * The specific trigger is named rather than `DISABLE TRIGGER USER`, so a second guard added
+   * to this table later is not silently stood down too.
+   */
+  const repairByHand = (sql: string, params: readonly unknown[]): Promise<void> =>
+    inTenant(async (tx) => {
+      await tx.query("ALTER TABLE crm.expense_claim DISABLE TRIGGER expense_claim_check_lifecycle");
+      await tx.query(sql, [...params]);
+      await tx.query("ALTER TABLE crm.expense_claim ENABLE TRIGGER expense_claim_check_lifecycle");
+    });
+
   const map = (tx: PoolClient, costCentre: string | null = "CC-SM"): Promise<unknown> =>
     upsertAccountMapping(tx, TENANT, {
       crmCategory: "congress",
@@ -745,12 +773,12 @@ describe("expense claims", () => {
       // Put the claim back the way an operator repairing it by hand would — the only
       // reachable way a second posting attempt happens at all, since `postClaim` enqueues
       // and transitions in one transaction and `posted -> approved` is not a transition.
-      await inTenant((tx) =>
-        tx.query(
-          `UPDATE crm.expense_claim SET state = 'approved', posted_at = NULL, erp_expense_id = NULL
-            WHERE tenant_id = $1 AND id = $2`,
-          [TENANT, id],
-        ),
+      // Since 0044 that is not a transition in the DATABASE either, so the repair goes
+      // through the escape hatch that migration names. See `repairByHand`.
+      await repairByHand(
+        `UPDATE crm.expense_claim SET state = 'approved', posted_at = NULL, erp_expense_id = NULL
+          WHERE tenant_id = $1 AND id = $2`,
+        [TENANT, id],
       );
 
       await inTenant(async (tx) => {
@@ -823,15 +851,22 @@ describe("expense claims", () => {
       });
     });
 
+    /**
+     * 0044 makes this row unreachable by transition — `-> posted` requires `erp_expense_id`,
+     * because nothing else on this table asks for it — so `MissingErpExpenseIdError` is now
+     * defence in depth against a repair rather than a guard on an ordinary path. It stays for
+     * the reason `summariseAttemptHistory().impossibleRevivals` stayed after 0038: the row
+     * cannot arrive by itself any more and it is still reachable by hand, which is precisely
+     * the row an operator should be told about rather than shown as fact. Built through the
+     * hatch, which is the only way it can now arrive.
+     */
     it("refuses a posted claim carrying no ERP id rather than re-minting one", async () => {
       const id = await approved();
-      await inTenant(async (tx) => {
-        await tx.query(
-          `UPDATE crm.expense_claim SET state = 'posted', posted_at = now()
-            WHERE tenant_id = $1 AND id = $2`,
-          [TENANT, id],
-        );
-      });
+      await repairByHand(
+        `UPDATE crm.expense_claim SET state = 'posted', posted_at = now()
+          WHERE tenant_id = $1 AND id = $2`,
+        [TENANT, id],
+      );
       await inTenant(async (tx) => {
         await expect(reimburseClaim(tx, TENANT, id)).rejects.toBeInstanceOf(
           MissingErpExpenseIdError,
@@ -857,12 +892,11 @@ describe("expense claims", () => {
         expect(transition).toBeDefined();
         expect(await markDead(tx, transition!.id, DISPATCH_CLOCK, "invalid_transition")).toBe(true);
       });
-      // An operator repair again: `reimbursed` is terminal, so nothing else re-attempts it.
-      await inTenant((tx) =>
-        tx.query("UPDATE crm.expense_claim SET state = 'posted' WHERE tenant_id = $1 AND id = $2", [
-          TENANT,
-          id,
-        ]),
+      // An operator repair again: `reimbursed` is terminal, so nothing else re-attempts it —
+      // and since 0044 the database says so too, which is what makes the hatch necessary here.
+      await repairByHand(
+        "UPDATE crm.expense_claim SET state = 'posted' WHERE tenant_id = $1 AND id = $2",
+        [TENANT, id],
       );
 
       await inTenant(async (tx) => {

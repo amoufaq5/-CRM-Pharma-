@@ -122,6 +122,9 @@ authorisation on its own.
 | `PUT /v1/admin/notifications/retention` | the two horizons (**administrator**) |
 | `GET /v1/admin/notifications/prune-candidates` | what tonight's prune would take, what it would hold back, and whether it would be refused |
 | `GET\|PUT /v1/admin/notifications/prune-guard` | the volume ceiling and its floor (**administrator**) |
+| `GET\|PUT /v1/admin/notifications/delivery-retention` | how long the record of a push is kept (**administrator**); 0046's third horizon |
+| `GET /v1/admin/notifications/:id/deliveries` | where one signal went, still answering after the notification is pruned |
+| `GET /v1/admin/notification-deliveries` | the tenant's recent pushes, newest first by write order; `?limit=` 1..500 |
 | `POST\|DELETE /v1/admin/notifications/prune-guard/override` | open or close a bounded, attributed window past the ceiling |
 | `GET\|POST /v1/expenses` | own claims (`?state=` repeats) / file one |
 | `POST /v1/expenses/:id/submit` | snapshots the S&M account in force now; **refused if the category is unmapped** |
@@ -247,6 +250,44 @@ That cap is a throttle, not a refusal — and the guard is measured against what
 would propose 2.5% every night and empty itself in forty passes unchallenged.
 `GET /v1/admin/notifications/prune-candidates` answers "what would tonight take" before
 anything is deleted.
+
+## Delivery history outlives the inbox
+
+`crm.notification_delivery` used to cascade from `crm.notification`, so the retention period
+for an inbox entry was also the retention period for the record that the signal had been
+pushed to a third party. It no longer references the notification at all: it **copies** the
+four facts that make a push legible on its own — the kind, the severity, when the signal was
+raised, and whose data left the tenant — and it has a **third horizon**,
+`retain_delivery_days` (730 by default, and forbidden by `CHECK` from being shorter than
+`retain_unread_days`, so evidence always outlives the message it is evidence of). Two years
+because a delivery record is evidence about a third party's endpoint *and* about a disclosure
+of a named employee to it, and that is audited on a different clock from an inbox badge.
+
+It copies no `subject`, `body` or `payload`, deliberately: the delivery table must not become
+a second, longer-retained copy of the inbox, or `retain_delivery_days` silently becomes the
+real retention period for notification prose and the two horizons above stop meaning
+anything. It copies nothing from the endpoint either, because the endpoint is still joinable
+— copying a fact readable from a live row is how two sources of one truth start to disagree.
+
+`notify_prune` gained a second **phase** rather than a second job: same pass, same
+transaction, same ceiling, same floor, same break-glass override — but measured against its
+own table, because a share *of the inbox* says nothing about a delete from the delivery
+table. The two phases refuse independently, so one mistyped inbox horizon cannot suspend the
+other table's retention. Only a `delivered` push is prunable; a `dead` one is kept forever,
+because a webhook that permanently failed is the most valuable row in the table.
+
+The table also got `seq`, for the reason `crm.outbox.seq` exists: `created_at` *and*
+`next_attempt_at` are both the transaction clock, and `raiseNotification` fans one signal to
+every matching endpoint in one transaction — so a dispatch batch had no write order at all,
+and both the claim order and the order the sender worked through it were the query plan's.
+
+Reachable over HTTP, which is the half this repo has forgotten five times:
+`GET|PUT /v1/admin/notifications/delivery-retention` and
+`GET /v1/admin/notifications/:id/deliveries` (which still answers after the notification is
+gone, with `notification_present: false`, so a client says "the inbox copy is gone" rather
+than rendering a dead link) and `GET /v1/admin/notification-deliveries`. Administrator, not
+every rep: a rep whose notification disappeared is entitled to know it was a rule, but a
+delivery record is about an endpoint they cannot see.
 
 ## Expenses
 
@@ -465,15 +506,31 @@ rule cannot drift apart — and that last one matters more for a probe, because 
 *authenticates*, so plaintext to a remote host would put the password on the wire purely to
 find out whether it was right.
 
-Three rules sit in the schema rather than the route, so the offline path cannot skip them:
+Four rules sit in the schema rather than the route, so the offline path cannot skip them:
 **one outstanding probe per endpoint** (a partial unique index, because a trigger cannot see
 another transaction's uncommitted row), a **cooldown per endpoint, of the tenant's chosen
 length** (120s by default — each endpoint is a different third party, so a quiet one is not
-rationed by a noisy one; this bounds the rate per destination and not the tenant's total
-probe volume, which nothing bounds yet; it
-answers `429`, not `409` — this is rate limiting and the message says when a retry becomes
-legal), and `requested_at` **overwritten by the trigger**, because a caller who could supply
-it could backdate one probe and make the next legal immediately.
+rationed by a noisy one, which bounds the rate per destination and deliberately says nothing
+about the tenant's total), a **total budget per tenant** (120 probes an hour by default,
+across every endpoint, because endpoints per tenant are uncapped and the sum of those
+per-endpoint rates therefore had no ceiling at all — five endpoints at the default cooldown
+already exceed it, and a fifty-endpoint tenant could emit 1,500 an hour), and `requested_at`
+**overwritten by the trigger**, because a caller who could supply it could backdate one probe
+and make the next legal immediately.
+
+Both limits answer `429` and not `409` — this is rate limiting, the state of the system is
+fine and only the pace is not — and both messages name the moment a retry becomes legal. The
+cooldown is tested first, because "you asked about THIS endpoint two minutes ago" is the
+better-aimed sentence and the budget's would otherwise hide it for a whole window. The budget
+is counted under a per-tenant advisory lock held to commit, because a count has no partial
+unique index available to it and two administrators pressing test at the same moment would
+otherwise both pass a check that sees neither other's uncommitted row. One consequence worth
+knowing: the retention ring now keeps **at least** the newest twenty per endpoint rather than
+exactly twenty, because a row inside the budget window is a row the budget is counting and a
+ring that deleted it would hand the slot back — a bound computed from rows cannot also be the
+reason those rows are deleted. Before that, with the cooldown set to 0 (which the schema
+permits), the ring would have dissolved the budget entirely in the one configuration that has
+no other bound.
 
 **And at boot the scheduler says whether it can send what the database asks for.** It
 compares the channels on each tenant's enabled endpoints against the senders it registered
@@ -502,7 +559,7 @@ re-reports a standing gap through the boot check above — which is the right su
 ## Tenant isolation is structural, not just a policy
 
 Every foreign key in `crm.*` into a tenant-scoped table is **composite** —
-`(tenant_id, ref_id) → (tenant_id, id)`, **all 46 of them, with none left single-column**,
+`(tenant_id, ref_id) → (tenant_id, id)`, **all 45 of them, with none left single-column**,
 and with constraint names and every `ON DELETE`, `ON UPDATE`, deferrability and match type
 preserved byte for byte (measured against the catalog before and after, not asserted by
 eye).
@@ -521,6 +578,15 @@ next function forgets.
 rather than passing for it. It carries a `pg_constraint` drift guard too: a table added next
 month by someone who does not know this rule fails a test instead of quietly reopening the
 class.
+
+0046 dropped one of the original 46 — `notification_delivery.notification_id` — on
+retention grounds, and did not weaken the rule: a reference that *exists* in `crm.*` is still
+composite, and that one's tenant guard moved into a `BEFORE INSERT` trigger that resolves the
+parent under the caller's own row security. That is **tighter** than the key it replaced,
+because a referential check runs with row security disabled and would have accepted another
+tenant's notification as existing, where an invisible row reads as absent. The drift guard
+cannot see a column with no reference, so `composite-fk.contract.test.ts` asserts the
+replacement live instead.
 
 **The pre-flight those migrations open with has now been seen to work.** A composite key's
 bulk `VALIDATE` is an ordinary query, so as `crm_app` with no tenant context it validates
@@ -593,8 +659,10 @@ PGUSER=… PGHOST=… ./scripts/verify-live-erp.sh
 ```
 
 Boots a real `operate-server` over a real Postgres, points it at the CRM's own JWKS, and
-runs **90 checks** through the shipped `dist` of `@crm/acl`, `@crm/credential` and
-`@crm/relay`. The CRM's own database is dropped and rebuilt from empty each run — it used to
+runs **124 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
+`@crm/relay` as a library, and 34 through the CRM's own `api` and `scheduler` **binaries**,
+started as processes exactly as `deploy/docker-compose.yml` starts them. The CRM's own
+database is dropped and rebuilt from empty each run — it used to
 be required to exist already, which made the gate's schema whatever was lying around, and
 that is how a check came to fail with `column "seq" does not exist` against a database three
 migrations behind. Everything the integration assumes had previously been read out of the ERP's
@@ -680,9 +748,18 @@ The named file is **recorded without being run** — with its real hash, so edit
 migration is refused exactly as before, and a database that *did* run it is untouched. The
 declaration lives in the file rather than in a deploy-script list, for the same reason
 `@requires: dba` does, and it is validated: a name matching no migration, or one that does
-not sort before the declaring file, is refused by `apply` and by `--dry-run`. Both report
-every retired file, as a warning, every run. `scripts/setup-test-db.sh` honours it too, so a
-test database matches a migrated one.
+not sort before the declaring file, is refused by `apply` and by `--dry-run`.
+`scripts/setup-test-db.sh` honours it too, with a pattern anchored at both ends so a header
+that merely *quotes* the syntax — which these headers do to each other constantly — cannot
+silently retire a live file there and not in production.
+
+**The warning is printed once, on the deploy that records it, and not again.** Afterwards
+the file is an ordinary ledger row and both commands fall silent about it; `--dry-run`
+reports it as `would_record_without_running` only while it is still pending. So the only way
+to learn that a file in the repository was never executed on an existing database is to read
+`crm._migrations` against the directory — which is what `pnpm db:migrate:verify`'s sixth
+property does, asserting the record, the matching hash, and the absence of an `applied` line
+for it.
 
 ```bash
 pnpm db:migrate:dry      # what a real run would do; exit 1 if an applied file was edited
@@ -691,11 +768,16 @@ pnpm db:migrate:verify   # the five properties above, against a throwaway databa
 ```
 
 **Two long-running processes, as on the ERP side.** The API is stateless and scales
-freely. The scheduler is multi-instance-safe but one is enough — and in production it
-currently refuses to start, because its ERP credential (short-lived per-tenant Ed25519
-service JWTs, ADR-0001 item 10) is not built and a static shared secret holding
-`controller` on every tenant is worse than no relay. The outbox is durable, so queued
-writes wait rather than being lost.
+freely. The scheduler is multi-instance-safe but one is enough. **It needs a signing key in
+production, and with one it works** — this paragraph used to say it "currently refuses to
+start, because its ERP credential is not built", which was false and is the kind of false
+sentence an operator acts on by not deploying: with `CRM_SIGNING_KEY_FILE` set it boots,
+mints short-lived per-tenant Ed25519 service JWTs under the role in
+`crm.erp_service_principal`, and drains the outbox — verified against a running
+`operate-server` (`docs/LIVE_ERP_VERIFICATION.md` §7). With only `ERP_TOKEN` under
+`NODE_ENV=production` it still refuses, deliberately: a static shared secret holding
+whatever role the ERP bound it to, on every tenant, is worse than no relay. The outbox is
+durable, so queued writes wait rather than being lost.
 
 The container plumbing in `deploy/` has **not been built or run** — the environment it was
 authored in has no Docker daemon. The migration runner it invokes was verified end to end

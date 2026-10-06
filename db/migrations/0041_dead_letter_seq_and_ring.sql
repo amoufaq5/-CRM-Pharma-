@@ -157,7 +157,12 @@ CREATE INDEX idx_outbox_dead_letter_seq
 -- column is untouched.
 DROP INDEX crm.idx_outbox_dead_letter_tenant;
 
--- `uq_outbox_dead_letter_attempt (outbox_id, attempt)` STAYS, and is now load-bearing three
+-- `uq_outbox_dead_letter_attempt (outbox_id, attempt)` STAYS here, and 0043 then renames it
+-- to `uq_outbox_dead_letter_tenant_attempt (tenant_id, outbox_id, attempt)` — because a
+-- unique index is ENFORCED with row security disabled, so the two-column form was
+-- cross-tenant. Every statement below about what it does for the ring is still true of the
+-- three-column form, which serves the trim's `(tenant_id, outbox_id)` predicate better. It is
+-- load-bearing three
 -- times over: it refuses a second row claiming to be the same episode (0036's reason), it
 -- serves the trigger's `max(attempt)` lookup on both branches, and it serves the ring's
 -- ordered scan in Part 2. `idx_outbox_dead_letter_revived_by` stays untouched — "who has

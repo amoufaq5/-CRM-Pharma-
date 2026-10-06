@@ -96,9 +96,12 @@
 -- an UPDATE reaching here IS the stand-down half of a replacement, and needs no inspection
 -- of what changed.
 --
--- `packages/storage/src/receipt-claim-state.contract.test.ts` pins the ordering from the
--- other side, so renaming this trigger breaks a test rather than quietly reordering two
--- refusals.
+-- `packages/storage/src/attachment.contract.test.ts` pins the ordering from the other side,
+-- by name, under "the claim state a receipt may be attached, replaced or stood down at" —
+-- so renaming this trigger breaks a test rather than quietly reordering two refusals. (An
+-- earlier draft of this header named a `receipt-claim-state.contract.test.ts` that was never
+-- written: the cases went into the existing suite, which already owns `TENANT_STORAGE` and
+-- the claim fixture they need.)
 --
 -- ===========================================================================
 -- SCOPED TO THE RECEIPT PURPOSE, AND WHAT THE OTHER PURPOSE WOULD MEAN

@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool, PoolClient } from "pg";
-import { withTenantContext } from "@crm/db";
+import { SET_TENANT_CONTEXT_SQL, withTenantContext } from "@crm/db";
 import { appPool, TENANT_CHANNEL_COVERAGE as TENANT } from "@crm/db/testing";
 
 import { NOTIFICATION_KINDS } from "./kinds.js";
@@ -10,16 +10,24 @@ import { verifyWebhook, type FetchLike } from "./sender.js";
 import { InvalidSmtpRelayError, SmtpSender, type SmtpRelayConfig, type SmtpTransport } from "./smtp.js";
 import { selfSignedCert, startSmtpSink, type SmtpSink, type SmtpSinkOptions } from "./testing-smtp.js";
 import {
+  DEFAULT_PROBE_BUDGET_MAX_PROBES,
+  DEFAULT_PROBE_BUDGET_WINDOW_SECONDS,
   DEFAULT_PROBE_COOLDOWN_SECONDS,
   EndpointNotFoundError,
   ProbeRequesterNotFoundError,
   EndpointProbeRunner,
+  InvalidProbeBudgetError,
   InvalidProbeCooldownError,
   MAX_PROBE_ATTEMPTS,
+  MAX_PROBE_BUDGET_MAX_PROBES,
+  MAX_PROBE_BUDGET_WINDOW_SECONDS,
   MAX_PROBE_COOLDOWN_SECONDS,
+  MIN_PROBE_BUDGET_MAX_PROBES,
+  MIN_PROBE_BUDGET_WINDOW_SECONDS,
   PROBE_EVENT,
   PROBE_STATES,
   PROBE_VERDICTS,
+  ProbeBudgetExceededError,
   ProbeCooldownError,
   ProbeInFlightError,
   SmtpProber,
@@ -28,13 +36,17 @@ import {
   latestProbe,
   listProbes,
   probeBody,
+  probeBudget,
   probeById,
   probeCooldownSeconds,
   recordProbeVerdict,
   requestProbe,
+  setProbeBudget,
   setProbeCooldownSeconds,
   type ChannelProber,
+  type ProbeBudgetState,
   type ProbeOutcome,
+  type ProbeRow,
   type ProbeTarget,
 } from "./probe.js";
 
@@ -140,6 +152,69 @@ describe("the endpoint probe", () => {
 
   const noCooldown = (tenant = TENANT): Promise<number> =>
     inTenant(tenant, (tx) => setProbeCooldownSeconds(tx, tenant, 0));
+
+  /**
+   * Waits until `expected` backends are WAITING on 0045's advisory lock.
+   *
+   * Polled from `pg_locks` rather than slept for, because the assertion the concurrency test
+   * makes is about an interleaving and a fixed sleep would assert a duration instead. A
+   * blocked `ungranted` advisory lock in classid 45 is the proof that the second transaction
+   * reached the guard and stopped there — i.e. that it has NOT yet counted anything — which
+   * is the only interleaving in which a lock-free check gives the wrong answer.
+   */
+  const waitUntilBlocked = async (via: PoolClient, expected: number): Promise<void> => {
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const { rows } = await via.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_locks
+          WHERE locktype = 'advisory' AND classid = 45 AND NOT granted`,
+      );
+      if ((rows[0]?.n ?? 0) >= expected) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("the concurrent request never blocked on the probe budget's advisory lock");
+  };
+
+  /**
+   * Twenty settled probes on one endpoint, two hours old — the only fixture the retention
+   * ring's trimming half can be observed against, since 0045 forbids it to delete a row
+   * inside the budget window.
+   *
+   * It has to stand the REQUEST guard down, and that is the fixture admitting what 0034 built
+   * on purpose: `requested_at` is overwritten on insert and frozen on update precisely so
+   * that no caller can backdate a probe and defeat the cooldown — and now the budget. There
+   * is therefore no in-band way to produce an aged row, and pretending otherwise would mean
+   * the guard had a hole. The TRIM trigger stays armed throughout, because it is the thing
+   * under test. Twenty rather than twenty-one, so the ring has nothing to trim on the way in
+   * and the test starts from a state it asserts rather than one it hopes for.
+   */
+  const ageTwentyProbes = async (endpoint: string): Promise<readonly string[]> => {
+    await client.query(
+      "ALTER TABLE crm.notification_endpoint_probe DISABLE TRIGGER notification_endpoint_probe_guard",
+    );
+    try {
+      return await inTenant(TENANT, async (tx) => {
+        const ids: string[] = [];
+        for (let i = 0; i < 20; i += 1) {
+          // Ages descend as `seq` ascends, so the newest 20 by `seq` are the newest by clock.
+          const { rows } = await tx.query<{ id: string }>(
+            `INSERT INTO crm.notification_endpoint_probe
+               (tenant_id, endpoint_id, requested_by, requested_at,
+                state, verdict, detail, completed_at)
+             VALUES ($1, $2, $3, now() - make_interval(secs => 7200 - $4::int),
+                     'complete', 'refused', 'aged fixture', now() - interval '2 hours')
+             RETURNING id`,
+            [TENANT, endpoint, ADMIN, i],
+          );
+          ids.push(rows[0]!.id);
+        }
+        return ids;
+      });
+    } finally {
+      await client.query(
+        "ALTER TABLE crm.notification_endpoint_probe ENABLE TRIGGER notification_endpoint_probe_guard",
+      );
+    }
+  };
 
   // -------------------------------------------------------------------------
   describe("the store, and the rules the database holds", () => {
@@ -253,6 +328,312 @@ describe("the endpoint probe", () => {
       expect(await inTenant(TENANT, (tx) => setProbeCooldownSeconds(tx, TENANT, 600))).toBe(600);
       expect(await inTenant(TENANT, (tx) => probeCooldownSeconds(tx, TENANT))).toBe(600);
     });
+  });
+
+  // -------------------------------------------------------------------------
+  /**
+   * The tenant's TOTAL probe budget (0045), which is the bound the cooldown deliberately
+   * cannot be.
+   *
+   * ADR-0001 recorded the gap in its own words: the cooldown is per endpoint, which is the
+   * right scope, "but endpoints per tenant are uncapped, so three endpoints means three
+   * probes back to back inside one cooldown window". So every test below that proves the
+   * budget binds does it across DIFFERENT endpoints — the only dimension in which the
+   * cooldown has nothing to say, and therefore the only place a new bound can be observed
+   * to be new.
+   */
+  describe("the tenant's total probe budget", () => {
+    const setBudget = (maxProbes: number, windowSeconds: number, tenant = TENANT): Promise<ProbeBudgetState> =>
+      inTenant(tenant, (tx) => setProbeBudget(tx, tenant, maxProbes, windowSeconds));
+
+    const budget = (tenant = TENANT): Promise<ProbeBudgetState> =>
+      inTenant(tenant, (tx) => probeBudget(tx, tenant));
+
+    const probe = (endpoint: string, tenant = TENANT, admin = ADMIN): Promise<ProbeRow> =>
+      inTenant(tenant, (tx) => requestProbe(tx, tenant, { endpointId: endpoint, requestedBy: admin }));
+
+    it("defaults the budget for a tenant that has never had a policy row", async () => {
+      // The absence of a policy row must read as the defaults rather than as "no budget" —
+      // the same fail-closed reading 0034 gives the cooldown. The SQL function LEFT JOINs
+      // its configuration off a one-row source precisely so this answers at all.
+      expect(await budget()).toEqual({
+        used: 0,
+        maxProbes: DEFAULT_PROBE_BUDGET_MAX_PROBES,
+        windowSeconds: DEFAULT_PROBE_BUDGET_WINDOW_SECONDS,
+        nextSlotAt: null,
+      });
+    });
+
+    it("stores a budget an administrator sets", async () => {
+      expect(await setBudget(40, 900)).toMatchObject({ used: 0, maxProbes: 40, windowSeconds: 900 });
+      expect(await budget()).toMatchObject({ maxProbes: 40, windowSeconds: 900 });
+    });
+
+    /**
+     * There is no 0, and that is the deliberate divergence from the cooldown. 0034 lets a
+     * tenant disable the cooldown because a cooldown protects a third party and a loopback
+     * sink has none; a tenant that has done so has given up its only per-destination bound,
+     * so this is the only one left — and a guard disabled by a value does not look like a
+     * disabled guard (0026's argument for stopping its share ceiling at 99).
+     */
+    it("refuses a budget out of range, and refuses 0 in particular", async () => {
+      for (const bad of [0, -1, 1.5, MAX_PROBE_BUDGET_MAX_PROBES + 1, Number.NaN]) {
+        await expect(
+          inTenant(TENANT, (tx) => setProbeBudget(tx, TENANT, bad, DEFAULT_PROBE_BUDGET_WINDOW_SECONDS)),
+        ).rejects.toThrow(InvalidProbeBudgetError);
+      }
+      for (const bad of [0, 59, 1.5, MAX_PROBE_BUDGET_WINDOW_SECONDS + 1, Number.NaN]) {
+        await expect(
+          inTenant(TENANT, (tx) => setProbeBudget(tx, TENANT, DEFAULT_PROBE_BUDGET_MAX_PROBES, bad)),
+        ).rejects.toThrow(InvalidProbeBudgetError);
+      }
+      expect(await budget()).toMatchObject({
+        maxProbes: DEFAULT_PROBE_BUDGET_MAX_PROBES,
+        windowSeconds: DEFAULT_PROBE_BUDGET_WINDOW_SECONDS,
+      });
+    });
+
+    /** The CHECK constraints say the same thing, so a psql prompt gets the same answer. */
+    it("declares the same bounds in the database as in the TypeScript", async () => {
+      const { rows } = await client.query<{ conname: string; def: string }>(
+        `SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint
+          WHERE conrelid = 'crm.notification_policy'::regclass
+            AND conname LIKE 'notification_policy_probe_budget%'
+          ORDER BY conname`,
+      );
+      expect(rows.map((r) => r.conname)).toEqual([
+        "notification_policy_probe_budget_max",
+        "notification_policy_probe_budget_window",
+      ]);
+      expect(rows[0]!.def).toContain(String(MIN_PROBE_BUDGET_MAX_PROBES));
+      expect(rows[0]!.def).toContain(String(MAX_PROBE_BUDGET_MAX_PROBES));
+      expect(rows[1]!.def).toContain(String(MIN_PROBE_BUDGET_WINDOW_SECONDS));
+      expect(rows[1]!.def).toContain(String(MAX_PROBE_BUDGET_WINDOW_SECONDS));
+    });
+
+    it("counts every endpoint's probes against one tenant total", async () => {
+      await noCooldown();
+      await setBudget(3, 3600);
+      const endpoints = [await addEndpoint(), await addEndpoint(), await addEndpoint()];
+      for (const endpoint of endpoints) await probe(endpoint);
+      expect(await budget()).toMatchObject({ used: 3, maxProbes: 3 });
+      // `used` is not a per-endpoint number anywhere: three endpoints, one probe each, and
+      // the ceiling is reached. This is the sentence from ADR-0001's open row, as a test.
+      const fourth = await addEndpoint();
+      await expect(probe(fourth)).rejects.toThrow(ProbeBudgetExceededError);
+    });
+
+    it("names the count, the window and the moment a retry becomes legal", async () => {
+      await noCooldown();
+      await setBudget(1, 3600);
+      const first = await probe(await addEndpoint());
+      const err = (await probe(await addEndpoint()).catch((e: unknown) => e)) as Error;
+
+      expect(err).toBeInstanceOf(ProbeBudgetExceededError);
+      // Attributable: the refusal names the tenant it is about, as the cooldown's names the
+      // endpoint. And it carries the actionable half.
+      expect(err.message).toContain(TENANT);
+      expect(err.message).toContain("1 of 1 permitted probes");
+      expect(err.message).toContain("3600 seconds");
+      expect(err.message).toContain("may probe again after");
+      expect(err.message).toContain("probe_budget_max_probes");
+      // The sentence names a real moment, not a word: one window after the probe that spent
+      // the budget. Rendered by Postgres, so compared by instant rather than by spelling.
+      const state = await budget();
+      expect(state.nextSlotAt).not.toBeNull();
+      expect(Date.parse(state.nextSlotAt!)).toBe(Date.parse(first.requested_at) + 3600 * 1000);
+      // And it is NOT the cooldown's refusal wearing a different message: the two endpoints
+      // are different, so the cooldown has nothing to say about either.
+      expect(err).not.toBeInstanceOf(ProbeCooldownError);
+      expect(err.message).not.toContain("probe-cooldown");
+    });
+
+    /**
+     * The ordering 0045 argues for: per-endpoint beats per-tenant for aim. An administrator
+     * repeating ONE endpoint is told to wait for that endpoint, which is what they can act
+     * on; the budget's sentence would hide that from them for the whole window. So a caller
+     * who is over both limits gets the cooldown, and the budget becomes reachable exactly
+     * where the gap was — across endpoints.
+     */
+    it("lets the cooldown's better-aimed refusal win when both apply", async () => {
+      await inTenant(TENANT, (tx) => setProbeCooldownSeconds(tx, TENANT, 120));
+      await setBudget(1, 3600);
+      const one = await addEndpoint();
+      const other = await addEndpoint();
+      const first = await probe(one);
+      await settle(first.id, { verdict: "delivered", detail: "ok" });
+
+      // Same endpoint, over both limits: the cooldown answers.
+      const sameEndpoint = (await probe(one).catch((e: unknown) => e)) as Error;
+      expect(sameEndpoint).toBeInstanceOf(ProbeCooldownError);
+      expect(sameEndpoint).not.toBeInstanceOf(ProbeBudgetExceededError);
+
+      // A different endpoint, over the budget only: the budget answers.
+      const otherEndpoint = (await probe(other).catch((e: unknown) => e)) as Error;
+      expect(otherEndpoint).toBeInstanceOf(ProbeBudgetExceededError);
+    });
+
+    it("bounds a tenant that has switched its per-endpoint cooldown off", async () => {
+      // The configuration with no other bound at all. 0034 permits a 0 cooldown and argues
+      // for it; without 0045 a tenant in that state could probe without limit.
+      await noCooldown();
+      await setBudget(2, 3600);
+      const one = await addEndpoint();
+      const first = await probe(one);
+      await settle(first.id, { verdict: "refused", detail: "no" });
+      const second = await probe(one);
+      await settle(second.id, { verdict: "refused", detail: "no" });
+      await expect(probe(one)).rejects.toThrow(ProbeBudgetExceededError);
+      await expect(probe(await addEndpoint())).rejects.toThrow(ProbeBudgetExceededError);
+    });
+
+    it("keeps one tenant's spending out of another's budget", async () => {
+      await noCooldown();
+      await noCooldown(OTHER_TENANT);
+      await setBudget(1, 3600);
+      await setBudget(1, 3600, OTHER_TENANT);
+      await probe(await addEndpoint());
+      await expect(probe(await addEndpoint())).rejects.toThrow(ProbeBudgetExceededError);
+      // Theirs is untouched: the count is tenant-scoped by the predicate AND by RLS.
+      const theirs = await addEndpoint({ tenant: OTHER_TENANT });
+      await probe(theirs, OTHER_TENANT, OTHER_ADMIN);
+      expect(await budget(OTHER_TENANT)).toMatchObject({ used: 1 });
+      expect(await budget()).toMatchObject({ used: 1 });
+    });
+
+    /**
+     * The case that makes `next_slot_at` an offset rather than a `min()`. A ceiling lowered
+     * under a tenant already above it leaves `used > max`, and the oldest row aging out does
+     * NOT free a slot — the row that has to go is the one at offset `used - max`. Naming the
+     * oldest would promise a retry that still fails, which is the one thing a rate-limit
+     * message must not do.
+     */
+    it("names a moment that actually frees a slot after a ceiling is lowered", async () => {
+      await noCooldown();
+      await setBudget(3, 3600);
+      const endpoint = await addEndpoint();
+      for (let i = 0; i < 3; i += 1) {
+        const p = await probe(endpoint);
+        await settle(p.id, { verdict: "unknown", detail: "n" });
+      }
+
+      /**
+       * Compared in SQL at full timestamp precision. `ProbeRow.requested_at` is rendered to
+       * the millisecond, and three probes in quick succession can share a millisecond while
+       * being ordered microseconds apart — which is the very distinction this test turns on.
+       * `spread` is asserted too, so the test cannot pass vacuously on a cluster fast enough
+       * to give all three the same clock.
+       */
+      const ask = async (): Promise<{
+        matches_newest: boolean;
+        matches_oldest: boolean;
+        spread: boolean;
+      }> =>
+        await inTenant(TENANT, async (tx) => {
+          const { rows } = await tx.query<{
+            matches_newest: boolean;
+            matches_oldest: boolean;
+            spread: boolean;
+          }>(
+            `WITH b AS (SELECT * FROM crm.notification_probe_budget($1)),
+                  r AS (SELECT min(requested_at) AS oldest, max(requested_at) AS newest
+                          FROM crm.notification_endpoint_probe WHERE tenant_id = $1)
+             SELECT b.next_slot_at = r.newest + make_interval(secs => b.window_seconds) AS matches_newest,
+                    b.next_slot_at = r.oldest + make_interval(secs => b.window_seconds) AS matches_oldest,
+                    r.newest > r.oldest AS spread
+               FROM b, r`,
+            [TENANT],
+          );
+          return rows[0]!;
+        });
+
+      // At the ceiling: the oldest row is the one whose expiry frees a slot.
+      expect(await ask()).toEqual({ matches_newest: false, matches_oldest: true, spread: true });
+
+      // Ceiling lowered to 1 with three spent: only the NEWEST aging out gets the count under
+      // the ceiling, so `min()` would have promised a retry that still fails.
+      await setBudget(1, 3600);
+      expect(await ask()).toEqual({ matches_newest: true, matches_oldest: false, spread: true });
+      expect(await budget()).toMatchObject({ used: 3, maxProbes: 1 });
+    });
+
+    it("reports no next slot while the tenant is under its ceiling", async () => {
+      await noCooldown();
+      await setBudget(5, 3600);
+      await probe(await addEndpoint());
+      const state = await budget();
+      expect(state).toMatchObject({ used: 1, maxProbes: 5 });
+      // Null rather than a moment: a slot is free NOW, and naming a future one would read as
+      // a refusal that has not happened.
+      expect(state.nextSlotAt).toBeNull();
+    });
+
+    /**
+     * TWO ADMINISTRATORS PRESSING TEST AT THE SAME MOMENT, with two real overlapping
+     * transactions rather than an argument about them.
+     *
+     * 0034's own header says why a trigger alone is not enough: "a trigger reads rows another
+     * transaction has not committed yet". A count has no partial unique index available to it
+     * — an index enforces one row per key, not N rows in a moving span — so 0045 serialises
+     * the count-then-insert with `pg_advisory_xact_lock` keyed on the tenant.
+     *
+     * The interleaving below is the one that breaks a lock-free check: B's INSERT STATEMENT
+     * BEGINS while A is still uncommitted, so B's own statement snapshot predates A's row. B
+     * must nonetheless see it — which it does, because the lock is xact-scoped (so A holds it
+     * until the row is visible) and a statement inside a volatile plpgsql function takes a
+     * fresh snapshot in READ COMMITTED (so B counts after the wait, not before it).
+     *
+     * Two endpoints, necessarily: the per-endpoint cooldown and the outstanding index already
+     * settle a race on one, and the budget is the first rule here that has to survive a race
+     * across two.
+     */
+    it("refuses the second of two simultaneous requests on different endpoints", async () => {
+      await noCooldown();
+      await setBudget(1, 3600);
+      const mine = await addEndpoint();
+      const theirs = await addEndpoint();
+
+      const a = await pool.connect();
+      const b = await pool.connect();
+      let raced: unknown = null;
+      try {
+        await a.query("SET ROLE crm_app");
+        await b.query("SET ROLE crm_app");
+        await a.query("BEGIN");
+        await b.query("BEGIN");
+        await a.query(SET_TENANT_CONTEXT_SQL, [TENANT]);
+        await b.query(SET_TENANT_CONTEXT_SQL, [TENANT]);
+
+        // A spends the only slot and holds its transaction open.
+        await requestProbe(a, TENANT, { endpointId: mine, requestedBy: ADMIN });
+
+        // B starts its INSERT while A is uncommitted. It blocks inside the guard, at the
+        // advisory lock, BEFORE it has counted anything.
+        const bInsert = requestProbe(b, TENANT, { endpointId: theirs, requestedBy: ADMIN }).catch(
+          (e: unknown) => {
+            raced = e;
+          },
+        );
+        await waitUntilBlocked(a, 1);
+        await a.query("COMMIT");
+        await bInsert;
+        await b.query("ROLLBACK");
+      } finally {
+        a.release();
+        b.release();
+      }
+
+      expect(raced).toBeInstanceOf(ProbeBudgetExceededError);
+      expect((raced as Error).message).toContain("1 of 1 permitted probes");
+      // One probe exists, not two. Without the lock both commit and the tenant sits at 2
+      // against a ceiling of 1 — which is the shape of this bug, verified by removing the
+      // lock from the guard and re-running this interleaving.
+      expect(await budget()).toMatchObject({ used: 1, maxProbes: 1 });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  describe("the rest of the store", () => {
 
     /**
      * A foreign-key check runs with row security DISABLED, so `tenant_id` = mine with
@@ -505,7 +886,21 @@ describe("the endpoint probe", () => {
       expect(history.map((p) => p.id)).toEqual([second.id, first.id]);
     });
 
-    it("keeps the newest 20 answered probes per endpoint and no more", async () => {
+    /**
+     * 0045 CHANGED THIS GUARANTEE, from "exactly the newest 20" to "AT LEAST the newest 20".
+     *
+     * The budget counts rows in this table inside a window, and 0034's ring deleted rows in
+     * that window — so the ring was handing budget back: a 21st probe on one endpoint
+     * deleted the 1st, the count stalled at 21, and with the cooldown at 0 (which 0034
+     * permits) a single endpoint could emit unbounded probes an hour while never retaining
+     * more than 21 rows. A bound computed from rows cannot also be the reason those rows are
+     * deleted, and retention is the half with no safety argument behind its exact number.
+     *
+     * So the ring keeps the newest 20 complete AND anything inside the budget window. That
+     * is strictly MORE retention than 0034 promised and never less, so nothing anybody read
+     * has disappeared. The next test is the one that proves it still trims.
+     */
+    it("keeps everything inside the budget window, because the budget is counting it", async () => {
       const endpoint = await addEndpoint();
       const other = await addEndpoint();
       await noCooldown();
@@ -518,8 +913,10 @@ describe("the endpoint probe", () => {
         await settle(probe.id, { verdict: "refused", detail: `attempt ${String(i)}` });
       }
       const keepers = await inTenant(TENANT, (tx) => listProbes(tx, endpoint, 100));
-      expect(keepers).toHaveLength(20);
-      expect(keepers.map((p) => p.id)).toEqual(ids.slice(-20).reverse());
+      expect(keepers).toHaveLength(24);
+      expect(keepers.map((p) => p.id)).toEqual([...ids].reverse());
+      // And the budget agrees it is counting all 24, which is the reason they are still here.
+      expect(await inTenant(TENANT, (tx) => probeBudget(tx, TENANT))).toMatchObject({ used: 24 });
 
       // Per endpoint: a debugging session on one endpoint must not evict another's history.
       const kept = await inTenant(TENANT, (tx) => requestProbe(tx, TENANT, { endpointId: other, requestedBy: ADMIN }));
@@ -527,6 +924,70 @@ describe("the endpoint probe", () => {
       expect(kept.endpoint_id).toBe(other);
     });
 
+    /**
+     * The ring, on rows the budget has stopped counting — which is the only state in which
+     * it may now delete anything.
+     *
+     * The fixture has to be AGED, and 0034 made that deliberately impossible for a caller:
+     * `requested_at` is overwritten by the request guard and frozen by the settle guard,
+     * precisely so nobody can backdate a probe and defeat the cooldown (and now the budget).
+     * The only honest way to build an aged row is therefore to stand the guard down for the
+     * length of the fixture, as the table's owner, and say so — which is what this does. The
+     * trim trigger is left ARMED throughout, because it is the thing under test.
+     */
+    it("trims past the newest 20 once the budget has stopped counting them", async () => {
+      const endpoint = await addEndpoint();
+      await noCooldown();
+      const aged = await ageTwentyProbes(endpoint);
+      // Two hours old against the default one-hour window: the budget is counting none of
+      // them, so the ring's window clause protects none of them.
+      expect(await inTenant(TENANT, (tx) => probeBudget(tx, TENANT))).toMatchObject({ used: 0 });
+      expect(await inTenant(TENANT, (tx) => listProbes(tx, endpoint, 100))).toHaveLength(20);
+
+      const live = await inTenant(TENANT, (tx) =>
+        requestProbe(tx, TENANT, { endpointId: endpoint, requestedBy: ADMIN }),
+      );
+      const after = await inTenant(TENANT, (tx) => listProbes(tx, endpoint, 100));
+      expect(after).toHaveLength(20);
+      expect(after.map((p) => p.id)).toEqual([live.id, ...[...aged].reverse().slice(0, 19)]);
+      // The one that fell out is the oldest, which is the ring doing exactly what 0034 said.
+      expect(after.map((p) => p.id)).not.toContain(aged[0]);
+    });
+
+    /**
+     * The other half, and the reason 0045 touches the ring at all: the same insert, with the
+     * window widened so the budget IS counting the aged rows, trims nothing. Without the
+     * window clause the row the budget is counting would be deleted and the slot refunded.
+     */
+    it("will not trim a row the budget is still counting", async () => {
+      const endpoint = await addEndpoint();
+      await noCooldown();
+      const aged = await ageTwentyProbes(endpoint);
+      await inTenant(TENANT, (tx) => setProbeBudget(tx, TENANT, 120, MAX_PROBE_BUDGET_WINDOW_SECONDS));
+      expect(await inTenant(TENANT, (tx) => probeBudget(tx, TENANT))).toMatchObject({ used: 20 });
+
+      const live = await inTenant(TENANT, (tx) =>
+        requestProbe(tx, TENANT, { endpointId: endpoint, requestedBy: ADMIN }),
+      );
+      const after = await inTenant(TENANT, (tx) => listProbes(tx, endpoint, 100));
+      expect(after).toHaveLength(21);
+      expect(after.map((p) => p.id)).toEqual([live.id, ...[...aged].reverse()]);
+      expect(await inTenant(TENANT, (tx) => probeBudget(tx, TENANT))).toMatchObject({ used: 21 });
+    });
+
+    /**
+     * The count here is 21 rather than 0034's 20 for the reason the window test above gives:
+     * all 21 are inside the budget window, so the ring may delete none of them. What the
+     * test is actually for is unchanged — an outstanding probe has no answer to keep and
+     * deleting it would silently cancel a request somebody is waiting on — and both of its
+     * load-bearing assertions are untouched.
+     *
+     * Worth recording while changing it: this test could never have caught the
+     * `state = 'complete'` clause going missing, before 0045 or after. An outstanding probe
+     * is always the NEWEST row for its endpoint (the partial unique index admits only one),
+     * so it is always inside the newest-20 keep set and never a trim candidate by `seq`
+     * either way. The clause is right and nothing here would notice if it were deleted.
+     */
     it("never trims a probe that is still waiting for an answer", async () => {
       const endpoint = await addEndpoint();
       await noCooldown();
@@ -537,7 +998,7 @@ describe("the endpoint probe", () => {
         if (i < 20) await settle(probe.id, { verdict: "unknown", detail: "n" });
       }
       const history = await inTenant(TENANT, (tx) => listProbes(tx, endpoint, 100));
-      expect(history).toHaveLength(20);
+      expect(history).toHaveLength(21);
       expect(history[0]!.state).toBe("requested");
       expect(history.filter((p) => p.state !== "complete")).toHaveLength(1);
     });

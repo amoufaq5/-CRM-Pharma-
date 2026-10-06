@@ -123,6 +123,42 @@ describe("the expense posting sweep", () => {
 
   beforeEach(clear);
 
+  /**
+   * Rewinds a claim to `approved` after it has been posted, through migration 0044's escape
+   * hatch.
+   *
+   * WHAT IT MANUFACTURES AND WHY A SHORTCUT IS CORRECT HERE. The state these cases need is
+   * "a claim sitting `approved` with a dead `Expense` create already behind it in the
+   * outbox", and production reaches it the other way round: `postClaim` enqueues and
+   * transitions in ONE transaction, so an enqueue that collapses onto a dead row throws and
+   * rolls the whole thing back, and the claim never leaves `approved` at all. There is no
+   * forward sequence of legal calls that both kills the outbox row and leaves the claim
+   * approved, because killing the row needs the row, and the row needs a posting the claim
+   * must then be un-posted from. So the rewind is a fixture, not a path — this file's own
+   * header says a test that needs an interleaving must produce it rather than hope for it,
+   * and this is the same argument one step further back.
+   *
+   * SINCE 0044 THE DATABASE REFUSES IT, and that is right: `posted -> approved` is not an
+   * edge of `crm.expense_claim_transitions()`, and before 0044 nothing stopped a rep's paid
+   * claim being rewound to a draft. So the fixture takes the hatch 0044's header names —
+   * `ALTER TABLE … DISABLE TRIGGER expense_claim_check_lifecycle`, by the owner, inside one
+   * transaction — rather than the trigger being loosened to admit it.
+   *
+   * The specific trigger is named rather than `DISABLE TRIGGER USER`, so a second guard added
+   * to this table later is not silently stood down too.
+   */
+  const rewindToApproved = (claimId: string): Promise<void> =>
+    inTenant(async (tx) => {
+      await tx.query("ALTER TABLE crm.expense_claim DISABLE TRIGGER expense_claim_check_lifecycle");
+      await tx.query(
+        `UPDATE crm.expense_claim
+            SET state = 'approved', posted_at = NULL, erp_expense_id = NULL
+          WHERE tenant_id = $1 AND id = $2`,
+        [TENANT, claimId],
+      );
+      await tx.query("ALTER TABLE crm.expense_claim ENABLE TRIGGER expense_claim_check_lifecycle");
+    });
+
   /** A mapped, submitted, approved claim: the only state the sweep acts on. */
   const approvedClaim = async (
     rep = REP,
@@ -602,14 +638,7 @@ describe("the expense posting sweep", () => {
         return row!.id;
       });
 
-      await inTenant((tx) =>
-        tx.query(
-          `UPDATE crm.expense_claim
-              SET state = 'approved', posted_at = NULL, erp_expense_id = NULL
-            WHERE tenant_id = $1 AND id = $2`,
-          [TENANT, claimId],
-        ),
-      );
+      await rewindToApproved(claimId);
       return { claimId, outboxId };
     };
 
@@ -766,14 +795,7 @@ describe("the expense posting sweep", () => {
           }
           return row!.id;
         });
-        await inTenant((tx) =>
-          tx.query(
-            `UPDATE crm.expense_claim
-                SET state = 'approved', posted_at = NULL, erp_expense_id = NULL
-              WHERE tenant_id = $1 AND id = $2`,
-            [TENANT, claimId],
-          ),
-        );
+        await rewindToApproved(claimId);
 
         const result = await sweep();
         expect(result.posted).toBe(1);

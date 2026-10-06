@@ -40,6 +40,8 @@ export function nextDelayMs(attempts: number, random: () => number = Math.random
 export interface ClaimedDelivery {
   readonly id: string;
   readonly notification_id: string;
+  /** The write order (0046). `bigint`, so it is read as text — `crm.outbox.seq`'s convention. */
+  readonly seq: string;
   readonly attempts: number;
   readonly endpoint_id: string;
   readonly channel: string;
@@ -49,10 +51,65 @@ export interface ClaimedDelivery {
 }
 
 /**
+ * Settles deliveries whose notification no longer exists.
+ *
+ * NEW WITH 0046, AND ONLY BECAUSE OF IT. While `crm.notification_delivery` cascaded from
+ * `crm.notification` this state could not arise; with the reference dropped it can, and it
+ * had to be handled rather than discovered: `claimDue` builds its payload by joining the
+ * notification, so an orphan would be CLAIMED by the statement's first CTE — `attempts`
+ * incremented, `next_attempt_at` advanced — and then dropped by the inner join, so it would
+ * be consumed on every tick without ever being delivered, dead-lettered or counted. Silent
+ * and unbounded.
+ *
+ * DEAD, not deleted and not left pending. The payload cannot be rebuilt from anything this
+ * row carries (0046 deliberately copies no `subject`, `body` or `payload` — see its header),
+ * so this is a permanent refusal and `dead` is the state for one. Deleting it would throw
+ * away the record of a push that was enqueued, which is the opposite of what 0046 is for;
+ * leaving it pending would leave it invisible.
+ *
+ * It takes a prune's hold with it: a `dead` delivery is never pruned at any horizon, so an
+ * orphan settled this way is retained indefinitely. That is acceptable because the only way
+ * to reach it is a hand-written DELETE of a notification with a live delivery — the prune
+ * itself cannot, since an unsettled delivery holds its notification back (0024).
+ */
+export async function settleOrphanedDeliveries(
+  tx: PoolClient,
+  tenantId: string,
+): Promise<number> {
+  const { rowCount } = await tx.query(
+    `UPDATE crm.notification_delivery d
+        SET state = 'dead',
+            last_error = left('the notification this push describes no longer exists, so its '
+                              || 'payload cannot be rebuilt — recorded as undeliverable', 2000)
+      WHERE d.tenant_id = $1
+        AND d.state IN ('pending', 'in_flight')
+        AND NOT EXISTS (SELECT 1 FROM crm.notification n
+                         WHERE n.tenant_id = d.tenant_id AND n.id = d.notification_id)`,
+    [tenantId],
+  );
+  return rowCount ?? 0;
+}
+
+/**
  * Claims due deliveries and moves their next attempt forward in the same statement.
  *
  * One query builds the payload too, so the sender needs nothing else: a second round trip
  * per delivery would be the dominant cost of a quiet night.
+ *
+ * EVERY ORDERING TERM IS `seq` SINCE 0046, and the reason is the one 0027, 0033 and 0041
+ * all record. `next_attempt_at` defaults to `now()`, the TRANSACTION timestamp, so a signal
+ * fanned out to three endpoints — or a whole expiry sweep's worth of deliveries, written in
+ * one transaction by design — becomes due at the identical instant; and the final
+ * `ORDER BY n.created_at` was the same clock a second time. Both sorts therefore fell
+ * through to the plan, so a batch's claim order and the order the sender worked through it
+ * were arbitrary among tied rows. `seq` is the insert order, which is what "oldest push
+ * first" was always supposed to mean.
+ *
+ * The `due` CTE also requires the notification to still exist, so an orphan is never
+ * claimed-and-lost by the inner join below. `settleOrphanedDeliveries` is what gives those
+ * rows an outcome; this predicate is what stops them being consumed silently in the
+ * meantime, and the two are deliberately separate — a claim must not be the thing that
+ * dead-letters.
  */
 export async function claimDue(
   tx: PoolClient,
@@ -68,7 +125,9 @@ export async function claimDue(
         WHERE d.tenant_id = $1
           AND d.state IN ('pending', 'in_flight')
           AND d.next_attempt_at <= $2
-        ORDER BY d.next_attempt_at
+          AND EXISTS (SELECT 1 FROM crm.notification n
+                       WHERE n.tenant_id = d.tenant_id AND n.id = d.notification_id)
+        ORDER BY d.next_attempt_at, d.seq
         LIMIT $3
         FOR UPDATE SKIP LOCKED
      ),
@@ -78,9 +137,9 @@ export async function claimDue(
               attempts = d.attempts + 1,
               next_attempt_at = $2::timestamptz + ($4 || ' milliseconds')::interval
         WHERE d.id IN (SELECT id FROM due)
-        RETURNING d.id, d.notification_id, d.endpoint_id, d.attempts
+        RETURNING d.id, d.tenant_id, d.notification_id, d.endpoint_id, d.attempts, d.seq
      )
-     SELECT c.id, c.notification_id, c.attempts, c.endpoint_id,
+     SELECT c.id, c.notification_id, c.seq::text AS seq, c.attempts, c.endpoint_id,
             e.channel, e.url, e.secret_env,
             jsonb_build_object(
               'deliveryId', c.id,
@@ -96,10 +155,16 @@ export async function claimDue(
               'createdAt', to_char(n.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
             ) AS payload
        FROM claimed c
-       JOIN crm.notification n ON n.id = c.notification_id
-       JOIN crm.rep_profile rp ON rp.id = n.recipient_rep_profile_id
-       JOIN crm.notification_endpoint e ON e.id = c.endpoint_id
-      ORDER BY n.created_at`,
+       -- Every join carries its tenant term since 0046. None of them is a behaviour
+       -- change: all three tables are RLS-FORCEd and this runs inside a tenant context,
+       -- so the policy already confined them. They are written out for 0043's reason --
+       -- the composite foreign key that made the notification pairing structural is
+       -- gone, so a reader of this query must be able to see the tenant match here
+       -- rather than infer it from a policy two files away.
+       JOIN crm.notification n ON n.tenant_id = c.tenant_id AND n.id = c.notification_id
+       JOIN crm.rep_profile rp ON rp.tenant_id = n.tenant_id AND rp.id = n.recipient_rep_profile_id
+       JOIN crm.notification_endpoint e ON e.tenant_id = c.tenant_id AND e.id = c.endpoint_id
+      ORDER BY c.seq`,
     [tenantId, now, limit, nextDelayMs(1, random)],
   );
   return rows;
@@ -160,6 +225,14 @@ export interface DispatchResult {
   readonly retried: number;
   readonly dead: number;
   readonly pending: number;
+  /**
+   * Unsettled deliveries whose notification was gone, recorded as undeliverable (0046).
+   *
+   * Counted separately from `dead` because the cause is different in kind: a `dead` row
+   * means a destination refused us, and this one means somebody removed the message out
+   * from under a queued push. A non-zero value here is not an endpoint problem.
+   */
+  readonly orphaned: number;
 }
 
 export interface NotificationDispatcherOptions {
@@ -193,6 +266,14 @@ export class NotificationDispatcher {
     let retried = 0;
     let dead = 0;
     try {
+      // Before the claim, in its own transaction: an orphan is not claimable (the `due` CTE
+      // refuses it) so it would otherwise sit unsettled and uncounted forever. Settling
+      // first also means the `pending` figure at the end of this pass is a count of pushes
+      // that can actually still happen.
+      const orphaned = await withTenantContext(client, tenantId, (tx) =>
+        settleOrphanedDeliveries(tx, tenantId),
+      );
+
       const claimed = await withTenantContext(client, tenantId, (tx) =>
         claimDue(tx, tenantId, now(), this.opts.batchSize ?? 20, random),
       );
@@ -244,7 +325,7 @@ export class NotificationDispatcher {
         return Number(rows[0]!.n);
       });
 
-      return { claimed: claimed.length, delivered, retried, dead, pending };
+      return { claimed: claimed.length, delivered, retried, dead, pending, orphaned };
     } finally {
       client.release();
     }

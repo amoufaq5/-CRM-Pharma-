@@ -13,10 +13,13 @@ on that path except one, which was wrong in a way nothing offline could have
 caught.
 
 Reproduce with `./scripts/verify-live-erp.sh`. It boots a real `operate-server`
-against a throwaway database and drives the **shipped `dist`** of `@crm/acl`,
-`@crm/credential`, `@crm/db` and `@crm/relay` at it — 59 assertions, every one
-of them over code that deploys. The script's header says what it does not prove;
-read that before quoting a pass from it.
+against a throwaway database and then does two things with it: it drives the
+**shipped `dist`** of `@crm/acl`, `@crm/credential`, `@crm/db` and `@crm/relay`
+at it as a library (90 assertions, §1–§6), and it starts the CRM's own **`api`
+and `scheduler` binaries as processes** and lets them do the work (34 assertions,
+§7 below). **124 assertions in total**, every one of them over code that deploys.
+The script's header says what it does not prove; read that before quoting a pass
+from it.
 
 ## The invocation that worked
 
@@ -330,6 +333,323 @@ middle one is the one the ADR names:
 
 The third was not reproduced live.
 
+## 7. The two binaries, driven as processes
+
+Everything in §1–§6 drives the CRM's `dist` as a **library**: the harness builds
+its own `OutboxRelay`, hands it a `ServiceCredential` it assembled itself, and
+calls `drainTenant`. ADR-0001's open table named what that leaves untested, in
+these words:
+
+> The CRM's own `api` and `scheduler` binaries were not driven at the live ERP.
+> The relay was driven directly. The scheduler's per-tenant loop, its credential
+> boot and its refusal to start on `ERP_TOKEN` under `NODE_ENV=production` are
+> all still verified only against the fixture.
+
+Both binaries now run as processes against the same live `operate-server`, and the
+chain they complete is the real one end to end:
+
+```
+POST /v1/samples/receipts  →  crm.outbox (StockMovement/create, pending)
+      (api.js, human JWT)          │
+                                   │  scheduler.js, its own relay_drain tick,
+                                   │  its own Ed25519 token, the tenant's own role
+                                   ▼
+                        POST /v1/stock-movements at the live ERP  →  delivered
+```
+
+Nothing in §7 calls `drainTenant`, mints a service token for the scheduler, or
+resolves a role on its behalf. The shell starts and stops the processes — the same
+pattern, and the same `trap`, the ERP and the JWKS endpoint already used — and
+`scripts/live-erp/drive-binaries.mjs` only makes requests, reads state and parses
+the log files the shell captured.
+
+### The invocation, and what in it is load-bearing
+
+```
+# the API, with a stand-in IdP in front of it
+PGUSER=crm_app PGDATABASE=crm_live1 PORT=0 \
+OIDC_ISSUER=https://idp.test OIDC_AUDIENCE=https://crm.test/api \
+OIDC_JWKS_URL=http://127.0.0.1:<ephemeral>/.well-known/jwks.json \
+  node packages/api/dist/bin/api.js
+
+# the scheduler, variable for variable as deploy/docker-compose.yml runs it
+PGUSER=crm_app PGDATABASE=crm_live1 \
+NODE_ENV=production ERP_BASE_URL=http://127.0.0.1:8788 \
+CRM_SIGNING_KEY_FILE=<work>/key.pem \
+CRM_TOKEN_ISSUER=https://crm.test ERP_TOKEN_AUDIENCE=https://erp.test \
+TICK_INTERVAL_MS=1000 \
+  node packages/scheduler/dist/bin/scheduler.js
+```
+
+- **`NODE_ENV=production` and no `ERP_TOKEN`.** The compose file defaults
+  `SCHEDULER_NODE_ENV` to `production`, so this is the deployed arrangement and
+  not a relaxed one. §7e asserts the refusal that arrangement implies.
+- **`CRM_SIGNING_KEY_FILE`, not `CRM_SIGNING_KEY_PEM`.** The path form is what
+  compose mounts at `/run/secrets`, and it is the one the boot reads from disk.
+- **`TICK_INTERVAL_MS=1000`.** The knob the binary already reads, used rather than
+  sleeping blindly: the gate waits, bounded, on the process's **own**
+  `relay_drain` line. A hang fails; it does not hang.
+- **`PORT=0` for the API.** The binary logs the port it actually bound, so the
+  gate needs no fourth reserved socket and a stale listener cannot be mistaken for
+  this one.
+- **A second key set for the IdP.** ADR-0001 item 10's two tiers "never mix", so
+  the human tier is given a different Ed25519 key, published in a different key
+  set, from the service key the ERP trusts. §7b's negative control is the live
+  form of that sentence.
+- **`crm.service_key` is populated through the shipped registry.**
+  `buildServiceCredential` refuses to start a process whose kid is not in that
+  table, so the key the JWKS endpoint has been serving since §1 is published and
+  activated through `PostgresServiceKeyRegistry` (with
+  `--propagation-seconds 0`, the override the shipped CLI offers, because the ERP
+  has already fetched this key set).
+
+### a. The API binary, authenticated, writing the only thing it writes
+
+| | |
+|---|---|
+| `GET /healthz` answers `200 ok`, so the process is connected as a role that does **not** bypass RLS | **confirmed** |
+| An unauthenticated `GET /v1/me` is refused 401 | **confirmed** |
+| An IdP-signed token is verified against the JWKS the binary **fetched over HTTP** and resolves to a rep | **confirmed** — `displayName: "Ada Lovelace"` |
+| …carrying `erpEmployeeId`, the `crm.rep_profile` mapping ADR-0001 Q3 exists for | **confirmed** — `emp-1` |
+| CONTROL: the same IdP signing a subject with no `rep_profile` row gets **403**, not a session | **confirmed** |
+| A token with no `tenant` claim resolves the same rep from `x-tenant-id` | **confirmed** |
+| `POST /v1/samples/receipts` records the movement and enqueues its ERP mirror in one transaction | **confirmed** — `201`, `erpMirrorEnqueued: true` |
+| …as `StockMovement`/`create` under the CRM's own `crm-sm-<movement id>` | **confirmed**, `state: pending` |
+| …with the inversion right: the CRM's `receipt` is the ERP's `issue` | **confirmed** |
+
+`/healthz` is not a formality here. `withTenantContext` refuses a connection whose
+role is `SUPERUSER` or `BYPASSRLS`, so a 200 is the binary's own statement that
+every tenant-scoped route below *can* be served. Pointed at `PGUSER=postgres` it
+answers exactly what README rule 1 says it answers:
+
+```
+503 {"status":"degraded","detail":"connected as postgres, which bypasses
+     row-level security — connect as crm_app"}
+```
+
+### b. The two credential tiers do not mix, live
+
+A token signed with the **ERP-facing service key** is refused by the CRM's own API:
+
+```
+401 {"detail":"unknown_key: no key 0EewNz9IuZsQgA6jthwt8ca4pWZMNTsepP0GfzyeVW8 …"}
+```
+
+Nothing in production can produce that token — the scheduler holds that key and
+never calls the API — which is precisely why it is worth proving the door is shut
+rather than assuming it. Pointed at the service key set instead of the IdP's, the
+API accepts it and the check goes red, so the check is measuring the key set and
+not the shape of the token.
+
+The complementary half: **the API publishes the key set the ERP verifies against**,
+out of `crm.service_key`, over its own socket.
+
+| | |
+|---|---|
+| `GET /.well-known/jwks.json` from the API publishes the active kid as `kty=OKP, crv=Ed25519` | **confirmed** |
+| and no private half (`d`) is in the document | **confirmed** — members are `kty,crv,kid,x,use,alg` |
+
+Everything earlier in this gate was served by `jwks-server.mjs`, a harness script
+calling `jwksResponse` directly. This is the deployed arrangement: the API
+publishes from the database and holds no private key at all, so a compromised API
+could not mint a token.
+
+### c. No API route crosses the boundary synchronously — pinned as a check
+
+The brief asked for an API route that genuinely reaches the ERP. **There is none,
+and that is the design.** `packages/api/src/` imports nothing from `@crm/acl`,
+constructs no `ErpClient`, and makes exactly one outbound HTTP call in the whole
+package — `fetch(url)` for the IdP's JWKS in `bin/api.ts`. Every read it serves
+comes from a `crm.*` snapshot; the only write that leaves the CRM is an
+`crm.outbox` row.
+
+So the boundary is crossed **asynchronously, by the scheduler**, and the gate pins
+that rather than papering over it:
+
+```
+ok: the ERP has not heard of it yet — no API route crosses the boundary
+    synchronously — GET /v1/stock-movements/crm-sm-acd4f040-… = 404
+```
+
+If that ever answers 200, some route has grown a synchronous ERP call and the
+chain in §7d stops proving what it says it proves.
+
+### d. The scheduler binary: the credential boot, the loop, the drain
+
+| | |
+|---|---|
+| It built a **signing** credential at boot from the file `CRM_SIGNING_KEY_FILE` names | **confirmed** — `kind=signing`, kid matches the published key |
+| It minted a per-tenant token under the ERP role resolved from `crm.erp_service_principal` | **confirmed** — `role=erp_admin`, `tenant=1111…1111` |
+| …with the jti and expiry an operator correlates a 401 with | **confirmed** |
+| …and the token itself is in **no** log line | **confirmed** — 0 lines of 22 carry a JWT shape |
+| The row the API queued reached `delivered` on the scheduler's own timer | **confirmed** — `attempts=1` |
+| …with the ERP's own response persisted on it | **confirmed** |
+| The mirrored `StockMovement` is at the live ERP | **confirmed** — `issue`, `12.000`, `wh-1` |
+| …carrying the lot in `reason`, the only place the ERP's `StockMovement` can hold it | **confirmed** — `"CRM sample receipt: lot LOT-LIVE-1 exp 2027-10-06 (drug_sample)"` |
+| It stops cleanly on `SIGTERM`, logging `shutdown`, draining the tick in flight | **confirmed** — exit 0 |
+
+**The credential boot is the half nobody had seen work.** It is not a token handed
+to the process: it reads a PKCS#8 PEM off disk, derives the RFC 7638 thumbprint,
+asks `crm.service_key` whether that kid is published, builds a
+`PostgresServiceRoleSource` over the pool, and resolves the tenant's ERP role
+through `withTenantContext` as `crm_app`. Pointed at the unpublished rogue key the
+gate generates for §1's negative control, the real refusal fires against the real
+database and the process never starts:
+
+```
+scheduler failed to start: the signing key tcxVJg9v072hIncwEkGOh2ZfDDRvFBwzvdP-agIkcgU
+is not in crm.service_key, so it is not published in the JWKS. Every token it signs
+would be rejected with credential_not_found. Publish it (crm-service-key publish)
+before starting.
+```
+
+**The log line is the operator's only view of a drain.** There is no metrics sink
+in this system, so a line that quietly changes shape is a line nobody notices
+changing. The gate reads the process's actual stdout:
+
+| | |
+|---|---|
+| Every line on stdout is one JSON object a log shipper can parse | **confirmed** — 22 of 22 |
+| …each carrying a `ts` and a `type` | **confirmed** |
+| The `relay_drain` summary names every counter a human reads | **confirmed** — `claimed delivered retried dead alarmed unattributed pending oldest` |
+| …and the numbers agree with the database | **confirmed** — `delivered=1` |
+| …attributed to the tenant it drained, with its duration — the per-tenant loop, not a global one | **confirmed** |
+
+```
+{"ts":"…","type":"job_ok","tenantId":"1111…1111","job":"relay_drain",
+ "durationMs":208,"detail":"claimed=1 delivered=1 retried=0 dead=0 alarmed=0
+ unattributed=0 pending=0 oldest=-s"}
+```
+
+The same tick also **read** the ERP, through the scheduler's own
+`SnapshotRefresher`, which closes a loop neither binary could close alone:
+
+| | |
+|---|---|
+| `crm.product_snapshot` was filled from the live ERP by this process | **confirmed** — 4 rows, `9.00 20.00 100.00 1000.00` |
+| …and the line says out loud that `since` bounded nothing | **confirmed** — `UNBOUNDED: product,rep,account published no filterable+sortable updated_at` |
+| **`?list_price[gte]=1000` at the ERP returns 3 rows; `?minPrice=1000` at the CRM's API returns 1** | **confirmed** — `ERP=[1000,20,9] API=[1000.00]` |
+
+That last line is why `packages/sync` exists, measured across both binaries and
+the live server in one assertion: the ERP compares the number as text (§4), the
+CRM's API answers the same question off the typed snapshot the scheduler just
+wrote, and only one of them is right.
+
+### e. The two negative controls
+
+**The ERP role comes from the tenant's row, not the process's environment.** The
+second scheduler run's environment is byte-identical to the first. The only change
+is one column of one row:
+
+| | |
+|---|---|
+| With `crm.erp_service_principal.erp_role` flipped to `erp_viewer`, the token carries `erp_viewer` | **confirmed** |
+| …the live ERP refuses the create, so the row **dies** rather than retrying forever | **confirmed** — `dead_reason = "forbidden: principal's effective roles do not grant 'create' on 'StockMovement'"` |
+| …and the record is not at the ERP, so the refusal was the ERP's | **confirmed** — 404 |
+| …and the binary logs the dead **row** on stderr, naming the write that will never land | **confirmed** |
+
+That last one only exists in a deployed process because the binary wires `onEvent`
+into `OutboxRelay`. No aggregate can reconstruct which write will never land:
+
+```
+{"ts":"…","type":"relay_dead","outboxId":"842af9ce-…","tenantId":"1111…1111",
+ "entity":"StockMovement","operation":"create","targetRecordId":"crm-sm-4b0e…",
+ "reason":"forbidden: principal's effective roles do not grant 'create' on 'StockMovement'"}
+```
+
+**It refuses to start on a static `ERP_TOKEN` under `NODE_ENV=production`.** A
+process-start decision, so it is asserted on the exit status and the sentence, not
+on a return value — and with no `CRM_SIGNING_KEY_FILE` in the environment, because
+a signing key takes precedence over `ERP_TOKEN` by design and leaving one set
+would make the check pass for the wrong reason.
+
+| | |
+|---|---|
+| It exits **non-zero** | **confirmed** — 1 |
+| …naming the cause (`ERP_TOKEN is a development-only static credential`) and the remedy (`CRM_SIGNING_KEY_PEM`) | **confirmed** |
+| …and it is a refusal, not a hang | **confirmed** — the gate fails a 124 from `timeout` by name |
+| COMPLEMENT: the same binary and the same `ERP_TOKEN` **do** start outside production | **confirmed** — `{"type":"credential","kind":"static","kid":null}` |
+| …with the development-only warning on stderr, not silently | **confirmed** |
+
+The complement is the half that makes the section mean anything: without it, this
+passes just as well against a binary that cannot start at all. The `-ne 124` guard
+earns its place too — removing `NODE_ENV=production` makes the process run until
+`timeout` kills it, which satisfies "exited non-zero" while proving the opposite.
+
+### f. Every process is shut down, on both paths
+
+A leaked listener is the failure that disguises itself: the next run fails on
+"something is already listening on 127.0.0.1:8788", four steps from the cause. The
+`trap` covers the failing path and names each process it kills; §14 covers the
+**passing** path, which the trap never exercises, and it examines only this run's
+own pids — another agent's scheduler on the same host is not this gate's business.
+
+### What this run falsified
+
+**Nothing about the two binaries.** They did exactly what `README.md` and ADR-0001
+say they do, on the first run that reached them. Four beliefs died in earlier
+rounds of this gate — a 409 that is really a 500, a tenant cross-check that is
+conditional, a 422 with no `detail`, an idempotency replay that told the operator
+less than before they pressed retry — and it is worth saying plainly that this
+round killed none of that kind. The credential boot, the per-tenant loop, the role
+resolution, the production refusal and the log line were all right as written, and
+"it worked first try" is information: the one part of the integration that had
+never been executed as a process turned out to need no changes at all.
+
+Two things did die, and both were in the **gate**, which is the next most useful
+place for a belief to die:
+
+- **A case's instrumented ERP client was seeing another case's traffic.** §6(v)
+  asserts that an ambiguous 500 on a *transition* reads nothing back, and it
+  failed:
+
+  ```
+  FAIL: an ambiguous 500 on a TRANSITION reads nothing back — existence is not
+        the question there
+        — got writes=1 recordReads=["/v1/leave-requests/crm-lr-muvyaod0-i"]
+  ```
+
+  The read it saw is `…-i`, which is §6(iv)'s row, not its own. §6(iv) leaves that
+  row `pending` deliberately, the first retry's full-jitter backoff is
+  `random(0, 1000)ms`, and `drainTenant` claims every **due** row of the tenant —
+  so the earlier row was retried through the later case's client and its probe was
+  attributed to the transition. The rule was never broken; the harness reported it
+  broken, which is the same disagreement between harness and reality as the four
+  deaths above, pointing the other way. A gate that fails while the code is
+  correct is worse than no gate, because the first assumption is that the code
+  changed. Fixed twice over: the §6(iv) row is parked an hour out before anything
+  else drains, and the assertion is scoped to reads of **its own** target, so no
+  future row can resurrect it. Four consecutive runs green.
+
+- **A throw inside a phase shrank the check count silently.** Found while proving
+  the new checks can fail: pointing the API at `PGUSER=postgres` made
+  `drive-binaries.mjs`'s own `withTenantContext` refuse, the phase died on an
+  unhandled rejection, and the remaining checks were neither `ok` nor `FAIL`. The
+  shell still failed the run, so nothing passed that should not have — but the
+  total was under-reported, and a count that can shrink is a count nobody can read
+  as coverage. Each phase now runs inside a `try`, a throw is a named failure like
+  any other, and the count is written in a `finally`.
+
+### How each new check was shown to fail
+
+Every assertion in §7 was watched going red, by breaking the thing it measures and
+restoring it. The breakages, and what each one reddened:
+
+| Breakage | Checks it turned red |
+|---|---|
+| The scheduler is never started; the drain phase runs anyway | 14 of §7d's 16 — credential, mint ×2, delivered, `erp_response`, the ERP record ×2, stdout-objects, the summary ×3, the snapshot ×2, the numeric comparison |
+| A plain-text line, a JWT-shaped line and a `pending=` counter removed from the captured stdout | the remaining 4 — stdout-objects, `ts`/`type`, the summary's counters, the token-leak check |
+| `erp_role` left at `erp_admin` instead of being flipped | 4 of §7e's 5 — the minted role, the dead row, the ERP's 404, the `relay_dead` line |
+| A non-JSON line appended to the scheduler's captured stderr | the 5th — stderr-is-JSON |
+| The API connected as `PGUSER=postgres` | 6 of §7a — `/healthz`, `/v1/me` ×2, the 403 control, the header fallback, the receipt |
+| `OIDC_JWKS_URL` pointed at the **service** key set | 8 of §7a/§7b — the cross-tier refusal, the IdP handshake ×2, the 403 control, the fallback, the receipt, the queued row ×2 |
+| `crm.service_key` emptied before the API starts; the anonymous probe aimed at a `public: true` route; the mirror POSTed to the ERP before §7c looks | 4 — the JWKS ×2, the 401 control, the no-synchronous-crossing check |
+| `CRM_SIGNING_KEY_FILE` pointed at the unpublished rogue key | the boot wait — `the scheduler's own relay_drain tick: the process exited first` |
+| `SIGKILL` instead of `SIGTERM` | the clean-stop check — exit 137 |
+| `NODE_ENV` dropped from the refusal run / added to the complement | both §7e production checks |
+| The API deliberately not killed before §14 | `a process this gate started is still running: 6450` |
+| A `kid` edited to disagree with its own key material | `publish-key.mjs` exits 1: `publish derived kid 9bBh8…, but the JWKS publishes not-the-thumbprint` |
+
 ## The defect found and fixed
 
 **A 422 dead-lettered with no reason a human could act on.**
@@ -463,10 +783,36 @@ ok: so the summary reads as the button being pressed instead of the cause being
 - **Option (b)'s single database is not exercised.** The ERP has its own database
   here, so cross-schema reads, the `crm_app` `SELECT` grant on the real
   `meta.operate_entity_records`, and the shared-fate properties are untested.
-- **The CRM's own `api` and `scheduler` binaries were not driven at the live
-  ERP.** The relay was driven directly. The scheduler's per-tenant loop, its
-  credential boot and its refusal to start on `ERP_TOKEN` under
-  `NODE_ENV=production` are all still verified only against the fixture.
+- ~~**The CRM's own `api` and `scheduler` binaries were not driven at the live
+  ERP.**~~ **Closed by §7.** Both run as processes now, the credential boot is the
+  real one, and the drain happens on the scheduler's own tick. What is still open
+  *within* that:
+  - **One tenant, one instance, one tick.** The per-tenant loop is exercised with
+    exactly one tenant in `crm.tenant`, so nothing here shows two tenants isolated
+    from each other inside one tick, and nothing shows two scheduler instances
+    sharing the work — `claimDueJobs` advances `next_run_at` inside the claim and
+    `FOR UPDATE SKIP LOCKED` is meant to make that safe, which is a concurrency
+    claim no single-instance run can test.
+  - **The jobs other than `relay_drain` and the snapshots are only observed, not
+    asserted.** `expiry_sweep`, `notify_prune`, `notify_dispatch` and
+    `expense_post` all run in the first tick against the live database and are
+    seen to succeed; the gate asserts nothing about what they did, because the
+    rows they act on are not seeded. `expense_post` in particular is the one job
+    that writes the GL, and the Finance questions below still gate it.
+  - **`relay_drain`'s own cadence is nudged, not waited out.** The second
+    scheduler run has its `next_run_at` pulled back to `now()` rather than the
+    gate spending the job's 30s window; the tick itself still happens on the
+    process's loop, through `claimDueJobs`, but the *schedule* is not what is
+    under test there.
+  - **The API's write path is exercised at one route.** `POST
+    /v1/samples/receipts` is the only API route that writes `crm.outbox`, so it is
+    the whole of the boundary — but `/v1/samples/returns`, the mirror in the other
+    direction (`return_to_warehouse` → the ERP's `receipt`), is not driven, and
+    neither is `POST /v1/erp-writes/:id/retry`.
+  - **The IdP is a stand-in signing EdDSA.** `verifyJwt` supports RS256
+    specifically because Entra, Auth0, Cognito and Keycloak default to it, and no
+    live run has ever handed it an RS256 token. Covered offline by `jwt.test.ts`
+    and nowhere else.
 - **Nothing about TLS, a proxy, concurrency, or key rotation under live traffic.**
   The JWKS is plain HTTP on loopback and one key is published for the run.
 - **No GL path.** `Expense`, `JournalEntry` and the period-lock retry were not

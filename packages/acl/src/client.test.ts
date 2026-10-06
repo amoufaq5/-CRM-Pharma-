@@ -310,3 +310,124 @@ describe("timeouts", () => {
     }
   });
 });
+
+/**
+ * THE GATEWAY'S REPLAY, which keeps a reply's status and not its body.
+ *
+ * `api-gateway-runtime` serves a `replay_hit_match` as `{status, bodyBytes: null,
+ * "x-idempotent-replay": "true"}`, and it stores a handler's 4xx and 5xx the same way it
+ * stores a success — for a 24-hour TTL, in a store that never evicts. So the relay, which
+ * re-sends the same outbox row under the same key on every transient refusal (sixty times
+ * over for a locked fiscal period), was handed the status with the cause stripped out.
+ *
+ * Both measured consequences were wrong in the expensive direction: a bodiless 422 parsed
+ * as `validation_failed` and dead-lettered a correct write, and a bodiless 409 parsed as a
+ * bare `conflict` — past the `invalid_transition` branch written to catch exactly it — and
+ * marked a transition delivered that the ERP had refused and never applied.
+ */
+describe("a replayed refusal is asked again", () => {
+  const replay = (status: number) => ({
+    status,
+    headers: { get: (n: string) => (n === "x-idempotent-replay" ? "true" : null) },
+    text: () => Promise.resolve(""),
+  });
+
+  function replayHarness(second: { status: number; body: unknown }): {
+    client: ErpClient;
+    calls: Call[];
+    replays: Array<{ method: string; path: string; status: number }>;
+  } {
+    const calls: Call[] = [];
+    const replays: Array<{ method: string; path: string; status: number }> = [];
+    let writes = 0;
+    const fetchImpl: FetchLike = (url, init) => {
+      calls.push({ url, method: init.method, headers: init.headers });
+      if (url.endsWith("/v1/meta/schema")) return Promise.resolve(response(200, ERP_SCHEMA_FIXTURE));
+      writes += 1;
+      // First write replays; the second — under a key the gateway has never seen — is the
+      // handler answering for real.
+      return Promise.resolve(writes === 1 ? replay(second.status) : response(second.status, second.body));
+    };
+    const credential: TenantCredential = { token: () => Promise.resolve("ed25519-token") };
+    return {
+      client: new ErpClient({
+        baseUrl: "https://erp.example/",
+        credential,
+        fetch: fetchImpl,
+        onIdempotentReplay: (i) => replays.push(i),
+      }),
+      calls,
+      replays,
+    };
+  }
+
+  const writeKeys = (calls: Call[]): string[] =>
+    calls.filter((c) => c.method !== "GET").map((c) => c.headers["idempotency-key"] ?? "");
+
+  it("recovers the ERP's own sentence from a replayed 422, instead of dead-lettering a correct write", async () => {
+    const h = replayHarness({ status: 422, body: { error: "period_locked", detail: "2026-10 is closed" } });
+    const err = await h.client
+      .create(TENANT, "Expense", { id: "crm-exp-1" }, "crm-exp-1-r0")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ErpError);
+    // The cause survives — which is the whole point, because `period_locked` is what tells
+    // the relay to wait rather than to give up.
+    expect((err as ErpError).code).toBe("period_locked");
+    expect((err as ErpError).detail).toContain("2026-10 is closed");
+
+    // Exactly one extra request, and the second key is not the first.
+    const keys = writeKeys(h.calls);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe("crm-exp-1-r0");
+    expect(keys[1]).not.toBe(keys[0]);
+    expect(keys[1]).toContain("asked-again");
+    expect(h.replays).toEqual([{ method: "POST", path: "/v1/expenses", status: 422 }]);
+  });
+
+  it("recovers `invalid_transition` from a replayed 409, instead of calling it delivered", async () => {
+    const h = replayHarness({
+      status: 409,
+      body: { error: "invalid_transition", detail: "'reimburse' cannot fire from 'approved'" },
+    });
+    const err = await h.client
+      .transition(TENANT, "Expense", "crm-exp-2", "reimburse", {}, "crm-exp-2-r0")
+      .catch((e: unknown) => e);
+    expect((err as ErpError).code).toBe("invalid_transition");
+    expect(writeKeys(h.calls)).toHaveLength(2);
+  });
+
+  /**
+   * A replayed SUCCESS is left alone, and that is not an oversight: there the write really
+   * did land, the empty body is expected, and the caller settles on it. Re-asking would be
+   * a second write attempt against a record that already exists.
+   */
+  it("does not ask again for a replayed success", async () => {
+    const calls: Call[] = [];
+    let writes = 0;
+    const fetchImpl: FetchLike = (url, init) => {
+      calls.push({ url, method: init.method, headers: init.headers });
+      if (url.endsWith("/v1/meta/schema")) return Promise.resolve(response(200, ERP_SCHEMA_FIXTURE));
+      writes += 1;
+      return Promise.resolve(replay(201));
+    };
+    const credential: TenantCredential = { token: () => Promise.resolve("ed25519-token") };
+    const client = new ErpClient({ baseUrl: "https://erp.example/", credential, fetch: fetchImpl });
+    expect(await client.create(TENANT, "Expense", { id: "crm-exp-3" }, "k")).toBeNull();
+    expect(writes).toBe(1);
+  });
+
+  it("asks again once and no more, so a replaying gateway cannot become a loop", async () => {
+    // Every answer is a replay. The second key is fresh, so a gateway that replays it
+    // anyway is misbehaving — and the client must still stop, not spin.
+    const calls: Call[] = [];
+    const fetchImpl: FetchLike = (url, init) => {
+      calls.push({ url, method: init.method, headers: init.headers });
+      if (url.endsWith("/v1/meta/schema")) return Promise.resolve(response(200, ERP_SCHEMA_FIXTURE));
+      return Promise.resolve(replay(422));
+    };
+    const credential: TenantCredential = { token: () => Promise.resolve("ed25519-token") };
+    const client = new ErpClient({ baseUrl: "https://erp.example/", credential, fetch: fetchImpl });
+    await client.create(TENANT, "Expense", { id: "crm-exp-4" }, "k").catch(() => undefined);
+    expect(writeKeys(calls)).toHaveLength(2);
+  });
+});

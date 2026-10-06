@@ -249,10 +249,11 @@ export function toProblem(err: unknown): ApiError {
       return new ApiError("conflict", message);
     case "LastAdministratorError":
       return new ApiError("last_administrator", message);
-    // The endpoint probe (0034). Four refusals, each a different instruction to the
-    // administrator: the endpoint is gone; one is already running; you asked too recently;
-    // the cooldown you tried to set is out of range. A 500 for any of them would be the
-    // API reporting its own surprise at a rule it enforces.
+    // The endpoint probe (0034, 0045). Six refusals, each a different instruction to the
+    // administrator: the endpoint is gone; the rep asking is gone; one is already running;
+    // you asked about THIS endpoint too recently; your tenant has spent its probe budget for
+    // the window; the number you tried to set is out of range. A 500 for any of them would
+    // be the API reporting its own surprise at a rule it enforces.
     case "EndpointNotFoundError":
     // Also a 404, and a separate class on purpose: "the endpoint is not here" and "the rep
     // asking is not here" send an administrator to look at different things.
@@ -261,8 +262,15 @@ export function toProblem(err: unknown): ApiError {
     case "ProbeInFlightError":
       return new ApiError("conflict", message);
     case "ProbeCooldownError":
+    // 0045's tenant-wide total, which the cooldown's per-endpoint scope deliberately cannot
+    // see. Also 429 and also rate limiting — the state of the system is fine, only the pace
+    // is not — and a separate class because the two ask for different actions: one says wait
+    // for THIS endpoint, the other says the tenant has spent its window across all of them.
+    // Both messages carry the moment a retry becomes legal, which is the actionable half.
+    case "ProbeBudgetExceededError":
       return new ApiError("too_many_requests", message);
     case "InvalidProbeCooldownError":
+    case "InvalidProbeBudgetError":
       return new ApiError("validation_failed", message);
     case "InvalidEndpointError":
     case "InvalidRetentionError":

@@ -285,7 +285,10 @@ export class Scheduler {
           // Prefixed rather than folded in, so a non-zero value is legible at a glance in a
           // line that is otherwise all zeroes on a healthy tenant.
           `${r.settleLost > 0 ? `LOST=${r.settleLost} ` : ""}` +
-          `pending=${r.lag.pending} oldest=${r.lag.oldestPendingAgeSeconds ?? "-"}s`
+          // `oldest=-s` is not a duration, and this line is the operator's only view of a
+          // drain. An empty queue says so in words.
+          `pending=${r.lag.pending} oldest=` +
+          `${r.lag.oldestPendingAgeSeconds === null ? "none" : `${r.lag.oldestPendingAgeSeconds}s`}`
         );
       }
       case "expiry_sweep": {
@@ -330,7 +333,25 @@ export class Scheduler {
             // the floor stops it tripping. Named here so the log says which knob did it.
             (r.floorWaived ? ` FLOOR-WAIVED: ${r.floorWaivedReason ?? "under the row floor"}` : "") +
             // A refusal deleted NOTHING, so it must not read like a quiet zero.
-            (r.refused ? ` REFUSED: ${r.refusalReason ?? "over the ceiling"}` : "")
+            (r.refused ? ` REFUSED: ${r.refusalReason ?? "over the ceiling"}` : "") +
+            // Phase two: `crm.notification_delivery`, under its own horizon and its own
+            // share of its own table (0046). Its numbers go in the same line because it is
+            // the same pass and the same transaction — a second line would read like a
+            // second job, which is the thing it deliberately is not. A share OF THE INBOX
+            // says nothing about a delete from the delivery table, which is why the two
+            // phases measure separately and refuse independently.
+            ` | deliveries deleted=${r.delivery.deleted} keptUnsettled=${r.delivery.keptUnsettled} ` +
+            `orphaned=${r.delivery.orphaned} more=${r.delivery.moreRemaining} ` +
+            `retainDelivery=${r.delivery.retainDeliveryDays}d ` +
+            `share=${r.delivery.sharePercent}%/${r.guard.prune_max_share_percent}% ` +
+            `prunable=${r.delivery.prunableTotal} pushes=${r.delivery.deliveryTotal}` +
+            (r.delivery.overridden ? " overridden=true" : "") +
+            (r.delivery.floorWaived
+              ? ` FLOOR-WAIVED: ${r.delivery.floorWaivedReason ?? "under the row floor"}`
+              : "") +
+            (r.delivery.refused
+              ? ` REFUSED: ${r.delivery.refusalReason ?? "over the ceiling"}`
+              : "")
           );
         } finally {
           client.release();
@@ -364,7 +385,11 @@ export class Scheduler {
         const r = await dispatcher.drainTenant(tenantId);
         const line =
           `claimed=${r.claimed} delivered=${r.delivered} retried=${r.retried} ` +
-          `dead=${r.dead} pending=${r.pending}`;
+          `dead=${r.dead} pending=${r.pending}` +
+          // Only when non-zero, like `LOST=` on the relay line: an orphan means somebody
+          // removed a notification out from under a queued push, which is not an endpoint
+          // problem and is not something a healthy deployment ever shows.
+          (r.orphaned > 0 ? ` ORPHANED=${r.orphaned}` : "");
         // Probes ride this tick rather than a job of their own. A probe failure must not
         // fail the dispatch: the notifications went out, and an administrator's test-send
         // going unanswered is not a reason to engage the job's failure backoff and stop

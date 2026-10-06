@@ -97,9 +97,13 @@ export async function raiseNotification(
     if (!meetsSeverity(input.severity, endpoint.min_severity)) continue;
     if (endpoint.kinds !== null && !endpoint.kinds.includes(input.kind)) continue;
     await tx.query(
+      // The conflict target names `tenant_id` since 0046: a unique index is enforced with
+      // row security disabled, so the old `(notification_id, endpoint_id)` key was
+      // cross-tenant — latent while the composite foreign key beside it co-guaranteed the
+      // pairing, and 0046 drops that key, so the tenant joins the key itself (0043's rule).
       `INSERT INTO crm.notification_delivery (tenant_id, notification_id, endpoint_id)
        VALUES ($1, $2, $3)
-       ON CONFLICT (notification_id, endpoint_id) DO NOTHING`,
+       ON CONFLICT (tenant_id, notification_id, endpoint_id) DO NOTHING`,
       [tenantId, created.id, endpoint.id],
     );
     deliveries += 1;

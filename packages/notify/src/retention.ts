@@ -23,6 +23,28 @@ export const DEFAULT_RETAIN_READ_DAYS = 30;
 export const DEFAULT_RETAIN_UNREAD_DAYS = 365;
 
 /**
+ * The THIRD horizon: how long the record of where a signal was pushed is kept (0046).
+ *
+ * A third projection of the same policy row rather than a third field on
+ * `NotificationPolicy`, for the reason `PruneGuard` is one. The horizons above are what
+ * every rep may read, because a rep whose notification disappeared is entitled to know it
+ * was a rule. This one is not an answer to that question: `crm.notification_delivery`
+ * records pushes to third-party endpoints that a rep cannot see and has no inbox entry for,
+ * so it is an administrative setting about evidence, not about an inbox. Keeping it separate
+ * also keeps `NotificationPolicy` the pair of numbers the retention API has always returned.
+ *
+ * The two are coupled in the database, not here: `notification_policy_delivery_not_shorter`
+ * (0046) forbids a delivery horizon shorter than the unread one, so raising the unread
+ * horizon past this number is refused with a sentence that says which to raise first.
+ */
+export interface DeliveryRetention {
+  readonly retain_delivery_days: number;
+}
+
+/** 730 days. The argument for two years, and what it costs, is in 0046's header. */
+export const DEFAULT_RETAIN_DELIVERY_DAYS = 730;
+
+/**
  * The ceiling on how much of an inbox one pass may delete, and the way past it.
  *
  * Stored on `crm.notification_policy` beside the horizons but read separately, because
@@ -73,10 +95,13 @@ const DEFAULT_GUARD: PruneGuard = {
   prune_guard_override_until: null,
 };
 
-const POLICY_COLUMNS = `retain_read_days, retain_unread_days,
+const POLICY_COLUMNS = `retain_read_days, retain_unread_days, retain_delivery_days,
             prune_max_share_percent, prune_guard_floor_rows,
             prune_guard_override_by, prune_guard_override_granted_at,
             prune_guard_override_until`;
+
+/** Every projection of the policy row, as one read. */
+type PolicyRow = NotificationPolicy & PruneGuard & DeliveryRetention;
 
 /**
  * The whole policy row, defaulting it into existence.
@@ -88,11 +113,11 @@ const POLICY_COLUMNS = `retain_read_days, retain_unread_days,
  * One read for both projections below, so a prune that needs the horizons AND the guard
  * does not ask twice and cannot see two different versions of the same row.
  */
-async function policyRow(tx: PoolClient, tenantId: string): Promise<NotificationPolicy & PruneGuard> {
+async function policyRow(tx: PoolClient, tenantId: string): Promise<PolicyRow> {
   await tx.query(`INSERT INTO crm.notification_policy (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING`, [
     tenantId,
   ]);
-  const { rows } = await tx.query<NotificationPolicy & PruneGuard>(
+  const { rows } = await tx.query<PolicyRow>(
     `SELECT ${POLICY_COLUMNS} FROM crm.notification_policy WHERE tenant_id = $1`,
     [tenantId],
   );
@@ -100,6 +125,7 @@ async function policyRow(tx: PoolClient, tenantId: string): Promise<Notification
     rows[0] ?? {
       retain_read_days: DEFAULT_RETAIN_READ_DAYS,
       retain_unread_days: DEFAULT_RETAIN_UNREAD_DAYS,
+      retain_delivery_days: DEFAULT_RETAIN_DELIVERY_DAYS,
       ...DEFAULT_GUARD,
     }
   );
@@ -122,6 +148,46 @@ const projectGuard = (row: PruneGuard): PruneGuard => ({
 /** The guard, defaulting the row into existence like the horizons do. */
 export async function notificationPruneGuard(tx: PoolClient, tenantId: string): Promise<PruneGuard> {
   return projectGuard(await policyRow(tx, tenantId));
+}
+
+/** The delivery horizon, defaulting the row into existence like the horizons do. */
+export async function notificationDeliveryRetention(
+  tx: PoolClient,
+  tenantId: string,
+): Promise<DeliveryRetention> {
+  const row = await policyRow(tx, tenantId);
+  return { retain_delivery_days: row.retain_delivery_days };
+}
+
+/**
+ * The retention CHECKs, as the sentences a 422 can carry.
+ *
+ * One map for all three horizons, rather than a prefix test per setter: the pairing
+ * constraints are what a partial update trips, and a partial update to ANY horizon can trip
+ * EITHER of them, so each setter has to be able to say the same two things.
+ */
+const RETENTION_CONSTRAINT_MESSAGES: Readonly<Record<string, string>> = {
+  notification_policy_unread_not_shorter:
+    "an unread notification must not be deleted sooner than a read one — " +
+    "retainUnreadDays must be at least retainReadDays",
+  // The inverse of the sentence above, one table over. Named from the delivery side because
+  // that is the horizon being introduced, but a caller RAISING retainUnreadDays meets it
+  // too, so the message says which number to move rather than only which rule broke.
+  notification_policy_delivery_not_shorter:
+    "the record of where a signal was pushed must not be deleted sooner than the " +
+    "notification it describes — retainDeliveryDays must be at least retainUnreadDays; " +
+    "raise retainDeliveryDays first",
+};
+
+/** Translates a retention CHECK into `InvalidRetentionError`, or rethrows. */
+function retentionError(err: unknown): Error {
+  const e = err as { constraint?: string };
+  const known = e?.constraint === undefined ? undefined : RETENTION_CONSTRAINT_MESSAGES[e.constraint];
+  if (known !== undefined) return new InvalidRetentionError(known);
+  if (e?.constraint?.startsWith("notification_policy_retain") === true) {
+    return new InvalidRetentionError("a retention period must be between 1 and 3650 days");
+  }
+  return err instanceof Error ? err : new Error(String(err));
 }
 
 /**
@@ -150,17 +216,38 @@ export async function setNotificationPolicy(
     );
     return rows[0]!;
   } catch (err) {
-    const e = err as { constraint?: string; message?: string };
-    if (e?.constraint === "notification_policy_unread_not_shorter") {
-      throw new InvalidRetentionError(
-        "an unread notification must not be deleted sooner than a read one — " +
-          "retainUnreadDays must be at least retainReadDays",
-      );
-    }
-    if (e?.constraint?.startsWith("notification_policy_retain") === true) {
-      throw new InvalidRetentionError("a retention period must be between 1 and 3650 days");
-    }
-    throw err instanceof Error ? err : new Error(String(err));
+    throw retentionError(err);
+  }
+}
+
+/**
+ * Change how long the record of a push is kept.
+ *
+ * Its own setter rather than a third option on `setNotificationPolicy`, matching the
+ * projection: the two inbox horizons are one decision an administrator makes about storage,
+ * and this is a decision about how long evidence of a disclosure to a third party is held.
+ * The ranges and the pairing are the database's (0046), translated rather than re-checked
+ * for the reason the others are — a partial update has to be judged against the row as it
+ * will be, and the CHECK is the only thing that sees that.
+ */
+export async function setNotificationDeliveryRetention(
+  tx: PoolClient,
+  tenantId: string,
+  input: { retainDeliveryDays: number },
+): Promise<DeliveryRetention> {
+  await policyRow(tx, tenantId);
+  try {
+    const { rows } = await tx.query<DeliveryRetention>(
+      `UPDATE crm.notification_policy
+          SET retain_delivery_days = $2,
+              updated_at           = now()
+        WHERE tenant_id = $1
+        RETURNING retain_delivery_days`,
+      [tenantId, input.retainDeliveryDays],
+    );
+    return rows[0]!;
+  } catch (err) {
+    throw retentionError(err);
   }
 }
 
@@ -320,6 +407,63 @@ export async function prunableNotifications(
   return rows;
 }
 
+/**
+ * Phase two: what the same pass did to `crm.notification_delivery`.
+ *
+ * WHY A SECOND PHASE OF ONE PASS, and not a second job or a horizon the first DELETE
+ * honours. All three were available.
+ *
+ * Not a second job: the two horizons are one policy and an operator who turns retention on
+ * wants one summary and one thing to enable. And the ORDER matters — pruning a notification
+ * is what makes its delivered rows outlive it, so the delivery phase has to run after the
+ * notification phase or every orphan waits a night for its own horizon to be considered.
+ *
+ * Not one DELETE with two horizons: they are different tables with different denominators,
+ * and the guard is a SHARE. 0026's whole argument is that a share reads the "horizon wrong
+ * by an order of magnitude" signature identically at every scale — but a share OF THE INBOX
+ * says nothing about a delete from the delivery table. A tenant with 10 notifications and
+ * two million delivery rows would see any delivery prune as an impossible share of the
+ * inbox, and the inverse tenant would see a catastrophic delivery prune pass a ceiling it
+ * never approached.
+ *
+ * So: one job, one transaction, one ceiling, one floor, one override window — and TWO
+ * measurements. `crm.notification_prune_guard_trips` and
+ * `crm.notification_prune_ceiling_exceeded` are asked again with the same
+ * `prune_max_share_percent` and `prune_guard_floor_rows`, against this table's own numerator
+ * and denominator. Nothing here is a new guard and nothing here bypasses the existing one;
+ * a refusal in either phase leaves that phase's rows untouched and says so independently,
+ * because "the inbox horizon is wrong" and "the delivery horizon is wrong" are two different
+ * mistakes and refusing both because of one would be the 0026 failure in reverse.
+ */
+export interface DeliveryPruneOutcome {
+  /** The horizon this phase applied, echoed so a log line carries it. */
+  readonly retainDeliveryDays: number;
+  readonly deleted: number;
+  /**
+   * Past its horizon and held back because the push is not settled — `pending`, `in_flight`
+   * or `dead`. A dead delivery is held back FOREVER; see the view's header in 0046.
+   */
+  readonly keptUnsettled: number;
+  /**
+   * Delivery rows that have outlived the notification they describe, counted at the moment
+   * this phase ran — so it includes the ones phase one orphaned a few statements earlier.
+   * The feature made countable: this number being non-zero is retention working, not a
+   * fault. Some of them are in `deleted`, where they were also past this horizon.
+   */
+  readonly orphaned: number;
+  /** Every delivery row the tenant holds — the denominator the ceiling is a share of. */
+  readonly deliveryTotal: number;
+  /** What this phase wanted to delete, BEFORE the batch cap. The guard's numerator. */
+  readonly prunableTotal: number;
+  readonly sharePercent: number;
+  readonly moreRemaining: boolean;
+  readonly refused: boolean;
+  readonly refusalReason: string | null;
+  readonly overridden: boolean;
+  readonly floorWaived: boolean;
+  readonly floorWaivedReason: string | null;
+}
+
 export interface PruneResult {
   readonly deletedRead: number;
   readonly deletedUnread: number;
@@ -367,6 +511,8 @@ export interface PruneResult {
    */
   readonly floorWaived: boolean;
   readonly floorWaivedReason: string | null;
+  /** Phase two: `crm.notification_delivery`, under its own horizon (0046). */
+  readonly delivery: DeliveryPruneOutcome;
 }
 
 /**
@@ -427,6 +573,183 @@ function floorWaivedSentence(prunableTotal: number, sharePercent: number, guard:
   );
 }
 
+/**
+ * The delivery phase's own two sentences.
+ *
+ * Written out rather than parameterised from the two above, because every noun in them
+ * changes: not "notification(s)" but "delivery record(s)", not "inbox" but the delivery
+ * table, and the way past a refusal is a different number to check. One wording per phase
+ * is also what keeps a preview and a verdict from describing the same number differently —
+ * which is the reason the inbox pair exists as functions at all.
+ */
+function deliveryRefusalSentence(
+  prunableTotal: number,
+  sharePercent: number,
+  deliveryTotal: number,
+  guard: PruneGuard,
+): string {
+  return (
+    `deleting ${prunableTotal} delivery record(s) would take ${sharePercent}% of this ` +
+    `tenant's ${deliveryTotal} recorded pushes, over its ${guard.prune_max_share_percent}% ` +
+    `ceiling; nothing was deleted — check retainDeliveryDays, or grant a prune guard ` +
+    `override to proceed`
+  );
+}
+
+function deliveryFloorWaivedSentence(
+  prunableTotal: number,
+  sharePercent: number,
+  guard: PruneGuard,
+): string {
+  return (
+    `${prunableTotal} delivery record(s) is ${sharePercent}% of the recorded pushes, over ` +
+    `the ${guard.prune_max_share_percent}% ceiling, but at or under the ` +
+    `${guard.prune_guard_floor_rows}-row floor below which the share is not consulted — ` +
+    `the phase ran`
+  );
+}
+
+/** Past its horizon, whatever the verdict. The delivery phase's half of `PAST_HORIZON`. */
+const DELIVERY_PAST_HORIZON = `c.created_at < ($2::timestamptz - make_interval(days => $3::int))`;
+
+interface DeliverySummary {
+  readonly delivery_total: string;
+  readonly orphaned: string;
+  readonly kept_unsettled: string;
+  readonly prunable: string;
+  readonly guard_trips: boolean;
+  readonly ceiling_exceeded: boolean;
+}
+
+/**
+ * The numbers phase two decides on, in one query.
+ *
+ * Measured before its delete, for the reason phase one's are: the share has to be known
+ * while the rows still exist, and the kept categories are disjoint from the deleted ones so
+ * the order changes no number. `delivery_total` counts the whole table for the tenant and
+ * the FILTERs narrow it, rather than a WHERE plus a scalar subquery — one scan answers
+ * numerator and denominator, and an aggregate over an empty table still returns a row.
+ */
+async function deliverySummary(
+  tx: PoolClient,
+  tenantId: string,
+  asOf: Date,
+  retainDeliveryDays: number,
+  guard: PruneGuard,
+): Promise<DeliverySummary> {
+  const { rows } = await tx.query<DeliverySummary>(
+    `SELECT count(*)                                                        AS delivery_total,
+            count(*) FILTER (WHERE c.orphaned)                              AS orphaned,
+            count(*) FILTER (WHERE ${DELIVERY_PAST_HORIZON} AND c.unsettled) AS kept_unsettled,
+            count(*) FILTER (WHERE ${DELIVERY_PAST_HORIZON}
+                               AND NOT c.unsettled)                          AS prunable,
+            crm.notification_prune_guard_trips(
+              count(*) FILTER (WHERE ${DELIVERY_PAST_HORIZON} AND NOT c.unsettled),
+              count(*), $4::int, $5::int)                                    AS guard_trips,
+            crm.notification_prune_ceiling_exceeded(
+              count(*) FILTER (WHERE ${DELIVERY_PAST_HORIZON} AND NOT c.unsettled),
+              count(*), $4::int)                                             AS ceiling_exceeded
+       FROM crm.notification_delivery_prune_candidates c
+      WHERE c.tenant_id = $1`,
+    [tenantId, asOf, retainDeliveryDays, guard.prune_max_share_percent, guard.prune_guard_floor_rows],
+  );
+  return rows[0]!;
+}
+
+/**
+ * Phase two of one pass. Runs in the caller's transaction, after phase one.
+ *
+ * Not exported: `pruneNotifications` is the only caller, deliberately. A second entry point
+ * into a delete is a second place the guard can be forgotten, and 0026 exists because an
+ * unattended prune that takes most of a table is a prune nobody authorised.
+ */
+async function pruneDeliveries(
+  tx: PoolClient,
+  tenantId: string,
+  guard: PruneGuard,
+  retainDeliveryDays: number,
+  asOf: Date,
+  maxRows: number,
+): Promise<DeliveryPruneOutcome> {
+  const summary = await deliverySummary(tx, tenantId, asOf, retainDeliveryDays, guard);
+  const prunableTotal = Number(summary.prunable);
+  const deliveryTotal = Number(summary.delivery_total);
+  const sharePercent = sharePercentOf(prunableTotal, deliveryTotal);
+  const common = {
+    retainDeliveryDays,
+    keptUnsettled: Number(summary.kept_unsettled),
+    orphaned: Number(summary.orphaned),
+    deliveryTotal,
+    prunableTotal,
+    sharePercent,
+  };
+
+  // Judged against the pass's own clock and against the SAME override window phase one used.
+  // One break-glass window for the job, not one per table: an operator who has looked at the
+  // numbers and said "drain it" has said it about tonight's prune, and making them grant two
+  // would mean the second one gets granted by reflex.
+  const overrideLive =
+    guard.prune_guard_override_until !== null &&
+    guard.prune_guard_override_until.getTime() > asOf.getTime();
+
+  if (summary.guard_trips && !overrideLive) {
+    return {
+      ...common,
+      deleted: 0,
+      moreRemaining: prunableTotal > 0,
+      refused: true,
+      refusalReason: deliveryRefusalSentence(prunableTotal, sharePercent, deliveryTotal, guard),
+      overridden: false,
+      floorWaived: false,
+      floorWaivedReason: null,
+    };
+  }
+
+  // `ORDER BY c.seq`, not `created_at`: oldest WRITE first. 0046 added `seq` because
+  // `created_at` is the transaction clock and a dispatch fan-out shares it exactly, so an
+  // ordered batch cap over a timestamp would pick arbitrarily among tied rows and a
+  // resumed drain could revisit what it had already considered.
+  const { rowCount } = await tx.query(
+    `DELETE FROM crm.notification_delivery
+      WHERE id IN (
+        SELECT c.id FROM crm.notification_delivery_prune_candidates c
+         WHERE c.tenant_id = $1 AND ${DELIVERY_PAST_HORIZON}
+           AND NOT c.unsettled
+         ORDER BY c.seq
+         LIMIT $4)`,
+    [tenantId, asOf, retainDeliveryDays, maxRows],
+  );
+  const deleted = rowCount ?? 0;
+  const floorWaived = summary.ceiling_exceeded && !summary.guard_trips;
+
+  return {
+    ...common,
+    deleted,
+    moreRemaining: prunableTotal > deleted,
+    refused: false,
+    refusalReason: null,
+    overridden: summary.guard_trips,
+    floorWaived,
+    floorWaivedReason: floorWaived
+      ? deliveryFloorWaivedSentence(prunableTotal, sharePercent, guard)
+      : null,
+  };
+}
+
+/** Phase two's numbers, with nothing deleted. */
+export interface DeliveryPrunePreview {
+  readonly retainDeliveryDays: number;
+  readonly wouldRefuse: boolean;
+  readonly refusalReason: string | null;
+  readonly floorWaived: boolean;
+  readonly floorWaivedReason: string | null;
+  readonly prunableTotal: number;
+  readonly keptUnsettled: number;
+  readonly orphaned: number;
+  readonly deliveryTotal: number;
+  readonly sharePercent: number;
+}
+
 export interface PrunePreview {
   readonly guard: PruneGuard;
   /** Whether tonight's pass would be refused for taking too much of the inbox. */
@@ -439,6 +762,15 @@ export interface PrunePreview {
   readonly prunableTotal: number;
   readonly inboxTotal: number;
   readonly sharePercent: number;
+  /**
+   * The same questions about phase two.
+   *
+   * Carried on the same preview rather than behind a second route, because an operator who
+   * is about to shorten a horizon needs to see both numbers at once: the inbox prune and the
+   * delivery prune are now one job, and a preview that answered for one of them would be a
+   * preview of half the night.
+   */
+  readonly delivery: DeliveryPrunePreview;
 }
 
 /**
@@ -506,6 +838,15 @@ export async function prunePreview(
   // Over the ceiling but the guard did not trip: the floor is the only other operand.
   const floorWaived = summary.ceiling_exceeded && !summary.guard_trips;
 
+  // Phase two's numbers, from the same clock and the same guard columns. A read, so it is
+  // the summary query alone — never `pruneDeliveries`, which deletes.
+  const d = await deliverySummary(tx, tenantId, asOf, row.retain_delivery_days, guard);
+  const dPrunable = Number(d.prunable);
+  const dTotal = Number(d.delivery_total);
+  const dShare = sharePercentOf(dPrunable, dTotal);
+  const dWouldRefuse = d.guard_trips && !overrideLive;
+  const dFloorWaived = d.ceiling_exceeded && !d.guard_trips;
+
   return {
     guard,
     wouldRefuse,
@@ -516,6 +857,18 @@ export async function prunePreview(
     prunableTotal,
     inboxTotal,
     sharePercent,
+    delivery: {
+      retainDeliveryDays: row.retain_delivery_days,
+      wouldRefuse: dWouldRefuse,
+      refusalReason: dWouldRefuse ? deliveryRefusalSentence(dPrunable, dShare, dTotal, guard) : null,
+      floorWaived: dFloorWaived,
+      floorWaivedReason: dFloorWaived ? deliveryFloorWaivedSentence(dPrunable, dShare, guard) : null,
+      prunableTotal: dPrunable,
+      keptUnsettled: Number(d.kept_unsettled),
+      orphaned: Number(d.orphaned),
+      deliveryTotal: dTotal,
+      sharePercent: dShare,
+    },
   };
 }
 
@@ -589,6 +942,12 @@ export async function pruneNotifications(
     // has arrived at a number nobody authorised stops AT the number: the horizons, the
     // candidate listing and this sentence are all still readable with the data intact.
     // `moreRemaining` falls out of the usual arithmetic — there is indeed more to do.
+    //
+    // PHASE TWO STILL RUNS. The two horizons are two different judgements and a refusal is
+    // a statement that THIS one looks wrong by an order of magnitude; stopping the delivery
+    // phase as well would let one mistyped inbox horizon suspend the other table's
+    // retention indefinitely, with nothing in the summary saying that was the reason.
+    // Phase two refuses on its own numbers or it does not.
     return {
       deletedRead: 0,
       deletedUnread: 0,
@@ -605,6 +964,14 @@ export async function pruneNotifications(
       // The guard tripped, so the floor did not waive anything.
       floorWaived: false,
       floorWaivedReason: null,
+      delivery: await pruneDeliveries(
+        tx,
+        tenantId,
+        guard,
+        row.retain_delivery_days,
+        asOf,
+        maxRows,
+      ),
     };
   }
 
@@ -621,7 +988,14 @@ export async function pruneNotifications(
     [...horizon, maxRows],
   );
 
+  // Phase two, AFTER the notification delete and in the same transaction. The order is
+  // load-bearing: the rows phase one has just orphaned are the ones this phase exists for,
+  // and running it first would make every orphan wait a night to be considered. Its own
+  // guard, its own numbers; see `DeliveryPruneOutcome`.
+  const delivery = await pruneDeliveries(tx, tenantId, guard, row.retain_delivery_days, asOf, maxRows);
+
   return {
+    delivery,
     deletedRead: deleted.filter((r) => r.was_read).length,
     deletedUnread: deleted.filter((r) => !r.was_read).length,
     ...kept,

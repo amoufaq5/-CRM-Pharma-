@@ -477,7 +477,20 @@ describe("notification retention", () => {
       expect(await remaining()).toBe(1);
     });
 
-    it("cleans up the delivery rows of what it does take", async () => {
+    /**
+     * INVERTED BY 0046, and the inversion is the feature.
+     *
+     * This test used to assert that a pruned notification took its delivery rows with it
+     * `// Via ON DELETE CASCADE (0021)`, with the reasoning that "a retention policy that
+     * left orphaned delivery rows behind would not actually bound anything". The first
+     * clause is now wrong and the second is still right, which is exactly why 0046 is two
+     * changes rather than one: the cascade is gone, so a delivery record outlives the
+     * inbox entry it describes — and `retain_delivery_days` is what bounds it instead, in
+     * the same pass, measured against its own table. The delivery-side assertions live in
+     * `delivery-retention.contract.test.ts`; what is pinned here is that the notification
+     * prune no longer reaches across.
+     */
+    it("leaves the delivery record of what it takes, for the delivery horizon to bound", async () => {
       await inTenant(async (c) => {
         const ep = await endpoint(c);
         const id = await notify(c, { createdDaysAgo: 400, read: true });
@@ -495,9 +508,14 @@ describe("notification retention", () => {
         );
         return Number(rows[0]!.n);
       });
-      // Via ON DELETE CASCADE (0021). Stated as an assertion because a retention policy
-      // that left orphaned delivery rows behind would not actually bound anything.
-      expect(left).toBe(0);
+      // The delivery row survives, and is now an orphan on purpose — it is the record that
+      // this signal was pushed to a third party, which the inbox horizon has no business
+      // deciding about. The default delivery horizon is 730 days and this row is 400 days
+      // old, so the same pass correctly leaves it.
+      expect(left).toBe(1);
+      const r = await prune();
+      expect(r.delivery.deleted).toBe(0);
+      expect(r.delivery.orphaned).toBe(1);
     });
 
     it("does not count a delivery as unsettled when the notification is kept anyway", async () => {

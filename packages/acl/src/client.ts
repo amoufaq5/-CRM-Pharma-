@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { toErpError, ErpError } from "./problems.js";
 import { TenantSchema, UiSchemaSchema, type UiSchema } from "./ui-schema.js";
 
@@ -38,6 +40,15 @@ export interface ErpClientOptions {
   readonly now?: () => number;
   /** Bounds a single request. Default 15s. */
   readonly timeoutMs?: number;
+  /**
+   * Called when the gateway answers a write with a REPLAY it has no body for, and this
+   * client therefore asks again under a fresh key. One call per occurrence.
+   *
+   * Observability only — the retry happens either way. It exists because this is the one
+   * place the client issues a request the caller did not ask for, and "each ambiguous write
+   * costs exactly one extra request" has to be assertable rather than promised.
+   */
+  readonly onIdempotentReplay?: (info: { readonly method: string; readonly path: string; readonly status: number }) => void;
 }
 
 export interface ListOptions {
@@ -299,15 +310,48 @@ export class ErpClient {
     if (body !== undefined) headers["content-type"] = "application/json";
     if (idempotencyKey !== undefined) headers["idempotency-key"] = idempotencyKey;
 
-    const res = await withTimeout(
-      this.options.fetch(`${this.baseUrl}${path}`, {
-        method,
-        headers,
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      }),
-      this.timeoutMs,
-      `${method} ${path}`,
-    );
+    const send = (key: string | undefined): ReturnType<FetchLike> => {
+      const h = key === undefined ? headers : { ...headers, "idempotency-key": key };
+      return withTimeout(
+        this.options.fetch(`${this.baseUrl}${path}`, {
+          method,
+          headers: h,
+          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        }),
+        this.timeoutMs,
+        `${method} ${path}`,
+      );
+    };
+
+    let res = await send(idempotencyKey);
+
+    // A REPLAYED REFUSAL IS NOT AN ANSWER, so ask again under a key the gateway has not
+    // seen.
+    //
+    // The deployed gateway's idempotency store keeps a reply's STATUS and not its body
+    // (`api-gateway-runtime/src/runtime.ts`: `bodyBytes: null`, `x-idempotent-replay:
+    // "true"`), and it keeps a handler's 4xx and 5xx the same way it keeps a success, for a
+    // 24-hour TTL in a store that never evicts. So a retry of the same outbox row — and the
+    // relay retries on every transient refusal, 60 times over for a locked fiscal period —
+    // got the status with the cause stripped out, which every error parse then failed. Two
+    // measured consequences, both wrong in the expensive direction: a bodiless 422 read as
+    // `validation_failed` and DEAD-LETTERED a correct write with
+    // `rejected: unrecognised_error_shape`, and a bodiless 409 read as a bare `conflict` —
+    // past the `invalid_transition` branch written to catch exactly it — and marked a
+    // transition DELIVERED that the ERP had refused and never applied.
+    //
+    // Re-asking is safe by construction, and that is the whole argument: the gateway only
+    // replays what it stored, and a stored 4xx/5xx means the handler REFUSED, so nothing was
+    // written and nothing is applied twice. A replayed 2xx is left alone — there the write
+    // did land, the empty body is expected, and the caller settles on it (which is what the
+    // live gate's replay check pins).
+    //
+    // One extra request, never a loop: the second key is fresh, so the gateway cannot
+    // replay it, and whatever comes back is a real answer from the handler.
+    if (res.status >= 400 && res.headers.get("x-idempotent-replay") === "true") {
+      this.options.onIdempotentReplay?.({ method, path, status: res.status });
+      res = await send(`${idempotencyKey ?? "crm"}-asked-again-${randomUUID()}`);
+    }
 
     const text = await res.text();
     const parsed = text === "" ? null : safeJson(text);

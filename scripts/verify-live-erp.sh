@@ -9,13 +9,23 @@
 # instance was available". Transcribing a verifier is not the same as satisfying
 # one, and reading a handler is not the same as seeing the body it emits.
 #
-# This boots the real server on a throwaway database and drives the SHIPPED dist
-# of @crm/credential, @crm/acl and @crm/relay at it. Nothing here mints its own
-# token, writes its own query string, or classifies its own error: a harness that
-# did would verify the harness.
+# This boots the real server on a throwaway database and does two things with it.
+# Sections 1-9 drive the SHIPPED dist of @crm/credential, @crm/acl and @crm/relay
+# at it as a LIBRARY. Sections 10-14 start the CRM's own `api` and `scheduler`
+# BINARIES as processes and let them do the work — the gap ADR-0001's open table
+# named in as many words: "the CRM's own api and scheduler binaries were not driven
+# at the live ERP. The relay was driven directly."
+#
+# Nothing here mints its own ERP token, writes its own query string, classifies its
+# own error, or drains the outbox by hand: a harness that did would verify the
+# harness. The one token this file's helpers assemble themselves is the HUMAN login
+# token, and only because there the CRM is the verifier and not the issuer — an
+# external IdP is what it stands in for.
 #
 # Every check carries a CONTROL where one is possible, because this repo has been
-# bitten three times by assertions that passed against inert behaviour. "An
+# bitten four times by assertions that passed against inert behaviour — and once,
+# in section 6, by one that FAILED while the code was correct, because a case's
+# instrumented client was seeing a previous case's retry. "An
 # unknown filter returns every row" is worthless without "a known filter returns
 # fewer"; "a bad sort does not reorder" is worthless without "a good sort does".
 #
@@ -23,6 +33,16 @@
 #   * Nothing about the ERP under load, concurrency, or more than one tenant's
 #     manifest. One tenant on the boot pack is served here; a tenant on a custom
 #     manifest (ADR-0001 Q11) has a different entity set and is NOT exercised.
+#     The scheduler's per-tenant loop runs with exactly ONE tenant and ONE
+#     instance, so neither tenant isolation inside a tick nor the claim/skip-locked
+#     story for two instances is tested.
+#   * Nothing about the jobs other than relay_drain and the snapshots. expiry_sweep,
+#     notify_prune, notify_dispatch and expense_post all run in the first tick
+#     against the live database and are observed to succeed; nothing is asserted
+#     about what they did, because the rows they act on are not seeded.
+#   * Nothing about an RS256 human token. The stand-in IdP signs EdDSA, and RS256
+#     is the format every real OIDC provider defaults to (jwt.ts supports it, and
+#     only packages/api/src/jwt.test.ts exercises it).
 #   * Nothing about ADR-0001 option (b)'s single-database arrangement. The ERP
 #     gets its own database here, so the CRM's SELECT grant on
 #     meta.operate_entity_records is still the stand-in from scripts/erp-fixture.sh.
@@ -32,7 +52,7 @@
 #   * Nothing about TLS, a reverse proxy, or key rotation under live traffic. The
 #     JWKS is served over plain HTTP on loopback.
 #   * It is not a CI gate. It needs a Postgres cluster, a built CrossEngin
-#     checkout and ~40 seconds. Run it when the CRM→ERP contract changes.
+#     checkout and about a minute. Run it when the CRM->ERP contract changes.
 #
 # Usage:
 #   ./scripts/verify-live-erp.sh                 # boot an ERP, run, tear down
@@ -59,8 +79,19 @@ export PGHOST="${PGHOST:-/var/run/postgresql}"
 export PGUSER="${PGUSER:-postgres}"
 
 WORK="$(mktemp -d)"
+# Each phase of the binaries' driver appends "<checks> <failures>" here.
+: > "$WORK/counts"
 ERP_PID=""
 JWKS_PID=""
+# The CRM's own long-running processes (§10–§13). Every one of them is a listener,
+# and a leaked listener does not fail the next run on the check that would name it
+# — it fails four steps later on something that reads like a different bug. So each
+# gets a variable the moment it is started and the trap kills all of them, pass or
+# fail, the same way the ERP and the JWKS endpoint already do.
+IDP_PID=""
+API_PID=""
+SCHED_PID=""
+DEV_SCHED_PID=""
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "ok: $*"; }
@@ -69,14 +100,54 @@ cleanup() {
   local code=$?
   [ -n "$ERP_PID" ] && kill "$ERP_PID" 2>/dev/null || true
   [ -n "$JWKS_PID" ] && kill "$JWKS_PID" 2>/dev/null || true
+  [ -n "$IDP_PID" ] && kill "$IDP_PID" 2>/dev/null || true
+  [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
+  [ -n "$SCHED_PID" ] && kill "$SCHED_PID" 2>/dev/null || true
+  [ -n "$DEV_SCHED_PID" ] && kill "$DEV_SCHED_PID" 2>/dev/null || true
   if [ "$code" -ne 0 ] && [ -f "$WORK/erp.log" ]; then
     echo; echo "--- last 25 lines of the operate-server log ---" >&2
     tail -25 "$WORK/erp.log" >&2
   fi
+  # The CRM's binaries write their own diagnosis and then die; without this the
+  # failure reads as "the gate timed out waiting for a tick".
+  for log in api.err api.out sched.err sched.out sched2.err sched2.out; do
+    if [ "$code" -ne 0 ] && [ -s "$WORK/$log" ]; then
+      echo; echo "--- last 15 lines of $log ---" >&2
+      tail -15 "$WORK/$log" >&2
+    fi
+  done
   rm -rf "$WORK"
   exit "$code"
 }
 trap cleanup EXIT
+
+# Waits for a pattern to appear in a log a background process is writing, and
+# gives up rather than hanging. A process that dies is reported as having died,
+# which is the difference between a readable failure and a stuck gate.
+#   wait_for_line <logfile> <grep -E pattern> <pid> <tries, half a second each> <what>
+wait_for_line() {
+  local log="$1" pattern="$2" pid="$3" tries="$4" what="$5"
+  local i=0
+  while [ "$i" -lt "$tries" ]; do
+    if [ -f "$log" ] && grep -Eq "$pattern" "$log"; then return 0; fi
+    kill -0 "$pid" 2>/dev/null || { tail -20 "$log" >&2 2>/dev/null || true; fail "$what: the process exited first"; }
+    sleep 0.5
+    i=$((i + 1))
+  done
+  tail -20 "$log" >&2 2>/dev/null || true
+  fail "$what: nothing matching /$pattern/ within $((tries / 2))s"
+}
+
+# SIGTERM, then wait for the graceful stop the binary promises. Both processes
+# drain an in-flight tick or request before exiting, so a check that reads their
+# log must not read it while a tick is still writing to it.
+stop_gracefully() {
+  local pid="$1" what="$2" status=0
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" || status=$?
+  echo "$status" > "$WORK/last-exit"
+  [ "$status" -eq 0 ] || echo "    ($what exited $status)"
+}
 
 command -v node >/dev/null || fail "node not found"
 command -v psql >/dev/null || fail "psql not found"
@@ -101,7 +172,13 @@ echo "--- 1. the CRM's own dist is current ---"
 for p in acl credential relay db; do
   [ -f "$ROOT/packages/$p/dist/index.js" ] || fail "packages/$p/dist/index.js is missing after a build"
 done
-ok "@crm/acl, @crm/credential, @crm/relay and @crm/db are built"
+# The two BINARIES, by the path their package.json `bin` entries name and their
+# compose services invoke — §10–§13 run these as processes, not as libraries.
+API_BIN="$ROOT/packages/api/dist/bin/api.js"
+SCHED_BIN="$ROOT/packages/scheduler/dist/bin/scheduler.js"
+[ -f "$API_BIN" ] || fail "no built API binary at $API_BIN"
+[ -f "$SCHED_BIN" ] || fail "no built scheduler binary at $SCHED_BIN"
+ok "@crm/acl, @crm/credential, @crm/relay and @crm/db are built, and so are both binaries"
 
 # ---------------------------------------------------------------------------
 echo "--- 2. the ERP checkout is built, and a manifest of it is taken ---"
@@ -291,11 +368,253 @@ fi
 
 # ---------------------------------------------------------------------------
 echo "--- 9. drive @crm/credential, @crm/acl and @crm/relay at the live server ---"
-node "$ROOT/scripts/live-erp/drive.mjs" || fail "live verification reported failures (see the ok:/FAIL: lines above)"
+# Through `tee` so the run's own count can be added to the binaries' below. One
+# total is the number the README quotes, and deriving it beats maintaining it.
+node "$ROOT/scripts/live-erp/drive.mjs" | tee "$WORK/drive.log" \
+  || fail "live verification reported failures (see the ok:/FAIL: lines above)"
+LIB_CHECKS="$(sed -n 's/^\([0-9]*\) checks, .*/\1/p' "$WORK/drive.log" | tail -1)"
+[ -n "$LIB_CHECKS" ] || fail "drive.mjs printed no check count"
+
+# ===========================================================================
+# THE CRM'S OWN BINARIES.
+#
+# Everything above drives the CRM's dist as a LIBRARY. ADR-0001's open table named
+# the gap that leaves, in these words:
+#
+#   The CRM's own `api` and `scheduler` binaries were not driven at the live ERP.
+#   The relay was driven directly. The scheduler's per-tenant loop, its credential
+#   boot and its refusal to start on `ERP_TOKEN` under `NODE_ENV=production` are
+#   all still verified only against the fixture.
+#
+# What follows starts both processes for real — the API with an IdP in front of it,
+# the scheduler with the signing key where production puts it — and lets them do
+# the work. Nothing below calls `drainTenant`, mints a service token for the
+# scheduler, or resolves a role on its behalf.
+#
+# THE SHELL OWNS THE PROCESSES AND `drive-binaries.mjs` OWNS THE ASSERTIONS. Every
+# listener started here gets a PID variable at the moment it is started, and the
+# trap above kills all of them whether the run passes or fails.
+# ===========================================================================
+echo
+echo "--- 10. the CRM's API binary, authenticated against a JWKS, at the live ERP ---"
+
+# The scheduler's boot check reads `crm.service_key`, not the socket: a signing key
+# that is not in that table is one no verifier has, so `buildServiceCredential`
+# refuses to start rather than mint tokens every ERP call rejects. The key the JWKS
+# endpoint has been serving since §5 is published here, through the shipped
+# registry — `crm-service-key generate` cannot be used because it generates its own
+# keypair, and the ERP has already fetched this one.
+export CRM_PGDATABASE="$CRM_DB"
+PUBLISHED_KID="$(node "$ROOT/scripts/live-erp/publish-key.mjs" "$WORK/key.jwk.json")" \
+  || fail "could not publish the service key into crm.service_key"
+[ "$PUBLISHED_KID" = "$KID" ] || fail "the registry published $PUBLISHED_KID, not the $KID the JWKS serves"
+ok "crm.service_key publishes $KID and it is the active signing key"
+
+# A SECOND key set, for the human tier. ADR-0001 item 10's two tiers "never mix":
+# any OIDC provider signs people into the CRM, and a short-lived Ed25519 service
+# token signs the CRM into the ERP. Served on an EPHEMERAL port, so this stands up
+# an IdP without reserving a fourth socket — §10c then proves the service key does
+# not open the API, which is the live form of "never mix".
+IDP_KID="$(node "$ROOT/scripts/live-erp/genkey.mjs" "$WORK" idp)"
+[ -n "$IDP_KID" ] && [ "$IDP_KID" != "$KID" ] || fail "the IdP key is missing, or is the service key"
+node "$ROOT/scripts/live-erp/jwks-server.mjs" 0 "$WORK/idp.jwk.json" > "$WORK/idp-jwks.log" 2>&1 &
+IDP_PID=$!
+wait_for_line "$WORK/idp-jwks.log" 'jwks listening on [0-9]+' "$IDP_PID" 40 "the stand-in IdP's JWKS"
+IDP_PORT="$(sed -n 's/^jwks listening on \([0-9]*\).*/\1/p' "$WORK/idp-jwks.log" | head -1)"
+[ -n "$IDP_PORT" ] || fail "could not read the IdP JWKS port"
+ok "a stand-in IdP publishes $IDP_KID on 127.0.0.1:$IDP_PORT — a different key set from the ERP's"
+
+# The rows the API's own authorisation depends on. Seeded as crm_app inside a tenant
+# context, for the reason §4 gives: a privileged INSERT with no tenant context is
+# the blind spot ADR-0001 item 14 records.
+LOT_ID="$(psql -d "$CRM_DB" -At -c 'SELECT gen_random_uuid()')"
+printf '{"lotId":"%s"}\n' "$LOT_ID" > "$WORK/binaries.json"
+PGPASSWORD="${CRM_PGPASSWORD:-crm_app}" psql -h "$PGHOST" -U "${CRM_PGUSER:-crm_app}" -d "$CRM_DB" \
+  -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL || fail "could not seed the rep profile and sample lot"
+BEGIN;
+SELECT set_config('app.current_tenant_id', '$TENANT', true);
+INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, erp_employee_id, display_name, status)
+VALUES ('$TENANT', 'rep-ada', 'E-1', 'emp-1', 'Ada Lovelace', 'active')
+ON CONFLICT (tenant_id, subject) DO UPDATE
+  SET erp_employee_id = EXCLUDED.erp_employee_id, status = 'active';
+INSERT INTO crm.sample_lot (id, tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+VALUES ('$LOT_ID', '$TENANT', 'itm-1', 'LOT-LIVE-1', CURRENT_DATE + 365, 'drug_sample')
+ON CONFLICT (tenant_id, erp_item_id, lot_number) DO NOTHING;
+COMMIT;
+SQL
+ok "crm.rep_profile maps rep-ada → Employee emp-1, and lot LOT-LIVE-1 of itm-1 exists"
+
+# PORT=0: the binary logs the port it actually bound, so no fourth fixed socket is
+# reserved and a stale listener cannot be mistaken for this one.
+export LIVE_KID="$KID"
+export LIVE_IDP_PEM="$WORK/idp.pem"
+export LIVE_OIDC_ISSUER="https://idp.test"
+export LIVE_OIDC_AUDIENCE="https://crm.test/api"
+export LIVE_ERP_ROLE="$ERP_ROLE"
+export CRM_PGUSER="${CRM_PGUSER:-crm_app}"
+export CRM_PGPASSWORD="${CRM_PGPASSWORD:-crm_app}"
+( cd "$ROOT" \
+  && PGHOST="$PGHOST" PGUSER="$CRM_PGUSER" PGPASSWORD="$CRM_PGPASSWORD" PGDATABASE="$CRM_DB" \
+     PORT=0 \
+     OIDC_ISSUER="$LIVE_OIDC_ISSUER" \
+     OIDC_AUDIENCE="$LIVE_OIDC_AUDIENCE" \
+     OIDC_JWKS_URL="http://127.0.0.1:$IDP_PORT/.well-known/jwks.json" \
+     exec node "$API_BIN" ) > "$WORK/api.out" 2> "$WORK/api.err" &
+API_PID=$!
+wait_for_line "$WORK/api.out" '"type":"listening"' "$API_PID" 120 "the CRM's API binary"
+API_PORT="$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$WORK/api.out" | head -1)"
+[ -n "$API_PORT" ] || fail "the API logged a listening line with no port in it"
+export CRM_API_BASE_URL="http://127.0.0.1:$API_PORT"
+ok "the API binary is listening on $API_PORT, verifying human tokens against the IdP's JWKS"
+
+node "$ROOT/scripts/live-erp/drive-binaries.mjs" api-write "$WORK" \
+  || fail "the API binary's checks reported failures (see the ok:/FAIL: lines above)"
 
 # ---------------------------------------------------------------------------
 echo
-echo "--- 10. the ERP checkout is exactly as it was found ---"
+echo "--- 11. the scheduler binary, booted as production does, drains that row ---"
+# The invocation is deploy/docker-compose.yml's `scheduler` service, variable for
+# variable: NODE_ENV=production, the signing key read from the path
+# CRM_SIGNING_KEY_FILE names, the issuer and audience that must match the ERP's
+# --jwt-issuer/--jwt-audience, and NO ERP_TOKEN. Nothing here hands it a token, a
+# role or a tenant list: it resolves all three itself.
+#
+# TICK_INTERVAL_MS is the knob the binary already reads, used rather than sleeping
+# blindly: at 1s the loop comes round fast enough that a bounded wait on the
+# process's OWN relay_drain line is the signal, instead of a guess about timing.
+SCHED_ENV=(
+  PGHOST="$PGHOST" PGUSER="$CRM_PGUSER" PGPASSWORD="$CRM_PGPASSWORD" PGDATABASE="$CRM_DB"
+  NODE_ENV=production
+  ERP_BASE_URL="$ERP_BASE_URL"
+  CRM_SIGNING_KEY_FILE="$WORK/key.pem"
+  CRM_TOKEN_ISSUER="$ISSUER"
+  ERP_TOKEN_AUDIENCE="$AUDIENCE"
+  TICK_INTERVAL_MS=1000
+)
+echo "    NODE_ENV=production CRM_SIGNING_KEY_FILE=… node packages/scheduler/dist/bin/scheduler.js"
+( cd "$ROOT" && exec env "${SCHED_ENV[@]}" node "$SCHED_BIN" ) > "$WORK/sched.out" 2> "$WORK/sched.err" &
+SCHED_PID=$!
+# `ensureJobs` creates every job row due immediately on a tenant's first tick, so
+# the first drain needs no nudging. 120s rather than 30: the same tick also runs
+# three snapshot refreshes against the live ERP.
+wait_for_line "$WORK/sched.out" '"type":"job_ok".*"job":"relay_drain"' "$SCHED_PID" 240 \
+  "the scheduler's own relay_drain tick"
+ok "the scheduler booted and reported a relay_drain tick of its own"
+
+stop_gracefully "$SCHED_PID" "the scheduler"
+SCHED_PID=""
+[ "$(cat "$WORK/last-exit")" = "0" ] || fail "the scheduler did not stop cleanly on SIGTERM"
+grep -q '"type":"shutdown"' "$WORK/sched.out" || fail "the scheduler exited without logging its shutdown"
+ok "and stopped cleanly on SIGTERM, draining the tick in flight first"
+
+node "$ROOT/scripts/live-erp/drive-binaries.mjs" drain "$WORK" \
+  || fail "the scheduler binary's checks reported failures (see the ok:/FAIL: lines above)"
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 12. the ERP role is the tenant's row, not the process's environment ---"
+# The control for §11b. The environment of the second run is byte-identical to the
+# first; the only change is one column of one row. `next_run_at` is pulled back to
+# now because the first run advanced it by the job's 30s cadence — the tick still
+# happens on the scheduler's own loop through `claimDueJobs`, this only stops the
+# gate spending half a minute waiting for a window.
+PGPASSWORD="$CRM_PGPASSWORD" psql -h "$PGHOST" -U "$CRM_PGUSER" -d "$CRM_DB" \
+  -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL || fail "could not downgrade the tenant's ERP role"
+BEGIN;
+SELECT set_config('app.current_tenant_id', '$TENANT', true);
+UPDATE crm.erp_service_principal SET erp_role = 'erp_viewer' WHERE tenant_id = '$TENANT';
+UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = '$TENANT' AND job = 'relay_drain';
+COMMIT;
+SQL
+node "$ROOT/scripts/live-erp/drive-binaries.mjs" role-setup "$WORK" || fail "could not queue the erp_viewer row"
+ok "crm.erp_service_principal now grants 'erp_viewer', which cannot create a StockMovement"
+
+( cd "$ROOT" && exec env "${SCHED_ENV[@]}" node "$SCHED_BIN" ) > "$WORK/sched2.out" 2> "$WORK/sched2.err" &
+SCHED_PID=$!
+wait_for_line "$WORK/sched2.out" '"type":"job_ok".*"job":"relay_drain"' "$SCHED_PID" 120 \
+  "the scheduler's relay_drain tick under erp_viewer"
+stop_gracefully "$SCHED_PID" "the scheduler"
+SCHED_PID=""
+
+node "$ROOT/scripts/live-erp/drive-binaries.mjs" role "$WORK" \
+  || fail "the role control reported failures (see the ok:/FAIL: lines above)"
+
+PGPASSWORD="$CRM_PGPASSWORD" psql -h "$PGHOST" -U "$CRM_PGUSER" -d "$CRM_DB" -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL
+BEGIN;
+SELECT set_config('app.current_tenant_id', '$TENANT', true);
+UPDATE crm.erp_service_principal SET erp_role = '$ERP_ROLE' WHERE tenant_id = '$TENANT';
+COMMIT;
+SQL
+ok "the tenant's role is restored to '$ERP_ROLE'"
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 13. the scheduler refuses a static ERP_TOKEN under NODE_ENV=production ---"
+# A NEGATIVE CONTROL, and the kind that matters: a static bearer token shared
+# across every tenant, carrying whatever role the ERP bound it to, is the weakest
+# credential in the system. The refusal is a process-start decision, so it is
+# asserted on the exit status and the sentence, not on a return value.
+#
+# NOTE WHAT IS ABSENT: no CRM_SIGNING_KEY_FILE. A signing key takes precedence over
+# ERP_TOKEN by design, so leaving one set would make this pass for the wrong reason.
+set +e
+( cd "$ROOT" && env \
+    PGHOST="$PGHOST" PGUSER="$CRM_PGUSER" PGPASSWORD="$CRM_PGPASSWORD" PGDATABASE="$CRM_DB" \
+    NODE_ENV=production ERP_TOKEN=a-static-development-token ERP_BASE_URL="$ERP_BASE_URL" \
+    TICK_INTERVAL_MS=1000 \
+    timeout 60 node "$SCHED_BIN" ) > "$WORK/prod.out" 2> "$WORK/prod.err"
+PROD_CODE=$?
+set -e
+[ "$PROD_CODE" -ne 0 ] || fail "the scheduler STARTED on a static ERP_TOKEN under NODE_ENV=production"
+[ "$PROD_CODE" -ne 124 ] || fail "the scheduler neither started nor refused — it hung"
+grep -q "ERP_TOKEN is a development-only static credential" "$WORK/prod.err" \
+  || { cat "$WORK/prod.err" >&2; fail "it exited $PROD_CODE without saying why — an operator gets no cause"; }
+grep -q "CRM_SIGNING_KEY_PEM" "$WORK/prod.err" \
+  || fail "the refusal does not name the variable that fixes it"
+ok "it exits $PROD_CODE and names both the cause and the remedy"
+
+# THE COMPLEMENT, and it is the half that makes the check mean anything: without it
+# this section passes just as well against a binary that cannot start at all.
+( cd "$ROOT" && exec env \
+    PGHOST="$PGHOST" PGUSER="$CRM_PGUSER" PGPASSWORD="$CRM_PGPASSWORD" PGDATABASE="$CRM_DB" \
+    ERP_TOKEN=a-static-development-token ERP_BASE_URL="$ERP_BASE_URL" TICK_INTERVAL_MS=60000 \
+    node "$SCHED_BIN" ) > "$WORK/dev.out" 2> "$WORK/dev.err" &
+DEV_SCHED_PID=$!
+wait_for_line "$WORK/dev.out" '"type":"started"' "$DEV_SCHED_PID" 120 "the same binary without NODE_ENV=production"
+grep -q '"type":"credential","kind":"static"' "$WORK/dev.out" \
+  || { tail -10 "$WORK/dev.out" >&2; fail "it started, but not on the static credential"; }
+grep -q "static ERP_TOKEN credential" "$WORK/dev.err" \
+  || fail "it took the static credential silently — development only is a thing to say out loud"
+stop_gracefully "$DEV_SCHED_PID" "the development scheduler"
+DEV_SCHED_PID=""
+ok "the same binary and the same ERP_TOKEN start outside production, with the warning on stderr"
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 14. both processes are gone ---"
+# A leaked listener is the failure that disguises itself: the next run fails on
+# "something is already listening", four steps from the cause. The trap covers the
+# failing path; this covers the passing one, which the trap never exercises.
+STARTED_PIDS="$API_PID $IDP_PID"
+for pid in $STARTED_PIDS; do
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+done
+API_PID=""
+IDP_PID=""
+# Only this run's own pids are examined. Another agent's scheduler on this host is
+# not this gate's business, and a `pgrep` wide enough to see it would fail the run
+# for somebody else's process.
+LEFT=""
+for pid in $STARTED_PIDS; do
+  kill -0 "$pid" 2>/dev/null && LEFT="$LEFT $pid"
+done
+[ -z "$LEFT" ] || fail "a process this gate started is still running:$LEFT"
+ok "every process this gate started — ERP, 2 key sets, API, 3 schedulers — is accounted for"
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 15. the ERP checkout is exactly as it was found ---"
 erp_manifest > "$WORK/erp-after.txt"
 if diff -q "$WORK/erp-before.txt" "$WORK/erp-after.txt" >/dev/null; then
   ok "not one file under $ERP_DIR changed"
@@ -304,5 +623,14 @@ else
   fail "this run MODIFIED the ERP checkout — it is read-only; see the diff above"
 fi
 
+# ---------------------------------------------------------------------------
 echo
+BIN_CHECKS=0
+BIN_FAILS=0
+while read -r c f; do
+  BIN_CHECKS=$((BIN_CHECKS + c))
+  BIN_FAILS=$((BIN_FAILS + f))
+done < "$WORK/counts"
+[ "$BIN_FAILS" -eq 0 ] || fail "$BIN_FAILS binary check(s) failed"
+ok "$LIB_CHECKS checks over the dist as a library + $BIN_CHECKS over the two binaries = $((LIB_CHECKS + BIN_CHECKS)), 0 failures"
 ok "every live check passed"
