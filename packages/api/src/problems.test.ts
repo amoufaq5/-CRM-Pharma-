@@ -85,6 +85,14 @@ describe("toProblem covers every domain error", () => {
       "snapshot refresh, run by the scheduler. Not a dependency of @crm/api. Its one error, " +
       "`CoercionError`, rejects a record whose ERP value will not coerce into a typed column " +
       "(rule 4) and is reported as a `RejectedRecord` in the refresh result, never to a caller",
+    "@crm/erasure":
+      "the retention disposition register and the erasure plan (0051), reached only by the " +
+      "`crm-erasure` CLI. Not a dependency of @crm/api, and deliberately not reachable over " +
+      "HTTP at all: 0050 makes the API refuse every request for an `erp_deleted` tenant, so " +
+      "the tenant's own API is precisely the surface that must not answer questions about its " +
+      "data. It exports no error class — a plan reports its refusals as data, in a typed " +
+      "`PlanRefusal` list, because \"what stands between us and being able to do this\" is an " +
+      "answer and not an exception",
   };
 
   /**

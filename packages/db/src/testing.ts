@@ -230,3 +230,12 @@ export const TENANT_ENDPOINT_RULES = "e9490000-0000-4000-8000-00000000001c";
  */
 export const TENANT_DELETION_STOPPED = "ea500000-0000-4000-8000-00000000001d";
 export const TENANT_DELETION_LIVE = "eb500000-0000-4000-8000-00000000001e";
+
+/**
+ * packages/erasure — plan.contract (migration 0051).
+ *
+ * Marked `erp_deleted` by that suite, which 0050 makes terminal, so it is its own tenant and
+ * never shared. The live one beside it proves the plan is per tenant.
+ */
+export const TENANT_ERASURE_STOPPED = "ec510000-0000-4000-8000-00000000001f";
+export const TENANT_ERASURE_LIVE = "ed510000-0000-4000-8000-000000000020";

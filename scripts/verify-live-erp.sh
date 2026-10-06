@@ -614,7 +614,50 @@ ok "every process this gate started — ERP, 2 key sets, API, 3 schedulers — i
 
 # ---------------------------------------------------------------------------
 echo
-echo "--- 15. the ERP checkout is exactly as it was found ---"
+echo "--- 15. the retention vocabulary still matches the ERP's own source ---"
+# Migration 0051 takes five obligation codes verbatim from the ERP's RETENTION_OBLIGATIONS so
+# that a deletion recorded on both sides of the boundary reads as one record rather than two
+# dialects. The whole value of that is lost the first time one side renames a code, and a
+# vocabulary copied by hand is a vocabulary that drifts — so this reads the ERP's SOURCE rather
+# than trusting the comment that says where the codes came from.
+#
+# A grep and not an import: the CRM deliberately depends on no @crossengin/* package (it reads
+# over HTTP), so there is nothing to typecheck against. The ERP file is read-only here, as
+# every other use of this checkout is.
+ERP_OBLIGATIONS_FILE="$ERP_DIR/packages/tenant-lifecycle/src/gdpr-deletion.ts"
+if [ ! -f "$ERP_OBLIGATIONS_FILE" ]; then
+  fail "the ERP has no $ERP_OBLIGATIONS_FILE — 0051's shared obligation codes cannot be checked"
+fi
+erp_codes="$(awk '/^export const RETENTION_OBLIGATIONS = \[/{inside=1;next} inside&&/^\] as const;/{exit} inside' \
+             "$ERP_OBLIGATIONS_FILE" | sed -n 's/.*"\([a-z0-9_]*\)".*/\1/p' | sort | tr '\n' ' ')"
+[ -n "$erp_codes" ] || fail "could not read RETENTION_OBLIGATIONS out of $ERP_OBLIGATIONS_FILE"
+
+# The CRM's half, from the CRM's own constant, through the same extraction.
+crm_codes="$(awk '/^export const ERP_RETENTION_OBLIGATIONS = \[/{inside=1;next} inside&&/^\] as const;/{exit} inside' \
+             "$ROOT/packages/erasure/src/obligations.ts" | sed -n 's/.*"\([a-z0-9_]*\)".*/\1/p' | sort | tr '\n' ' ')"
+[ -n "$crm_codes" ] || fail "could not read ERP_RETENTION_OBLIGATIONS out of packages/erasure/src/obligations.ts"
+
+if [ "$erp_codes" != "$crm_codes" ]; then
+  fail "the shared retention vocabulary has drifted. ERP: [$erp_codes] CRM: [$crm_codes]"
+fi
+ok "0051's shared obligation codes are spelled exactly as the ERP spells them — $crm_codes"
+
+# And the database agrees with the TypeScript, which the contract suite also asserts — repeated
+# here because this gate runs against a database built by the real migration runner.
+db_codes="$(PGPASSWORD="${CRM_PGPASSWORD:-crm_app}" psql -h "$PGHOST" -U "${CRM_PGUSER:-crm_app}" -d "$CRM_DB" \
+            -tAc "SELECT string_agg(o, ' ' ORDER BY o) FROM unnest(crm.retention_obligations()) o" 2>/dev/null || true)"
+[ -n "$db_codes" ] || fail "crm.retention_obligations() answered nothing"
+for code in $crm_codes; do
+  case " $db_codes " in
+    *" $code "*) ;;
+    *) fail "crm.retention_obligations() is missing the shared code $code" ;;
+  esac
+done
+ok "and crm.retention_obligations() carries every one of them — $db_codes"
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 16. the ERP checkout is exactly as it was found ---"
 erp_manifest > "$WORK/erp-after.txt"
 if diff -q "$WORK/erp-before.txt" "$WORK/erp-after.txt" >/dev/null; then
   ok "not one file under $ERP_DIR changed"

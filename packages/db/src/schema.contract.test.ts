@@ -183,6 +183,17 @@ describe("CRM schema invariants", () => {
     const PLATFORM_WIDE: Readonly<Record<string, string>> = {
       _migrations: "the migration ledger; describes the deployment",
       service_key: "published Ed25519 PUBLIC keys for the ERP service credential; one set signs for every tenant",
+      // Added by 0051, which predicted this test would refuse it. The register describes the
+      // SCHEMA and not a tenant: every tenant's rows in `crm.visit` are governed by the same
+      // decision about what `crm.visit` is, so a per-tenant copy would be 39 rows multiplied
+      // by every tenant, all of them necessarily identical, and the first time two disagreed
+      // one tenant's data would be erased under a rule nobody wrote for it. It holds no
+      // tenant's data — table names, a disposition, a legal basis in prose — so there is
+      // nothing here for a policy to confine.
+      data_disposition:
+        "the retention disposition register (0051): one row per tenant-scoped TABLE, saying " +
+        "erase, retain with an obligation, or undecided with the question. A statement about " +
+        "the schema, identical for every tenant by construction",
     };
     const { rows } = await client.query<{ relname: string }>(`
       SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

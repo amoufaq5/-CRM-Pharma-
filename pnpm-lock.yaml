@@ -109,6 +109,15 @@ importers:
         specifier: ^8.13.0
         version: 8.23.0
 
+  packages/erasure:
+    dependencies:
+      '@crm/db':
+        specifier: workspace:*
+        version: link:../db
+      pg:
+        specifier: ^8.13.0
+        version: 8.23.0
+
   packages/expense:
     dependencies:
       '@crm/acl':

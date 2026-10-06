@@ -781,10 +781,77 @@ escape hatch is.
 
 **It does not erase anything, and that is a decision rather than an omission.** Some of the
 CRM's copies may be records a jurisdiction requires us to keep; a deletion that destroys an
-expense claim is as wrong as one that keeps everything. The ERP's own vocabulary for this is
-`retentionObligation` on an attestation — "we did not delete this, and here is the law that
-says so" — and the CRM has no equivalent yet. Keeping-while-stopped is the half that is
-defensible today. The open items are in the ADR.
+expense claim is as wrong as one that keeps everything. Keeping-while-stopped is the half
+that is defensible today. The vocabulary for the other half is below.
+
+## What happens to each table, and who decided
+
+**19 of this CRM's 39 tenant-scoped tables have no answer yet, and that is now a fact you can
+read rather than a gap nobody mentioned.** Migration 0051 adds `crm.data_disposition`: one row
+per tenant-scoped table saying `erase`, `retain` with a lawful basis, or `undecided` with the
+question somebody has to answer.
+
+The rule it is built on is CrossEngin's, copied word for word from its ADR-0317:
+
+> Silence is not "none". A subsystem in scope must say what it destroyed, say it found
+> nothing, or say it is lawfully keeping it. An absent attestation refuses the tombstone.
+
+That ADR is also exact about why, and it is not what anyone would guess: *"The thing that made
+the first tombstone false was not a wrong number — every number in it was whatever the author
+typed. It was a subsystem **nobody asked**, whose silence read as nothing to delete."* And on
+the cryptography: *"A proof over a scope assembled from nothing is a correct proof of a false
+claim."*
+
+So completeness is the only property that matters here, and it is derived from `pg_catalog`
+rather than from a list: `crm.undeclared_tenant_tables()` must be empty, the migration refuses
+to apply if it is not, and a test fails on the day a new tenant-scoped table arrives without a
+decision. **`undecided` is a first-class value** for the same reason — a table with no row is
+silence and refuses with "nobody looked at this", where a table marked `undecided` refuses
+with the *question*, which is the difference between a bug and an agenda item.
+
+**The obligation codes are the ERP's own spellings**, for the five that overlap:
+`tax_records_7y`, `medical_records_10y`, `audit_logs_3y`, `financial_transactions_7y`,
+`anti_money_laundering_5y`, and `none`. A deletion recorded on both sides of the boundary
+should read as one record rather than two dialects — and because a vocabulary copied by hand
+is one that drifts, `verify-live-erp.sh` greps the ERP's own source and fails if a code has
+been renamed on either side. Two codes are ours: `deletion_evidence` (the receipt — destroying
+the proof of a deletion defeats it) and `drug_sample_custody`, which deliberately carries **no
+period** where every ERP code does, because how long a pharma company must keep sample-custody
+records is jurisdictional and a number in the code name would make every other deployment
+either wrong or forced to misuse it. The period lives in the row's note.
+
+```
+crm-erasure plan <tenant-uuid>   what would happen to that tenant's rows
+crm-erasure questions            the 19 tables nobody has decided about, with the question
+crm-erasure obligations          the vocabulary
+```
+
+**A CLI and not a route**, because of a tension 0050 created on purpose: once a tenant is
+`erp_deleted` the API refuses every request for it, so the tenant's own API is exactly the
+surface that cannot answer questions about its data. That is correct, and it makes this a
+platform-operator act in the shape `crm-service-key` already established.
+
+**`plan` produces a plan and never a tombstone.** It refuses on four grounds — the tenant is
+not stopped (so the plan is advisory and authorises nothing), a table is undeclared, a table
+is declared undecided, or the register names a table that no longer exists — and it exits 1
+while any of them hold, so an operator scripting it gets "is this ready" from the exit code.
+Row counts are taken in **one** query, because thirty-nine separate counts are thirty-nine
+moments and the figures are what a tombstone will eventually commit to by hash. Undecided
+tables are deliberately **not** counted: putting "crm.visit: 4,312 rows" in front of somebody
+invites the decision this register exists to collect from a lawyer.
+
+The three retained today are `expense_claim` (`financial_transactions_7y` — the case 0050's
+header named), and `tenant` plus `tenant_deletion_check`, both `deletion_evidence`, because
+erasing them would destroy the only CRM-side proof that the deletion was observed and acted
+on. Everything decided as `erase` is either a copy whose source of truth the ERP has already
+destroyed, this deployment's own operational state, or a credential.
+
+**No `anonymise` disposition**, and that is a reversal worth stating: the follow-up this
+closes named three options, and writing it turned up that no table in this schema wants the
+third. A visit naming a doctor is the plausible candidate and it is `undecided`, so choosing
+anonymisation for it now would pre-empt the decision the register exists to collect. A
+disposition with no row using it and no code implementing it is the "built and unreachable"
+this repository keeps finding.
 
 ## Verified against a running ERP
 
