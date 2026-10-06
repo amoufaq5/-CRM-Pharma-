@@ -1034,8 +1034,11 @@ is queued and made later, because an external call must never sit inside a busin
 transaction.
 
 **27. Read state is a column, not an approximation.** `read_at` per notification per
-recipient, so an unread badge is a count. The ERP has no per-user read state and
-approximates "unread" by recency, which goes wrong the moment someone reads on two devices.
+recipient, so an unread badge is a count rather than "the newest N, probably". The ERP had
+the same gap when this was written and closed it in its ADR-0309, which also gave it
+per-user quiet hours; the rule stays because it is ours and because the reasoning — *what
+is new* and *what have you seen* diverge the instant somebody reads one and reloads — is
+what the column exists for, not because the other system lacked it.
 
 **28. A webhook signature commits to the timestamp as well as the body.** Signing the body
 alone lets anyone who captured one delivery replay it forever. `verifyWebhook` ships
