@@ -19,6 +19,14 @@ export const PROBLEM_TYPES = {
   outside_territory: "outside-territory",
   visit_final: "visit-final",
   plan_final: "plan-final",
+  // Separate from the two `*_final` types above, because "this is over" and "not from
+  // HERE" are different sentences and the pair was answering both with the first. A
+  // `planned → completed` refusal came back titled "Visit is final" with a detail saying
+  // otherwise, so a client rendering `title` — which is what a title is for — showed the
+  // wrong thing. One type for every domain rather than one per domain: the fact is
+  // identical, the `detail` names the record and the states, and `conflict` is already
+  // shared across a dozen domains on exactly that reasoning.
+  invalid_transition: "invalid-transition",
   lot_expired: "lot-expired",
   insufficient_stock: "insufficient-stock",
   last_administrator: "last-administrator",
@@ -50,6 +58,7 @@ const STATUS: Readonly<Record<ProblemKind, number>> = {
   outside_territory: 403,
   visit_final: 409,
   plan_final: 409,
+  invalid_transition: 409,
   // Both are well-formed requests the material's state refuses, which is a conflict
   // rather than a validation failure — and a mobile client branches on them: an expired
   // lot means bin it, a short balance means re-count the bag.
@@ -82,6 +91,7 @@ const TITLE: Readonly<Record<ProblemKind, string>> = {
   outside_territory: "Outside your territory",
   visit_final: "Visit is final",
   plan_final: "Call plan is final",
+  invalid_transition: "Transition not allowed",
   lot_expired: "Lot is expired or withdrawn",
   insufficient_stock: "Not enough stock on hand",
   last_administrator: "Last administrator",
@@ -161,8 +171,18 @@ export function toProblem(err: unknown): ApiError {
     case "OutsideTerritoryError":
       return new ApiError("outside_territory", message);
     case "VisitIsFinalError":
-    case "InvalidTransitionError":
       return new ApiError("visit_final", message);
+    // TWO FACTS, ONE CLASS. `InvalidTransitionError` is raised for every transition the map
+    // refuses — `completed → in_progress`, where the visit really is over, and
+    // `planned → completed`, where it is not — and the pair used to answer `visit_final`
+    // for both, so the second came back titled "Visit is final" with a detail saying
+    // otherwise. The class already branched on it to choose its sentence; it now says so,
+    // and the mapper reads the flag rather than reconstructing the transition map.
+    case "InvalidTransitionError":
+      return new ApiError(
+        (err as { fromIsFinal?: boolean }).fromIsFinal === true ? "visit_final" : "invalid_transition",
+        message,
+      );
     case "VisitNotFoundError":
       return new ApiError("not_found", message);
     case "InvalidDateRangeError":
@@ -202,9 +222,12 @@ export function toProblem(err: unknown): ApiError {
     // Call plans (0015/0016).
     case "TargetOutsideTerritoryError":
       return new ApiError("outside_territory", message);
-    case "InvalidPlanTransitionError":
+    // `PlanFrozenError` really does mean the plan is closed to change; the transition
+    // error does not, and shared the title with it.
     case "PlanFrozenError":
       return new ApiError("plan_final", message);
+    case "InvalidPlanTransitionError":
+      return new ApiError("invalid_transition", message);
     case "ApprovalRefusedError":
       return new ApiError("forbidden", message);
     case "DuplicatePlanError":
@@ -268,8 +291,11 @@ export function toProblem(err: unknown): ApiError {
     // submitted it" sends the reader looking for an approval nobody attempted.
     case "RejectionFourEyesViolationError":
       return new ApiError("forbidden", message);
+    // Same fact as the two above, so the same type. It answered a bare `conflict`, which
+    // was not wrong — just less than the client could have been told, and inconsistent
+    // with two sibling state machines in the same API.
     case "InvalidExpenseClaimTransitionError":
-      return new ApiError("conflict", message);
+      return new ApiError("invalid_transition", message);
     // A rep with no `erp_employee_id` cannot be the subject of an ERP Expense. A
     // configuration gap in the mapping table ADR-0001 Q3 exists for, not a bad request —
     // but the caller can do nothing with a 500, and an administrator can act on this.

@@ -491,7 +491,43 @@ describe("toProblem covers every domain error", () => {
   it("maps the transition refusals whose constructors need real states", () => {
     expect(toProblem(new visit.InvalidTransitionError("completed", "in_progress")).status).toBe(409);
     expect(toProblem(new expense.InvalidExpenseClaimTransitionError("reimbursed", "draft")).status).toBe(409);
-    expect(toProblem(new expense.InvalidExpenseClaimTransitionError("draft", "posted")).kind).toBe("conflict");
+    // All three state machines answer ONE type, and it is not a `*_final` one. A refused
+    // transition is usually not terminal — `planned → completed` is the obvious case — and
+    // it used to come back titled "Visit is final" with a detail saying otherwise, which is
+    // the wrong sentence for a client that renders `title`.
+    for (const e of [
+      // `planned` has outgoing transitions, so this is "not from here" and NOT "this is
+      // over" — the case that used to be titled "Visit is final".
+      new visit.InvalidTransitionError("planned", "completed"),
+      new callplan.InvalidPlanTransitionError("draft cannot be approved"),
+      new expense.InvalidExpenseClaimTransitionError("draft", "posted"),
+    ]) {
+      const problem = toProblem(e);
+      expect(problem.kind, e.name).toBe("invalid_transition");
+      // Through `body()`, because the TITLE a client renders is the thing that was wrong —
+      // asserting the kind alone would have passed before this change too.
+      expect(problem.body().title, e.name).toBe("Transition not allowed");
+      expect(problem.body().type).toBe(`${PROBLEM_BASE}/invalid-transition`);
+      // The detail still carries the states, which is where the specifics belong.
+      expect(problem.body().detail, e.name).toBe(e.message);
+    }
+  });
+
+  /**
+   * And the two that really DO mean "this is over" keep their own types, because the
+   * remedy differs: a transition refusal says try a legal one, a final-state refusal says
+   * there is nothing left to do to this record.
+   */
+  it("keeps a separate type for the genuinely final states", () => {
+    expect(toProblem(new visit.VisitIsFinalError("visit v1 is completed")).body().title).toBe("Visit is final");
+    // And the SAME class answers `visit_final` when its source state really is terminal,
+    // which is the distinction the flag exists for.
+    const terminal = toProblem(new visit.InvalidTransitionError("completed", "in_progress"));
+    expect(terminal.kind).toBe("visit_final");
+    expect(terminal.body().title).toBe("Visit is final");
+    expect(toProblem(new callplan.PlanFrozenError("plan p1 is frozen")).body().title).toBe(
+      "Call plan is final",
+    );
   });
 
   /**

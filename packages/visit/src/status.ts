@@ -21,6 +21,20 @@ export const VISIT_TRANSITIONS: Readonly<Record<VisitStatus, readonly VisitStatu
 };
 
 export class InvalidTransitionError extends Error {
+  /**
+   * True when the SOURCE state has no outgoing transitions at all.
+   *
+   * The constructor already branched on this to choose its sentence — "a completed visit is
+   * final" versus "cannot move a visit from planned to completed" — and then threw the
+   * distinction away, so `problems.ts` had one error class covering two different facts and
+   * answered both with the `visit_final` problem type. A `planned → completed` refusal
+   * therefore came back titled "Visit is final" with a detail saying otherwise.
+   *
+   * Carried as a field rather than recomputed by the mapper, because `VISIT_TRANSITIONS` is
+   * this package's to know and a second reader of it is a second thing to keep in step.
+   */
+  readonly fromIsFinal: boolean;
+
   constructor(
     readonly from: VisitStatus,
     readonly to: VisitStatus,
@@ -32,6 +46,7 @@ export class InvalidTransitionError extends Error {
         : `cannot move a visit from ${from} to ${to} (allowed: ${allowed.join(", ")})`,
     );
     this.name = "InvalidTransitionError";
+    this.fromIsFinal = allowed.length === 0;
   }
 }
 

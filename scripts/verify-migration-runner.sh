@@ -16,9 +16,17 @@
 #      they must be idempotent.
 #   4. An edited already-applied migration is REFUSED, not silently re-run or
 #      silently skipped.
+#   5. The cross-tenant pre-flight in 0035/0037 actually FIRES on a leaking database.
+#      It walks `crm.tenant` to ask the question from inside each tenant, and
+#      `crm.tenant` is EMPTY in a database either of this repo's setup paths builds
+#      — so on every run until now that DO block looped zero times, applied cleanly,
+#      and proved nothing. ADR-0001 carries that as an open item. This builds a
+#      database that really does leak and asserts the migration refuses it.
 #
 # Usage: PGDATABASE=… [PGHOST=… PGUSER=… PGPASSWORD=…] scripts/verify-migration-runner.sh
-# The database must already exist and must NOT already have a crm schema.
+# The database must already exist and must NOT already have a crm schema. Property 5
+# needs a SECOND throwaway database, so the role must be able to CREATEDB; it is named
+# after PGDATABASE and dropped at the end.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -90,6 +98,106 @@ mv -f "$victim.bak" "$victim"; trap - EXIT
 grep -q 'CHANGED_AFTER_APPLY' /tmp/crm-dry-3.log || fail "dry run did not name the edited file"
 [ "$run_code" != "0" ] || fail "a real run ACCEPTED an edited migration"
 echo "ok: refused (dry run exit 1, real run exit $run_code)"
+
+echo "--- 5. the cross-tenant pre-flight fires on a leaking database ---"
+# 0035 and 0037 open with a DO block that asks, from inside each registered tenant,
+# whether any reference already points across a tenant boundary — because a composite
+# foreign key's bulk VALIDATE is an ordinary query and therefore sees ZERO rows as
+# `crm_app` with no tenant context, so it would mark itself valid over a violating table.
+# The block is the only thing standing between that and a silently-wrong constraint, and
+# nothing has ever exercised it: it enumerates `crm.tenant`, which neither setup path
+# populates.
+#
+# So: apply everything up to 0034, register two tenants, write the leak that this schema
+# actually shipped once — a tenant B `rep_role` naming a tenant A `rep_profile`, through
+# `granted_by`, which was a single-column reference until 0035 converted it — and then let
+# the runner reach 0035.
+PRE_DB="${PGDATABASE}_preflight"
+PRE_DIR="$(mktemp -d)"
+cleanup_pre() {
+  rm -rf "$PRE_DIR"
+  PGDATABASE=postgres dropdb --if-exists "$PRE_DB" >/dev/null 2>&1 || true
+}
+trap cleanup_pre EXIT
+
+for f in "$MIGRATIONS_DIR"/*.sql; do
+  n="$(basename "$f" | cut -c1-4)"
+  [ "$n" -le 0034 ] && cp "$f" "$PRE_DIR/"
+done
+[ -f "$PRE_DIR/0035_composite_fks.sql" ] && fail "the subset must stop before 0035"
+
+PGDATABASE=postgres dropdb --if-exists "$PRE_DB" >/dev/null 2>&1 || true
+PGDATABASE=postgres createdb "$PRE_DB" \
+  || fail "could not create $PRE_DB — property 5 needs a role that can CREATEDB"
+PGDATABASE="$PRE_DB" "$ROOT/scripts/erp-fixture.sh" >/dev/null
+MIGRATIONS_DIR="$PRE_DIR" PGDATABASE="$PRE_DB" node packages/db/dist/bin/migrate.js >/tmp/crm-pre-1.log 2>&1 \
+  || { cat /tmp/crm-pre-1.log >&2; fail "could not apply migrations 0003-0034 to $PRE_DB"; }
+
+# Seeded as crm_app under each tenant's own context, which is the only way the rows can be
+# written at all — and is also why the leak is invisible to an uncontexted query, which is
+# the whole point of the pre-flight.
+A="a0000000-0000-4000-8000-00000000aaaa"
+B="b0000000-0000-4000-8000-00000000bbbb"
+PGDATABASE="$PRE_DB" psql -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL || fail "could not seed the leak"
+SET ROLE crm_app;
+INSERT INTO crm.tenant (tenant_id, display_name) VALUES ('$A','Tenant A'), ('$B','Tenant B');
+BEGIN;
+  SELECT set_config('app.current_tenant_id', '$A', true);
+  INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name)
+  VALUES ('a0000000-0000-4000-8000-00000000a001','$A','pf-a','pf-a','Rep A');
+COMMIT;
+BEGIN;
+  SELECT set_config('app.current_tenant_id', '$B', true);
+  INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name)
+  VALUES ('b0000000-0000-4000-8000-00000000b001','$B','pf-b','pf-b','Rep B'),
+         ('b0000000-0000-4000-8000-00000000b002','$B','pf-b2','pf-b2','Rep B2');
+  -- THE LEAK: granted_by is tenant A's profile, in a tenant B row. A single-column
+  -- reference at this point in the chain, so Postgres accepts it.
+  INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by)
+  VALUES ('$B','b0000000-0000-4000-8000-00000000b001','administrator',
+          'a0000000-0000-4000-8000-00000000a001');
+COMMIT;
+SQL
+
+# Both directions, because they are the pre-flight's whole premise. From inside tenant B
+# the row is there; with no tenant context it is not — which is exactly why a bulk VALIDATE
+# cannot see it and why the DO block has to iterate tenants to find it.
+present="$(PGDATABASE="$PRE_DB" psql -At -c "SET ROLE crm_app;
+  SELECT set_config('app.current_tenant_id','$B',false);
+  SELECT count(*) FROM crm.rep_role r WHERE r.granted_by = 'a0000000-0000-4000-8000-00000000a001'" | tail -1)"
+[ "$present" = "1" ] || fail "the leak row was not seeded (tenant B sees $present)"
+leaked="$(PGDATABASE="$PRE_DB" psql -At -c "SET ROLE crm_app;
+  SELECT count(*) FROM crm.rep_role r WHERE r.granted_by = 'a0000000-0000-4000-8000-00000000a001'" | tail -1)"
+[ "$leaked" = "0" ] || fail "the leak row should be invisible with no tenant context, saw $leaked"
+echo "ok: the leak exists inside tenant B and is invisible without a tenant context"
+
+set +e
+MIGRATIONS_DIR="$PRE_DIR" PGDATABASE="$PRE_DB" node packages/db/dist/bin/migrate.js >/dev/null 2>&1
+MIGRATIONS_DIR="$MIGRATIONS_DIR" PGDATABASE="$PRE_DB" node packages/db/dist/bin/migrate.js >/tmp/crm-pre-2.log 2>&1
+pre_code=$?
+set -e
+[ "$pre_code" != "0" ] || { cat /tmp/crm-pre-2.log >&2; fail "0035 ACCEPTED a database with a cross-tenant reference"; }
+grep -q "rep_role" /tmp/crm-pre-2.log || { cat /tmp/crm-pre-2.log >&2; fail "the refusal does not name the offending table"; }
+grep -qi "granted_by" /tmp/crm-pre-2.log || { cat /tmp/crm-pre-2.log >&2; fail "the refusal does not name the offending column"; }
+grep -q "$B" /tmp/crm-pre-2.log || { cat /tmp/crm-pre-2.log >&2; fail "the refusal does not name the offending tenant"; }
+echo "ok: refused, naming the table, the column and the tenant (exit $pre_code)"
+
+# And the negative control: the same database WITHOUT the leak migrates all the way. A
+# pre-flight that refused everything would satisfy every assertion above.
+# `crm.rep_role` is append-only — a grant is revoked, never deleted (0023) — so removing
+# the row needs the guard lifted, exactly as `api.contract.test.ts`'s fixture does. Worth
+# noting rather than hiding: the append-only rule is why a leaked grant could not simply be
+# cleaned up in place, and why 0035 refuses rather than repairing.
+PGDATABASE="$PRE_DB" psql -v ON_ERROR_STOP=1 -q -o /dev/null -c "SET ROLE crm_app;
+  BEGIN;
+    SELECT set_config('app.current_tenant_id', '$B', true);
+    ALTER TABLE crm.rep_role DISABLE TRIGGER USER;
+    DELETE FROM crm.rep_role WHERE granted_by = 'a0000000-0000-4000-8000-00000000a001';
+    ALTER TABLE crm.rep_role ENABLE TRIGGER USER;
+  COMMIT;" || fail "could not remove the leak row"
+MIGRATIONS_DIR="$MIGRATIONS_DIR" PGDATABASE="$PRE_DB" node packages/db/dist/bin/migrate.js >/tmp/crm-pre-3.log 2>&1 \
+  || { cat /tmp/crm-pre-3.log >&2; fail "the same database refused even after the leak was removed"; }
+echo "ok: and the same database migrates once the leak is gone"
 
 echo
 echo "migration runner verified against $PGDATABASE"

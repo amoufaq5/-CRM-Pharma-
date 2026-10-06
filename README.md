@@ -510,6 +510,20 @@ rather than passing for it. It carries a `pg_constraint` drift guard too: a tabl
 month by someone who does not know this rule fails a test instead of quietly reopening the
 class.
 
+**The pre-flight those migrations open with has now been seen to work.** A composite key's
+bulk `VALIDATE` is an ordinary query, so as `crm_app` with no tenant context it validates
+against **zero visible rows** and marks itself valid over a table holding a violation. The
+only thing standing between that and a silently-wrong constraint is a `DO` block that asks
+the question from inside each registered tenant — and it enumerates `crm.tenant`, which
+neither of this repo's setup paths populates, so on every run until now it looped zero times,
+applied cleanly, and proved nothing. `scripts/verify-migration-runner.sh` now builds a
+database that really leaks: migrations up to 0034, two registered tenants, and the leak this
+schema actually shipped once — a tenant-B `rep_role` naming a tenant-A profile through
+`granted_by`, which was single-column until 0035 converted it. It asserts the row is visible
+inside tenant B and invisible without a context (the pre-flight's whole premise), that the
+migration then **refuses** and names the table, the column and the tenant, and — the control
+that matters — that the same database migrates all the way once the leak is removed.
+
 ## The snapshot refresh tells you when it could not be incremental
 
 `snapshot_incremental` cannot be incremental against `pack-erp-core`, and until recently
@@ -661,7 +675,7 @@ test database matches a migrated one.
 ```bash
 pnpm db:migrate:dry      # what a real run would do; exit 1 if an applied file was edited
 pnpm db:migrate          # apply
-pnpm db:migrate:verify   # the four properties above, against a throwaway database
+pnpm db:migrate:verify   # the five properties above, against a throwaway database
 ```
 
 **Two long-running processes, as on the ERP side.** The API is stateless and scales
