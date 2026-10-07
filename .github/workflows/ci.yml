@@ -88,9 +88,28 @@ jobs:
       - name: Provision roles and schema
         run: ./scripts/setup-test-db.sh
 
+      # `pnpm test`, with its failures made READABLE. The plain step output is not: every
+      # job that uses a service container ends by dumping that container's whole log, and
+      # postgres:16 under this suite writes ~90 KB of expected negative-test errors, which
+      # buries vitest's own output beyond the reach of the logs API. That is not a
+      # cosmetic problem — it is why this job stayed red for 33 consecutive runs while
+      # the cause (`crm_app` had no password, so a third of the files never ran) sat
+      # unread. So on failure the failing lines are re-emitted as workflow ANNOTATIONS,
+      # which are served by their own endpoint and cannot be buried.
       - name: Test
-        run: pnpm test
-
+        run: |
+          set +e
+          pnpm test > "$RUNNER_TEMP/vitest.log" 2>&1
+          code=$?
+          set -e
+          tail -80 "$RUNNER_TEMP/vitest.log"
+          if [ "$code" -ne 0 ]; then
+            sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/vitest.log" \
+              | grep -E "^ *(FAIL|×|✗)|AssertionError|^ *→ |Timeout|Test Files  |Tests  " \
+              | head -40 > "$RUNNER_TEMP/failures.txt" || true
+            while IFS= read -r line; do printf '::error::%s\n' "$line"; done < "$RUNNER_TEMP/failures.txt"
+          fi
+          exit "$code"
   # The migration RUNNER, separately, on its own fresh database.
   #
   # build-and-test applies migrations with psql (scripts/setup-test-db.sh), which
