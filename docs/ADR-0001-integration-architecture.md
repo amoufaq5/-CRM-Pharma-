@@ -787,7 +787,8 @@ Concretely, and these specifics are the decision, not commentary on it:
        `pnpm install --frozen-lockfile --prod`, which keeps the promise the prune was
        there for — nothing is re-resolved — and leaves the links in place.
 
-    **Why six weeks of green CI said nothing: there was no `.dockerignore`.** `COPY
+    **Why six weeks of CI said nothing — and "green CI" is the wrong phrase, which
+    is item 24's subject: there was no `.dockerignore`.** `COPY
     packages/ packages/` landed the host's `dist/` and `tsconfig.tsbuildinfo` on top of
     what pnpm had just installed, `tsc` found every project up to date, emitted nothing,
     and the image shipped artifacts compiled on a developer's machine while its own build
@@ -813,6 +814,48 @@ Concretely, and these specifics are the decision, not commentary on it:
     deliberately, because the ERP keeps its last good key set on any non-200 and replaces
     it on a 200, so an empty document would silently disarm every verifier that fetched
     it. The gate now asserts the refusal.
+
+24. **A third of the test suite has never run in CI, and "green" was never checked
+    either.** Item 23 said six weeks of green CI went over an unbuildable image. Reading
+    the actual runs to confirm that — which the increment had not done, because it looked
+    at the files rather than the results — found the phrase was wrong in a way that
+    matters more than the correction. The `deploy-stack` job was green. **`build-and-test`
+    was RED**, on every run, and had been.
+
+    The cause, reproduced exactly against the same `postgres:16` image over TCP:
+
+    ```
+    FATAL:  password authentication failed for user "crm_app"
+    DETAIL:  User "crm_app" has no password assigned.
+            Connection matched pg_hba.conf line 128: "host all all all scram-sha-256"
+    ```
+
+    `appPool()` connects as `crm_app` on purpose — decision item 2, and the reason is in
+    that function's own comment: the API suite once ran as the admin, so RLS was off for
+    the entire suite and `crm.revoke_rep_role` ended one tenant's grant from another
+    tenant with every test passing. But `0001` creates the role with `CREATE ROLE crm_app
+    LOGIN` and no password. Over a unix socket, peer auth ignores that. Over TCP against
+    the official image, it is fatal — and CI connects over TCP.
+
+    Measured: **32 of 82 test files failed and 1,073 of 2,117 tests never ran**, against a
+    tree that is 82/82 green over a socket. The two numbers differ by more than the
+    failures, and that is the part worth keeping: after a `beforeAll` fails, vitest
+    reports the rest of the file as SKIPPED, and a skipped contract test is
+    indistinguishable from a passing one in a summary line. The suite did not report
+    1,073 missing tests. It reported 17 failures.
+
+    **Two fixes, because the first is forgettable.** `PGAPPPASSWORD` is set in CI and
+    `setup-test-db.sh` applies it — and then that script OPENS the suite's own connection
+    with exactly what `appPool()` would use and refuses to finish if it cannot. A test
+    database the suite cannot authenticate to is worse than no database: it does not
+    fail, it hollows out, and the summary line still looks like an answer. With the fix,
+    the same container over TCP runs 82/82 and 2,117/2,117.
+
+    **The rule, and it is item 23's rule pointed at a different thing: read the result,
+    not the configuration.** Item 23 came from never running `docker build`. This came
+    from never reading a CI run — including, for one commit, my own, which is why the
+    correction belongs here in the record rather than in a quietly amended sentence
+    upstream. A red job that nobody reads is not a gate. It is a habit.
 
 ## Alternatives considered
 
@@ -1229,7 +1272,7 @@ commit.
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
 | **THERE IS NO CLIENT.** The CRM is an API and a background process: 16 packages, 54 migrations, 104 routes, no web UI, no mobile app, no on-device store. This is the largest thing not written down anywhere until now, and it matters more than its one row suggests, because "offline-first" is load-bearing in the brief and a great deal of this system exists to serve a client that does not exist: device-minted ids for idempotent replay (0017), `POST /v1/sync/visits` and the per-row batch results, the `UiSchema`-free hand-rolled route surface, the staleness question below, and the signature capture that commits to bytes no app has produced. Every one of those is a guess about a consumer until something consumes it. Choosing the shape — a PWA like the ERP's `operate-web`, a Capacitor wrapper, or native — is a product decision with a long tail, not an increment to slot in. | Product | _set a date_ |
 
-| **The TLS edge is the one service never started, and ACME is tested nowhere.** `pnpm deploy:smoke` runs Postgres, migrate, the api and the scheduler for real (item 23), and CI runs Caddy too — but against `DOMAIN=localhost` with Caddy's internal CA, so certificate issuance over ACME has still never happened. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so the step is skipped with `CRM_SMOKE_SKIP_CADDY=1`, which prints that it was skipped. The first real deploy is therefore the first time ACME, a real domain and a real certificate are exercised together — the one remaining part of the stack where that is true. | Platform | _set a date_ |
+| **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 
 > The deadlines in the original table (8–26 September) all lapsed before the answers came
 > in. They are left blank above rather than back-dated.

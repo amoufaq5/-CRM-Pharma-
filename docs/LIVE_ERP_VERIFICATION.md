@@ -980,11 +980,15 @@ Things in that transcript that had never happened before:
 
 ## What is still not proven
 
-- **The TLS edge.** Docker Hub answered `429 Too Many Requests` to every
-  anonymous pull of `caddy:2` in this sandbox, so step 7 was skipped — with
-  `CRM_SMOKE_SKIP_CADDY=1`, which prints that it was skipped, because an
-  unexplained skip is a lie. CI has no such limit and runs it. ACME is not tested
-  anywhere: the edge uses Caddy's internal CA against `DOMAIN=localhost`.
+- **ACME, though the edge itself now is.** Docker Hub answered `429 Too Many
+  Requests` to every anonymous pull of `caddy:2` in this sandbox, so step 7 was
+  skipped here with `CRM_SMOKE_SKIP_CADDY=1`, which prints that it was skipped,
+  because an unexplained skip is a lie. CI has no such limit, and the run on the
+  commit that landed this answered `ok: caddy serves the api over TLS` on a build
+  of `deploy/Dockerfile` with no deviations at all — so the proxy and the
+  certificate path are exercised. What is not is **issuance**: `DOMAIN=localhost`
+  means Caddy's internal CA, so the first real deploy is the first time ACME, a
+  real domain and a real certificate happen together.
 - **The build in this sandbox needed two deviations**, both printed by the script
   and neither committed: the proxy's CA inside the build (a sandbox that
   re-terminates TLS, else pnpm cannot reach the registry) and a digest for the
@@ -997,3 +1001,48 @@ Things in that transcript that had never happened before:
   run, so the outbox has nothing to drain into. §1–§7 above cover that path
   against a real `operate-server`.
 - **Nothing about load, concurrency across replicas, or a restart under traffic.**
+
+## And then CI, which had been red the whole time
+
+The section above says six weeks of CI went over an unbuildable image. Checking
+that claim — by reading the actual runs, which the work had not done, because it
+read the files instead — found it was wrong in the more interesting direction.
+
+`deploy-stack` was green. **`build-and-test` was failing, on every run.**
+
+```
+FATAL:  password authentication failed for user "crm_app"
+DETAIL:  User "crm_app" has no password assigned.
+        Connection matched pg_hba.conf line 128: "host all all all scram-sha-256"
+```
+
+Reproduced exactly, now that a daemon is available, by running the suite against
+the same `postgres:16` image over TCP rather than the local unix socket:
+
+| | over a socket (local) | over TCP (CI) |
+|---|---|---|
+| test files | 82 passed | **32 failed**, 50 passed |
+| tests | 2,117 passed | 17 failed, 1,027 passed, **1,073 skipped** |
+
+`appPool()` connects as `crm_app` deliberately — the API suite once ran as the
+admin, so RLS was off for all of it, and `crm.revoke_rep_role` ended one tenant's
+grant from another tenant with every test green. But `0001` creates the role with
+`CREATE ROLE crm_app LOGIN` and no password: invisible under peer auth on a
+socket, fatal under `scram-sha-256` over TCP.
+
+**The number that matters is 1,073, not 17.** After a `beforeAll` fails, vitest
+reports the rest of the file as skipped, and a skipped contract test looks exactly
+like a passing one in a summary line. The suite never said "1,073 tests did not
+run". It said "17 failed", and 17 failures in a red job that nobody opened is
+indistinguishable from flake.
+
+Fixed in two places, because a password is forgettable: CI sets `PGAPPPASSWORD`,
+and `scripts/setup-test-db.sh` applies it and then **opens the suite's own
+connection** with exactly what `appPool()` would use, refusing to finish if it
+cannot — naming the socket-versus-TCP distinction in the error, since that is the
+whole of it. Verified: the same container over TCP now runs **82 files / 2,117
+tests green**, and with `PGAPPPASSWORD` unset the setup stops with the reason
+instead of building a database the suite would skip against.
+
+Nothing about the two defects is related. What is related is the habit: item 23
+came of never running `docker build`, and this came of never reading a CI run.

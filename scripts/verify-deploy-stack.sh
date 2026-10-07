@@ -145,10 +145,10 @@ echo "--- 8. the Dockerfile's manifest layer lists every workspace package ---"
 # THEN copy sources, so a source-only change reuses the dependency layer. The cost is a
 # list that has to be kept in step with the workspace, and it was not — it named 8 of
 # the 16 packages, so the other eight were not pnpm importers, got no node_modules, and
-# the image could not build at all. Six weeks of CI passed over it because nothing
-# compared the two lists. This does, deriving the expected one from pnpm-workspace.yaml,
-# so adding a package and forgetting the Dockerfile is a red job rather than a broken
-# deploy.
+# the image could not build at all. Six weeks of THIS JOB passing went over it, because
+# nothing compared the two lists. This does, deriving the expected one from
+# pnpm-workspace.yaml, so adding a package and forgetting the Dockerfile is a red job
+# rather than a broken deploy.
 python3 - "$ROOT" <<'PY' || fail "the Dockerfile's manifest list and the workspace disagree"
 import pathlib, re, sys, yaml
 

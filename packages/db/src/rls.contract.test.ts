@@ -303,6 +303,16 @@ describe("row-level security contract", () => {
       try {
         await client.query("BEGIN");
         await client.query("SELECT 1/0").catch(() => undefined);
+        // The second round trip is not padding, and this test flaked without it — on TCP
+        // only, which is why a socket-only run never showed it and CI would have.
+        // node-postgres settles a SUCCESSFUL query on ReadyForQuery, by which time
+        // `_transactionStatus` is already updated, but it rejects a FAILED one on
+        // ErrorResponse, which the backend sends FIRST. Over a unix socket both messages
+        // land in one read and the status is 'E' by the time the catch runs; over TCP they
+        // can arrive in separate reads and it still reads 'T'. The queue dispatches the
+        // next query only on ReadyForQuery, so awaiting anything at all here means the
+        // first one has been processed and the status has settled.
+        await client.query("SELECT 1").catch(() => undefined);
         expect((client as unknown as { getTransactionStatus(): string }).getTransactionStatus()).toBe(
           "E",
         );

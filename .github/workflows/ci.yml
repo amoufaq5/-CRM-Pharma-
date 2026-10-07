@@ -37,6 +37,22 @@ jobs:
       PGUSER: postgres
       PGPASSWORD: postgres
       PGDATABASE: crm_test
+      # The APPLICATION identity's password, and it is load-bearing here in a way it
+      # is not locally. `appPool()` connects as crm_app — deliberately, because the
+      # admin bypasses RLS and a suite run as the admin cannot catch a missing tenant
+      # predicate — and 0001 creates that role with no password. Over a unix socket
+      # peer auth ignores that; over TCP the postgres image's pg_hba is
+      # `host all all all scram-sha-256`, and this job connects over TCP.
+      #
+      # So every suite needing the application identity answered `password
+      # authentication failed for user "crm_app"` here: 32 of 82 files failed and
+      # 1,073 tests never ran, while the same tree was 82/82 green over a socket. It
+      # did not look like 1,073 missing tests either — vitest reports them as skipped
+      # after the beforeAll fails, and a skipped contract test reads like a passing one
+      # in a summary line. setup-test-db.sh now sets this password AND opens the
+      # suite's own connection to prove it works, so forgetting this variable stops
+      # the setup instead of hollowing out the run.
+      PGAPPPASSWORD: crm-test-app
 
     steps:
       - uses: actions/checkout@v4

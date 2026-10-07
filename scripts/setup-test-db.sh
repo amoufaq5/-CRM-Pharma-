@@ -63,4 +63,45 @@ if [ "$applied" -eq 0 ]; then
 fi
 echo "applied $applied application migration(s)"
 
+# ---------------------------------------------------------------------------
+# PROVE the application connection works, as the suite will open it.
+#
+# `CREATE ROLE crm_app LOGIN` in 0001 sets no password, which is invisible over a
+# unix socket (peer or trust auth ignores it) and fatal over TCP against the
+# official postgres image, whose pg_hba is `host all all all scram-sha-256`. CI
+# connects over TCP. So for however long `appPool()` has existed, CI has answered
+# `password authentication failed for user "crm_app" — User "crm_app" has no
+# password assigned` to every suite that needs the application identity: 32 of 82
+# test files failed and 1,073 tests never ran, while the same tree is 82/82 green
+# over a socket. Found by reading a CI log, not by a failing local run.
+#
+# Two halves to the fix and this is the second, because the first is a password
+# somebody can forget: the suite's own connection is OPENED HERE, with exactly
+# what `appPool()` would use, and a failure stops the setup with the reason. A test
+# database the suite cannot authenticate to is worse than no database — it does not
+# fail, it SKIPS, and a skipped contract test is indistinguishable from a passing
+# one in a summary line.
+if [ -n "${PGAPPPASSWORD:-}" ]; then
+  psql -v ON_ERROR_STOP=1 -q -c "ALTER ROLE ${PGAPPUSER:-crm_app} PASSWORD '${PGAPPPASSWORD}'"
+  echo "set a password on ${PGAPPUSER:-crm_app} from PGAPPPASSWORD"
+fi
+
+app_user="${PGAPPUSER:-crm_app}"
+probe="$(mktemp)"; probe_err="$(mktemp)"
+trap 'rm -f "$probe" "$probe_err"' EXIT
+if ! PGUSER="$app_user" PGPASSWORD="${PGAPPPASSWORD:-}" \
+     psql -w -v ON_ERROR_STOP=1 -qtAc "SELECT current_user" > "$probe" 2>"$probe_err"; then
+  echo "the application identity cannot connect to this database, so the contract suites would SKIP:" >&2
+  sed 's/^/  /' "$probe_err" >&2
+  case "${PGHOST:-/var/run/postgresql}" in
+    /*) echo "  over a unix socket this is usually pg_hba or a missing LOGIN, not the password." >&2 ;;
+    *)  echo "  over TCP the official postgres image requires scram-sha-256: export PGAPPPASSWORD" >&2
+        echo "  before running this script (and give the same value to the test run)." >&2 ;;
+  esac
+  exit 1
+fi
+[ "$(cat "$probe")" = "$app_user" ] \
+  || { echo "connected as $(cat "$probe"), expected $app_user" >&2; exit 1; }
+echo "$app_user can connect — the identity the contract suites use"
+
 echo "test database ready"

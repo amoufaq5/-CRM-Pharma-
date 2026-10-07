@@ -1110,9 +1110,22 @@ correctly; and the scheduler refuses to start without an ERP credential, starts 
 and signs with exactly the key the api publishes out of the database. `pnpm deploy:image`
 replays the same build without a daemon in about thirty seconds.
 
-Still unexercised: ACME (the edge is tested with Caddy's internal CA against
-`DOMAIN=localhost`), a real OIDC issuer, and the ERP itself — all three are someone else's
-host.
+CI's run on the commit that landed this answered `ok: caddy serves the api over TLS` as
+well, on a build of `deploy/Dockerfile` with no deviations — so the edge is exercised too.
+Still unexercised: ACME issuance (`DOMAIN=localhost` means Caddy's internal CA, so the
+first real deploy is the first real certificate), a real OIDC issuer, and the ERP itself.
+
+**And checking the claim above found CI itself had been red the whole time**, in a
+different job, for a reason that has nothing to do with the image: `appPool()` connects as
+`crm_app` on purpose, `0001` creates that role without a password, and the official
+postgres image requires `scram-sha-256` over TCP — which is how CI connects and a local
+socket is not. 32 of 82 test files failed there and **1,073 of 2,117 tests never ran**,
+against a tree that is 82/82 green locally. The failure did not look like 1,073 missing
+tests: vitest skips the rest of a file after its `beforeAll` fails, and a skipped contract
+test reads like a passing one. CI now sets `PGAPPPASSWORD`, and
+`scripts/setup-test-db.sh` opens the suite's own connection to prove it works before
+declaring the database ready — because a test database the suite cannot authenticate to
+does not fail, it hollows out.
 
 ## Rules that are not negotiable
 
