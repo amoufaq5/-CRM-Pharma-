@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+
 import { Pool, type PoolClient } from "pg";
 
 /**
@@ -276,4 +279,82 @@ export async function withRegistryTriggersOff<T>(
   } finally {
     await client.query("ALTER TABLE crm.tenant ENABLE TRIGGER tenant_erp_deleted_is_terminal");
   }
+}
+
+/**
+ * Grep the repository, in Node, because `rg` is not everywhere.
+ *
+ * Two coverage suites derived their claim by shelling out to ripgrep —
+ * every `src` file of every package for every `subjectTable` argument, `db/migrations`
+ * for every `CREATE TABLE crm.attachment`. Both worked on the machine they were written
+ * on and neither works on a GitHub runner, which has no ripgrep: `spawnSync rg ENOENT`.
+ * That is
+ * the fixture-kinder-than-reality failure in its purest form — a test whose verdict
+ * depends on a binary nobody declared — and it was one of the two reasons CI stayed red
+ * for 33 consecutive runs.
+ *
+ * The name above is written without its colon on purpose: the notify suite greps for
+ * that exact token in non-test source, and this file is non-test source. It found this
+ * very comment, which is the test working.
+ *
+ * Installing ripgrep in the workflow would have fixed the symptom. This removes the
+ * dependency: a directory walk and a RegExp, output in ripgrep's `path:line:text` shape
+ * so the call sites parse it unchanged.
+ *
+ * IT THROWS ON ZERO MATCHES, and that is deliberate rather than tidy. `rg` exits 1 when
+ * it finds nothing, which made `execFileSync` throw — so a scan that found nothing failed
+ * the test. A Node implementation returning `[]` would instead hand a coverage test an
+ * empty producer set, which it would pass vacuously: the single worst outcome available
+ * here, worse than ENOENT, because it is green. Scanning zero files throws for the same
+ * reason, and names the root it was given.
+ */
+export function grepRepo(opts: {
+  readonly root: string;
+  readonly dir: string;
+  readonly pattern: RegExp;
+  readonly include?: (relativePath: string) => boolean;
+}): readonly string[] {
+  const { root, dir, pattern } = opts;
+  const include = opts.include ?? ((): boolean => true);
+  const skip = new Set(["node_modules", ".git", "dist", "coverage"]);
+  const hits: string[] = [];
+  let scanned = 0;
+
+  const walk = (relative: string): void => {
+    const entries = readdirSync(resolvePath(root, relative), { withFileTypes: true }).sort((a, b) =>
+      a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+    );
+    for (const entry of entries) {
+      const rel = relative === "" ? entry.name : `${relative}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (!skip.has(entry.name)) walk(rel);
+        continue;
+      }
+      if (!entry.isFile() || !include(rel)) continue;
+      scanned += 1;
+      const lines = readFileSync(resolvePath(root, rel), "utf8").split("\n");
+      lines.forEach((text, i) => {
+        // A fresh lastIndex per line: a /g pattern from a caller would otherwise skip
+        // lines depending on where the previous match ended.
+        pattern.lastIndex = 0;
+        if (pattern.test(text)) hits.push(`${rel}:${i + 1}:${text}`);
+      });
+    }
+  };
+
+  // "." is the repository root, and it must not become a "./" prefix on every path:
+  // ripgrep printed one, these call sites do not want one, and a caller matching on
+  // `rel === "package.json"` would silently see nothing. Normalised here rather than at
+  // each site.
+  walk(dir === "." ? "" : dir);
+  if (scanned === 0) {
+    throw new Error(`grepRepo scanned no files under ${root}/${dir} — wrong root, or an include() that matches nothing`);
+  }
+  if (hits.length === 0) {
+    throw new Error(
+      `grepRepo found no match for ${String(pattern)} in ${scanned} file(s) under ${root}/${dir} — ` +
+        `ripgrep exited 1 here and failed the test, and so does this`,
+    );
+  }
+  return hits;
 }

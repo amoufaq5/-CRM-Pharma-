@@ -1127,6 +1127,17 @@ test reads like a passing one. CI now sets `PGAPPPASSWORD`, and
 declaring the database ready — because a test database the suite cannot authenticate to
 does not fail, it hollows out.
 
+That was not the whole of it. With the password fixed the job was still red, and the
+failure reproduced nowhere locally — nor could the log be read: every job with a service
+container ends by dumping that container's entire log, and `postgres:16` under this suite
+writes ~90 KB of expected negative-test errors. The Test step now re-emits its failures as
+workflow annotations, which cannot be buried, and the next run named the cause in one
+line: `spawnSync rg ENOENT`. Two coverage suites shelled out to **ripgrep**, which a
+GitHub runner does not have. `grepRepo` in `packages/db/src/testing.ts` is now the same
+scan in Node, and it throws when it matches nothing — because `rg` exited 1 and failed the
+test, while returning `[]` would hand a coverage suite an empty producer set and let it
+pass vacuously. **83 files / 2,123 tests green on both transports.**
+
 ## Rules that are not negotiable
 
 **1. `crm_app` owns nothing of the ERP's, and the application never connects as a

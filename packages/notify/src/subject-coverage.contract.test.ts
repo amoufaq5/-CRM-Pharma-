@@ -1,9 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import type { Pool, PoolClient } from "pg";
-import { appPool } from "@crm/db/testing";
+import { appPool, grepRepo } from "@crm/db/testing";
 
 import { NOTIFICATION_KINDS } from "./kinds.js";
 
@@ -49,18 +48,17 @@ describe("notification subject coverage", () => {
   const producersInSource = (): ReadonlyMap<string, readonly string[]> => {
     // `--glob` excludes tests and build output: a fixture naming a made-up table is the
     // retention suite proving the unknown-subject path, not a producer.
-    const out = execFileSync(
-      "rg",
-      [
-        "--no-heading", "--line-number", "--color=never",
-        "--glob", "packages/*/src/**/*.ts",
-        "--glob", "!**/*.test.ts",
-        "--glob", "!**/dist/**",
-        "subjectTable:\\s*",
-        ".",
-      ],
-      { cwd: root, encoding: "utf8" },
-    );
+    // Was ripgrep, which is not on a GitHub runner — `spawnSync rg ENOENT`, and one of
+    // the two reasons CI was red for 33 runs. `grepRepo` is the same scan in Node, and
+    // like `rg` it THROWS when it matches nothing rather than handing this test an empty
+    // producer set it would pass vacuously.
+    const out = grepRepo({
+      root,
+      dir: "packages",
+      pattern: /subjectTable:\s*/,
+      include: (rel) =>
+        /^packages\/[^/]+\/src\/.*\.ts$/.test(rel) && !rel.endsWith(".test.ts"),
+    }).join("\n");
 
     const byTable = new Map<string, string[]>();
     const unparsed: string[] = [];

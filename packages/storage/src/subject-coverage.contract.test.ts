@@ -1,9 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import type { Pool, PoolClient } from "pg";
-import { appPool } from "@crm/db/testing";
+import { appPool, grepRepo } from "@crm/db/testing";
 
 import { MAX_ATTACHMENT_BYTES } from "./content.js";
 import {
@@ -309,13 +308,14 @@ describe("attachment subject coverage", () => {
    * fresh database, which is a failure nobody sees until CI builds one from nothing.
    */
   it("is created by exactly one migration", () => {
-    const hits = execFileSync(
-      "rg",
-      ["--no-heading", "--line-number", "--color=never", "CREATE TABLE crm\\.attachment", "db/migrations"],
-      { cwd: root, encoding: "utf8" },
-    )
-      .split("\n")
-      .filter((l) => l !== "");
+    // Was ripgrep; a GitHub runner has none (`spawnSync rg ENOENT`). `grepRepo` scans in
+    // Node and, like `rg`, throws rather than returning nothing — which here would turn
+    // "exactly one migration creates it" into "no migration mentions it, fine".
+    const hits = grepRepo({
+      root,
+      dir: "db/migrations",
+      pattern: /CREATE TABLE crm\.attachment/,
+    });
     expect(hits).toHaveLength(3);
     for (const hit of hits) expect(hit).toMatch(/^db\/migrations\/0033_attachments\.sql:/);
   });

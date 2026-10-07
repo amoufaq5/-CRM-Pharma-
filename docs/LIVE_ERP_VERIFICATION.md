@@ -1046,3 +1046,53 @@ instead of building a database the suite would skip against.
 
 Nothing about the two defects is related. What is related is the habit: item 23
 came of never running `docker build`, and this came of never reading a CI run.
+
+### The second cause, which the annotations named in one line
+
+Fixing the password left the job red, and the failure reproduced nowhere: not
+over a socket, not over TCP against the same `postgres:16` image, not with
+`CI=true` and `PGHOST=localhost`. 82 files / 2,117 tests green in all three.
+
+Reading the log was not an option either, and that is worth recording as its own
+finding: **every job with a service container ends by dumping that container's
+entire log**, and `postgres:16` under this suite writes ~90 KB of expected
+negative-test errors — `ERROR: new row violates row-level security policy`, which
+is a test *passing*. Checking the residual failure meant 92,834 characters of
+that and not one line of vitest. So the Test step now re-emits its failures as
+workflow **annotations**, which have their own endpoint and cannot be buried by a
+sidecar. The next run named the cause in one line:
+
+```
+FAIL packages/notify/src/subject-coverage.contract.test.ts
+  → spawnSync rg ENOENT
+```
+
+**Two coverage suites shelled out to ripgrep.** A GitHub runner has none. They
+scanned the repository for every `subjectTable` argument in non-test source and
+for every `CREATE TABLE crm.attachment` in `db/migrations`, and they worked only
+on a machine with `rg` installed — a test whose verdict depends on a binary
+nobody declared.
+
+Installing ripgrep in the workflow would have fixed the symptom. Instead the
+dependency is gone: `grepRepo` in `packages/db/src/testing.ts` is the same scan
+in Node, emitting ripgrep's `path:line:text` so both call sites parse it
+unchanged. **It throws when it matches nothing**, and that is the whole design
+rather than an edge case: `rg` exits 1 on no match, which made `execFileSync`
+throw and the test fail, while a Node version returning `[]` would hand a
+coverage suite an empty producer set and let it pass vacuously — green, claiming
+coverage it never checked. Scanning zero files throws for the same reason.
+`packages/db/src/testing.test.ts` pins both refusals, the `node_modules`/`dist`
+skip, and that a `/g` pattern does not skip lines through a stale `lastIndex`.
+
+Two things caught themselves on the way:
+
+- the new helper's own doc comment contained the literal token `subjectTable:`,
+  and the notify suite — which greps non-test source for exactly that — failed on
+  it. The test was right; the comment now names it without the colon and says
+  why;
+- `grepRepo({ dir: "." })` prefixed every path with `./`, so a caller matching
+  `rel === "package.json"` saw nothing. Normalised in the helper, pinned by a
+  test, and found by writing the test rather than by using it.
+
+**83 files / 2,123 tests green on both transports.** The suite grew by one file
+and six tests, all of them about the harness.

@@ -7,3 +7,9 @@ coverage/
 .DS_Store
 .smtp-crosscheck-venv/
 tsconfig.typecheck-tests.json
+
+# scripts/verify-deploy-smoke.sh copies a sandbox CA here to inject into a verification
+# build, and deletes it on exit — but not if it is killed outright. A certificate is not
+# a secret, yet a stray one in the repository is exactly the generated-file-that-looks-
+# like-source problem that nearly committed a transient tsconfig once already.
+.verify-ca.crt

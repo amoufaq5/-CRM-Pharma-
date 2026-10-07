@@ -851,6 +851,24 @@ Concretely, and these specifics are the decision, not commentary on it:
     fail, it hollows out, and the summary line still looks like an answer. With the fix,
     the same container over TCP runs 82/82 and 2,117/2,117.
 
+    **And a second cause, which only became visible once the failures could be read.**
+    The password fix left the job red, and the failure reproduced nowhere locally — not
+    over a socket, not over TCP against the same image, not with `CI=true`. The log was
+    no help either, for a structural reason worth knowing: every job with a service
+    container ends by dumping that container's whole log, and `postgres:16` under this
+    suite writes ~90 KB of expected negative-test errors, which is more than the logs API
+    will serve. So the Test step now re-emits its failures as workflow ANNOTATIONS, which
+    have their own endpoint. The next run named it in one line: `spawnSync rg ENOENT`.
+
+    Two coverage suites shelled out to **ripgrep**, which a GitHub runner does not have —
+    a test whose verdict depends on a binary nobody declared. Installing it in the
+    workflow would have fixed the symptom; instead the dependency is gone. `grepRepo` in
+    `packages/db/src/testing.ts` is the same scan in Node, and **it throws when it matches
+    nothing**, because `rg` exited 1 and failed the test while a Node version returning
+    `[]` would hand a coverage suite an empty producer set to pass vacuously. That refusal
+    is pinned by `testing.test.ts`, along with the one the helper's own comment tripped:
+    it contained the literal token the notify suite greps for, and that suite caught it.
+
     **The rule, and it is item 23's rule pointed at a different thing: read the result,
     not the configuration.** Item 23 came from never running `docker build`. This came
     from never reading a CI run — including, for one commit, my own, which is why the
