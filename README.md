@@ -779,6 +779,29 @@ quarantine a tenant's field force with one word — and once set it is terminal,
 evidence write-once. Reinstating a tenant is deliberately a migration, as 0044's lifecycle
 escape hatch is.
 
+**And the registry row cannot be deleted, which it could until 0053.** That terminal trigger
+was `BEFORE UPDATE`, so a single `DELETE FROM crm.tenant WHERE …` succeeded as `crm_app` and
+did three things, all measured before the fix was written: the API **served the tenant again**
+(an unlisted tenant is served by design — the fail-open argued above, which is what makes
+removing the row an *un-stop* rather than a nuisance); the 0052 erasure receipt was
+**orphaned**, since its trigger checks the registry at INSERT and nothing after; and
+`TRUNCATE crm.tenant` did it to **every tenant at once**, because a statement-level truncation
+fires no row trigger. One statement undid 0050, 0051 and 0052 together.
+
+Three layers, because the three holes are genuinely different and any one left open re-opens
+the bypass: the trigger now fires on `DELETE` too (a live tenant's row stays deletable — this
+is not a blanket append-only); a `BEFORE TRUNCATE` statement trigger refuses truncation
+outright; and `crm.tenant_tombstone.tenant_id` now **references the registry** with
+`ON DELETE RESTRICT` — the first foreign key into `crm.tenant` in this schema's history, which
+makes the receipt pin the row structurally rather than by trigger. `RESTRICT` and not
+`CASCADE`: cascade would make the delete succeed and take the receipts with it, which is the
+same bypass with extra steps.
+
+The trigger is the layer doing the work today. The key only pins a tenant that has been
+*erased*; the trigger pins one that has been *stopped*, which is every deleted tenant from the
+moment the watcher sees the tombstone until somebody runs the erasure — a window that stays
+open while the nineteen undecided dispositions stay undecided.
+
 **It does not erase anything, and that is a decision rather than an omission.** Some of the
 CRM's copies may be records a jurisdiction requires us to keep; a deletion that destroys an
 expense claim is as wrong as one that keeps everything. Keeping-while-stopped is the half

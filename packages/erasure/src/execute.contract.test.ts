@@ -4,6 +4,7 @@ import {
   TENANT_ERASE_BYSTANDER as BYSTANDER,
   TENANT_ERASE_EXEC as DOOMED,
   appPool,
+  withRegistryTriggersOff,
 } from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
@@ -199,7 +200,9 @@ describe("the erasure executor and its receipt (0052)", () => {
         await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [t]);
       });
     }
-    await client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[DOOMED, BYSTANDER]]);
+    await withRegistryTriggersOff(client, () =>
+      client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[DOOMED, BYSTANDER]]),
+    );
   };
 
   beforeAll(async () => {
@@ -511,6 +514,37 @@ describe("the erasure executor and its receipt (0052)", () => {
         ),
     );
     expect(msg).toMatch(/^tombstone-wrong-erp-receipt: /);
+  });
+
+  /**
+   * 0053's third layer: the receipt pins the registry row structurally, not by trigger.
+   *
+   * The first reference into `crm.tenant` in this schema's history — ADR-0001 carried the
+   * observation that nothing pointed at the registry, which is why a row could vanish from
+   * under a receipt that depends on it. Asserted with the terminal trigger DISABLED, because
+   * with it on the trigger answers first and this key would never be seen to do anything.
+   */
+  it("pins the registry row with a foreign key, not only with a trigger", async () => {
+    await register(DOOMED, "Gone");
+    await stop(DOOMED);
+    await seed(DOOMED);
+    await withEverythingDecided(() =>
+      executeTenantErasure(client, DOOMED, { executedBy: ALICE, approvedBy: BOB }),
+    );
+
+    const msg = await withRegistryTriggersOff(client, () =>
+      client.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [DOOMED]).then(
+        () => "SUCCEEDED",
+        (e: { message?: string }) => e.message ?? "",
+      ),
+    );
+    expect(msg).toContain("tenant_tombstone_tenant_id_fkey");
+
+    const { rows } = await client.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM crm.tenant WHERE tenant_id = $1",
+      [DOOMED],
+    );
+    expect(rows[0]!.n).toBe("1");
   });
 
   it("refuses a four-eyes violation in the database as well as in the code", async () => {

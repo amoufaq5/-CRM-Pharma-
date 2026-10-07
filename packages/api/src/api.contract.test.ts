@@ -2,7 +2,13 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { createHash, createSign, generateKeyPairSync, randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { appPool, testPool, TENANT_API as TENANT, TENANT_API_OTHER as OTHER } from "@crm/db/testing";
+import {
+  appPool,
+  testPool,
+  withRegistryTriggersOff,
+  TENANT_API as TENANT,
+  TENANT_API_OTHER as OTHER,
+} from "@crm/db/testing";
 
 import { startApi, type RunningApi } from "./server.js";
 import type { JwksKey } from "./jwt.js";
@@ -3345,8 +3351,14 @@ describe("the API, end to end", () => {
           WHERE tenant_id = $1`,
         [TENANT, TOMB, "a".repeat(64)],
       );
+    // 0053 makes a stopped tenant's row undeletable — it was deletable, and that was a bypass:
+    // removing it UN-stopped the tenant, because the join below treats an unlisted tenant as
+    // one to serve. This suite borrows the shared tenant id and has to hand it back, which is
+    // the one legitimate reason to turn the guarantee off.
     const unregister = (): Promise<unknown> =>
-      admin.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [TENANT]);
+      withRegistryTriggersOff(admin, () =>
+        admin.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [TENANT]),
+      );
 
     afterEach(async () => {
       await unregister();

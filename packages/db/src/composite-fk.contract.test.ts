@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 
-import { appPool, TENANT_FK_A, TENANT_FK_B } from "./testing.js";
+import { appPool, TENANT_FK_A, TENANT_FK_B, withRegistryTriggersOff } from "./testing.js";
 import { withTenantContext } from "./tenant-context.js";
 
 /**
@@ -769,7 +769,11 @@ describe("a cross-tenant reference is refused by the database", () => {
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1 AND parent_id IS NOT NULL", [tenant]);
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1", [tenant]);
       await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [tenant]);
-      await tx.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [tenant]);
+      // 0053: this suite stops its tenants to seed a 0052 receipt, so the row is undeletable
+      // until the guarantee is explicitly turned off.
+      await withRegistryTriggersOff(tx, () =>
+        tx.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [tenant]),
+      );
       for (const t of SILENCED) {
         await tx.query(`ALTER TABLE crm.${t} ENABLE TRIGGER USER`);
       }
@@ -1139,6 +1143,34 @@ describe("no reference in crm escapes its tenant", () => {
         "genuinely cannot be converted yet, add it to AWAITING_CONVERSION with the reason " +
         "and the migration that owes it.",
     ).toEqual(known);
+  });
+
+  /**
+   * The one reference the drift guard above is RIGHT not to see, said out loud.
+   *
+   * 0053 added `crm.tenant_tombstone.tenant_id -> crm.tenant (tenant_id)` — the first
+   * reference into the registry in this schema's history, and a single-column one. The guard
+   * does not flag it because it filters on `parent_cols = 'id'`, and that filter is exactly
+   * right rather than accidentally lucky: the hazard it polices is a reference naming a ROW in
+   * another tenant, and here the referenced value IS the tenant. There is no second column to
+   * carry and nothing to escape.
+   *
+   * Asserted so the pass is a rule and not an emergent accident. A future single-column
+   * reference into the registry has to appear here with its own argument; one into anything
+   * else still fails the guard.
+   */
+  it("references the tenant registry by tenant_id, which is the one safe single-column shape", () => {
+    const byTenantId = live
+      .filter((f) => f.parent_cols === "tenant_id")
+      .map((f) => `${f.conname} -> ${f.parent}`)
+      .sort();
+    expect(byTenantId).toEqual(["tenant_tombstone_tenant_id_fkey -> tenant"]);
+
+    // And it is RESTRICT, because CASCADE would make the delete succeed and take the receipts
+    // with it — the bypass 0053 closed, with extra steps. `confdeltype` is a single char here,
+    // which is how this row of the catalog reads.
+    const key = live.find((f) => f.conname === "tenant_tombstone_tenant_id_fkey");
+    expect(key?.on_delete).toBe("r");
   });
 
   it("every hardened reference is still composite", () => {

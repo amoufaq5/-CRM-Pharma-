@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 
 /**
  * The FIXTURE connection. Connects as the admin role.
@@ -248,3 +248,32 @@ export const TENANT_ERASURE_LIVE = "ed510000-0000-4000-8000-000000000020";
  */
 export const TENANT_ERASE_EXEC = "ee520000-0000-4000-8000-000000000021";
 export const TENANT_ERASE_BYSTANDER = "ef520000-0000-4000-8000-000000000022";
+
+/**
+ * Runs `fn` with `crm.tenant`'s protective triggers off, for test cleanup only.
+ *
+ * Migration 0053 made a stopped tenant's registry row undeletable, because deleting it
+ * un-stopped the tenant (the API serves an unlisted tenant by design) and orphaned its
+ * erasure receipt. That is a guarantee, so the only legitimate way around it is a fixture
+ * handing back a tenant id it borrowed — and the only honest way to do that is to turn the
+ * guarantee off explicitly, here, where it is named and commented, rather than for a test to
+ * quietly find a statement that works.
+ *
+ * Shared because four suites need it and four copies of a trigger-disable is how one of them
+ * ends up missing the re-enable. `crm_app` owns the table, so it may do this; the `finally`
+ * puts both triggers back even when `fn` throws.
+ *
+ * A suite that asserts the REFUSAL must not use this — see `tenant-deletion.contract.test.ts`,
+ * which tests the delete is refused with the triggers on and only then cleans up with them off.
+ */
+export async function withRegistryTriggersOff<T>(
+  client: PoolClient,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await client.query("ALTER TABLE crm.tenant DISABLE TRIGGER tenant_erp_deleted_is_terminal");
+  try {
+    return await fn();
+  } finally {
+    await client.query("ALTER TABLE crm.tenant ENABLE TRIGGER tenant_erp_deleted_is_terminal");
+  }
+}

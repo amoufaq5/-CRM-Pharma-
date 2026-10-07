@@ -4,6 +4,7 @@ import {
   TENANT_ERASURE_LIVE as LIVE,
   TENANT_ERASURE_STOPPED as STOPPED,
   appPool,
+  withRegistryTriggersOff,
 } from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
@@ -124,7 +125,9 @@ describe("retention dispositions and the erasure plan (0051)", () => {
         tx.query("DELETE FROM crm.product_snapshot WHERE tenant_id = $1", [t]),
       );
     }
-    await client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[STOPPED, LIVE]]);
+    await withRegistryTriggersOff(client, () =>
+      client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[STOPPED, LIVE]]),
+    );
     client?.release();
     await pool?.end();
   });
@@ -144,7 +147,9 @@ describe("retention dispositions and the erasure plan (0051)", () => {
         tx.query("DELETE FROM crm.product_snapshot WHERE tenant_id = $1", [t]),
       );
     }
-    await client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[STOPPED, LIVE]]);
+    await withRegistryTriggersOff(client, () =>
+      client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[STOPPED, LIVE]]),
+    );
     await register(LIVE, "Still Trading");
   });
 

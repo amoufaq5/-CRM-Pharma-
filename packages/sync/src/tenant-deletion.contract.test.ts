@@ -4,6 +4,7 @@ import {
   TENANT_DELETION_LIVE as LIVE_TENANT,
   TENANT_DELETION_STOPPED as STOPPED_TENANT,
   appPool,
+  withRegistryTriggersOff,
 } from "@crm/db/testing";
 import { TENANT_DELETION_TOMBSTONE_KIND, type TenantDeletionVerdict } from "@crm/acl";
 import { withTenantContext } from "@crm/db";
@@ -124,14 +125,22 @@ describe("tenant deletion signal (0050)", () => {
     // The stopped tenant's row is deliberately left behind: 0050 makes `erp_deleted` terminal
     // and its receipt write-once, so the only way to clean it up is a DELETE.
     await clearChecks();
-    await client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[STOPPED_TENANT, LIVE_TENANT]]);
+    // 0053 refuses a stopped tenant's row, which this suite creates on purpose. Handing the
+    // id back is the one legitimate reason to turn that off, and it is turned off by name.
+    await withRegistryTriggersOff(client, () =>
+      client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[STOPPED_TENANT, LIVE_TENANT]]),
+    );
     client?.release();
     await pool?.end();
   });
 
   beforeEach(async () => {
     await clearChecks();
-    await client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[STOPPED_TENANT, LIVE_TENANT]]);
+    // 0053 refuses a stopped tenant's row, which this suite creates on purpose. Handing the
+    // id back is the one legitimate reason to turn that off, and it is turned off by name.
+    await withRegistryTriggersOff(client, () =>
+      client.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1)", [[STOPPED_TENANT, LIVE_TENANT]]),
+    );
     await register(LIVE_TENANT, "Still Trading");
   });
 
@@ -291,6 +300,45 @@ describe("tenant deletion signal (0050)", () => {
       expect(msg).toContain(next);
     }
     expect(await statusOf(STOPPED_TENANT)).toBe("erp_deleted");
+  });
+
+  /**
+   * THE BYPASS 0053 CLOSED, and it is worth being exact about why a DELETE was worse than an
+   * UPDATE. 0050's terminal trigger was `BEFORE UPDATE`, so a DELETE succeeded — and the API
+   * deliberately SERVES a tenant the registry does not list (an argued fail-open: the registry
+   * is the scheduler's work list and is empty in every test database). So removing the row did
+   * not stop the tenant, it un-stopped it, and took the only CRM-side evidence of the deletion
+   * with it. One statement, and 0050, 0051 and 0052 were all undone.
+   */
+  it("refuses to let a stopped tenant's registry row be deleted", async () => {
+    await register(STOPPED_TENANT, "Gone");
+    await recordTenantDeletionCheck(client, STOPPED_TENANT, deleted());
+    const msg = await refusal("DELETE FROM crm.tenant WHERE tenant_id = $1", [STOPPED_TENANT]);
+    expect(msg).toMatch(/^tenant-erp-deleted-terminal: /);
+    expect(msg).toContain("cannot be deleted");
+    expect(msg).toContain("serve the tenant again");
+    expect(await statusOf(STOPPED_TENANT)).toBe("erp_deleted");
+  });
+
+  /** A tenant that was never stopped is still removable: this is not a blanket append-only. */
+  it("leaves a live tenant's row deletable", async () => {
+    await client.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [LIVE_TENANT]);
+    expect(await statusOf(LIVE_TENANT)).toBeNull();
+  });
+
+  /**
+   * And TRUNCATE, which a row-level trigger never sees. `TRUNCATE crm.tenant` on its own is
+   * refused by 0052's foreign key (a referenced table cannot be truncated), so the reachable
+   * path is CASCADE — which would otherwise wipe the registry AND every erasure receipt in one
+   * statement, un-stopping every deleted tenant in the deployment.
+   */
+  it("refuses TRUNCATE, including CASCADE", async () => {
+    const plain = await refusal("TRUNCATE crm.tenant");
+    expect(plain).toContain("cannot truncate a table referenced in a foreign key constraint");
+
+    const cascade = await refusal("TRUNCATE crm.tenant CASCADE");
+    expect(cascade).toMatch(/^tenant-registry-no-truncate: /);
+    expect(cascade).toContain("fires no row trigger");
   });
 
   it("freezes the receipt once it is filed", async () => {
