@@ -45,6 +45,9 @@
     },
     {
       "path": "./packages/storage"
+    },
+    {
+      "path": "./packages/erasure"
     }
   ]
 }

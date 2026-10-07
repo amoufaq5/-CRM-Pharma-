@@ -758,6 +758,62 @@ Concretely, and these specifics are the decision, not commentary on it:
     they checked. `pnpm typecheck:tests` is now a CI gate, and it caught two more real
     violations in code written the same day, including one of this session's own.
 
+23. **The deployment stack is verified by running it, and the day that started it could
+    not build.** Every file in `deploy/` carried the same status for six weeks — "never
+    been built or run: no Docker daemon has been available in any session that touched
+    this repo" — and `scripts/verify-deploy-stack.sh` was written to hold the compose file
+    to a real standard in spite of that, with seven static properties and the honest
+    disclaimer that the image's own `RUN` steps were unverified.
+
+    The disclaimer was accurate and the premise was never checked. **`dockerd` starts
+    fine in that container.** One command. The first real `docker build` failed, and the
+    image had not been buildable since `deploy/` landed, for four independent reasons,
+    each of them fatal and none of them visible to reading the file:
+
+    1. the manifest layer copied 8 of the 16 workspace `package.json` files, so the other
+       eight were not pnpm importers, got no `node_modules`, and the build died on
+       `TS2307: Cannot find module '@crm/db'` from inside `packages/notify`. A clean
+       build emitted no `packages/api/dist/bin/api.js` at all — the compose file was
+       impeccable and named an entrypoint that could not exist;
+    2. `@crm/erasure` was absent from the root `tsconfig.json`'s references, and the root
+       `build` script is `tsc --build`, so the Article 17 executor and the tombstone
+       signer were compiled by nothing — not in the image, and not by `pnpm build`;
+    3. `pnpm prune --prod` rewrites `node_modules`, asks before doing it, and refuses
+       with no TTY. A docker build has none, so that step could never have run;
+    4. and had it run, prune empties every workspace importer's `node_modules` and
+       relinks only the root, so the api would have died on `Cannot find package
+       '@crm/callplan'` at its first import. Measured: 12 links before, zero after.
+       `pnpm -r prune` does not exist. The fix is a second
+       `pnpm install --frozen-lockfile --prod`, which keeps the promise the prune was
+       there for — nothing is re-resolved — and leaves the links in place.
+
+    **Why six weeks of green CI said nothing: there was no `.dockerignore`.** `COPY
+    packages/ packages/` landed the host's `dist/` and `tsconfig.tsbuildinfo` on top of
+    what pnpm had just installed, `tsc` found every project up to date, emitted nothing,
+    and the image shipped artifacts compiled on a developer's machine while its own build
+    step was decorative. A laptop build looked right for the wrong reason; only a clean
+    context — CI, which was not building — would have shown otherwise. **Three defects in
+    the build were hidden by a fourth property that made local builds succeed.**
+
+    The rule this sets: **a deployment artifact is unverified until it has been run, and
+    "we cannot run it here" is a claim to test, not to inherit.** Three gates now, in
+    increasing cost — `pnpm deploy:verify` (ten static properties), `pnpm deploy:image`
+    (replays both Dockerfile stages without a daemon, interpreting the file rather than
+    restating it, and runs the entrypoints out of the runtime stage's own file set), and
+    `pnpm deploy:smoke` (builds the image and brings the stack up against a real
+    Postgres). CI runs all three. `docs/LIVE_ERP_VERIFICATION.md` records the run: the
+    `0001` ERP precondition refusing a real deploy for the first time, 54 migrations
+    applied and a second run a no-op, the api healthy *as* `crm_app`, the JWKS answering
+    503 rather than an empty key set, and the scheduler signing with exactly the key the
+    api publishes — the credential design working across two containers and a database.
+
+    One correction belongs here too, because it was mine and it was in a gate: the smoke
+    script's first version asserted `200` on `/.well-known/jwks.json` before any key was
+    published. It failed, and the script was what was wrong — `routes.ts` answers 503
+    deliberately, because the ERP keeps its last good key set on any non-200 and replaces
+    it on a 200, so an empty document would silently disarm every verifier that fetched
+    it. The gate now asserts the refusal.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1171,7 +1227,9 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS NO CLIENT.** The CRM is an API and a background process: 15 packages, 49 migrations, 104 routes, no web UI, no mobile app, no on-device store. This is the largest thing not written down anywhere until now, and it matters more than its one row suggests, because "offline-first" is load-bearing in the brief and a great deal of this system exists to serve a client that does not exist: device-minted ids for idempotent replay (0017), `POST /v1/sync/visits` and the per-row batch results, the `UiSchema`-free hand-rolled route surface, the staleness question below, and the signature capture that commits to bytes no app has produced. Every one of those is a guess about a consumer until something consumes it. Choosing the shape — a PWA like the ERP's `operate-web`, a Capacitor wrapper, or native — is a product decision with a long tail, not an increment to slot in. | Product | _set a date_ |
+| **THERE IS NO CLIENT.** The CRM is an API and a background process: 16 packages, 54 migrations, 104 routes, no web UI, no mobile app, no on-device store. This is the largest thing not written down anywhere until now, and it matters more than its one row suggests, because "offline-first" is load-bearing in the brief and a great deal of this system exists to serve a client that does not exist: device-minted ids for idempotent replay (0017), `POST /v1/sync/visits` and the per-row batch results, the `UiSchema`-free hand-rolled route surface, the staleness question below, and the signature capture that commits to bytes no app has produced. Every one of those is a guess about a consumer until something consumes it. Choosing the shape — a PWA like the ERP's `operate-web`, a Capacitor wrapper, or native — is a product decision with a long tail, not an increment to slot in. | Product | _set a date_ |
+
+| **The TLS edge is the one service never started, and ACME is tested nowhere.** `pnpm deploy:smoke` runs Postgres, migrate, the api and the scheduler for real (item 23), and CI runs Caddy too — but against `DOMAIN=localhost` with Caddy's internal CA, so certificate issuance over ACME has still never happened. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so the step is skipped with `CRM_SMOKE_SKIP_CADDY=1`, which prints that it was skipped. The first real deploy is therefore the first time ACME, a real domain and a real certificate are exercised together — the one remaining part of the stack where that is true. | Platform | _set a date_ |
 
 > The deadlines in the original table (8–26 September) all lapsed before the answers came
 > in. They are left blank above rather than back-dated.

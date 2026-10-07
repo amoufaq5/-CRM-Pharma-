@@ -132,19 +132,50 @@ jobs:
       - name: Verify the migration runner
         run: ./scripts/verify-migration-runner.sh
 
-  # The deployment stack has never been built or run in this project — no Docker
-  # daemon has been available. `docker compose config` is client-side, so the file
-  # can at least be held to a standard: it resolves against the committed
-  # .env.example, the application services run as crm_app and not the admin,
-  # nothing serves before the migration succeeds, Caddy waits for the api to be
-  # HEALTHY, no image floats on `latest`, the runtime is not root, and only the
-  # scheduler can hold the ERP signing key.
+  # The deployment stack, in three layers of increasing cost.
   #
-  # A pass here does NOT mean the stack works. It means it is well-formed and those
-  # invariants hold. Building an image remains unverified and is called out as such.
+  # This job used to say the stack "has never been built or run — no Docker daemon has
+  # been available". The second half was never checked: `dockerd` starts fine in the
+  # development container, and the day someone tried it, the image turned out not to
+  # build at all. Four independent reasons, each fatal, each sitting there for six weeks
+  # while this job passed — because every check was a check on the TEXT of the files.
+  #
+  #   1. docker compose config, plus ten static properties (identities, ordering, tags,
+  #      root, the signing key, and now the manifest list, the context, and the build);
+  #   2. the image's build replayed without Docker, which is what a developer runs;
+  #   3. a real build and a real stack: Postgres, migrate, the api, the scheduler, the
+  #      TLS edge. GitHub's runners have a daemon, so there is no excuse for stopping at
+  #      the first two.
   deploy-stack:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify the deployment stack
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.33.0 }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Static properties of the stack
         run: ./scripts/verify-deploy-stack.sh
+
+      # Replays both stages of the Dockerfile outside Docker, against a context built
+      # from tracked files only, and then RUNS the entrypoints out of the runtime stage's
+      # file set. Fast, and it catches everything the four defects were.
+      - name: Replay the image build
+        run: ./scripts/verify-image-build.sh
+
+      # The real thing. Builds the image and brings the stack up against a real Postgres:
+      # the 0001 ERP precondition refusing, all 54 migrations applying, a second run as a
+      # no-op, the api healthy as crm_app, the JWKS fail-closed rule, 401 problem
+      # documents, the scheduler refusing without a credential and running with one, and
+      # the api publishing exactly the key the scheduler signs with.
+      #
+      # No CRM_SMOKE_CA_FILE and no CRM_SMOKE_PIN_BASE here: a runner has no TLS
+      # interception and no anonymous-pull limit to dodge, so this builds deploy/Dockerfile
+      # byte for byte.
+      - name: Build and run the stack
+        run: ./scripts/verify-deploy-smoke.sh

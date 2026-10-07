@@ -829,3 +829,171 @@ not this work's doing: excluding that one file, `packages/acl` and
 `./scripts/typecheck-tests.sh` reports `ok: acl`, `ok: credential` and
 `ok: relay`. The only test-typecheck failure in the workspace is in
 `packages/storage`, another agent's new package.
+
+# The deployment stack, built and run
+
+*2026-10-07. Reproduce with `pnpm deploy:smoke` (needs a Docker daemon) or
+`pnpm deploy:image` (does not).*
+
+The question that prompted this was "is it ready to be deployed, and where do I
+host it", and answering it honestly meant reading `deploy/` again. Every document
+in it carried the same sentence — the stack has **never been built or run**, no
+Docker daemon has been available in any session that touched this repo — and the
+first half followed from the second, which nobody had checked.
+
+**`dockerd` starts fine in this container.** It took one command. What the first
+real `docker build` then showed is that the image could not be built at all, and
+had not been buildable since the day `deploy/` landed.
+
+## The four defects
+
+Each is independently fatal, and each was invisible to reading the file.
+
+**1. The manifest layer named 8 of the 16 workspace packages.** `deploy/Dockerfile`
+copies the `package.json` files, installs, then copies sources — the ordering that
+makes a source-only change reuse the dependency layer. The list was never
+complete: `callplan`, `credential`, `erasure`, `expense`, `notify`, `role`,
+`sample` and `storage` were absent. A package not present when pnpm runs is not an
+importer, so it gets no `node_modules` of its own, and the build step died:
+
+```
+packages/notify/src/dispatch.ts(2,35): error TS2307: Cannot find module '@crm/db'
+packages/credential/src/credential.ts(1,39): error TS2307: Cannot find module '@crm/acl'
+tsc exit=2   # 102 .js emitted; no packages/api/dist/bin/api.js at all
+```
+
+The compose file was impeccable, and it named an entrypoint that could not exist.
+
+**2. `@crm/erasure` was built by nothing.** It is absent from the root
+`tsconfig.json`'s references, and the root `build` script is `tsc --build`, which
+builds references and nothing else. So the GDPR Article 17 executor and the
+tombstone signer — the previous two increments — compiled only when someone ran
+`pnpm --filter @crm/erasure build` by hand. The package typechecks, its tests pass
+(vitest transpiles from source), it declares a `crm-erasure` bin, and no gate
+anywhere asked whether that bin exists.
+
+**3. `pnpm prune --prod` cannot run in a docker build.** Excluding dev
+dependencies rewrites `node_modules`, pnpm 10 asks before doing that, and with no
+TTY it refuses outright:
+
+```
+ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY  Aborted removal of modules directory due to no TTY
+```
+
+A docker build has no TTY. The step could never have succeeded.
+
+**4. And had it succeeded, the image could not have served a request.** In a
+workspace, prune empties every importer's `node_modules` and relinks only the
+root. Measured: `packages/api/node_modules/@crm` holds 12 links before, and is
+**empty** after. The api would have died on its first import:
+
+```
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@crm/callplan'
+  imported from /app/packages/api/dist/handlers/routes.js
+```
+
+`pnpm -r prune` is not a thing — exit 1, dev dependencies left in place. The fix
+is a second `pnpm install --frozen-lockfile --prod --ignore-scripts`, which keeps
+the promise the prune was there for (nothing is re-resolved; the lockfile is read
+again and obeyed) and leaves all 12 links in place with typescript and vitest
+gone.
+
+## Why six weeks of CI never said a word
+
+There was no `.dockerignore`. `COPY packages/ packages/` therefore landed the
+host's `packages/*/dist`, `packages/*/tsconfig.tsbuildinfo` and
+`packages/*/node_modules` on top of what pnpm had just installed. `tsc --build`
+read a buildinfo written on the host, concluded every project was up to date, and
+emitted nothing — and the image still worked, because `dist/` had arrived in the
+same `COPY`. An image built on a developer's machine shipped artifacts compiled on
+that machine, from whatever their tree happened to contain, and its own build step
+was decorative. Only a clean context shows the truth, and the only clean context
+was CI, which was not building.
+
+That is the shape worth remembering: **the three defects in the build were hidden
+by a fourth property that made local builds succeed for the wrong reason.** Every
+check that existed was a check on the text of the files.
+
+## What now runs
+
+| | what | needs a daemon |
+|---|---|---|
+| `pnpm deploy:verify` | ten static properties, `docker compose config` among them | no |
+| `pnpm deploy:image` | replays both Dockerfile stages, then runs the entrypoints out of the runtime stage's file set | no |
+| `pnpm deploy:smoke` | builds the image and brings the stack up against a real Postgres | yes |
+
+`verify-image-build.sh` *interprets* `deploy/Dockerfile` — it parses the COPY and
+RUN steps and replays them, and a step it cannot interpret is a failure rather
+than a skip. A paraphrase would have been written from the same wrong list and
+agreed with it. It assembles the context from `git ls-files`, so working-tree
+edits are included and nothing `.gitignore` covers can appear, which is the same
+guarantee `.dockerignore` now gives the real build. Each stage gets its own
+directory, so the runtime stage has exactly what its COPY lines give it — which is
+the only way defect 4 becomes visible.
+
+## The run
+
+```
+--- 1. build the image from a clean context ---
+ok: image built
+--- 3. the database, and a migration that must refuse ---
+ok: database healthy
+ok: migrate refuses without the ERP, naming the cause
+--- 4. the ERP stand-in, then the real migration ---
+ok: 53 migrations applied
+ok: a second run applies nothing
+--- 5. the api, as crm_app ---
+ok: api healthy (and therefore connected as a role RLS applies to)
+ok: healthz 200, jwks 503 with nothing published, 401 problem documents on a real route
+--- 6. the scheduler: refuses without a credential, runs with one ---
+ok: refuses to start with no credential, saying which variables to set
+ok: scheduler running, signing with zheYxcWUS-b7wCfHkHt2aDB-nM82n_RXaC1JlJyVuGE
+ok: the api publishes exactly the key the scheduler holds
+```
+
+Things in that transcript that had never happened before:
+
+- **migration `0001`'s ERP precondition refused a real deploy.** Until now it was
+  tested in SQL. In a container it produces the message an operator will actually
+  read, naming `meta.operate_entity_records` and what to run first, instead of a
+  deploy dying on `schema "meta" does not exist` thirty lines later.
+- **The api came up healthy**, and healthy is a stronger claim than it looks:
+  `/healthz` asks the database what role the connection runs as and answers 503
+  for the table owner. The compose file's two identities — admin for `migrate`,
+  `crm_app` for everything else — are the isolation guarantee, and this is where
+  they stop being an assertion.
+- **The JWKS answered 503 with nothing published, not an empty key set.** The
+  first version of the smoke script asserted 200 there and failed. The script was
+  what was wrong: the rule is in `routes.ts`, and the reason is the ERP's refresh
+  logic, which keeps its last good key set on any non-200 and replaces it on a
+  200. An empty document would silently disarm every verifier that fetched it. The
+  script now asserts the refusal.
+- **The credential worked across two containers and a database.** The scheduler
+  holds the private key and refuses to boot without one; the api publishes the
+  public half out of `crm.service_key` and holds no private key at all. The smoke
+  test asserts the kid the scheduler logs is the kid the api serves — so a
+  compromised api still cannot mint an ERP token.
+- **The scheduler's refusal is quiet enough to leave running.** With
+  `restart: unless-stopped` and no credential it crash-loops, but Docker's restart
+  backoff grows: 9 restarts in the first 22 seconds, 10 by 52. It fails closed,
+  says which variables to set, and does not flood.
+
+## What is still not proven
+
+- **The TLS edge.** Docker Hub answered `429 Too Many Requests` to every
+  anonymous pull of `caddy:2` in this sandbox, so step 7 was skipped — with
+  `CRM_SMOKE_SKIP_CADDY=1`, which prints that it was skipped, because an
+  unexplained skip is a lie. CI has no such limit and runs it. ACME is not tested
+  anywhere: the edge uses Caddy's internal CA against `DOMAIN=localhost`.
+- **The build in this sandbox needed two deviations**, both printed by the script
+  and neither committed: the proxy's CA inside the build (a sandbox that
+  re-terminates TLS, else pnpm cannot reach the registry) and a digest for the
+  base image (the same 429). CI passes neither, so CI builds `deploy/Dockerfile`
+  byte for byte.
+- **A real OIDC issuer.** `OIDC_*` points at `your-idp.example.com`; every
+  request in the smoke run is a 401 by design. The authenticated path is covered
+  by §7 of this document against a stand-in IdP, and by the contract tests.
+- **The ERP.** `ERP_BASE_URL` points at a host that does not exist in the smoke
+  run, so the outbox has nothing to drain into. §1–§7 above cover that path
+  against a real `operate-server`.
+- **Nothing about load, concurrency across replicas, or a restart under traffic.**

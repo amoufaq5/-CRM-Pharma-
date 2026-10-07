@@ -1,0 +1,44 @@
+# What must never enter the build context.
+#
+# There was no .dockerignore at all until the deployment question was asked, and its
+# absence was load-bearing in the wrong direction: `COPY packages/ packages/` in
+# deploy/Dockerfile landed the HOST's packages/*/dist, packages/*/tsconfig.tsbuildinfo
+# and packages/*/node_modules on top of what pnpm had just installed in the image.
+#
+# Three consequences, all bad, in order of how long they stay hidden:
+#
+#   1. tsc --build reads a tsbuildinfo written on the host, concludes every project is
+#      up to date, and emits NOTHING. The image still works, because dist/ arrived in
+#      the same COPY — so it ships artifacts compiled on a developer's machine, from
+#      whatever their tree happened to contain, and the image's own build step is
+#      decorative.
+#   2. A clean build (CI, a fresh clone) has no host dist/ to inherit, so it is the
+#      only place the real behaviour shows. The two differ, which is the worst
+#      possible arrangement: the failure appears where nobody is watching.
+#   3. node_modules copied from a host are pnpm symlinks into that host's store. They
+#      resolved here by luck of matching paths; nothing makes that true in general.
+#
+# So the first three entries are correctness, not hygiene. The rest is bulk the image
+# has no use for — .git alone is larger than everything the Dockerfile copies.
+node_modules
+**/node_modules
+dist
+**/dist
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+.git
+.github
+.gitignore
+docs
+scripts
+.smtp-crosscheck-venv
+coverage
+**/coverage
+
+# Secrets never belong in a context: a layer keeps them even if a later step deletes
+# them, and deploy/.env is the one file an operator fills with real credentials.
+.env
+.env.*
+deploy/.env
+deploy/secrets

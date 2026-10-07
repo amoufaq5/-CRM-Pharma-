@@ -11,11 +11,18 @@
 # fails on an unknown key or a dangling service reference. That turns "it looks right"
 # into a gate.
 #
-# WHAT IT STILL DOES NOT DO: nothing here builds an image or starts a container. The
-# Dockerfile's RUN steps, the pnpm install inside it, the runtime's ability to find its
-# own dist/, and whether the services actually talk to each other remain UNVERIFIED.
-# Do not read a pass here as "the stack works". It means the stack is well-formed and
-# the invariants below hold.
+# WHAT IT STILL DOES NOT DO: nothing here builds an image or starts a container, and
+# whether the services actually talk to each other remains UNVERIFIED. Do not read a
+# pass as "the stack works": it means the stack is well-formed and the invariants below
+# hold.
+#
+# It used to say the same about the image's own RUN steps, and that gap was not
+# theoretical — the image could not build, in four independent ways, for six weeks (the
+# header of scripts/verify-image-build.sh lists them). Properties 8-10 below are the
+# cheap static half of the answer: the manifest list matches the workspace, the context
+# cannot carry host build output, and the build step covers every package. The expensive
+# half is verify-image-build.sh, which replays both stages for real, and CI, which
+# builds the image with Docker.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -132,5 +139,80 @@ assert any(k.startswith('CRM_SIGNING_KEY') for k in env), 'scheduler has no sign
 " || fail "the scheduler cannot be given a signing key"
 ok "only the scheduler can hold the signing key"
 
+# ---------------------------------------------------------------------------
+echo "--- 8. the Dockerfile's manifest layer lists every workspace package ---"
+# The manifest layer exists for layer caching: copy the package.json files, install,
+# THEN copy sources, so a source-only change reuses the dependency layer. The cost is a
+# list that has to be kept in step with the workspace, and it was not — it named 8 of
+# the 16 packages, so the other eight were not pnpm importers, got no node_modules, and
+# the image could not build at all. Six weeks of CI passed over it because nothing
+# compared the two lists. This does, deriving the expected one from pnpm-workspace.yaml,
+# so adding a package and forgetting the Dockerfile is a red job rather than a broken
+# deploy.
+python3 - "$ROOT" <<'PY' || fail "the Dockerfile's manifest list and the workspace disagree"
+import pathlib, re, sys, yaml
+
+root = pathlib.Path(sys.argv[1])
+globs = yaml.safe_load((root / "pnpm-workspace.yaml").read_text())["packages"]
+expected = {
+    str(d.relative_to(root))
+    for g in globs
+    for d in root.glob(g)
+    if (d / "package.json").exists()
+}
+copied = set(re.findall(r"^COPY\s+(\S+)/package\.json\s", (root / "deploy/Dockerfile").read_text(), re.M))
+
+missing = sorted(expected - copied)
+extra = sorted(copied - expected)
+if missing:
+    print(f"  in the workspace, not copied into the image: {', '.join(missing)}")
+if extra:
+    print(f"  copied into the image, not in the workspace: {', '.join(extra)}")
+sys.exit(1 if (missing or extra) else 0)
+PY
+ok "all $(ls -d "$ROOT"/packages/*/package.json | wc -l | tr -d ' ') workspace manifests are in the manifest layer"
+
+# ---------------------------------------------------------------------------
+echo "--- 9. the build context cannot carry the host's build output ---"
+# This is what hid property 8's defect. With no .dockerignore, `COPY packages/ packages/`
+# lands the host's packages/*/dist and packages/*/tsconfig.tsbuildinfo on top of what
+# pnpm just installed; tsc then finds every project up to date, emits NOTHING, and the
+# image ships whatever a developer's tree happened to contain. It looks correct
+# everywhere except a clean build — which is to say everywhere except CI, where a green
+# log is nobody's reading material.
+[ -f "$ROOT/.dockerignore" ] || fail "there is no .dockerignore, so the build context carries the host's dist/ and node_modules"
+for pattern in node_modules dist '*.tsbuildinfo'; do
+  grep -qxF "$pattern" "$ROOT/.dockerignore" || grep -qxF "**/$pattern" "$ROOT/.dockerignore" \
+    || fail ".dockerignore does not exclude $pattern; a host build would leak into the image"
+done
+ok ".dockerignore excludes node_modules, dist and *.tsbuildinfo"
+
+# ---------------------------------------------------------------------------
+echo "--- 10. the image's build step covers every workspace package ---"
+# That step is `pnpm exec tsc --build`, which builds the root tsconfig's references and
+# nothing else. A package missing from that list fails no gate: it typechecks
+# (scripts/typecheck-tests.sh walks packages/* itself), its tests pass (vitest
+# transpiles from source), and it simply never gets compiled. @crm/erasure sat in
+# exactly that state — the GDPR Article 17 executor and the tombstone signer, declaring
+# a bin that `pnpm build` never produced and no image ever carried.
+python3 - "$ROOT" <<'PY' || fail "the root tsconfig does not cover every workspace package"
+import json, pathlib, sys
+
+root = pathlib.Path(sys.argv[1])
+# tsconfig.json is strict JSON here, not JSONC. If that changes, so must this parse.
+refs = {r["path"].strip("./") for r in json.loads((root / "tsconfig.json").read_text())["references"]}
+buildable = {
+    str(d.relative_to(root))
+    for d in (root / "packages").iterdir()
+    if (d / "tsconfig.json").exists() and (d / "src").is_dir()
+}
+missing = sorted(buildable - refs)
+if missing:
+    print(f"  compiled by nothing: {', '.join(missing)}")
+sys.exit(1 if missing else 0)
+PY
+ok "every package with sources is a root tsconfig reference"
+
 echo
-echo "deploy stack statically verified — NOT built and NOT run (no Docker daemon here)"
+echo "deploy stack statically verified — the image itself is replayed by"
+echo "scripts/verify-image-build.sh and built for real by CI"

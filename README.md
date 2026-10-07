@@ -1092,9 +1092,27 @@ mints short-lived per-tenant Ed25519 service JWTs under the role in
 whatever role the ERP bound it to, on every tenant, is worse than no relay. The outbox is
 durable, so queued writes wait rather than being lost.
 
-The container plumbing in `deploy/` has **not been built or run** — the environment it was
-authored in has no Docker daemon. The migration runner it invokes was verified end to end
-against a live Postgres 16.
+The container plumbing in `deploy/` **has now been built and run**, and that sentence cost
+six weeks to be able to write. It used to say the stack had "not been built or run — the
+environment it was authored in has no Docker daemon", and the second half was never
+checked: `dockerd` starts in that container, nobody had tried, and the image did not
+build. Four independent reasons, each fatal — a manifest layer naming 8 of 16 workspace
+packages, an unbuilt `@crm/erasure`, a `pnpm prune --prod` that cannot run without a TTY,
+and the same prune emptying every workspace link so the api could not have loaded a single
+handler. Every one of them was invisible to reading the file, and to a laptop build, which
+inherited the host's own `dist/` because there was no `.dockerignore`.
+
+What runs now, on every push (`pnpm deploy:smoke`, and `deploy-stack` in CI): the image
+builds from a clean context; `migrate` refuses a database with no ERP in it, naming the
+cause; all 54 migrations apply and a second run is a no-op; the api comes up healthy as
+`crm_app`; `/healthz`, the JWKS fail-closed rule and the 401 problem documents answer
+correctly; and the scheduler refuses to start without an ERP credential, starts with one,
+and signs with exactly the key the api publishes out of the database. `pnpm deploy:image`
+replays the same build without a daemon in about thirty seconds.
+
+Still unexercised: ACME (the edge is tested with Caddy's internal CA against
+`DOMAIN=localhost`), a real OIDC issuer, and the ERP itself — all three are someone else's
+host.
 
 ## Rules that are not negotiable
 

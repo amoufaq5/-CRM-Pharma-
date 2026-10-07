@@ -12,27 +12,26 @@ Three processes and a TLS edge:
 All three run the **same image** with different entrypoints, so what is tested is
 what ships.
 
-> **Status.** The Dockerfile, compose file and Caddyfile in this directory have
-> **not been built or run** — the development container these were authored in has
-> no Docker daemon. What they invoke *was* verified against a live Postgres 16: the
-> migration runner (ownership, RLS forcing, idempotence, refusal of an edited
-> migration) and the service credential (key lifecycle, token minting, the
-> scheduler booting in production mode). Treat the container plumbing as
-> unexercised until someone runs `docker compose build` once.
+> **Status.** The stack **has been built and run** — image, migrations, api,
+> scheduler, and a real Postgres — and that is new as of 2026-10-07. Everything in
+> this directory spent six weeks marked "not built, no Docker daemon available",
+> and the second half of that was never checked. `dockerd` starts fine in the
+> container these files were written in. Nobody had tried. The image did not
+> build, in four independent and individually fatal ways, and every one of them
+> was invisible both to reading the file and to a build on a laptop.
+>
+> Reproduce it with `pnpm deploy:smoke` (needs a daemon; it builds the image and
+> brings the stack up), or `pnpm deploy:image` for the thirty-second version that
+> replays the build without one. CI runs all three layers on every push.
 
 ## What is and is not verified here
 
-The stack has **never been built or run**: no Docker daemon has been available in
-any session that touched this repo. `docker build` and `docker compose up` are
-therefore both unproven, and so is anything that depends on them — the image's
-`RUN` steps, whether the runtime finds its own `dist/`, and whether the services
-actually talk to each other.
+Three scripts, in increasing cost, and it is worth knowing which one answers what.
 
-What *is* checked, by `pnpm deploy:verify` (`scripts/verify-deploy-stack.sh`) and in
-CI: `docker compose config` is client-side, needs no daemon, and does real work —
-it resolves the anchors and merges, expands every `${VAR}`, and fails on an unknown
-key or a dangling service reference. On top of that the script asserts the
-invariants this file claims:
+**`pnpm deploy:verify`** — ten static properties, no daemon needed.
+`docker compose config` is client-side and does real work: it resolves the anchors
+and merges, expands every `${VAR}`, and fails on an unknown key or a dangling
+service reference. On top of that:
 
 - the compose file resolves against the committed `.env.example`, and every
   `${VAR}` without a default is documented there (a variable added to compose and
@@ -41,11 +40,62 @@ invariants this file claims:
 - neither serves before `migrate` completes successfully, and `caddy` waits for
   `api` to be healthy;
 - no image floats on `latest`, and the runtime image is not root;
-- only the `scheduler` can be given the ERP signing key.
+- only the `scheduler` can be given the ERP signing key;
+- **the Dockerfile's manifest layer lists every workspace package**, derived from
+  `pnpm-workspace.yaml` rather than by hand;
+- **`.dockerignore` keeps the host's `node_modules`, `dist/` and `*.tsbuildinfo`
+  out of the build context**;
+- **the root `tsconfig.json` references every package with sources**, so the
+  image's single `tsc --build` cannot silently skip one.
 
-Each check was confirmed by breaking the thing it checks and watching it fail.
-**A pass still does not mean the stack works.** Read it as: well-formed, and those
-invariants hold.
+The last three exist because of what the first seven missed. They are cheap and
+they are not sufficient: all seven passed for six weeks over an image that could
+not build.
+
+**`pnpm deploy:image`** — replays both stages of the Dockerfile without Docker,
+against a context assembled from tracked files only, and then runs the
+entrypoints out of the runtime stage's file set. It *interprets* the Dockerfile
+rather than restating it, because a restatement would have been written from the
+same wrong list. Thirty seconds, no daemon, and it catches all four of the
+defects below.
+
+**`pnpm deploy:smoke`** — builds the image and brings the stack up against a real
+Postgres. What it proves, each of which had never run before:
+
+- the image builds from a clean context;
+- `migrate` **refuses** a database with no ERP in it, naming the real cause (the
+  `0001` precondition, previously tested only in SQL);
+- with the ERP stand-in present, all 54 migrations apply, and a second run
+  applies nothing;
+- the api comes up **healthy**, which includes "connected as a role row-level
+  security applies to" — so the compose file's two identities are proven, not
+  asserted;
+- `/healthz` answers 200, the JWKS answers **503 rather than an empty key set**
+  when nothing is published, and a real route answers 401 with an RFC 9457
+  problem document;
+- the scheduler refuses to start with no ERP credential and starts with one, and
+  **the api publishes exactly the key the scheduler signs with** — the credential
+  design working across two containers and a database.
+
+What is still unexercised: ACME (the edge is tested against `DOMAIN=localhost`
+with Caddy's internal CA), a real OIDC issuer, and the ERP itself. All three are
+someone else's host.
+
+### The four defects, since the shape of them is the lesson
+
+| | what | why nothing caught it |
+|---|---|---|
+| 1 | the manifest layer copied 8 of the 16 workspace `package.json` files, so the other eight were not pnpm importers, got no `node_modules`, and `tsc --build` failed with TS2307 on `@crm/db` from inside `packages/notify` | nothing compared that list to the workspace |
+| 2 | `@crm/erasure` was not a root `tsconfig` reference, so `tsc --build` never built it — the GDPR Article 17 executor and the tombstone signer were missing from the image, and from `pnpm build` | it typechecks, its tests pass, and nothing asks whether it is compiled |
+| 3 | `pnpm prune --prod` rewrites `node_modules` and asks first, refusing outright with no TTY. A docker build has none, so the step could never have succeeded | only running it says so |
+| 4 | and had it run, prune empties every workspace importer's `node_modules` and relinks only the root, so the api would have died on `Cannot find package '@crm/callplan'` at its first import | only running the result says so |
+
+The reason all four survived: no `.dockerignore`, so `COPY packages/ packages/`
+landed the host's `dist/` and `tsconfig.tsbuildinfo` on top of what pnpm had just
+installed. `tsc` then found every project up to date, emitted nothing, and the
+image shipped artifacts compiled on a developer's machine. A laptop build looked
+correct; only a clean one — which is to say, only CI, which was not building —
+would have shown the truth.
 
 ## The one ordering constraint: the ERP goes first
 
@@ -108,8 +158,15 @@ an `.env` knob, so it cannot be set wrong.
 
 ```bash
 cd deploy
-cp .env.example .env     # then fill it in — nothing in it works as shipped
+cp .env.example .env     # then fill it in
 $EDITOR .env
+# Precisely which values must be real, since "nothing works as shipped" was too
+# strong and an operator acts on that kind of sentence: with the placeholders
+# untouched, db, migrate and api come up and /healthz answers 200 (deploy:smoke
+# does exactly this). The two that must be real are OIDC_* — without a reachable
+# issuer every request is a 401 — and the scheduler's signing key, without which
+# it refuses to start and says so. The passwords should obviously not stay
+# `change-me-*`.
 
 # 1. the ERP must already be in this database (see above)
 # 2. build once, then let compose order the rest
