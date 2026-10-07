@@ -306,15 +306,27 @@ describe("retention dispositions and the erasure plan (0051)", () => {
   it("is actionable for a stopped tenant once every table is decided", async () => {
     await register(STOPPED, "Gone");
     await stop(STOPPED);
+    // `expense_claim` is switched too, and that is forced rather than chosen: its shipped
+    // disposition is `retain` and it references `rep_profile`, so deciding only the undecided
+    // ones leaves a retained child of an erased parent — which 0052's
+    // `retained_child_of_erased` refusal catches. The guard being right, not the fixture being
+    // clever; `execute.contract.test.ts` has the same note and a test for the other direction.
     await aroundRegister(
       `UPDATE crm.data_disposition
-          SET disposition = 'erase', question = NULL, decided_by = 'test', decided_at = now()
-        WHERE disposition = 'undecided'`,
+          SET disposition = 'erase', question = NULL, obligation = NULL, obligation_note = NULL,
+              retained_reference = NULL, decided_by = 'test', decided_at = now()
+        WHERE disposition = 'undecided' OR table_name = 'expense_claim'`,
       async () => {
         const plan = await planTenantErasure(client, STOPPED);
         expect(plan.refusals).toEqual([]);
         expect(plan.actionable).toBe(true);
-        expect(plan.erase.length + plan.retain.length).toBe(39);
+        // Derived, not a literal: 0052 added two tables and this read 39 until it did.
+        const { rows } = await client.query<{ n: string }>(
+          "SELECT count(*)::text AS n FROM crm.data_disposition",
+        );
+        expect(plan.erase.length + plan.retain.length).toBe(Number(rows[0]!.n));
+        // And the order covers every table it will erase, children first.
+        expect([...plan.eraseOrder].sort()).toEqual(plan.erase.map((t) => t.table).sort());
       },
     );
     // And the register is exactly as it was: nineteen still undecided.
@@ -367,7 +379,11 @@ describe("retention dispositions and the erasure plan (0051)", () => {
     const named = [...plan.erase, ...plan.retain].map((t) => t.table);
     expect(named).not.toContain("visit");
     expect(named).not.toContain("sample_transaction");
-    expect(named).toHaveLength(20);
+    // Derived from the register rather than a literal, which 0052's two new tables broke.
+    const { rows } = await client.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM crm.data_disposition WHERE disposition <> 'undecided'",
+    );
+    expect(named).toHaveLength(Number(rows[0]!.n));
   });
 
   it("carries the obligation and where the data stays, for every retained table", async () => {

@@ -853,6 +853,65 @@ anonymisation for it now would pre-empt the decision the register exists to coll
 disposition with no row using it and no code implementing it is the "built and unreachable"
 this repository keeps finding.
 
+## The erasure, and the receipt that proves it happened
+
+`crm-erasure execute` is **the only thing in this repository that destroys data on purpose**,
+and it does the destroying and the proving in **one transaction**. That is ADR-0319's property
+and there is no two-step version: a deletion that commits without its proof is unprovable, a
+proof that commits without its deletion is false, and no ordering of two transactions avoids
+both.
+
+Per table, the receipt says one of exactly three things — ADR-0317's outcomes, with its rule
+about which may carry figures:
+
+| Outcome | Means | Carries |
+|---|---|---|
+| `erased` | rows were destroyed | a count, ≥ 1 |
+| `nothing_to_erase` | asked, held nothing | no figures at all |
+| `retained` | lawfully kept | a count, an obligation, a note and where it still is |
+
+A `retain` disposition over an **empty** table attests `nothing_to_erase`, not `retained`: the
+outcome describes what was found and done, not what the register decided, and "we are lawfully
+keeping it" about zero rows reads as evidence and is not.
+
+**Assembly refuses when a table in scope has not attested.** That is the rule the hashes are
+worth anything because of. Two hashes: a content manifest over the attestation list, and a
+proof over that manifest plus the tenant, the ERP tombstone, the timestamp and both people.
+Both are **domain-tagged**, and neither uses `JSON.stringify` — its output depends on property
+insertion order, so the same list rebuilt by a later reader could fail to verify. Fields are
+written in a fixed order with absent values marked rather than omitted, because omitting them
+lets `obligation=null, note="x"` and `obligation="x", note=null` collide.
+
+**Four-eyes, in three places:** the CLI refuses equal `--executed-by`/`--approved-by`,
+`assembleTombstone` refuses it, and a CHECK on the table refuses it. Plus
+`--yes-destroy-data`, typed out.
+
+**Two guards the foreign-key graph makes mandatory**, and both were found by looking at the
+graph rather than reasoning about it:
+
+- **A retained table may not reference an erased one.** For a `RESTRICT` edge the delete would
+  be refused — loud, and the transaction rolls back. For a **`CASCADE`** edge it would *destroy
+  the retained child*, silently, with no attestation, inside a transaction that then commits a
+  signed proof saying those rows were kept. `visit_product → visit` and
+  `call_plan_product → call_plan` are both `CASCADE`, so this is the first mistake a
+  half-answered register will produce, not a hypothetical.
+- **Children are deleted before parents**, computed from the catalog because `rep_profile` is
+  the parent of eleven tables. Explicitly, even where a cascade would do it — not for the
+  delete's correctness but for the **figures'**: a child removed by its parent's cascade
+  reports zero rows erased while its rows are gone, and that zero goes into a hash.
+
+The receipt is **append-only** on both tables, with no exception at all — unlike
+`crm.rep_role`, which permits exactly one update because a grant may be revoked. A tombstone
+has no second state: its hashes commit to its own contents, so an UPDATE would either break
+the proof or, worse because it looks fine, be accompanied by a recomputed hash and produce a
+consistent receipt for a claim nobody made. And a receipt may only exist for a tenant the ERP
+deleted, citing *that tenant's* ERP tombstone — so a CRM tombstone implies a stopped tenant
+implies an ERP tombstone, three facts each refusing to exist without the one behind it.
+
+Ours are `crmtomb_…` where the ERP's are `tomb_…`, deliberately: they are different claims by
+different controllers about different data, and the one thing they must never do is look
+alike.
+
 ## Verified against a running ERP
 
 ```bash

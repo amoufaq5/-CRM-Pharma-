@@ -146,6 +146,15 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
 
   notification_endpoint_probe_endpoint_id_fkey: { table: "notification_endpoint_probe", column: "endpoint_id", parent: "notification_endpoint", onDelete: "CASCADE" },
   notification_endpoint_probe_requested_by_fkey: { table: "notification_endpoint_probe", column: "requested_by", parent: "rep_profile", onDelete: "RESTRICT" },
+
+  // 0052: the CRM's own deletion receipt, and the only reference added since 0046 dropped two.
+  // RESTRICT rather than CASCADE, and for this table that is the whole point: the attestations
+  // are what the receipt's content hash commits to, so a cascade that removed them with their
+  // receipt would leave a hash over nothing — and removing the receipt is refused outright by
+  // its append-only trigger, which makes this RESTRICT unreachable in practice and correct
+  // anyway. It is composite because 0035's rule has no exceptions: an attestation cannot name
+  // another tenant's receipt.
+  tenant_tombstone_attestation_tombstone_fkey: { table: "tenant_tombstone_attestation", column: "tombstone_id", parent: "tenant_tombstone", onDelete: "RESTRICT" },
 };
 
 /**
@@ -213,6 +222,9 @@ interface Fixture {
   readonly claim: string;
   /** That claim's receipt — the parent the four `crm.attachment` references need. */
   readonly att: string;
+  /** 0052's CRM deletion receipt, and the ERP receipt it has to cite to exist. */
+  readonly tomb: string;
+  readonly erpTomb: string;
 }
 
 const fixture = (p: "a" | "b"): Fixture => ({
@@ -231,6 +243,12 @@ const fixture = (p: "a" | "b"): Fixture => ({
   endp: `${p}0000000-0000-4000-8000-0000000000a1`,
   claim: `${p}0000000-0000-4000-8000-0000000000b1`,
   att: `${p}0000000-0000-4000-8000-0000000000c1`,
+  // Not uuids: 0052 shapes these `crmtomb_` + 32 hex and `tomb_` + 12-40, deliberately unlike
+  // each other and unlike the ERP's, so no reader can confuse the two receipts.
+  // Written out rather than computed: 0052 wants exactly 32 hex after `crmtomb_`, and the
+  // first version of this got it to 31 by slicing.
+  tomb: `crmtomb_${p}${"0".repeat(31)}`,
+  erpTomb: `tomb_${p}${"0".repeat(31)}`,
 });
 
 const A = fixture("a");
@@ -421,6 +439,13 @@ const PROBES: Readonly<Record<string, Probe>> = {
                                                expired_on, discovered_on, due_by, continues_obligation_id)
           VALUES ($1, $2, $3, 1, DATE '2026-01-05', DATE '2026-01-06', DATE '2026-02-05', $4)`,
     params: [TENANT_FK_B, B.rep2, B.lot, A.obl],
+  },
+  tenant_tombstone_attestation_tombstone_fkey: {
+    what: "an attestation hung off another tenant's deletion receipt",
+    sql: `INSERT INTO crm.tenant_tombstone_attestation
+            (tenant_id, tombstone_id, table_name, outcome)
+          VALUES ($1, $2, 'visit', 'nothing_to_erase')`,
+    params: [TENANT_FK_B, A.tomb],
   },
   expense_claim_rep_profile_id_fkey: {
     what: "an expense claim filed by another tenant's rep",
@@ -675,6 +700,32 @@ describe("a cross-tenant reference is refused by the database", () => {
          VALUES ($1, $2, 'expense_receipt', 'crm.expense_claim', $3, 'image/png', 64, $4, $5)`,
         [f.att, tenant, f.claim, SIG, f.rep1],
       );
+
+      // 0052's receipt, which needs its tenant marked `erp_deleted` first (that trigger is
+      // the pairing 0050 and 0052 build between a stop, an ERP tombstone and a CRM one). These
+      // two tenants exist only for this suite, so stopping them costs nothing — and the
+      // registry row is written here rather than assumed, because `crm.tenant` is empty in
+      // every test database.
+      await tx.query(
+        `INSERT INTO crm.tenant (tenant_id, display_name) VALUES ($1, 'FK probe tenant')
+         ON CONFLICT (tenant_id) DO NOTHING`,
+        [tenant],
+      );
+      await tx.query(
+        `UPDATE crm.tenant
+            SET status = 'erp_deleted', erp_tombstone_id = $2, erp_tombstone_kind = 'tenant_deletion',
+                erp_tombstone_deleted_at = now(), erp_tombstone_proof_sha256 = $3,
+                erp_tombstone_observed_at = now()
+          WHERE tenant_id = $1 AND status <> 'erp_deleted'`,
+        [tenant, f.erpTomb, SIG],
+      );
+      await tx.query(
+        `INSERT INTO crm.tenant_tombstone
+           (id, tenant_id, erp_tombstone_id, content_manifest_sha256, proof_sha256,
+            executed_by, approved_by, rows_erased, rows_retained)
+         VALUES ($1,$2,$3,$4,$4,'ops:probe','compliance:probe',0,0)`,
+        [f.tomb, tenant, f.erpTomb, SIG],
+      );
     });
   };
 
@@ -688,6 +739,9 @@ describe("a cross-tenant reference is refused by the database", () => {
   const SILENCED = [
     "sample_transaction", "sample_holding", "rep_role", "visit", "call_plan",
     "attachment", "attachment_blob", "attachment_access",
+    // 0052: append-only, for the same reason the attachments are — a receipt whose only job is
+    // being there afterwards. A fixture still has to be removable.
+    "tenant_tombstone", "tenant_tombstone_attestation",
   ];
 
   const unseed = async (tenant: string): Promise<void> => {
@@ -707,6 +761,7 @@ describe("a cross-tenant reference is refused by the database", () => {
         "call_plan_product", "call_plan_target", "call_plan", "cycle",
         "expense_claim", "outbox", "rep_role",
         "account_assignment", "territory_assignment",
+        "tenant_tombstone_attestation", "tenant_tombstone",
       ]) {
         await tx.query(`DELETE FROM crm.${t} WHERE tenant_id = $1`, [tenant]);
       }
@@ -714,6 +769,7 @@ describe("a cross-tenant reference is refused by the database", () => {
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1 AND parent_id IS NOT NULL", [tenant]);
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1", [tenant]);
       await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [tenant]);
+      await tx.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [tenant]);
       for (const t of SILENCED) {
         await tx.query(`ALTER TABLE crm.${t} ENABLE TRIGGER USER`);
       }

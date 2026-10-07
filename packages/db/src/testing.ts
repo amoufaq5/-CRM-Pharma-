@@ -239,3 +239,12 @@ export const TENANT_DELETION_LIVE = "eb500000-0000-4000-8000-00000000001e";
  */
 export const TENANT_ERASURE_STOPPED = "ec510000-0000-4000-8000-00000000001f";
 export const TENANT_ERASURE_LIVE = "ed510000-0000-4000-8000-000000000020";
+
+/**
+ * packages/erasure — execute.contract (migration 0052).
+ *
+ * Its own tenant, never shared: this suite really deletes rows, and `erp_deleted` is terminal.
+ * The second one stays alive so every assertion that the erasure is per tenant means something.
+ */
+export const TENANT_ERASE_EXEC = "ee520000-0000-4000-8000-000000000021";
+export const TENANT_ERASE_BYSTANDER = "ef520000-0000-4000-8000-000000000022";
