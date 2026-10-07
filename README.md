@@ -935,6 +935,36 @@ Ours are `crmtomb_…` where the ERP's are `tomb_…`, deliberately: they are di
 different controllers about different data, and the one thing they must never do is look
 alike.
 
+**A receipt is not in its own scope**, which it was until 0054. The first version attested
+`nothing_to_erase` about `crm.tenant_tombstone` — from inside the transaction that writes a row
+into it. The statement was false by the time it committed, and the content hash committed to
+it. Run the erasure twice and that table attested `retained, 1`, counting the first receipt,
+and was wrong the moment it landed because there were then two. Two signed receipts about one
+tenant, disagreeing about one table, for purely structural reasons. Both measured.
+
+The fix is not a new disposition — `retain` under `deletion_evidence` is right for those
+tables. It is the **scope**: `is_receipt_store` marks them in the register, and a receipt
+neither counts them nor speaks about them. The ERP's own six subsystems do not include its
+tombstone store either, so excluding ours is faithful to the mirror. A receipt store also
+cannot be dispositioned `erase`, by CHECK: an erasure would destroy the proof of itself, and
+that one is arithmetic rather than a jurisdictional judgement a deployment may amend.
+
+**The exclusion is declared on the receipt and inside its hash** — 0051's insight one level in:
+a declared "we are deliberately silent about this" is not silence. Without it a reader
+comparing 41 register rows to 39 attestations finds a discrepancy with no explanation, and
+"the hash covers everything except two things you have to work out" is not a property anybody
+can check. The list is sorted and de-duplicated, by CHECK, because a hash over a list whose
+order varies is a hash nobody can recompute.
+
+**And the manifest format is versioned, stored and verified by.** Adding the exclusion list
+changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable
+from a tampered one — so `manifest_version` is written with each receipt, `v1` receipts stay
+verifiable forever under the rules they were made with, and the version is inside the hashed
+bytes as well as beside them so rewriting the column cannot make a v1 digest verify as v2.
+No backfill and no re-signing: re-hashing a stored receipt under a new format would produce one
+that verifies and was never signed by the people it names, which is the forgery this whole
+subsystem exists to make impossible. A migration is not an exception to that.
+
 ## Verified against a running ERP
 
 ```bash

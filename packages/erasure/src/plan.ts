@@ -88,6 +88,11 @@ export interface ErasurePlan {
   readonly eraseOrder: readonly string[];
   /** Every table the register governs, which is what an attestation list is checked against. */
   readonly inScope: readonly string[];
+  /**
+   * The receipt stores (0054): in the register, and NOT in a receipt's scope, because the
+   * transaction that signs an attestation about them is the one that writes their rows.
+   */
+  readonly excludedTables: readonly string[];
 }
 
 interface DispositionRow {
@@ -97,6 +102,7 @@ interface DispositionRow {
   readonly obligation_note: string | null;
   readonly retained_reference: string | null;
   readonly question: string | null;
+  readonly is_receipt_store: boolean;
 }
 
 /**
@@ -202,11 +208,18 @@ export async function planTenantErasureWithin(
   if (orphans.length > 0) refusals.push({ kind: "orphaned", tables: orphans.map((r) => r.t) });
 
   const { rows: register } = await client.query<DispositionRow>(
-    `SELECT table_name, disposition, obligation, obligation_note, retained_reference, question
+    `SELECT table_name, disposition, obligation, obligation_note, retained_reference, question,
+            is_receipt_store
        FROM crm.data_disposition ORDER BY table_name`,
   );
 
-  const undecided = register.filter((r) => r.disposition === "undecided");
+  // Split off the receipt stores before anything else looks at the register. They stay in it —
+  // 0051's completeness guard is over every tenant-scoped table and has no exceptions — but a
+  // receipt neither counts them nor speaks about them.
+  const excludedTables = register.filter((r) => r.is_receipt_store).map((r) => r.table_name).sort();
+  const governed = register.filter((r) => !r.is_receipt_store);
+
+  const undecided = governed.filter((r) => r.disposition === "undecided");
   if (undecided.length > 0) {
     refusals.push({
       kind: "undecided",
@@ -217,7 +230,7 @@ export async function planTenantErasureWithin(
   // Counted for the DECIDED tables only. Counting an undecided table would put a number in
   // front of somebody who has not been told what the number means, and the first thing anyone
   // does with "crm.visit: 4,312 rows" is decide it is too many to keep.
-  const decided = register.filter((r) => r.disposition !== "undecided");
+  const decided = governed.filter((r) => r.disposition !== "undecided");
   const counts = await countRows(
     client,
     tenantId,
@@ -263,7 +276,8 @@ export async function planTenantErasureWithin(
     tombstoneId,
     tenantStatus,
     eraseOrder,
-    inScope: register.map((r) => r.table_name),
+    inScope: governed.map((r) => r.table_name),
+    excludedTables,
   };
 }
 

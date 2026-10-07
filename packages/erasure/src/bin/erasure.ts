@@ -158,6 +158,8 @@ async function main(): Promise<number> {
                 `  under ERP tombstone ${t.erpTombstoneId}\n` +
                 `  ${String(t.rowsErased)} rows erased, ${String(t.rowsRetained)} retained, ` +
                 `${String(t.attestations.length)} tables attested\n` +
+                `  deliberately silent about: ${t.excludedTables.join(", ") || "nothing"}\n` +
+                `  manifest format ${t.manifestVersion}\n` +
                 `  executed by ${t.executedBy}, approved by ${t.approvedBy}\n` +
                 `  manifest ${t.contentManifestSha256}\n  proof    ${t.proofSha256}\n` +
                 `  ${t.problems.length === 0 ? "VERIFIED: both hashes recompute" : `FAILED: ${t.problems.join("; ")}`}\n\n`,
@@ -215,6 +217,8 @@ async function main(): Promise<number> {
                 `  destroyed ${String(tombstone.rowsErased)} rows\n` +
                 `  retained  ${String(tombstone.rowsRetained)} rows\n` +
                 `  attested  ${String(tombstone.attestations.length)} tables\n` +
+                `  silent    ${tombstone.excludedTables.join(", ") || "nothing"} (the receipt's own storage)\n` +
+                `  format    manifest ${tombstone.manifestVersion}\n` +
                 `  manifest  ${tombstone.contentManifestSha256}\n` +
                 `  proof     ${tombstone.proofSha256}\n` +
                 `  order     ${eraseOrder.join(" -> ")}\n\n` +

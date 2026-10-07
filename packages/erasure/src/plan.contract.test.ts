@@ -325,9 +325,10 @@ describe("retention dispositions and the erasure plan (0051)", () => {
         const plan = await planTenantErasure(client, STOPPED);
         expect(plan.refusals).toEqual([]);
         expect(plan.actionable).toBe(true);
-        // Derived, not a literal: 0052 added two tables and this read 39 until it did.
+        // Derived, not a literal: 0052 added two tables and this read 39 until it did — and
+        // 0054 then took those same two OUT of a receipt's scope, because they are the receipt.
         const { rows } = await client.query<{ n: string }>(
-          "SELECT count(*)::text AS n FROM crm.data_disposition",
+          "SELECT count(*)::text AS n FROM crm.data_disposition WHERE NOT is_receipt_store",
         );
         expect(plan.erase.length + plan.retain.length).toBe(Number(rows[0]!.n));
         // And the order covers every table it will erase, children first.
@@ -384,9 +385,11 @@ describe("retention dispositions and the erasure plan (0051)", () => {
     const named = [...plan.erase, ...plan.retain].map((t) => t.table);
     expect(named).not.toContain("visit");
     expect(named).not.toContain("sample_transaction");
-    // Derived from the register rather than a literal, which 0052's two new tables broke.
+    // Derived from the register rather than a literal, which 0052's two new tables broke and
+    // 0054 changed again by excluding them from scope.
     const { rows } = await client.query<{ n: string }>(
-      "SELECT count(*)::text AS n FROM crm.data_disposition WHERE disposition <> 'undecided'",
+      `SELECT count(*)::text AS n FROM crm.data_disposition
+        WHERE disposition <> 'undecided' AND NOT is_receipt_store`,
     );
     expect(named).toHaveLength(Number(rows[0]!.n));
   });

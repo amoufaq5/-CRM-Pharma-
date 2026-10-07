@@ -29,6 +29,9 @@ export {
 
 export {
   ATTESTATION_OUTCOMES,
+  CURRENT_MANIFEST_VERSION,
+  MANIFEST_VERSIONS,
+  type ManifestVersion,
   TombstoneInvalidError,
   assembleTombstone,
   assertAttestationWellFormed,

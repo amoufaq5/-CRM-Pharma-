@@ -6,6 +6,7 @@ import {
   assembleTombstone,
   newCrmTombstoneId,
   type CrmTombstone,
+  type ManifestVersion,
   type TableAttestation,
 } from "./tombstone.js";
 import type { RetentionObligation } from "./obligations.js";
@@ -151,14 +152,15 @@ export async function executeTenantErasure(
       approvedBy: options.approvedBy,
       inScope: plan.inScope,
       attestations,
+      excludedTables: plan.excludedTables,
       id: newId(),
     });
 
     await tx.query(
       `INSERT INTO crm.tenant_tombstone
          (id, tenant_id, erp_tombstone_id, deleted_at, content_manifest_sha256, proof_sha256,
-          executed_by, approved_by, rows_erased, rows_retained)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          executed_by, approved_by, rows_erased, rows_retained, excluded_tables, manifest_version)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text[],$12)`,
       [
         tombstone.id,
         tenantId,
@@ -170,6 +172,8 @@ export async function executeTenantErasure(
         tombstone.approvedBy,
         tombstone.rowsErased,
         tombstone.rowsRetained,
+        [...tombstone.excludedTables],
+        tombstone.manifestVersion,
       ],
     );
 
@@ -213,9 +217,12 @@ export async function readTenantTombstones(
       approved_by: string;
       rows_erased: number;
       rows_retained: number;
+      excluded_tables: string[];
+      manifest_version: ManifestVersion;
     }>(
       `SELECT id, erp_tombstone_id, deleted_at, content_manifest_sha256, proof_sha256,
-              executed_by, approved_by, rows_erased, rows_retained
+              executed_by, approved_by, rows_erased, rows_retained, excluded_tables,
+              manifest_version
          FROM crm.tenant_tombstone WHERE tenant_id = $1 ORDER BY seq`,
       [tenantId],
     );
@@ -250,6 +257,8 @@ export async function readTenantTombstones(
         approvedBy: h.approved_by,
         rowsErased: h.rows_erased,
         rowsRetained: h.rows_retained,
+        excludedTables: h.excluded_tables,
+        manifestVersion: h.manifest_version,
         attestations: as.map((a) => ({
           table: a.table_name,
           outcome: a.outcome,

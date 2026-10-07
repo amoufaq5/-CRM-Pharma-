@@ -286,8 +286,10 @@ describe("the erasure executor and its receipt (0052)", () => {
     const result = await withEverythingDecided(() =>
       executeTenantErasure(client, DOOMED, { executedBy: ALICE, approvedBy: BOB }),
     );
+    // Every table the register governs, which since 0054 means every row EXCEPT the receipt
+    // stores: a receipt cannot speak about its own storage, and it says so in `excludedTables`.
     const { rows } = await client.query<{ n: string }>(
-      "SELECT count(*)::text AS n FROM crm.data_disposition",
+      "SELECT count(*)::text AS n FROM crm.data_disposition WHERE NOT is_receipt_store",
     );
     expect(result.tombstone.attestations).toHaveLength(Number(rows[0]!.n));
   });
@@ -545,6 +547,100 @@ describe("the erasure executor and its receipt (0052)", () => {
       [DOOMED],
     );
     expect(rows[0]!.n).toBe("1");
+  });
+
+  /**
+   * 0054, against the database: the receipt is silent about its own storage, says so, and two
+   * runs agree.
+   *
+   * Before it, run one attested `nothing_to_erase` about `crm.tenant_tombstone` while writing
+   * a row into it, and run two attested `retained, 1` about the same table — two signed
+   * receipts disagreeing about one table for structural reasons. Both measured.
+   */
+  it("does not attest about its own storage, and declares what it left out", async () => {
+    await register(DOOMED, "Gone");
+    await stop(DOOMED);
+    await seed(DOOMED);
+    const first = await withEverythingDecided(() =>
+      executeTenantErasure(client, DOOMED, { executedBy: ALICE, approvedBy: BOB }),
+    );
+    const named = first.tombstone.attestations.map((a) => a.table);
+    expect(named).not.toContain("tenant_tombstone");
+    expect(named).not.toContain("tenant_tombstone_attestation");
+    expect([...first.tombstone.excludedTables]).toEqual([
+      "tenant_tombstone",
+      "tenant_tombstone_attestation",
+    ]);
+    expect(first.tombstone.manifestVersion).toBe("v2");
+
+    // The register is still complete over every tenant-scoped table — the exclusion is a
+    // declared property of two rows, not a hole in the guard.
+    const { rows } = await client.query<{ n: string; r: string }>(
+      `SELECT count(*)::text AS n,
+              count(*) FILTER (WHERE is_receipt_store)::text AS r FROM crm.data_disposition`,
+    );
+    expect(named).toHaveLength(Number(rows[0]!.n) - Number(rows[0]!.r));
+
+    // AND THE SECOND RUN AGREES, which is the property that was broken.
+    const second = await withEverythingDecided(() =>
+      executeTenantErasure(client, DOOMED, { executedBy: ALICE, approvedBy: BOB }),
+    );
+    expect(second.tombstone.attestations.map((a) => a.table)).not.toContain("tenant_tombstone");
+    expect([...second.tombstone.excludedTables]).toEqual([...first.tombstone.excludedTables]);
+    expect(verifyTombstone(second.tombstone)).toEqual([]);
+  });
+
+  it("stores and reads back the exclusion list and the format version", async () => {
+    await register(DOOMED, "Gone");
+    await stop(DOOMED);
+    await seed(DOOMED);
+    await withEverythingDecided(() =>
+      executeTenantErasure(client, DOOMED, { executedBy: ALICE, approvedBy: BOB }),
+    );
+    const stored = await readTenantTombstones(client, DOOMED);
+    expect(stored).toHaveLength(1);
+    expect([...stored[0]!.excludedTables]).toEqual([
+      "tenant_tombstone",
+      "tenant_tombstone_attestation",
+    ]);
+    expect(stored[0]!.manifestVersion).toBe("v2");
+    // The round trip must preserve everything the hash covers, the exclusion list included.
+    expect(verifyTombstone(stored[0]!)).toEqual([]);
+  });
+
+  /** A receipt store cannot be made erasable: an erasure would destroy the proof of itself. */
+  it("refuses to let a receipt store be dispositioned erase", async () => {
+    const msg = await client
+      .query(
+        "UPDATE crm.data_disposition SET disposition = 'erase', obligation = NULL, obligation_note = NULL, retained_reference = NULL WHERE table_name = 'tenant_tombstone'",
+      )
+      .then(
+        () => "SUCCEEDED",
+        (e: { message?: string }) => e.message ?? "",
+      );
+    expect(msg).toContain("data_disposition_receipt_store_is_retained");
+  });
+
+  it("refuses an unsorted or duplicated exclusion list in the database", async () => {
+    await register(DOOMED, "Gone");
+    await stop(DOOMED);
+    for (const bad of ["ARRAY['b_store','a_store']", "ARRAY['a_store','a_store']", "ARRAY['Bad-Name']"]) {
+      const msg = await withTenantContext(client, DOOMED, (tx) =>
+        tx
+          .query(
+            `INSERT INTO crm.tenant_tombstone
+               (id, tenant_id, erp_tombstone_id, content_manifest_sha256, proof_sha256,
+                executed_by, approved_by, rows_erased, rows_retained, excluded_tables)
+             VALUES ('crmtomb_0000000000000000000000000000000c',$1,$2,$3,$3,'a','b',0,0,${bad})`,
+            [DOOMED, TOMB, SHA],
+          )
+          .then(
+            () => "SUCCEEDED",
+            (e: { message?: string }) => e.message ?? "",
+          ),
+      );
+      expect(msg, bad).toContain("tenant_tombstone_excluded_canonical");
+    }
   });
 
   it("refuses a four-eyes violation in the database as well as in the code", async () => {

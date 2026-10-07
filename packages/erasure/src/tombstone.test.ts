@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CURRENT_MANIFEST_VERSION,
   TombstoneInvalidError,
   assembleTombstone,
   assertAttestationWellFormed,
@@ -53,7 +54,10 @@ describe("the canonical manifest", () => {
   });
 
   it("is domain-tagged, so a digest cannot be mistaken for another kind of claim", () => {
-    expect(canonicalAttestationManifest([])).toContain("crm.tenant_tombstone.manifest.v1");
+    // The tag carries the format VERSION, so a v1 digest cannot verify as v2 even if the
+    // stored version column were rewritten — the tag is inside the hashed bytes and that is not.
+    expect(canonicalAttestationManifest([])).toContain("crm.tenant_tombstone.manifest.v2");
+    expect(canonicalAttestationManifest([], [], "v1")).toContain("crm.tenant_tombstone.manifest.v1");
     const manifest = computeContentManifestSha256([erased("a_table")]);
     const proof = computeProofSha256({
       tenantId: TENANT,
@@ -174,6 +178,105 @@ describe("assembleTombstone", () => {
     const id = newCrmTombstoneId();
     expect(id).toMatch(/^crmtomb_[0-9a-f]{32}$/);
     expect(id.startsWith("tomb_")).toBe(false);
+  });
+});
+
+describe("a receipt is not in its own scope (0054)", () => {
+  /**
+   * THE DEFECT THIS CLOSED, which no test caught because every test passed. 0052's receipt
+   * attested `nothing_to_erase` about `crm.tenant_tombstone` inside the transaction that wrote
+   * a row into it — a statement its own signing falsified, with the content hash committing to
+   * it. Run twice and the same table attested `retained, 1`, counting the first receipt, which
+   * was wrong the moment it landed because there were then two. Two signed receipts about one
+   * tenant, disagreeing about one table, for purely structural reasons.
+   */
+  it("refuses a table that is both excluded and attested", () => {
+    expect(() =>
+      assemble({
+        inScope: ["a_table", "b_table", "c_table", "tenant_tombstone"],
+        attestations: [erased("a_table"), nothing("b_table"), retained("c_table"), nothing("tenant_tombstone")],
+        excludedTables: ["tenant_tombstone"],
+      }),
+    ).toThrow(/cannot speak about its own storage/);
+  });
+
+  /** An excluded table does not count as silence, which is what makes the exclusion usable. */
+  it("does not demand an attestation for an excluded table", () => {
+    const t = assemble({
+      inScope: ["a_table", "b_table", "c_table", "tenant_tombstone"],
+      excludedTables: ["tenant_tombstone"],
+    });
+    expect(t.attestations.map((a) => a.table)).not.toContain("tenant_tombstone");
+    expect(t.excludedTables).toEqual(["tenant_tombstone"]);
+  });
+
+  /** But a table that is neither attested nor excluded is still silence, and still refused. */
+  it("still refuses real silence", () => {
+    expect(() =>
+      assemble({
+        inScope: ["a_table", "b_table", "c_table", "d_table", "tenant_tombstone"],
+        excludedTables: ["tenant_tombstone"],
+      }),
+    ).toThrow(/d_table/);
+  });
+
+  /** The exclusion list is inside the hash, so it cannot be edited after the fact. */
+  it("commits to the exclusion list", () => {
+    const a = assemble({ excludedTables: ["tenant_tombstone"] });
+    const b = assemble({ excludedTables: ["tenant_tombstone", "tenant_tombstone_attestation"] });
+    expect(b.contentManifestSha256).not.toBe(a.contentManifestSha256);
+    expect(b.proofSha256).not.toBe(a.proofSha256);
+  });
+
+  it("sorts the list, so two orders hash the same", () => {
+    const a = assemble({ excludedTables: ["b_store", "a_store"] });
+    const b = assemble({ excludedTables: ["a_store", "b_store"] });
+    expect(a.contentManifestSha256).toBe(b.contentManifestSha256);
+    expect(a.excludedTables).toEqual(["a_store", "b_store"]);
+  });
+
+  it("stamps the format version it was signed under", () => {
+    expect(assemble().manifestVersion).toBe(CURRENT_MANIFEST_VERSION);
+    expect(CURRENT_MANIFEST_VERSION).toBe("v2");
+  });
+
+  /**
+   * A v1 receipt stays verifiable under v1 rules forever. Without the stored version the fix
+   * would have made every receipt written before it indistinguishable from a tampered one —
+   * there are none in production, but a migration that depends on that is wrong the first time
+   * it is false.
+   */
+  it("verifies a v1 receipt under v1 rules, and v2 under v2", () => {
+    const v2 = assemble({ excludedTables: ["tenant_tombstone"] });
+    expect(verifyTombstone(v2)).toEqual([]);
+
+    const v1 = {
+      ...v2,
+      manifestVersion: "v1" as const,
+      excludedTables: [],
+      contentManifestSha256: computeContentManifestSha256(v2.attestations, [], "v1"),
+    };
+    const v1Signed = {
+      ...v1,
+      proofSha256: computeProofSha256({
+        tenantId: v1.tenantId,
+        erpTombstoneId: v1.erpTombstoneId,
+        deletedAt: v1.deletedAt,
+        contentManifestSha256: v1.contentManifestSha256,
+        executedBy: v1.executedBy,
+        approvedBy: v1.approvedBy,
+      }),
+    };
+    expect(verifyTombstone(v1Signed)).toEqual([]);
+    // And the two formats do not collide: a v1 digest is not a v2 digest of the same list.
+    expect(v1.contentManifestSha256).not.toBe(v2.contentManifestSha256);
+  });
+
+  /** Reading a v2 receipt as v1 fails, which is the tag inside the bytes doing its job. */
+  it("refuses to verify a receipt whose stored version was rewritten", () => {
+    const v2 = assemble({ excludedTables: ["tenant_tombstone"] });
+    const lied = { ...v2, manifestVersion: "v1" as const };
+    expect(verifyTombstone(lied).length).toBeGreaterThan(0);
   });
 });
 
