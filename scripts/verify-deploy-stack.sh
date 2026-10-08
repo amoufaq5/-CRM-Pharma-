@@ -213,6 +213,37 @@ sys.exit(1 if missing else 0)
 PY
 ok "every package with sources is a root tsconfig reference"
 
+
+# ---------------------------------------------------------------------------
+echo "--- 11. every built service names the stage it wants ---"
+# Docker's default build target is the LAST stage in the file, so adding one at the end
+# silently re-points every service that did not say otherwise. The web stage did exactly
+# that: migrate, api and scheduler were each built as the caddy image and died on
+# `exec: "node": executable file not found in $PATH`. A Dockerfile with more than one
+# usable target has no safe default, so every service must say which it is.
+python3 - <<'PY' || fail "a built service does not name its build target"
+import json, subprocess, sys
+
+config = json.loads(subprocess.run(["docker", "compose", "config", "--format", "json"], capture_output=True, text=True, check=True).stdout)
+problems = []
+for name, svc in (config.get("services") or {}).items():
+    build = svc.get("build")
+    if build is None:
+        continue
+    target = build.get("target")
+    if target is None:
+        problems.append(f"  {name}: builds with no target, so it gets whatever stage is last in the Dockerfile")
+        continue
+    command = svc.get("command") or []
+    if isinstance(command, str):
+        command = command.split()
+    if command and command[0] == "node" and target != "runtime":
+        problems.append(f"  {name}: runs node but builds the `{target}` stage")
+for line in problems:
+    print(line)
+sys.exit(1 if problems else 0)
+PY
+ok "every built service names its target, and every node service builds the runtime stage"
 echo
 echo "deploy stack statically verified — the image itself is replayed by"
 echo "scripts/verify-image-build.sh and built for real by CI"

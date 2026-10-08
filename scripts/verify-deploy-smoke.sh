@@ -101,7 +101,9 @@ if pinned:
 print(f"    injected {' and '.join(what)}; nothing else differs from deploy/Dockerfile")
 PY
 fi
-docker build -f "$DOCKERFILE" -t "$PROJECT:smoke" "$ROOT" > "$WORK/build.log" 2>&1 \
+# --target runtime, for the same reason compose names it: the last stage is the edge,
+# and an api container built from caddy:2 has no node in it.
+docker build --target runtime -f "$DOCKERFILE" -t "$PROJECT:smoke" "$ROOT" > "$WORK/build.log" 2>&1 \
   || { tail -30 "$WORK/build.log" >&2; fail "docker build failed"; }
 ok "image built"
 

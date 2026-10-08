@@ -17,6 +17,11 @@ name: crm-pharma
 x-crm-build: &crm-build
   context: ..
   dockerfile: deploy/Dockerfile
+  # EXPLICIT, because the default is the LAST stage and that is now `web`. Without this,
+  # migrate, api and scheduler would each be built as the caddy image and die on
+  # `exec: "node": executable file not found in $PATH` — which is exactly what CI
+  # answered the first time the web stage existed. The caddy service overrides it below.
+  target: runtime
 
 # The APPLICATION identity. Never the admin: crm_app owns crm.* and holds SELECT
 # on one ERP table, and a table's owner bypasses RLS — so the runtime connecting
