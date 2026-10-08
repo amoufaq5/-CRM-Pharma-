@@ -279,6 +279,19 @@ else
     || { dc logs caddy | tail -10 >&2; fail "the edge did not serve /healthz over TLS"; }
   grep -q '"status":"ok"' "$WORK/edge.log" || fail "the edge answered, but not with the api's health"
   ok "caddy serves the api over TLS"
+
+  # The SAME origin serves the app. That is the arrangement that keeps both sides free of
+  # CORS, so it is worth an assertion rather than an assumption — and an edge that
+  # proxies the API correctly while answering 404 for the app is green everywhere and
+  # useless to a rep.
+  dc exec -T caddy sh -c 'wget -q -O - --no-check-certificate https://localhost/' > "$WORK/edge-app.log" 2>&1 \
+    || fail "the edge did not serve the app at /"
+  grep -q 'id="app"' "$WORK/edge-app.log" || fail "the edge served something at /, but not the field client's shell"
+  dc exec -T caddy sh -c 'wget -q -O - --no-check-certificate https://localhost/app.js' > "$WORK/edge-bundle.log" 2>&1 \
+    || fail "the edge did not serve the app bundle"
+  grep -q 'dev-token' "$WORK/edge-bundle.log" \
+    && fail "the bundle the edge serves still carries the paste-a-token login path"
+  ok "and serves the field client from the same origin, with the dev login compiled out"
 fi
 
 echo

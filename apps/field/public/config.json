@@ -1,0 +1,8 @@
+{
+  "apiBaseUrl": "",
+  "oidc": {
+    "issuer": "",
+    "clientId": "crm-field",
+    "scope": "openid profile email"
+  }
+}

@@ -1096,3 +1096,108 @@ Two things caught themselves on the way:
 
 **83 files / 2,123 tests green on both transports.** The suite grew by one file
 and six tests, all of them about the harness.
+
+# The client, in a real browser, taken offline
+
+*2026-10-08. Reproduce with `pnpm client:verify` (needs a Postgres and a Chrome).*
+
+ADR-0001's open table carried one row longer than any other, in capitals: **THERE IS NO
+CLIENT**. Everything the CRM had built for a device was a guess about a consumer that did
+not exist — ids minted before the network (0012), `POST /v1/sync/visits` answering per
+row, the upsert that makes a replay idempotent, `tenant_deleted` given its own problem
+type specifically so "an offline client holding a queue of unsent visits" would stop
+rather than spin. Nothing had ever held such a queue.
+
+`scripts/verify-client-live.sh` stands up a throwaway database with the ERP stand-in and
+all 54 migrations, a stand-in IdP publishing a JWKS, the CRM's **own `api` binary**
+verifying tokens against it, and a static server that serves the app and proxies `/v1`
+from one origin — `deploy/Caddyfile`'s arrangement, reproduced rather than assumed. Then
+it drives a real Chromium over the DevTools Protocol, with no test framework: Node 22
+ships a WebSocket client, and `Network.emulateNetworkConditions {offline: true}` is the
+one capability that matters here.
+
+**32 checks, 0 failures.** The sequence, in one session:
+
+```
+ok: an unauthenticated device is offered a sign-in, not a blank screen
+ok: the API's /v1/accounts reaches the screen, in the rep's own territory and the server's order
+ok: the app says it is offline
+ok: a visit is recorded with no network, and the screen says it is on the device — not filed
+ok: the visit is in IndexedDB, which is what survives the tab being killed
+ok: the id was minted on the device as a v7 UUID (01a11cde-b6ef-7470-81bc-417d853301df)
+ok: and NOTHING is in crm.visit yet — the queue is the only copy
+ok: syncing while offline reports it could not reach the server, and keeps the row
+ok: exactly one row in crm.visit
+ok: and its primary key is the id the DEVICE minted, which is what makes a replay idempotent
+ok: re-sending an already-accepted visit is accepted again
+ok: and there is STILL one row — the upsert by device id holds
+ok: three visits queue up across a round with no signal
+ok: and all three land in one batch when the signal returns
+ok: the server's own words are on screen (rep … did not cover account acc-not-mine on …)
+ok: the refused row is KEPT as rejected, not dropped — a visit that happened is not deleted by a 403
+ok: the app opens with NO network, served by its own service worker
+ok: with how old it is stated, rather than implied to be live
+ok: the page threw no uncaught errors throughout
+```
+
+And from outside the app, as the admin so RLS cannot flatter the result: **4 visits, 4
+distinct device-minted v7 ids, no duplicates**, every one attributed to the caller the
+token named rather than anything the body claimed.
+
+## Three defects it found, none of which a unit test would have
+
+**1. "Sync now" did nothing, for up to half an hour.** One failed attempt backs a row off
+15 seconds, doubling to thirty minutes. The rep regains signal, sees "online", presses
+the button — and nothing happens, because `dueEntries` correctly answers that nothing is
+due. A button that does nothing is worse than no button. The fix is `reviveDue`: both a
+connectivity transition and an explicit request are new information that the backoff's
+premise has gone, so the wait is void for *pending* rows and untouched for refused ones,
+which are not waiting on a network. The run went from timing out here to `1 sent`.
+
+**2. A queue entry whose key was not its own visit id was immortal.** The server echoes
+the id it was sent (the body's); `applySyncResults` folds on the entry's key; if they
+differ the two never meet, so the row is re-sent on every drain, never accepted, never
+rejected, and reported nowhere. `enqueueVisit` cannot produce it — the entry id *is* the
+record id — but an older build or a hand-edited store can, and a test fixture did while
+testing something else. Now refused before anything is sent, visibly, by
+`rejectUnreconcilable`.
+
+**3. The image built the app's manifest but not its sources.** `COPY packages/` with no
+`COPY apps/`: pnpm linked the workspace correctly from the manifest, `tsc --build` passed,
+and the bundle step had nothing to bundle. Caught by `verify-image-build.sh` before Docker
+ever ran it — the replay script added yesterday, catching its first defect in a Dockerfile
+edit made today.
+
+## Three existing gates caught the new packages on their first day
+
+Worth recording, because this is what they were built for:
+
+- **`verify-deploy-stack.sh` property 8** — "in the workspace, not copied into the image:
+  apps/field, packages/client". The manifest-layer check, written the day the image turned
+  out not to build, catching the same class of omission on a brand-new package.
+- **`verify-deploy-stack.sh` property 10** — `@crm/client` was missing from the root
+  `tsconfig.json`, so `tsc --build` never built it and the app bundled a **stale** `dist`.
+  That is exactly how `@crm/erasure` had been uncompiled for a week.
+- **`problems.test.ts`'s package audit** — "@crm/client is in the workspace but neither in
+  AUDITED nor in EXCLUDED". It is excluded, with the reason: it is the *other end* of that
+  file, consuming the problem kinds `toProblem` produces, and it declares no error class
+  because a client that threw on a refusal could not queue it.
+
+A fourth, `scripts/typecheck-tests.sh`, caught a `: void` arrow returning a value in a
+test written an hour earlier. Which in turn exposed that the **app's** typecheck was in no
+CI job at all: `pnpm typecheck` was `tsc --build`, which builds the root tsconfig's
+references, and an app is not one. It now runs the app's own typecheck too — both
+projects, including the service worker's, which needs `lib.webworker` alone because
+declaring `self` under `lib.dom` degrades every ServiceWorker event to a bare `Event` and
+typechecks green while `event.respondWith` does not exist.
+
+## What this does not prove
+
+- **A real identity provider.** The token is minted by the same harness stand-in §10 uses.
+  The PKCE implementation is tested against RFC 7636's own vector, and no live issuer has
+  ever answered it.
+- **Most of the product.** Roughly 90 of the 104 routes have no screen.
+- **Any browser but Chromium**, and iOS Safari is the one that matters most for a field
+  app. No Capacitor wrapper, no device under memory pressure, no push.
+- **A real ERP behind the outbox.** `ERP_BASE_URL` points nowhere in this run; §1–§7 cover
+  that path.

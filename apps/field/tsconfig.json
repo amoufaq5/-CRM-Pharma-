@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // The browser, so: DOM, and a bundler resolving the imports rather than Node.
+    // `noEmit` because esbuild does the emitting — tsc is here to typecheck, including
+    // the tests, which `scripts/typecheck-tests.sh` does not reach under apps/.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "types": []
+  },
+  "include": ["src/**/*.ts", "build.mjs"],
+  // The service worker is its own project (tsconfig.sw.json): `lib.dom` and
+  // `lib.webworker` both declare `self`, and under both at once every ServiceWorker
+  // event degrades to a bare `Event` — which is how a worker typechecks green while
+  // `event.respondWith` does not exist.
+  "exclude": ["src/sw.ts"]
+}

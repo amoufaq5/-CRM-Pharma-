@@ -1,0 +1,69 @@
+/* One stylesheet, no framework: a rep's phone in a car park should not download 200 KB
+   of CSS to show eight accounts. Dark by default because that is where this is used. */
+:root {
+  --bg: #0b1f20;
+  --panel: #12302f;
+  --line: #1f4a47;
+  --ink: #e8f5f2;
+  --muted: #9ec4bd;
+  --accent: #7fd1c1;
+  --warn: #ffd37a;
+  --bad: #ff9f9f;
+  --ok: #8ce0a8;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); -webkit-text-size-adjust: 100%; }
+#app { max-width: 46rem; margin: 0 auto; padding: 0 1rem 4rem; }
+.booting { color: var(--muted); padding: 2rem 0; }
+
+header.bar {
+  position: sticky; top: 0; z-index: 2;
+  display: flex; align-items: center; gap: .75rem; flex-wrap: wrap;
+  padding: .75rem 0; background: var(--bg); border-bottom: 1px solid var(--line);
+}
+header.bar h1 { font-size: 1.05rem; margin: 0; flex: 1 1 auto; }
+.who { color: var(--muted); font-size: .85rem; }
+
+.pill { font-size: .75rem; padding: .15rem .5rem; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.pill.online { color: var(--ok); border-color: var(--ok); }
+.pill.offline { color: var(--warn); border-color: var(--warn); }
+.pill.blocked { color: var(--bad); border-color: var(--bad); }
+
+button {
+  font: inherit; padding: .6rem .9rem; border-radius: .5rem; cursor: pointer;
+  background: var(--accent); color: #06201f; border: 1px solid var(--accent); font-weight: 600;
+}
+button.secondary { background: transparent; color: var(--ink); border-color: var(--line); font-weight: 500; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+section { margin: 1.25rem 0; }
+h2 { font-size: .95rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 .5rem; }
+
+ul.list { list-style: none; margin: 0; padding: 0; display: grid; gap: .5rem; }
+ul.list li {
+  display: flex; align-items: center; gap: .75rem;
+  padding: .7rem .85rem; background: var(--panel); border: 1px solid var(--line); border-radius: .6rem;
+}
+ul.list li .grow { flex: 1 1 auto; min-width: 0; }
+ul.list li .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+ul.list li .meta { color: var(--muted); font-size: .8rem; }
+
+form { display: grid; gap: .75rem; background: var(--panel); border: 1px solid var(--line); border-radius: .6rem; padding: 1rem; }
+label { display: grid; gap: .3rem; font-size: .85rem; color: var(--muted); }
+input, select, textarea {
+  font: inherit; color: var(--ink); background: #0c2726; border: 1px solid var(--line);
+  border-radius: .4rem; padding: .55rem .6rem; width: 100%;
+}
+textarea { min-height: 5rem; resize: vertical; }
+.row { display: flex; gap: .5rem; flex-wrap: wrap; }
+.row > * { flex: 1 1 10rem; }
+.actions { display: flex; gap: .5rem; margin-top: .25rem; }
+
+.note { color: var(--muted); font-size: .85rem; }
+.error { color: var(--bad); }
+.good { color: var(--ok); }
+.warn { color: var(--warn); }
+.dev { border: 1px dashed var(--warn); color: var(--warn); padding: .6rem .8rem; border-radius: .5rem; font-size: .85rem; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }

@@ -62,11 +62,13 @@ mkdir -p "$CTX" "$IMG" "$RT"
 
 # ---------------------------------------------------------------------------
 echo "--- 1. the build context, from tracked files only ---"
-# `git ls-files` gives working-tree CONTENT for tracked paths: uncommitted edits are
-# included, so this gates what you are about to commit, while everything .gitignore
-# covers — node_modules/, dist/, *.tsbuildinfo — cannot appear. That is the tree a fresh
-# clone has, and the one .dockerignore now guarantees Docker sees.
-git ls-files -z | tar -cf - --null -T - | (cd "$CTX" && tar -xf -)
+# `--cached --others --exclude-standard`: tracked files AND new ones that .gitignore does
+# not cover, which is exactly the set `docker build` would send. Tracked-only was the
+# first version and it was wrong in a way that bit immediately — a brand-new package is
+# untracked until `git add`, so the replay failed on a COPY whose source the real build
+# would have had. What .gitignore covers still cannot appear: node_modules/, dist/,
+# *.tsbuildinfo, which is the guarantee .dockerignore gives the real build.
+git ls-files --cached --others --exclude-standard -z | tar -cf - --null -T - | (cd "$CTX" && tar -xf -)
 for pattern in 'node_modules' 'dist' '*.tsbuildinfo'; do
   found="$(find "$CTX" -name "$pattern" | head -1)"
   [ -z "$found" ] || fail "host build output reached the context: $found"
@@ -126,9 +128,12 @@ for line in joined:
             continue  # the harness already has the pinned pnpm
         if cmd.startswith("useradd"):
             continue  # there is one uid here and it is not ours to change
-        if not cmd.startswith("pnpm "):
+        # `pnpm …` and `node …` are the repo's own tooling and replay as themselves.
+        # Anything else — apt, curl, a shell pipeline — cannot be reproduced honestly
+        # here and is a hard stop rather than a skip.
+        if not (cmd.startswith("pnpm ") or cmd.startswith("node ") or cmd.startswith("NODE_ENV=production node ")):
             sys.exit(f"cannot replay `RUN {cmd}` outside Docker — teach this script, or "
-                     f"keep the RUN steps to pnpm and the two exceptions above")
+                     f"keep the RUN steps to pnpm/node and the two exceptions above")
         steps.append(("RUN", stage, cmd))
         continue
     if verb == "COPY":
@@ -163,7 +168,17 @@ echo "--- 3. replay both stages ---"
 # COPY lines give it and nothing else — which is the only way to find out whether the
 # list is complete, and the reason step 5 runs the entrypoints from there rather than
 # from the build stage, where every file in the repository is lying around.
-dir_for() { case "$1" in build) echo "$IMG" ;; runtime) echo "$RT" ;; *) fail "no directory for stage $1" ;; esac; }
+# One directory per stage, created on demand. Hard-coding build and runtime meant a
+# third target — the `web` stage that carries the app bundle — failed here rather than
+# being replayed, which is the wrong way round for a script whose job is to follow the
+# Dockerfile wherever it goes.
+dir_for() {
+  case "$1" in
+    build) echo "$IMG" ;;
+    runtime) echo "$RT" ;;
+    *) mkdir -p "$WORK/stage-$1"; echo "$WORK/stage-$1" ;;
+  esac
+}
 
 while IFS=$'\t' read -r verb stage arg; do
   case "$verb" in
@@ -285,6 +300,25 @@ migs="$(find "$RT/db/migrations" -name '*.sql' | wc -l | tr -d ' ')"
 ctx_migs="$(find "$CTX/db/migrations" -name '*.sql' | wc -l | tr -d ' ')"
 [ "$migs" = "$ctx_migs" ] || fail "runtime stage has $migs migrations, the repository has $ctx_migs"
 ok "$migs migrations present"
+
+# ---------------------------------------------------------------------------
+echo "--- 7. the web stage carries the app the edge serves ---"
+# The Caddyfile serves /srv and proxies /v1 to the api, which is the arrangement that
+# keeps both sides free of CORS. An empty /srv would mean a deployed stack whose edge
+# answers 404 for the app while every API route works — green everywhere, useless.
+WEB="$WORK/stage-web"
+if [ -d "$WEB" ]; then
+  for file in srv/index.html srv/app.js srv/sw.js srv/config.json srv/manifest.webmanifest; do
+    [ -f "$WEB/$file" ] || fail "the web stage has no $file; the edge would serve nothing"
+  done
+  grep -q "__DEV_TOKEN_LOGIN__" "$WEB/srv/app.js" \
+    && fail "the production bundle still contains the dev-token placeholder; the define did not apply"
+  grep -q "dev-token" "$WEB/srv/app.js" \
+    && fail "the production bundle still contains the paste-a-token login path"
+  ok "the web stage serves the app, and the paste-a-token path is compiled out of it"
+else
+  fail "the Dockerfile declares no web stage; the app would not be served anywhere"
+fi
 
 echo
 echo "image replayed without Docker: $(find "$RT/packages" -path '*/dist/*' -name '*.js' | wc -l | tr -d ' ') modules, $count entrypoints, all loadable"

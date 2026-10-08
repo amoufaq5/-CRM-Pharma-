@@ -34,9 +34,11 @@ WORKDIR /app
 # flattens them onto one path; `COPY --parents`, which would not, needs the
 # dockerfile:1.7-labs frontend. An unstable frontend is the worse dependency.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json tsconfig.json ./
+COPY apps/field/package.json           apps/field/
 COPY packages/acl/package.json         packages/acl/
 COPY packages/api/package.json         packages/api/
 COPY packages/callplan/package.json    packages/callplan/
+COPY packages/client/package.json      packages/client/
 COPY packages/credential/package.json  packages/credential/
 COPY packages/db/package.json          packages/db/
 COPY packages/erasure/package.json     packages/erasure/
@@ -57,9 +59,23 @@ RUN pnpm install --frozen-lockfile
 # just installed, tsc finds every project up to date, emits nothing, and the image
 # ships artifacts compiled on someone's laptop rather than the ones it built.
 COPY packages/ packages/
+# apps/ too, and this was missing until the replay script tried to run the app build and
+# found no build.mjs: the manifest layer above copies apps/field/package.json, so pnpm
+# links the workspace correctly and `tsc --build` succeeds — and the bundle step a few
+# lines down had nothing to bundle. A build that passes every typecheck and produces no
+# app.
+COPY apps/ apps/
 # Builds every project in the root tsconfig's references. A package absent from that
 # list is silently not built — property 10 gates that too.
 RUN pnpm exec tsc --build
+
+# The field client's bundle. Built here rather than in a second image so there is one
+# source of truth for what is deployed, and built BEFORE the prod install below, because
+# esbuild is a dev dependency that install removes.
+#
+# NODE_ENV=production is what compiles out the paste-a-token login path entirely — the
+# same rule the scheduler applies to ERP_TOKEN, applied where no config file can flip it.
+RUN NODE_ENV=production node apps/field/build.mjs
 
 # Drop the dev dependencies. A second install rather than `pnpm prune --prod`, which
 # this file used until the replay script ran it: in a workspace, prune empties every
@@ -103,3 +119,17 @@ USER crm
 # Overridden per service in compose. Defaults to the API, the thing most likely
 # to be run by hand.
 CMD ["node", "packages/api/dist/bin/api.js"]
+
+# ---- web --------------------------------------------------------------------
+# The TLS edge, carrying the app it serves.
+#
+# One origin for the app and the API is not a convenience: it is why neither has any CORS.
+# Caddy serves these files and proxies /v1, /healthz and /.well-known to the api service
+# (deploy/Caddyfile), so the browser only ever talks to one host — and a client that never
+# makes a cross-origin request needs no preflight to be allowed.
+#
+# Built as a separate TARGET of this same Dockerfile rather than a second file, so the
+# bundle the edge serves is the one the build stage produced from the committed sources.
+FROM caddy:2 AS web
+
+COPY --from=build /app/apps/field/dist /srv

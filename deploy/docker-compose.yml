@@ -139,8 +139,14 @@ services:
     # claim, so N instances share the work safely. One is simply enough.
     restart: unless-stopped
 
+  # The edge, and the app it serves. Built from the same Dockerfile as the API — its
+  # `web` target is caddy:2 plus the field client's bundle, produced by the build stage
+  # from the committed sources — so the files a browser downloads cannot drift from the
+  # API they call.
   caddy:
-    image: caddy:2
+    build:
+      <<: *crm-build
+      target: web
     depends_on:
       api:
         # HEALTHY, not merely started. The api healthcheck reports readiness, which

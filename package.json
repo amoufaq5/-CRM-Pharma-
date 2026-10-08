@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "tsc --build",
-    "typecheck": "tsc --build --force",
+    "typecheck": "tsc --build --force && pnpm --filter @crm/field typecheck",
     "test": "vitest run",
     "test:watch": "vitest",
     "db:migrate": "pnpm --filter @crm/db build && node packages/db/dist/bin/migrate.js",
@@ -25,6 +25,8 @@
     "deploy:verify": "./scripts/verify-deploy-stack.sh",
     "deploy:image": "./scripts/verify-image-build.sh",
     "deploy:smoke": "./scripts/verify-deploy-smoke.sh",
+    "client:build": "pnpm --filter @crm/field build",
+    "client:verify": "./scripts/verify-client-live.sh",
     "typecheck:tests": "./scripts/typecheck-tests.sh",
     "smtp:crosscheck": "./scripts/crosscheck-smtp.sh"
   },

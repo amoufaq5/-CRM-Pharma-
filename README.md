@@ -31,8 +31,10 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/sample/` | Sample and promo-material custody: lots, expiry, balances, transfers, counts, the ERP mirror. |
 | `packages/role/` | The administrative roles: dated grants, four eyes, and the guard against locking a tenant out. |
 | `packages/expense/` | Expense claims: the lifecycle, the category-to-account map, and the ERP posting. Refuses until Finance maps the category. |
-| `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints. See [`deploy/README.md`](deploy/README.md). |
-| `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres). |
+| `packages/client/` | The field client's pure layer: the wire schemas, the outbox state machine, the backoff, device-minted ids, and the classifier that decides what a refusal MEANS for a queue. No DOM, no `fetch`, no clock. |
+| `apps/field/` | The app a rep uses. A framework-free PWA: IndexedDB outbox, PKCE sign-in, a service worker for the offline shell. Sign in, see my accounts, record a visit with no network, watch it sync. |
+| `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints, plus a `web` target that serves the app from the same origin — which is why nothing here has CORS. See [`deploy/README.md`](deploy/README.md). |
+| `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres), `verify-client-live.sh` (the app, in a real Chromium, taken offline). |
 
 ## Running it
 
@@ -47,6 +49,17 @@ pnpm test
 ```
 
 CI runs exactly this against a `postgres:16` service container on every push.
+
+The app, and the checks that drive it:
+
+```bash
+pnpm client:build          # the bundle a browser downloads (esbuild; tsc only typechecks)
+pnpm client:verify         # the app in a real Chromium, taken offline, against the real API
+```
+
+`client:verify` needs a Postgres it can create a database in, and a Chrome or Chromium —
+it finds one, or fails saying so. A browser check that skips when there is no browser is
+not a check.
 
 ## The API
 
@@ -1137,6 +1150,56 @@ GitHub runner does not have. `grepRepo` in `packages/db/src/testing.ts` is now t
 scan in Node, and it throws when it matches nothing — because `rg` exited 1 and failed the
 test, while returning `[]` would hand a coverage suite an empty producer set and let it
 pass vacuously. **83 files / 2,123 tests green on both transports.**
+
+## The app
+
+`apps/field` is the client, and it is a first slice rather than the product: **sign in, see
+my accounts, record a visit with no network, watch it sync, read a refusal.** Roughly 90 of
+the 104 routes still have no screen — samples, call plans, expenses, notifications, the
+manager's views, all of admin.
+
+What it settles is the part that was a guess. Everything built for an offline device —
+ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
+upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
+queue knows to stop rather than spin — had never been consumed by anything. It is now,
+and `pnpm client:verify` proves it the only way that means anything: **32 checks in a real
+Chromium, taken offline mid-session, against the real API binary, counting rows in
+Postgres.** The sequence it drives:
+
+- a visit recorded with the network down lands in IndexedDB, pending, with a device-minted
+  v7 id — and **nothing** in `crm.visit`;
+- syncing while still offline keeps it and says so;
+- the signal returns, the row lands **once**, and its primary key is the id the device
+  minted;
+- re-sending the same body is accepted again and there is still one row;
+- three visits across a round with no signal go up in one batch;
+- a visit for an account outside the rep's territory comes back refused, stays on screen
+  with the server's own sentence, and is deleted by nobody but a person;
+- and the app **opens with no network at all**, served by its own service worker, saying
+  how stale its cached accounts are rather than implying they are live.
+
+Two layers, split the way the rest of this repo splits: `@crm/client` is pure — schemas,
+the outbox state machine, the backoff, and `classifyRowOutcome`, which maps every problem
+kind the API can answer with onto `retry`, `permanent`, `reauthenticate` or `stop` — and
+`apps/field` is the impure sibling that owns IndexedDB, `fetch`, PKCE and the DOM. 126
+tests cover the protocol without a browser; the browser run covers what they cannot.
+
+**No framework.** The bundle is zod and the app, for the reason the rest of this repo has
+no runtime dependencies: a rep's phone on rural 3G should not download a framework to show
+eight accounts and a form.
+
+**One origin.** Caddy serves the app and proxies `/v1` to the API, so the browser never
+makes a cross-origin request — which is why neither side has a line of CORS, and why
+putting the app on a second host would need one.
+
+**The paste-a-token login is compiled out of a production bundle**, not disabled by a flag:
+`NODE_ENV=production` removes the branch at build time, and `verify-image-build.sh` greps
+the built file to prove it. The same rule the scheduler applies to `ERP_TOKEN`, applied
+where a mis-copied config file cannot undo it.
+
+Still open: the IdP itself (Security's row in ADR-0001 — the harness signs with a stand-in),
+Capacitor packaging, iOS Safari, push instead of polling, and a generated client so the
+schemas cannot drift from the server's.
 
 ## Rules that are not negotiable
 

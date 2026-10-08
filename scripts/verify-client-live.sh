@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# The field client, in a real browser, against the real API and a real Postgres.
+#
+# WHY THIS EXISTS. ADR-0001's open table has carried one row longer than any other, and
+# in capitals: THERE IS NO CLIENT. Everything the CRM built for a device — visit ids
+# minted before the network exists (0012), `POST /v1/sync/visits` with per-row outcomes,
+# upsert-by-device-id so a replay cannot duplicate, `tenant_deleted` given its own problem
+# type so "a client holding a queue of unsent visits" knows to stop — was a guess about a
+# consumer that did not exist. Nothing consumed any of it.
+#
+# So this does, and it does it the only way that proves anything: a real Chromium, taken
+# OFFLINE mid-session with a visit half-recorded, and the row counted in Postgres from
+# outside the app. The unit tests in packages/client cover the protocol; they cannot tell
+# you whether IndexedDB survived the navigation, whether the service worker served the
+# shell with the network down, or whether the id the device minted is the primary key the
+# database ended up with.
+#
+# WHAT IT STANDS UP: a throwaway database with the ERP stand-in and all the CRM's
+# migrations, a stand-in IdP publishing a JWKS, the CRM's own `api` binary verifying
+# tokens against it, and a static server that serves the app and proxies /v1 from ONE
+# origin — which is deploy/Caddyfile's arrangement, and the reason this client needs no
+# CORS.
+#
+# WHAT IT DOES NOT PROVE: a real identity provider (the token is minted by the harness's
+# IdP stand-in, as §10 of the live-ERP check does), a real ERP behind the outbox, iOS
+# Safari, or a device under memory pressure. And it drives one browser engine: Chromium.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok()   { echo "ok: $*"; }
+
+WORK="$(mktemp -d)"
+API_PID=""
+IDP_PID=""
+WEB_PID=""
+CLIENT_DB="${CRM_CLIENT_DB:-crm_client_live_$$}"
+
+cleanup() {
+  for pid in "$WEB_PID" "$API_PID" "$IDP_PID"; do
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  done
+  # The screenshots and logs are the record of a failed run, so they are copied out
+  # before the directory goes.
+  if [ -n "${CRM_CLIENT_KEEP:-}" ]; then
+    echo "artifacts kept in $WORK" >&2
+  else
+    psql -d postgres -q -c "DROP DATABASE IF EXISTS $CLIENT_DB WITH (FORCE)" >/dev/null 2>&1 || true
+    rm -rf "$WORK"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+wait_for_line() {
+  local log="$1" pattern="$2" pid="$3" tries="$4" what="$5" i=0
+  while [ "$i" -lt "$tries" ]; do
+    if [ -f "$log" ] && grep -Eq "$pattern" "$log"; then return 0; fi
+    kill -0 "$pid" 2>/dev/null || { tail -20 "$log" >&2 2>/dev/null || true; fail "$what: the process exited first"; }
+    sleep 0.5
+    i=$((i + 1))
+  done
+  tail -20 "$log" >&2 2>/dev/null || true
+  fail "$what: nothing matching /$pattern/ within $((tries / 2))s"
+}
+
+# The harness talks to Postgres as the ADMIN — it creates a database and reads rows from
+# outside any tenant context, so an assertion cannot be satisfied by RLS hiding one. The
+# API below is given crm_app instead, which is the whole point of the separation.
+export PGUSER="${PGUSER:-postgres}"
+export PGHOST="${PGHOST:-/var/run/postgresql}"
+
+command -v psql >/dev/null || fail "psql not found"
+command -v node >/dev/null || fail "node not found"
+node -e 'if (typeof WebSocket !== "function") process.exit(1)' \
+  || fail "this Node has no global WebSocket; the browser driver needs Node >= 22"
+
+# ---------------------------------------------------------------------------
+echo "--- 1. build what is under test ---"
+# The SHIPPED artefacts, not the sources: the bundle a browser downloads and the dist the
+# API binary runs from. A check that compiled its own copy would be verifying something
+# nobody deploys.
+pnpm -s build >/dev/null 2>&1 || fail "pnpm build failed"
+(cd "$ROOT/apps/field" && node build.mjs >/dev/null) || fail "the app bundle failed to build"
+[ -f "$ROOT/apps/field/dist/app.js" ] || fail "no app bundle was produced"
+[ -f "$ROOT/packages/api/dist/bin/api.js" ] || fail "the API binary was not built"
+ok "app bundle $(du -k "$ROOT/apps/field/dist/app.js" | cut -f1) KB, and the API binary, both built"
+
+# ---------------------------------------------------------------------------
+echo "--- 2. a throwaway database with the ERP stand-in and every migration ---"
+psql -d postgres -q -c "DROP DATABASE IF EXISTS $CLIENT_DB WITH (FORCE)" >/dev/null 2>&1 || true
+psql -d postgres -q -c "CREATE DATABASE $CLIENT_DB" >/dev/null || fail "could not create $CLIENT_DB"
+PGDATABASE="$CLIENT_DB" "$ROOT/scripts/setup-test-db.sh" > "$WORK/setup.log" 2>&1 \
+  || { tail -15 "$WORK/setup.log" >&2; fail "the schema could not be built"; }
+ok "$CLIENT_DB has the ERP stand-in and $(grep -c 'applied' "$WORK/setup.log" >/dev/null && sed -n 's/^applied \([0-9]*\) application.*/\1/p' "$WORK/setup.log" | head -1) migrations"
+
+export PGDATABASE="$CLIENT_DB"
+TENANT="$(psql -At -c "SELECT gen_random_uuid()")"
+
+# ---------------------------------------------------------------------------
+echo "--- 3. a stand-in identity provider, publishing a JWKS ---"
+IDP_KID="$(node "$ROOT/scripts/live-erp/genkey.mjs" "$WORK" idp)" || fail "could not generate an IdP key"
+node "$ROOT/scripts/live-erp/jwks-server.mjs" 0 "$WORK/idp.jwk.json" > "$WORK/idp.log" 2>&1 &
+IDP_PID=$!
+wait_for_line "$WORK/idp.log" 'jwks listening on [0-9]+' "$IDP_PID" 40 "the IdP's JWKS"
+IDP_PORT="$(sed -n 's/^jwks listening on \([0-9]*\).*/\1/p' "$WORK/idp.log" | head -1)"
+ok "an IdP stand-in publishes $IDP_KID on 127.0.0.1:$IDP_PORT"
+
+# ---------------------------------------------------------------------------
+echo "--- 4. the rows a rep needs to exist at all ---"
+# Seeded as crm_app INSIDE a tenant context, for the reason ADR-0001 item 14 records: a
+# privileged insert with no context is the blind spot that let a fixture pass where the
+# app could not.
+psql -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL || fail "could not seed the rep, territory and accounts"
+BEGIN;
+SET ROLE crm_app;
+SELECT set_config('app.current_tenant_id', '$TENANT', true);
+
+INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, erp_employee_id, display_name, status)
+VALUES ('$TENANT', 'rep-ada', 'E-1', 'emp-1', 'Ada Lovelace', 'active');
+
+INSERT INTO crm.territory (tenant_id, code, name)
+VALUES ('$TENANT', 'T-LIVE', 'Live territory');
+
+INSERT INTO crm.territory_assignment (tenant_id, territory_id, rep_profile_id, role, valid_from)
+SELECT '$TENANT', t.id, r.id, 'primary', CURRENT_DATE - 1
+  FROM crm.territory t, crm.rep_profile r
+ WHERE t.code = 'T-LIVE' AND r.subject = 'rep-ada';
+
+INSERT INTO crm.account_assignment (tenant_id, erp_account_id, territory_id, valid_from)
+SELECT '$TENANT', a.id, t.id, CURRENT_DATE - 1
+  FROM crm.territory t, (VALUES ('acc-live-1'), ('acc-live-2')) AS a(id)
+ WHERE t.code = 'T-LIVE';
+
+INSERT INTO crm.account_snapshot (tenant_id, erp_account_id, name, status, country, erp_updated_at, synced_at)
+VALUES ('$TENANT', 'acc-live-1', 'St Mary''s Hospital', 'active', 'GB', now(), now()),
+       ('$TENANT', 'acc-live-2', 'Riverside Clinic', 'active', 'GB', now(), now());
+COMMIT;
+SQL
+ok "rep-ada holds T-LIVE, which covers acc-live-1 and acc-live-2 — and acc-not-mine is covered by nobody"
+
+# ---------------------------------------------------------------------------
+echo "--- 5. the CRM's own API binary ---"
+export LIVE_IDP_PEM="$WORK/idp.pem"
+export LIVE_OIDC_ISSUER="https://idp.test"
+export LIVE_OIDC_AUDIENCE="https://crm.test/api"
+export LIVE_TENANT_ID="$TENANT"
+# The API connects as the APPLICATION role, and its password has to be the one
+# setup-test-db.sh actually set — which is PGAPPPASSWORD. Hard-coding `crm_app` worked
+# over a unix socket, where peer auth ignores the password, and would have failed in CI
+# over TCP where scram does not.
+API_PGUSER="${CRM_PGUSER:-${PGAPPUSER:-crm_app}}"
+API_PGPASSWORD="${CRM_PGPASSWORD:-${PGAPPPASSWORD:-crm_app}}"
+( cd "$ROOT" \
+  && PGUSER="$API_PGUSER" PGPASSWORD="$API_PGPASSWORD" PGDATABASE="$CLIENT_DB" \
+     PORT=0 \
+     OIDC_ISSUER="$LIVE_OIDC_ISSUER" \
+     OIDC_AUDIENCE="$LIVE_OIDC_AUDIENCE" \
+     OIDC_JWKS_URL="http://127.0.0.1:$IDP_PORT/.well-known/jwks.json" \
+     exec node "$ROOT/packages/api/dist/bin/api.js" ) > "$WORK/api.out" 2> "$WORK/api.err" &
+API_PID=$!
+wait_for_line "$WORK/api.out" '"type":"listening"' "$API_PID" 120 "the API binary"
+API_PORT="$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$WORK/api.out" | head -1)"
+[ -n "$API_PORT" ] || fail "the API logged no port"
+ok "the API is listening on $API_PORT, verifying tokens against the IdP's JWKS"
+
+# ---------------------------------------------------------------------------
+echo "--- 6. one origin: the app's files, and /v1 proxied to the API ---"
+# deploy/Caddyfile's arrangement, which is why neither the app nor the API has any CORS.
+node "$ROOT/scripts/client/serve.mjs" "$ROOT/apps/field/dist" "http://127.0.0.1:$API_PORT" 0 > "$WORK/web.log" 2>&1 &
+WEB_PID=$!
+wait_for_line "$WORK/web.log" 'serving on [0-9]+' "$WEB_PID" 40 "the static server"
+WEB_PORT="$(sed -n 's/^serving on \([0-9]*\)$/\1/p' "$WORK/web.log" | head -1)"
+APP_URL="http://127.0.0.1:$WEB_PORT/"
+
+# Proven, not assumed: an unauthenticated API call through the SAME origin is still 401.
+THROUGH="$(curl -s -o /dev/null -w '%{http_code}' "${APP_URL%/}/v1/accounts")"
+[ "$THROUGH" = "401" ] || fail "an unauthenticated /v1/accounts through the app's origin answered $THROUGH, not 401"
+ok "the app is served at $APP_URL and /v1 reaches the API, which still refuses an anonymous call"
+
+# ---------------------------------------------------------------------------
+echo "--- 7. drive the app in a real browser ---"
+CRM_FIELD_TOKEN="$(node "$ROOT/scripts/live-erp/human-token.mjs" rep-ada)" || fail "could not mint a human token"
+export CRM_FIELD_TOKEN
+export CRM_FIELD_TENANT="$TENANT"
+export CRM_PGDATABASE="$CLIENT_DB"
+node "$ROOT/scripts/client/drive-app.mjs" "$APP_URL" "$WORK" | tee "$WORK/drive.log" \
+  || fail "the browser run reported failures (see the ok:/FAIL: lines above)"
+CHECKS="$(sed -n 's/^\([0-9]*\) checks, .*/\1/p' "$WORK/drive.log" | tail -1)"
+[ -n "$CHECKS" ] || fail "the browser run printed no check count"
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 8. the server's own view of what the client did ---"
+VISITS="$(psql -At -c "SELECT count(*) FROM crm.visit WHERE tenant_id = '$TENANT'")"
+[ "$VISITS" = "4" ] || fail "crm.visit holds $VISITS rows for this tenant, expected 4"
+DISTINCT_IDS="$(psql -At -c "SELECT count(DISTINCT id) FROM crm.visit WHERE tenant_id = '$TENANT'")"
+[ "$DISTINCT_IDS" = "4" ] || fail "4 rows but $DISTINCT_IDS distinct ids — a replay duplicated"
+V7="$(psql -At -c "SELECT count(*) FROM crm.visit WHERE tenant_id = '$TENANT' AND substring(id::text, 15, 1) = '7'")"
+[ "$V7" = "4" ] || fail "only $V7 of 4 visit ids are v7 — something other than the device minted one"
+ok "4 visits, 4 distinct device-minted v7 ids, no duplicates"
+
+REP_OWNED="$(psql -At -c "SELECT count(*) FROM crm.visit v JOIN crm.rep_profile r ON r.id = v.rep_profile_id WHERE v.tenant_id = '$TENANT' AND r.subject = 'rep-ada'")"
+[ "$REP_OWNED" = "4" ] || fail "$REP_OWNED of 4 visits are attributed to rep-ada"
+ok "every visit is attributed to the CALLER, which the API takes from the token and never from the body"
+
+echo
+echo "ok: $CHECKS checks in a real browser, against the real API binary and a real Postgres"
+echo "not proven here: a real IdP, a real ERP behind the outbox, Safari, or a device under memory pressure"

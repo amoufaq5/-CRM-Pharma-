@@ -167,6 +167,60 @@ jobs:
       - name: Verify the migration runner
         run: ./scripts/verify-migration-runner.sh
 
+  # The field client, driven in a real browser against the real API binary.
+  #
+  # ADR-0001's open table carried THERE IS NO CLIENT longer than any other row, and
+  # everything the CRM built for a device — ids minted before the network exists, per-row
+  # sync outcomes, upsert-by-device-id so a replay cannot duplicate — was a guess about a
+  # consumer that did not exist. This job is what stops it being a guess, and it is its
+  # own job because it needs a browser and a database and takes longer than the unit
+  # tests it complements.
+  #
+  # The browser is driven over the DevTools Protocol with no test framework: Node 22 ships
+  # a WebSocket client, the harness needs five verbs, and `Network.emulateNetworkConditions`
+  # is the one capability that matters — an offline-first client that has never been
+  # offline is a guess too.
+  field-client:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: crm_client
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGAPPPASSWORD: crm-test-app
+      # The harness creates its own throwaway database; this one just has to exist for
+      # the admin connection that creates it.
+      PGDATABASE: crm_client
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.33.0 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # A runner has Chrome; the harness finds it, or fails saying so rather than
+      # skipping. A browser check that skips when there is no browser is not a check.
+      - name: Drive the field client in a real browser
+        run: ./scripts/verify-client-live.sh
+
   # The deployment stack, in three layers of increasing cost.
   #
   # This job used to say the stack "has never been built or run — no Docker daemon has

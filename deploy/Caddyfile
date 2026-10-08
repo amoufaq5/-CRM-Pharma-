@@ -1,9 +1,15 @@
-# Automatic HTTPS for the CRM API.
+# Automatic HTTPS, the field client, and the API — on ONE origin.
 #
-# TLS terminates here, so the API itself never sees a certificate. It also means
-# the API must not be published directly — `expose` rather than `ports` in
-# compose keeps it on the internal network, which matters because the API trusts
-# the Authorization header and nothing else.
+# TLS terminates here, so the API itself never sees a certificate. It also means the API
+# must not be published directly — `expose` rather than `ports` in compose keeps it on the
+# internal network, which matters because the API trusts the Authorization header and
+# nothing else.
+#
+# THE ONE-ORIGIN ARRANGEMENT IS LOAD-BEARING, not tidiness. The browser downloads the app
+# from this host and calls `/v1/...` on this host, so it never makes a cross-origin
+# request — which is why neither the app nor the API has a line of CORS in it, and why
+# adding a second host for the app would need one. `scripts/verify-client-live.sh`
+# reproduces this split with a static server rather than assuming it.
 {
 	email {$ACME_EMAIL}
 }
@@ -11,8 +17,20 @@
 {$DOMAIN} {
 	encode zstd gzip
 
-	# The API is the whole surface; there is no web UI in this repo yet.
-	reverse_proxy api:8080
+	# The API's own paths. Everything else is the app.
+	@api path /v1/* /healthz /.well-known/*
+	handle @api {
+		reverse_proxy api:8080
+	}
+
+	handle {
+		root * /srv
+		# A single-page app: a deep link is the shell, which then renders the route. The
+		# service worker caches these files and never the API — a stale bundle is an
+		# inconvenience, a stale ANSWER is a lie.
+		try_files {path} /index.html
+		file_server
+	}
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
@@ -21,6 +39,11 @@
 		Referrer-Policy "strict-origin-when-cross-origin"
 		-Server
 	}
+
+	# config.json carries the API base url and the issuer, and an operator changing it
+	# must not be fighting a cached copy on every device.
+	@config path /config.json
+	header @config Cache-Control "no-store"
 
 	log {
 		output stdout

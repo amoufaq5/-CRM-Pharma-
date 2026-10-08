@@ -875,6 +875,75 @@ Concretely, and these specifics are the decision, not commentary on it:
     correction belongs here in the record rather than in a quietly amended sentence
     upstream. A red job that nobody reads is not a gate. It is a habit.
 
+25. **There is a client, and what it proves is the protocol rather than the product.**
+    Every increment before this one built for a consumer that did not exist. The ids
+    minted on the device (0012), `POST /v1/sync/visits` answering per row, the upsert that
+    makes a replay idempotent, `tenant_deleted` given its own problem type so "an offline
+    client holding a queue of unsent visits" would know to stop — all of it was a guess
+    about something that had never run. `packages/client` and `apps/field` are that
+    something.
+
+    **The split is the repo's own.** `@crm/client` is the contracts-and-engine layer: the
+    wire schemas, the outbox state machine, the backoff, the id minting, and
+    `classifyRowOutcome` — which maps every problem kind the API can answer with onto one
+    of five dispositions. It has no DOM, no `fetch` and no clock of its own, so 102 tests
+    cover the offline protocol without a browser. `apps/field` is the impure sibling:
+    IndexedDB, `fetch`, PKCE, a service worker, and a hand-rolled renderer. No framework,
+    for the reason the rest of this repo has no runtime dependencies — a rep's phone on
+    rural 3G should not download a framework to show eight accounts and a form.
+
+    **The classification is the design.** An offline queue gets this wrong by default in
+    one of two ways, both silent: retry everything, and it spins forever on a visit the
+    server will never accept; drop what failed, and a rep's call report disappears because
+    a lot expired. So every kind is classified by hand — `retry` for the three transient
+    ones, `permanent` for the sixteen the server understood and refuses, `reauthenticate`
+    for 401, and `stop` for `tenant_deleted`, the one disposition that condemns the whole
+    queue because every other row is bound for the same dead tenant. An UNKNOWN kind is
+    permanent, deliberately: a refusal this client has never heard of is far likelier to be
+    a rule it is breaking than a hiccup, and it is surfaced by name as "the server refused
+    this with X, which this client does not recognise" — a bug report rather than a loop.
+
+    **A refused visit is kept, not dropped.** It sits on screen as `rejected` with the
+    server's own sentence, and only a person's click discards it. A visit that happened is
+    not deleted by a 403.
+
+    **THREE DEFECTS THE LIVE RUN FOUND**, none of which a unit test would have:
+
+    1. **"Sync now" did nothing for up to half an hour.** One failed attempt backs a row
+       off 15 seconds, doubling to thirty minutes. The rep then regains signal, sees
+       "online", presses the button — and `dueEntries` correctly answers that nothing is
+       due. The fix is `reviveDue`: a connectivity transition and an explicit request are
+       both new information that the backoff's premise is gone, so the wait is void for
+       pending rows and untouched for refused ones.
+    2. **An entry whose key was not its own visit id was immortal.** The server echoes the
+       id it was sent, the fold matches on the entry's key, the two never meet — so the row
+       was re-sent on every drain, never accepted, never rejected, never reported. Produced
+       by a test fixture that minted two ids while testing something else;
+       `enqueueVisit` cannot produce it, but an older build or a hand-edited store can.
+       Now refused visibly by `rejectUnreconcilable` before anything is sent.
+    3. **The image built the app's manifest but not its sources.** `COPY packages/` without
+       `COPY apps/`, so `tsc --build` passed, pnpm linked the workspace correctly, and the
+       bundle step had nothing to bundle. Caught by `verify-image-build.sh` before Docker
+       ever ran it.
+
+    **Deployment is one origin, and that is why there is no CORS anywhere.** The
+    Dockerfile's new `web` target is caddy:2 plus the bundle the build stage produced;
+    Caddy serves `/srv` and proxies `/v1`, `/healthz` and `/.well-known` to the API. A
+    browser that never makes a cross-origin request needs no preflight to be allowed, so
+    the API still has no CORS layer and does not need one — and
+    `scripts/verify-client-live.sh` reproduces the same split with a static server rather
+    than assuming it. The production bundle also has the paste-a-token login path compiled
+    OUT entirely (`NODE_ENV=production` at build time, not a runtime flag), which the
+    replay script asserts by grepping the built file — the same rule the scheduler applies
+    to `ERP_TOKEN`, applied where no config file can flip it.
+
+    **What this does not settle.** Roughly 90 of the 104 routes still have no screen: every
+    sample path, call plans, expenses, notifications, the manager's views, all of admin.
+    The client's copy of the wire schemas can drift from the server's, and nothing compares
+    them statically — the live run is what catches it, and a generated client is the real
+    fix. Push is polling. There is no Capacitor wrapper, no iOS Safari run, and no device
+    under memory pressure.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1288,7 +1357,7 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS NO CLIENT.** The CRM is an API and a background process: 16 packages, 54 migrations, 104 routes, no web UI, no mobile app, no on-device store. This is the largest thing not written down anywhere until now, and it matters more than its one row suggests, because "offline-first" is load-bearing in the brief and a great deal of this system exists to serve a client that does not exist: device-minted ids for idempotent replay (0017), `POST /v1/sync/visits` and the per-row batch results, the `UiSchema`-free hand-rolled route surface, the staleness question below, and the signature capture that commits to bytes no app has produced. Every one of those is a guess about a consumer until something consumes it. Choosing the shape — a PWA like the ERP's `operate-web`, a Capacitor wrapper, or native — is a product decision with a long tail, not an increment to slot in. | Product | _set a date_ |
+| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 32 checks in a real Chromium taken offline mid-session, against the real API binary, counting rows in Postgres. **What is NOT built is most of the product**: samples (disbursements, counts, transfers, returns, obligations), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 90 of the 104 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 

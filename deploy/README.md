@@ -7,10 +7,17 @@ Three processes and a TLS edge:
 | `migrate` | one-shot | brings the `crm` schema up to date, then exits 0 |
 | `api` | long-running | the HTTP API reps and the web client talk to |
 | `scheduler` | long-running | drains the outbox to the ERP, refreshes snapshots |
-| `caddy` | long-running | automatic HTTPS in front of `api` |
+| `caddy` | long-running | automatic HTTPS, the field client's files, and the proxy to `api` |
 
-All three run the **same image** with different entrypoints, so what is tested is
-what ships.
+The first three run the **same image** with different entrypoints, so what is tested is
+what ships. `caddy` is the same Dockerfile's `web` target: caddy:2 plus the field client's
+bundle, produced by that build stage from the committed sources — so the files a browser
+downloads cannot drift from the API they call.
+
+**One origin is load-bearing, not tidiness.** The app is served from this host and calls
+`/v1/...` on this host, so the browser never makes a cross-origin request — which is why
+neither the app nor the API contains a line of CORS. Serving the app from a second host
+would need one.
 
 > **Status.** The stack **has been built and run** — image, migrations, api,
 > scheduler, and a real Postgres — and that is new as of 2026-10-07. Everything in

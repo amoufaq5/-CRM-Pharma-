@@ -85,6 +85,12 @@ describe("toProblem covers every domain error", () => {
       "snapshot refresh, run by the scheduler. Not a dependency of @crm/api. Its one error, " +
       "`CoercionError`, rejects a record whose ERP value will not coerce into a typed column " +
       "(rule 4) and is reported as a `RejectedRecord` in the refresh result, never to a caller",
+    "@crm/client":
+      "the field client's pure layer, which runs in a BROWSER. It is the other end of this " +
+      "file: it CONSUMES the problem kinds toProblem produces, and classifies each one as " +
+      "retry, permanent, reauthenticate or stop (`classifyRowOutcome`). It is not a " +
+      "dependency of @crm/api — the arrow points the other way — and it declares no error " +
+      "class, because a client that threw on a refusal could not queue it",
     "@crm/erasure":
       "the retention disposition register and the erasure plan (0051), reached only by the " +
       "`crm-erasure` CLI. Not a dependency of @crm/api, and deliberately not reachable over " +
