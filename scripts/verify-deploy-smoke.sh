@@ -246,11 +246,28 @@ PY
 dc up -d --force-recreate scheduler >/dev/null 2>&1 || fail "could not restart the scheduler with a key"
 started=""
 for _ in $(seq 1 15); do
-  if dc logs scheduler 2>&1 | grep -q '"type":"started"'; then started=yes; break; fi
+  # Both lines, not just "started". The credential line is what carries the kid, and it
+  # is emitted BEFORE the schedulers are wired — so waiting on "started" alone was
+  # waiting on the wrong evidence, and would read a missing credential line as a wrong
+  # key rather than as a slow boot.
+  if dc logs scheduler 2>&1 | grep -q '"type":"started"' \
+    && dc logs scheduler 2>&1 | grep -q '"type":"credential"'; then started=yes; break; fi
   sleep 2
 done
-[ -n "$started" ] || { dc logs scheduler 2>&1 | tail -10 >&2; fail "the scheduler never started with a credential"; }
-dc logs scheduler 2>&1 | grep -q "\"kid\":\"$kid\"" || fail "the scheduler is not signing with the key that was just published"
+[ -n "$started" ] || { dc logs scheduler 2>&1 | tail -20 >&2; fail "the scheduler never started with a credential"; }
+if ! dc logs scheduler 2>&1 | grep -q "\"kid\":\"$kid\""; then
+  # The evidence, not just the verdict. Without this the failure says the key is wrong
+  # and gives no way to tell a wrong key from a missing credential line, a static
+  # fallback (which logs "kid":null), or a PEM the env file mangled.
+  echo "expected kid: $kid" >&2
+  echo "credential line(s) the scheduler logged:" >&2
+  dc logs scheduler 2>&1 | grep '"type":"credential"' >&2 || echo "  (none)" >&2
+  echo "published line(s) the generator logged:" >&2
+  grep '"type":"published"' "$WORK/key.log" >&2 || echo "  (none)" >&2
+  echo "scheduler tail:" >&2
+  dc logs scheduler 2>&1 | tail -20 >&2
+  fail "the scheduler is not signing with the key that was just published"
+fi
 ok "scheduler running, signing with $kid"
 
 # The two halves of the credential, across two containers: the scheduler holds the
