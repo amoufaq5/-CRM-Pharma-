@@ -169,3 +169,74 @@ export function problemKind(type: string): string {
   const tail = type.startsWith(`${PROBLEM_BASE}/`) ? type.slice(PROBLEM_BASE.length + 1) : type;
   return tail.replaceAll("-", "_");
 }
+
+// ---- samples --------------------------------------------------------------
+
+/**
+ * What `POST /v1/samples/disbursements` and each element of `POST /v1/sync/disbursements`
+ * accept — the act at the centre of a pharma field visit, and the one with legal weight.
+ *
+ * `signatureSha256` IS THE DESIGN, and it shapes everything the client does here. The
+ * ledger row commits to the digest of bytes the device captured; the bytes themselves go
+ * up separately, to a route that 404s until this row exists. So a disbursement recorded
+ * at a clinic desk with no signal is TWO queued things in a fixed order, and the second
+ * cannot be sent until the first has been accepted. That is why the outbox grew
+ * dependencies.
+ *
+ * `quantity` is a string here rather than a number, and deliberately: the column is
+ * `numeric(16,3)` and a float cannot represent 0.1. The server accepts either; sending
+ * the decimal as text is the only form that cannot lose a third decimal place on the way.
+ */
+export const DisbursementBody = z.object({
+  id: Uuid,
+  lotId: Uuid,
+  quantity: z.string().regex(/^\d{1,13}(\.\d{1,3})?$/, "expected a decimal quantity"),
+  occurredAt: z.string().datetime(),
+  erpAccountId: ErpRecordId,
+  erpContactId: ErpRecordId.nullish(),
+  recipientName: z.string().min(1).max(200),
+  signatureSha256: z.string().regex(/^[0-9a-f]{64}$/, "expected a lowercase sha256 hex digest"),
+  visitId: Uuid.nullish(),
+});
+export type DisbursementBody = z.infer<typeof DisbursementBody>;
+
+export const ATTACHMENT_CONTENT_TYPES = ["image/png", "image/jpeg", "application/pdf"] as const;
+
+/** `MAX_ATTACHMENT_BYTES` in @crm/storage, which the API enforces. 512 KiB. */
+export const MAX_ATTACHMENT_BYTES = 524_288;
+export const MAX_ATTACHMENT_BASE64_CHARS = 4 * Math.ceil(MAX_ATTACHMENT_BYTES / 3);
+
+/**
+ * The signature itself, for `POST /v1/samples/disbursements/:id/signature`.
+ *
+ * There is no `sha256` field and that is the server's choice, not an omission: it computes
+ * the digest from the bytes it received and compares it to what the ledger committed. A
+ * client that sent its own digest would be asserting the thing under test.
+ */
+export const SignatureBody = z.object({
+  id: Uuid,
+  contentType: z.enum(ATTACHMENT_CONTENT_TYPES),
+  contentBase64: z.string().min(1).max(MAX_ATTACHMENT_BASE64_CHARS),
+});
+export type SignatureBody = z.infer<typeof SignatureBody>;
+
+/** A row of `GET /v1/samples/holdings`: what this rep is carrying. */
+export const Holding = z.object({
+  rep_profile_id: Uuid,
+  lot_id: Uuid,
+  erp_item_id: z.string(),
+  lot_number: z.string(),
+  expiry_date: z.string().nullable(),
+  material_kind: z.string(),
+  // Text, because the column is numeric(16,3) and JSON numbers are doubles. Parsing it
+  // into a float to show it would reintroduce exactly the error the column type avoids.
+  quantity_on_hand: z.string(),
+  quantity_in_transit: z.string(),
+});
+export type Holding = z.infer<typeof Holding>;
+
+export const HoldingList = z.object({ data: z.array(Holding) });
+
+export const Disbursement = z
+  .object({ id: Uuid, lot_id: Uuid, quantity: z.string(), signature_sha256: z.string() })
+  .passthrough();

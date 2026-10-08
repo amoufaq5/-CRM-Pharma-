@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { VisitBody } from "./api.js";
+import type { DisbursementBody, VisitBody } from "./api.js";
 import {
   DEFAULT_BACKOFF,
   applyBatchFailure,
@@ -11,14 +11,57 @@ import {
   rejectUnreconcilable,
   reviveDue,
   summariseOutbox,
+  enqueueDisbursement,
+  enqueueSignature,
+  rejectOrphanedDependents,
+  type DisbursementEntry,
   type OutboxEntry,
+  type SignatureEntry,
+  type VisitEntry,
 } from "./outbox.js";
 
 const body = (id: string, account = "ACC-1"): VisitBody => ({ id, erpAccountId: account });
 
-const entry = (over: Partial<OutboxEntry> & { id: string }): OutboxEntry => ({
+/**
+ * A visit entry. Typed as `VisitEntry` rather than `OutboxEntry` deliberately: under the
+ * union, spreading a partial over a base makes `kind` a union of all three and nothing is
+ * assignable to anything. One helper per kind keeps the discriminant pinned.
+ */
+const entry = (over: Partial<VisitEntry> & { id: string }): VisitEntry => ({
   kind: "visit",
   body: body(over.id),
+  state: "pending",
+  attempts: 0,
+  nextAttemptAt: 0,
+  queuedAt: 0,
+  ...over,
+});
+
+const disbursement = (id: string): DisbursementBody => ({
+  id,
+  lotId: "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c1e",
+  quantity: "2",
+  occurredAt: "2026-10-08T09:00:00.000Z",
+  erpAccountId: "ACC-1",
+  recipientName: "Dr Ada",
+  signatureSha256: "a".repeat(64),
+});
+
+const disbursementEntry = (over: Partial<DisbursementEntry> & { id: string }): DisbursementEntry => ({
+  kind: "disbursement",
+  body: disbursement(over.id),
+  state: "pending",
+  attempts: 0,
+  nextAttemptAt: 0,
+  queuedAt: 0,
+  ...over,
+});
+
+const signatureEntry = (
+  over: Partial<SignatureEntry> & { id: string; dependsOn: string },
+): SignatureEntry => ({
+  kind: "signature",
+  body: { id: over.id, contentType: "image/png", contentBase64: "aGk=" },
   state: "pending",
   attempts: 0,
   nextAttemptAt: 0,
@@ -39,7 +82,9 @@ describe("enqueueVisit", () => {
     const first = enqueueVisit([], body("a", "ACC-1"), 1000);
     const second = enqueueVisit(first, body("a", "ACC-2"), 5000);
     expect(second).toHaveLength(1);
-    expect(second[0]?.body.erpAccountId).toBe("ACC-2");
+    const replaced = second[0];
+    expect(replaced?.kind).toBe("visit");
+    expect(replaced?.kind === "visit" ? replaced.body.erpAccountId : null).toBe("ACC-2");
   });
 
   it("keeps the original queue time when a row is replaced, and restarts its backoff", () => {
@@ -260,5 +305,86 @@ describe("rejectUnreconcilable", () => {
     const out = enqueueVisit([], body("x"), 1);
     expect(out[0]?.id).toBe(out[0]?.body.id);
     expect(rejectUnreconcilable(out).refused).toEqual([]);
+  });
+});
+
+describe("dependencies", () => {
+  it("holds a signature back while its disbursement is still queued", () => {
+    // `POST /v1/samples/disbursements/:id/signature` answers 404 until that row exists,
+    // and a 404 is permanent. A signature sent early would be refused forever for a
+    // reason that was only ever about timing.
+    const entries = [disbursementEntry({ id: "d1" }), signatureEntry({ id: "s1", dependsOn: "d1" })];
+    expect(dueEntries(entries, 1000).map((e) => e.id)).toEqual(["d1"]);
+    expect(dueEntries(entries, 1000, 200, "signature")).toEqual([]);
+  });
+
+  it("releases the signature once the disbursement has left the queue", () => {
+    // Absence IS acceptance: the queue is this device's whole memory of what is unsent, so
+    // a row that is gone is a row the server took — and that reading survives a restart
+    // where a flag would not.
+    const entries = [signatureEntry({ id: "s1", dependsOn: "d1" })];
+    expect(dueEntries(entries, 1000).map((e) => e.id)).toEqual(["s1"]);
+  });
+
+  it("does not release a signature whose disbursement is merely backed off", () => {
+    const entries = [
+      disbursementEntry({ id: "d1", nextAttemptAt: 9_000_000, attempts: 2 }),
+      signatureEntry({ id: "s1", dependsOn: "d1" }),
+    ];
+    expect(dueEntries(entries, 1000)).toEqual([]);
+  });
+
+  it("enqueueSignature records which disbursement it belongs to", () => {
+    const queued = enqueueSignature([], { id: "s1", contentType: "image/png", contentBase64: "aGk=" }, "d1", 500);
+    expect(queued[0]).toMatchObject({ kind: "signature", dependsOn: "d1", state: "pending", queuedAt: 500 });
+  });
+
+  it("queues a disbursement like any other record, keyed by its own id", () => {
+    const queued = enqueueDisbursement([], disbursement("d1"), 500);
+    expect(queued[0]).toMatchObject({ kind: "disbursement", id: "d1", state: "pending" });
+    expect(queued[0]?.id).toBe(queued[0]?.body.id);
+  });
+});
+
+describe("rejectOrphanedDependents", () => {
+  it("REFUSES a signature whose disbursement was refused, naming the cause", () => {
+    // Otherwise it is the immortal row in another costume: never sent (its dependency is
+    // still in the queue), never reported, and counted as "waiting to send" on a screen
+    // telling a rep their day has not gone in yet.
+    const entries = [
+      disbursementEntry({ id: "d1", state: "rejected", lastReason: "lot LOT-1 expired on 2026-09-01" }),
+      signatureEntry({ id: "s1", dependsOn: "d1" }),
+    ];
+    const out = rejectOrphanedDependents(entries);
+    expect(out.refused).toHaveLength(1);
+    expect(out.refused[0]?.id).toBe("s1");
+    expect(out.refused[0]?.reason).toContain("the disbursement it belongs to was refused");
+    expect(out.refused[0]?.reason).toContain("lot LOT-1 expired");
+    expect(out.entries.find((e) => e.id === "s1")?.state).toBe("rejected");
+  });
+
+  it("blocks a signature whose disbursement is blocked, rather than rejecting it", () => {
+    // A blocked queue is a deleted tenant, not a bad row: the distinction is what tells a
+    // rep whether anything can ever be done about it.
+    const entries = [
+      disbursementEntry({ id: "d1", state: "blocked", lastReason: "tenant deleted" }),
+      signatureEntry({ id: "s1", dependsOn: "d1" }),
+    ];
+    const out = rejectOrphanedDependents(entries);
+    expect(out.entries.find((e) => e.id === "s1")?.state).toBe("blocked");
+  });
+
+  it("leaves a signature alone while its disbursement is still pending", () => {
+    const entries = [disbursementEntry({ id: "d1" }), signatureEntry({ id: "s1", dependsOn: "d1" })];
+    expect(rejectOrphanedDependents(entries).refused).toEqual([]);
+  });
+
+  it("leaves a signature alone when its disbursement has already been accepted", () => {
+    // Gone from the queue is the success case, and it must not be read as a missing
+    // prerequisite — that would refuse the signature at the exact moment it became
+    // sendable.
+    const entries = [signatureEntry({ id: "s1", dependsOn: "d1" })];
+    expect(rejectOrphanedDependents(entries).refused).toEqual([]);
+    expect(rejectOrphanedDependents(entries).entries[0]?.state).toBe("pending");
   });
 });

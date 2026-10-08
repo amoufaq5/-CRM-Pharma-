@@ -1,4 +1,4 @@
-import type { VisitBody } from "./api.js";
+import type { DisbursementBody, SignatureBody, VisitBody } from "./api.js";
 import { SYNC_BATCH_MAX } from "./api.js";
 import { classifyRowOutcome, type Disposition, type RowOutcome } from "./outcome.js";
 
@@ -18,10 +18,20 @@ import { classifyRowOutcome, type Disposition, type RowOutcome } from "./outcome
 export const OUTBOX_STATES = ["pending", "rejected", "blocked"] as const;
 export type OutboxState = (typeof OUTBOX_STATES)[number];
 
-export interface OutboxEntry {
+/**
+ * The kinds, in the order they must be SENT.
+ *
+ * Not alphabetical and not arbitrary: a signature's upload route 404s until its
+ * disbursement exists, so signatures go last — and in the same pass, because a
+ * disbursement accepted at the top of a drain leaves the queue and unblocks its signature
+ * before the loop reaches it. A rep who signed at a clinic desk with no signal gets both
+ * halves in one reconnection rather than two.
+ */
+export const OUTBOX_KINDS = ["visit", "disbursement", "signature"] as const;
+export type OutboxKind = (typeof OUTBOX_KINDS)[number];
+
+interface OutboxEntryBase {
   readonly id: string;
-  readonly kind: "visit";
-  readonly body: VisitBody;
   readonly state: OutboxState;
   /** How many times this row has been SENT, not how many batches it rode in. */
   readonly attempts: number;
@@ -30,7 +40,35 @@ export interface OutboxEntry {
   readonly queuedAt: number;
   readonly lastReason?: string;
   readonly lastType?: string;
+  /**
+   * Another entry's id that must be ACCEPTED before this one can be sent.
+   *
+   * Only a signature has one today, and it names its disbursement. "Accepted" is read as
+   * "no longer in the queue", which is the only definition that survives a restart: the
+   * queue is the whole of this device's memory, so a row that left it is a row the server
+   * took.
+   */
+  readonly dependsOn?: string;
 }
+
+export interface VisitEntry extends OutboxEntryBase {
+  readonly kind: "visit";
+  readonly body: VisitBody;
+}
+
+export interface DisbursementEntry extends OutboxEntryBase {
+  readonly kind: "disbursement";
+  readonly body: DisbursementBody;
+}
+
+export interface SignatureEntry extends OutboxEntryBase {
+  readonly kind: "signature";
+  readonly body: SignatureBody;
+  /** The disbursement this signature belongs to. Required, unlike the base's. */
+  readonly dependsOn: string;
+}
+
+export type OutboxEntry = VisitEntry | DisbursementEntry | SignatureEntry;
 
 export interface BackoffPolicy {
   /** First delay, doubled per attempt. */
@@ -53,24 +91,66 @@ export function backoffMs(attempts: number, policy: BackoffPolicy, random: () =>
   return Math.round(raw - spread / 2 + random() * spread);
 }
 
-export function enqueueVisit(
+/**
+ * Queue one record, keyed by its own id.
+ *
+ * One slot per record, whatever the kind: the entry id IS the record id, the server
+ * upserts by it, and editing something unsent replaces its body rather than queuing a
+ * second write of the same thing.
+ */
+export function enqueue(
   entries: readonly OutboxEntry[],
-  body: VisitBody,
+  next: NewOutboxEntry,
   now: number,
 ): readonly OutboxEntry[] {
-  const existing = entries.find((e) => e.id === body.id);
-  const entry: OutboxEntry = {
-    id: body.id,
-    kind: "visit",
-    body,
-    state: "pending",
-    // A re-queued row starts its backoff over: the body changed, so the previous
-    // refusal was about something that no longer exists.
+  const existing = entries.find((e) => e.id === next.id);
+  const entry = {
+    ...next,
+    state: "pending" as const,
+    // A re-queued row starts its backoff over: the body changed, so the previous refusal
+    // was about something that no longer exists.
     attempts: 0,
     nextAttemptAt: now,
     queuedAt: existing?.queuedAt ?? now,
-  };
-  return existing === undefined ? [...entries, entry] : entries.map((e) => (e.id === body.id ? entry : e));
+  } as OutboxEntry;
+  return existing === undefined ? [...entries, entry] : entries.map((e) => (e.id === next.id ? entry : e));
+}
+
+/** The fields `enqueue` sets itself, so a caller supplies only the record. */
+type OutboxEntryStatus = Pick<OutboxEntryBase, "state" | "attempts" | "nextAttemptAt" | "queuedAt">;
+
+export type NewOutboxEntry =
+  | Omit<VisitEntry, keyof OutboxEntryStatus>
+  | Omit<DisbursementEntry, keyof OutboxEntryStatus>
+  | Omit<SignatureEntry, keyof OutboxEntryStatus>;
+
+export function enqueueVisit(entries: readonly OutboxEntry[], body: VisitBody, now: number): readonly OutboxEntry[] {
+  return enqueue(entries, { id: body.id, kind: "visit", body }, now);
+}
+
+export function enqueueDisbursement(
+  entries: readonly OutboxEntry[],
+  body: DisbursementBody,
+  now: number,
+): readonly OutboxEntry[] {
+  return enqueue(entries, { id: body.id, kind: "disbursement", body }, now);
+}
+
+/**
+ * A signature, which cannot be sent until its disbursement has been.
+ *
+ * `dependsOn` is the disbursement's id rather than a flag, because the ORDER is the
+ * contract: `POST /v1/samples/disbursements/:id/signature` answers 404 while that row does
+ * not exist, and a 404 is permanent — a signature sent too early would be refused forever
+ * for a reason that was only ever about timing.
+ */
+export function enqueueSignature(
+  entries: readonly OutboxEntry[],
+  body: SignatureBody,
+  disbursementId: string,
+  now: number,
+): readonly OutboxEntry[] {
+  return enqueue(entries, { id: body.id, kind: "signature", body, dependsOn: disbursementId }, now);
 }
 
 /**
@@ -87,12 +167,49 @@ export function dueEntries(
   entries: readonly OutboxEntry[],
   now: number,
   limit: number = SYNC_BATCH_MAX,
+  kind?: OutboxKind,
 ): readonly OutboxEntry[] {
+  // "In the queue" is the whole test for an unsatisfied dependency. A row that has left
+  // it was accepted — the queue is this device's entire memory of what is unsent, so
+  // absence is acceptance, and that reading survives a restart where a flag would not.
+  const present = new Set(entries.map((e) => e.id));
   return entries
-    .filter((e) => e.state === "pending" && e.nextAttemptAt <= now)
+    .filter(
+      (e) =>
+        e.state === "pending" &&
+        e.nextAttemptAt <= now &&
+        (kind === undefined || e.kind === kind) &&
+        (e.dependsOn === undefined || !present.has(e.dependsOn)),
+    )
     .slice()
     .sort((a, b) => a.queuedAt - b.queuedAt || (a.id < b.id ? -1 : 1))
     .slice(0, Math.max(0, Math.min(limit, SYNC_BATCH_MAX)));
+}
+
+/**
+ * A row whose prerequisite will never land cannot land either, so it is refused now.
+ *
+ * The alternative is the immortal-row failure in another costume: a signature waiting on a
+ * disbursement the server refused would sit pending forever, never sent (its dependency
+ * is still in the queue), never reported, and counted as "waiting to send" on a screen
+ * that says a rep's day has not gone in yet. One refusal propagates, naming the row it
+ * came from, because "your signature could not be filed because the disbursement was
+ * refused" is the sentence a person can act on.
+ */
+export function rejectOrphanedDependents(
+  entries: readonly OutboxEntry[],
+): { readonly entries: readonly OutboxEntry[]; readonly refused: readonly { readonly id: string; readonly reason: string }[] } {
+  const byId = new Map(entries.map((e) => [e.id, e]));
+  const refused: { id: string; reason: string }[] = [];
+  const next = entries.map((entry) => {
+    if (entry.state !== "pending" || entry.dependsOn === undefined) return entry;
+    const parent = byId.get(entry.dependsOn);
+    if (parent === undefined || parent.state === "pending") return entry;
+    const reason = `the ${parent.kind} it belongs to was ${parent.state === "blocked" ? "blocked" : "refused"}: ${parent.lastReason ?? "no reason given"}`;
+    refused.push({ id: entry.id, reason });
+    return { ...entry, state: parent.state, lastReason: reason };
+  });
+  return { entries: next, refused };
 }
 
 export interface ApplyResult {

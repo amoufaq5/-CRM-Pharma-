@@ -1,8 +1,13 @@
 import {
   Account,
   AccountList,
+  DisbursementBody,
+  Holding,
+  HoldingList,
   Me,
   VisitBody,
+  enqueueDisbursement,
+  enqueueSignature,
   enqueueVisit,
   mintUuidV7,
   summariseOutbox,
@@ -12,6 +17,8 @@ import {
   type OutboxEntry,
   type SyncReport,
 } from "@crm/client";
+
+import { capture, createSignaturePad, type SignaturePad } from "./signature.js";
 
 import { beginLogin, completeLogin, isExpired, readCallback, sessionStorageAuth, type Session } from "./auth.js";
 import { loadConfig, type FieldConfig } from "./config.js";
@@ -41,11 +48,14 @@ interface State {
   session: Session | null;
   me: Me | null;
   accounts: readonly Account[];
+  holdings: readonly Holding[];
   cachedAt: number | null;
   outbox: readonly OutboxEntry[];
   online: boolean;
   /** The account a visit is being recorded against, if the form is open. */
   recording: Account | null;
+  /** The lot being disbursed, if that form is open. */
+  disbursing: Holding | null;
   message: { kind: "good" | "warn" | "error"; text: string } | null;
   blocked: string | null;
   syncing: boolean;
@@ -57,10 +67,12 @@ const state: State = {
   session: null,
   me: null,
   accounts: [],
+  holdings: [],
   cachedAt: null,
   outbox: [],
   online: navigator.onLine,
   recording: null,
+  disbursing: null,
   message: null,
   blocked: null,
   syncing: false,
@@ -68,6 +80,8 @@ const state: State = {
 
 let store: ClientStore | null = null;
 let transport: ApiTransport | null = null;
+/** The live pad, so a re-render can detach the old canvas's listeners. */
+let pad: SignaturePad | null = null;
 
 const app = (): HTMLElement => {
   const el = document.getElementById("app");
@@ -81,6 +95,25 @@ function text(value: string | null | undefined, fallback = "—"): string {
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c);
+}
+
+/**
+ * What a queued row IS, in a rep's words.
+ *
+ * The type system asked for this: under the entry union, rendering `body.erpAccountId`
+ * stopped compiling, and the reason it stopped is the reason the UI was wrong — "ACC-1"
+ * tells a rep nothing about which of two refused things it was. A disbursement names the
+ * recipient; a signature names the disbursement it belongs to.
+ */
+function describeEntry(entry: OutboxEntry): string {
+  switch (entry.kind) {
+    case "visit":
+      return `Visit — ${entry.body.erpAccountId}`;
+    case "disbursement":
+      return `Samples to ${entry.body.recipientName} — ${entry.body.quantity} unit(s)`;
+    case "signature":
+      return `Signature for disbursement ${entry.dependsOn.slice(0, 8)}`;
+  }
 }
 
 function ago(from: number | null, now: number): string {
@@ -140,7 +173,14 @@ function render(): void {
   }
 
   parts.push(renderOutbox(summary, now));
-  parts.push(state.recording !== null ? renderVisitForm(state.recording) : renderAccounts(now));
+  if (state.recording !== null) {
+    parts.push(renderVisitForm(state.recording));
+  } else if (state.disbursing !== null) {
+    parts.push(renderDisburseForm(state.disbursing));
+  } else {
+    parts.push(renderAccounts(now));
+    parts.push(renderHoldings(now));
+  }
 
   root.innerHTML = parts.join("");
   wireReady();
@@ -192,7 +232,7 @@ function renderOutbox(summary: ReturnType<typeof summariseOutbox>, now: number):
       <ul class="list">
         ${rejected
           .map(
-            (e) => `<li><span class="grow"><span class="name">${escapeHtml(e.body.erpAccountId)}</span>
+            (e) => `<li><span class="grow"><span class="name">${escapeHtml(describeEntry(e))}</span>
               <span class="meta error">${escapeHtml(e.lastReason ?? "refused")}</span></span>
               <button class="secondary" data-discard="${escapeHtml(e.id)}">Discard</button></li>`,
           )
@@ -224,6 +264,69 @@ function renderAccounts(now: number): string {
         .join("")}
     </ul>
     <div class="actions"><button id="refresh" class="secondary" ${state.online ? "" : "disabled"}>Refresh</button></div>
+  </section>`;
+}
+
+function renderHoldings(now: number): string {
+  if (state.holdings.length === 0) {
+    return `<section><h2>My samples</h2>
+      <p class="note">No stock is cached on this device${state.online ? "" : ", and there is no network to fetch it"}.
+      A rep holds material only after confirming receipt from a warehouse.</p></section>`;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  return `<section>
+    <h2>My samples (${state.holdings.length} lot(s))</h2>
+    <ul class="list">
+      ${state.holdings
+        .map((h) => {
+          // Expiry is the one fact a rep must not have to work out: disbursing an expired
+          // lot is refused by the database, and finding that out through a queued refusal
+          // hours later is the worst way to learn it.
+          const expired = h.expiry_date !== null && h.expiry_date <= today;
+          return `<li><span class="grow">
+            <span class="name">${escapeHtml(h.lot_number)} · ${escapeHtml(h.erp_item_id)}</span>
+            <span class="meta${expired ? " error" : ""}">${escapeHtml(h.quantity_on_hand)} on hand${h.expiry_date !== null ? ` · expires ${escapeHtml(h.expiry_date)}${expired ? " — EXPIRED" : ""}` : ""}${Number(h.quantity_in_transit) > 0 ? ` · ${escapeHtml(h.quantity_in_transit)} in transit` : ""}</span>
+          </span>
+          <button data-disburse="${escapeHtml(h.lot_id)}" ${expired || Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Disburse</button></li>`;
+        })
+        .join("")}
+    </ul>
+  </section>`;
+}
+
+function renderDisburseForm(holding: Holding): string {
+  return `<section>
+    <h2>Disburse — ${escapeHtml(holding.lot_number)}</h2>
+    <form id="disburse-form">
+      <div class="row">
+        <label>To account
+          <select name="erpAccountId">
+            ${state.accounts
+              .map((a) => `<option value="${escapeHtml(a.erp_account_id)}">${escapeHtml(text(a.name, a.erp_account_id))}</option>`)
+              .join("")}
+          </select>
+        </label>
+        <label>Quantity (of ${escapeHtml(holding.quantity_on_hand)})
+          <input name="quantity" type="text" inputmode="decimal" value="1" autocomplete="off" />
+        </label>
+      </div>
+      <label>Received by
+        <input name="recipientName" type="text" maxlength="200" autocomplete="off" placeholder="Name of the person signing" />
+      </label>
+      <label>Signature
+        <canvas id="signature-pad" width="600" height="180"
+                style="touch-action:none; background:#fff; border-radius:.4rem; width:100%; height:180px"></canvas>
+      </label>
+      <div class="actions">
+        <button id="clear-signature" type="button" class="secondary">Clear signature</button>
+      </div>
+      <div class="actions">
+        <button id="save-disbursement" type="submit">Record disbursement</button>
+        <button id="cancel-disbursement" type="button" class="secondary">Cancel</button>
+      </div>
+      <p class="note">The ledger commits to a hash of this signature; the image follows once
+        the disbursement itself has been accepted. Both are saved on this device first.</p>
+    </form>
   </section>`;
 }
 
@@ -338,14 +441,44 @@ function wireReady(): void {
     });
   }
 
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-disburse]")) {
+    button.addEventListener("click", () => {
+      const lotId = button.dataset["disburse"];
+      state.disbursing = state.holdings.find((h) => h.lot_id === lotId) ?? null;
+      state.message = null;
+      render();
+    });
+  }
+
+  on("cancel-disbursement", "click", () => {
+    state.disbursing = null;
+    pad?.detach();
+    pad = null;
+    render();
+  });
+  on("clear-signature", "click", () => pad?.clear());
+
+  const canvas = document.getElementById("signature-pad");
+  if (canvas instanceof HTMLCanvasElement) {
+    pad?.detach();
+    pad = createSignaturePad(canvas);
+  }
+  document.getElementById("disburse-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveDisbursement(event.target as HTMLFormElement);
+  });
+
   for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-discard]")) {
     button.addEventListener("click", () => {
       const id = button.dataset["discard"];
       void (async () => {
         if (store === null || id === undefined) return;
-        // A discard is a decision, so it removes only that row and only on a click. The
-        // app never discards anything on its own.
-        state.outbox = state.outbox.filter((e) => e.id !== id);
+        // A discard is a decision, so it happens only on a click — the app never discards
+        // anything on its own. It DOES take dependents with it: a signature whose
+        // disbursement has been thrown away can never be filed, and leaving it would make
+        // it due the moment its prerequisite vanished, then refused with a 404 that says
+        // nothing about what actually happened.
+        state.outbox = state.outbox.filter((e) => e.id !== id && e.dependsOn !== id);
         await store.replaceOutbox(state.outbox);
         render();
       })();
@@ -401,6 +534,100 @@ async function saveVisit(form: HTMLFormElement): Promise<void> {
   await store.replaceOutbox(state.outbox);
   state.recording = null;
   state.message = { kind: "good", text: "Saved on this device. It will sync when there is a network." };
+  render();
+  void drain({ manual: false });
+}
+
+/**
+ * Record a disbursement: two queued rows, in an order the engine knows about.
+ *
+ * The signature is hashed HERE, once, from the same bytes that go into the second row —
+ * so the digest the ledger commits to and the image that is uploaded agree by
+ * construction rather than by a later comparison. The server recomputes it and answers
+ * `signature_mismatch` if they ever disagree, and that refusal is permanent, which is why
+ * it must not be possible to produce one by accident.
+ */
+async function saveDisbursement(form: HTMLFormElement): Promise<void> {
+  const holding = state.disbursing;
+  if (holding === null || store === null) return;
+
+  if (pad === null || pad.isEmpty()) {
+    state.message = { kind: "error", text: "A signature is required: the ledger row commits to it." };
+    render();
+    return;
+  }
+
+  const data = new FormData(form);
+  const recipientName = String(data.get("recipientName") ?? "").trim();
+  const quantity = String(data.get("quantity") ?? "").trim();
+
+  let signature;
+  try {
+    signature = await capture(await pad.toPng());
+  } catch (err) {
+    state.message = { kind: "error", text: (err as Error).message };
+    render();
+    return;
+  }
+
+  const disbursementId = mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) });
+  const candidate = {
+    id: disbursementId,
+    lotId: holding.lot_id,
+    quantity,
+    occurredAt: new Date().toISOString(),
+    erpAccountId: String(data.get("erpAccountId") ?? ""),
+    recipientName,
+    signatureSha256: signature.sha256,
+  };
+
+  // Validated against the API's own schema before anything is queued. A quantity with
+  // four decimals, or an empty recipient, must fail at the keyboard: inside a batch it
+  // comes back as `validation_failed` hours later, which a rep cannot act on.
+  const parsed = DisbursementBody.safeParse(candidate);
+  if (!parsed.success) {
+    state.message = {
+      kind: "error",
+      text: `This disbursement cannot be saved: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`,
+    };
+    render();
+    return;
+  }
+
+  const signatureId = mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) });
+  let queue = enqueueDisbursement(state.outbox, parsed.data, Date.now());
+  queue = enqueueSignature(
+    queue,
+    { id: signatureId, contentType: signature.contentType, contentBase64: signature.base64 },
+    disbursementId,
+    Date.now(),
+  );
+  state.outbox = queue;
+  await store.replaceOutbox(state.outbox);
+
+  // The holding on screen is decremented optimistically, so a rep disbursing twice from
+  // one lot is not offered stock the first disbursement has already spent. The server is
+  // the authority and `refreshReference` replaces this the moment there is a network.
+  const remaining = Number(holding.quantity_on_hand) - Number(quantity);
+  state.holdings = state.holdings.map((h) =>
+    h.lot_id === holding.lot_id
+      ? {
+          ...h,
+          // `toFixed(3)` to match the column's own spelling. The server sends numeric(16,3)
+          // as text — "10.000" — and `String(8)` would put "8" on the same screen for the
+          // same kind of number, which reads as two different units.
+          quantity_on_hand: Number.isFinite(remaining) ? Math.max(0, remaining).toFixed(3) : h.quantity_on_hand,
+        }
+      : h,
+  );
+
+  pad.detach();
+  pad = null;
+  state.disbursing = null;
+  state.message = {
+    kind: "good",
+    text: "Saved on this device: the disbursement, then its signature. Both sync when there is a network.",
+  };
   render();
   void drain({ manual: false });
 }
@@ -494,7 +721,9 @@ async function refreshReference(): Promise<void> {
   const me = Me.safeParse(meResult.body);
   const accountsResult = await transport.get("/v1/accounts");
   const accounts = accountsResult.kind === "ok" ? AccountList.safeParse(accountsResult.body) : null;
-  if (!me.success || accounts === null || !accounts.success) {
+  const holdingsResult = await transport.get("/v1/samples/holdings");
+  const holdings = holdingsResult.kind === "ok" ? HoldingList.safeParse(holdingsResult.body) : null;
+  if (!me.success || accounts === null || !accounts.success || holdings === null || !holdings.success) {
     state.message = { kind: "error", text: "The server's reply did not match the contract this app was built against." };
     render();
     return;
@@ -502,8 +731,15 @@ async function refreshReference(): Promise<void> {
 
   state.me = me.data;
   state.accounts = accounts.data.data;
+  state.holdings = holdings.data.data;
   state.cachedAt = Date.now();
-  const cache: CachedReference = { me: me.data, accounts: accounts.data.data, visits: [], fetchedAt: state.cachedAt };
+  const cache: CachedReference = {
+    me: me.data,
+    accounts: accounts.data.data,
+    visits: [],
+    holdings: holdings.data.data,
+    fetchedAt: state.cachedAt,
+  };
   await store.writeCache(cache);
   render();
 }
@@ -550,6 +786,9 @@ async function boot(): Promise<void> {
   if (cached !== null) {
     state.me = cached.me;
     state.accounts = cached.accounts;
+    // `?? []` rather than a required field: a cache written before holdings existed is
+    // still a usable cache, and refusing it would lose a rep's accounts on an upgrade.
+    state.holdings = cached.holdings ?? [];
     state.cachedAt = cached.fetchedAt;
   }
 

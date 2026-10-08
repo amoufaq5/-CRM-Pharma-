@@ -1223,3 +1223,73 @@ typechecks green while `event.respondWith` does not exist.
   app. No Capacitor wrapper, no device under memory pressure, no push.
 - **A real ERP behind the outbox.** `ERP_BASE_URL` points nowhere in this run; §1–§7 cover
   that path.
+
+## Samples, and a signature drawn on glass
+
+*2026-10-08, same script. `pnpm client:verify` is 62 checks now.*
+
+The disbursement is the act at the centre of a pharma field visit and the one with legal
+weight, and it is the first thing in this repo that needed the outbox to be more than a
+list. `DisbursementBody.signatureSha256` is required, so the **ledger commits to the
+digest** of bytes the device captured; the image goes up separately, to a route that
+answers 404 until that ledger row exists. One disbursement at a clinic desk with no signal
+is therefore two queued rows in a fixed order.
+
+What the browser run now drives:
+
+```
+ok: the rep's own stock reaches the screen from /v1/samples/holdings
+ok: with the balance the ledger's trigger computed (10.000 on hand · expires 2027-10-08)
+ok: a disbursement with no signature is refused at the keyboard, not queued
+ok: a stroke drawn with pointer events leaves ink on the canvas (1473 dark pixels)
+ok: with a signature it is saved on the device, and the screen says both halves are queued
+ok: two rows are queued for one disbursement, not one
+ok: the disbursement carries the digest of a signature that has not been uploaded yet
+ok: with the PNG itself on the device (15420 base64 chars)
+ok: and the database has neither
+ok: the lot's balance falls on the device while offline (8.000 on hand)
+ok: one disbursement in crm.sample_transaction
+ok: with real bytes behind it (11564 bytes)
+ok: and its stored bytes hash to exactly what the ledger committed to
+```
+
+And from outside the app:
+
+```
+ok: the stored signature hashes to exactly what the ledger committed to before it was uploaded
+ok: and the holding fell from 10 to 8, by the ledger's own trigger
+```
+
+That second-to-last line is one SQL join —
+`a.content_sha256 = t.signature_sha256` — and it is the whole commitment: the ledger row
+was written before the image existed anywhere but a canvas, and the blob trigger recomputed
+the digest from the stored bytes. If they ever differ the API answers `signature_mismatch`,
+which is permanent, so equality is not a nicety.
+
+**The rep's stock was granted through the real receipt route**, not inserted. Holdings are
+maintained by 0018's triggers, so a fixture writing `sample_holding` directly would be
+verifying its own arithmetic; `POST /v1/samples/receipts` is how a rep gets material, and
+the harness checks the trigger agreed (`10.000`).
+
+### Three harness mistakes, each of which named a real property
+
+- **The first stroke drew nothing.** `Input.dispatchMouseEvent` takes VIEWPORT
+  coordinates, and the signature pad sits below a header, an outbox summary and a form — so
+  the events landed on whatever happened to be at those coordinates. It read as "CDP mouse
+  events do not reach a pointer handler", which a four-line probe disproved in one run
+  (1449 dark pixels on a bare canvas). The driver scrolls the element into view first, and
+  refuses to draw if it is still not fully in the viewport. A rep scrolls to it too.
+- **The samples step was written after the tenant-deletion step.** `erp_deleted` is
+  terminal — 0050 made it a status and 0053 made it unreachable in reverse — so nothing
+  after it can sync anything. The order of the script is now part of its meaning: every
+  check that needs a working tenant runs before the one that deletes it.
+- **The screen printed `8` where the server prints `8.000`.** The optimistic local
+  decrement used `String(10 - 2)`, putting two spellings of one `numeric(16,3)` on the same
+  screen. `toFixed(3)` matches the column's own form, which is also the form the server
+  sends.
+
+### What is still not built
+
+Transfers, counts, write-offs, returns, the disposal obligations with their regulatory
+deadlines, and the expiry sweep — the rest of custody. Roughly 85 of the 104 routes have no
+screen.

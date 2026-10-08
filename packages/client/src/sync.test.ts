@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import type { VisitBody } from "./api.js";
-import { DEFAULT_BACKOFF, enqueueVisit, type OutboxEntry } from "./outbox.js";
+import type { DisbursementBody, SignatureBody, VisitBody } from "./api.js";
+import { DEFAULT_BACKOFF, enqueueDisbursement, enqueueSignature, enqueueVisit, type OutboxEntry } from "./outbox.js";
 import type { CachedReference, ClientStore } from "./store.js";
 import { syncOnce, type SyncTransport, type TransportResult } from "./sync.js";
 
@@ -21,16 +21,45 @@ function memoryStore(entries: readonly OutboxEntry[] = []): ClientStore & { entr
   return state;
 }
 
-function recordingTransport(answers: readonly TransportResult[]): SyncTransport & { batches: VisitBody[][] } {
+/**
+ * One recorder for all three routes, because the engine's job is to call the right one in
+ * the right order and the test has to be able to see which it called.
+ */
+function recordingTransport(answers: readonly TransportResult[]): SyncTransport & {
+  batches: VisitBody[][];
+  disbursementBatches: DisbursementBody[][];
+  signatures: { disbursementId: string; body: SignatureBody }[];
+  calls: string[];
+} {
   const batches: VisitBody[][] = [];
+  const disbursementBatches: DisbursementBody[][] = [];
+  const signatures: { disbursementId: string; body: SignatureBody }[] = [];
+  const calls: string[] = [];
   let i = 0;
+  const next = (): TransportResult => {
+    const answer = answers[Math.min(i, answers.length - 1)];
+    i += 1;
+    return answer ?? { kind: "network" };
+  };
   return {
     batches,
+    disbursementBatches,
+    signatures,
+    calls,
     postVisits: async (visits) => {
       batches.push([...visits]);
-      const answer = answers[Math.min(i, answers.length - 1)];
-      i += 1;
-      return answer ?? { kind: "network" };
+      calls.push("visits");
+      return next();
+    },
+    postDisbursements: async (disbursements) => {
+      disbursementBatches.push([...disbursements]);
+      calls.push("disbursements");
+      return next();
+    },
+    putSignature: async (disbursementId, body) => {
+      signatures.push({ disbursementId, body });
+      calls.push(`signature:${disbursementId}`);
+      return next();
     },
   };
 }
@@ -213,5 +242,118 @@ describe("syncOnce", () => {
       backoff: { ...DEFAULT_BACKOFF, baseMs: 1000, jitter: 0 },
     });
     expect(store.entries[0]?.nextAttemptAt).toBe(11_000);
+  });
+});
+
+describe("syncOnce with samples", () => {
+  const now = (): number => 10_000;
+
+  const disbursementBody = (id: string): DisbursementBody => ({
+    id,
+    lotId: "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c1e",
+    quantity: "2",
+    occurredAt: "2026-10-08T09:00:00.000Z",
+    erpAccountId: "ACC-1",
+    recipientName: "Dr Ada",
+    signatureSha256: "b".repeat(64),
+  });
+
+  const signatureBody = (id: string): SignatureBody => ({ id, contentType: "image/png", contentBase64: "aGk=" });
+
+  const bothQueued = (now = 1000): readonly OutboxEntry[] => {
+    const withDisbursement = enqueueDisbursement([], disbursementBody("d1"), now);
+    return enqueueSignature(withDisbursement, signatureBody("s1"), "d1", now);
+  };
+
+  it("sends the disbursement FIRST and then its signature, in one drain", async () => {
+    // The whole point of the send order: a rep who signed at a clinic desk with no signal
+    // gets both halves on one reconnection, because the disbursement leaving the queue is
+    // what makes the signature due.
+    const store = memoryStore(bothQueued());
+    const transport = recordingTransport([ok(["d1"]), { kind: "ok", status: 201, body: { id: "s1" } }]);
+    const report = await syncOnce({ store, transport, now });
+
+    expect(transport.calls).toEqual(["disbursements", "signature:d1"]);
+    expect(transport.disbursementBatches[0]?.map((d) => d.id)).toEqual(["d1"]);
+    expect(transport.signatures[0]).toMatchObject({ disbursementId: "d1", body: { id: "s1" } });
+    expect(report.accepted).toEqual(["d1", "s1"]);
+    expect(store.entries).toEqual([]);
+  });
+
+  it("does not attempt the signature when the disbursement could not be sent", async () => {
+    const store = memoryStore(bothQueued());
+    const transport = recordingTransport([{ kind: "network" }]);
+    const report = await syncOnce({ store, transport, now, random: () => 0.5 });
+
+    expect(transport.calls).toEqual(["disbursements"]);
+    expect(report.retrying).toEqual(["d1"]);
+    expect(report.remaining).toBe(2);
+  });
+
+  it("REFUSES THE SIGNATURE in the same pass when its disbursement is refused", async () => {
+    // Not next time: a signature left pending behind a refused disbursement is counted as
+    // "waiting to send" on a screen that is telling the rep something false.
+    const store = memoryStore(bothQueued());
+    const transport = recordingTransport([ok([], [{ id: "d1", type: "lot_expired", error: "lot LOT-1 expired" }])]);
+    const report = await syncOnce({ store, transport, now });
+
+    expect(transport.calls).toEqual(["disbursements"]);
+    expect(report.rejected.map((r) => r.id).sort()).toEqual(["d1", "s1"]);
+    expect(report.rejected.find((r) => r.id === "s1")?.reason).toContain("lot LOT-1 expired");
+    expect(store.entries.map((e) => e.state)).toEqual(["rejected", "rejected"]);
+  });
+
+  it("treats a refusal of the signature itself as that row's own verdict", async () => {
+    // One row per request, so a 409 is about this signature — `signature_mismatch` says
+    // the bytes do not hash to what the ledger committed, and re-sending them can never
+    // work.
+    const store = memoryStore([...enqueueSignature([], signatureBody("s1"), "d1", 1000)]);
+    const transport = recordingTransport([
+      { kind: "status", status: 409, problemKind: "signature_mismatch", detail: "the stored image does not match the committed digest" },
+    ]);
+    const report = await syncOnce({ store, transport, now });
+
+    expect(report.rejected).toEqual([{ id: "s1", reason: "the stored image does not match the committed digest" }]);
+    expect(store.entries[0]?.state).toBe("rejected");
+  });
+
+  it("sends signatures one at a time, because the route takes one", async () => {
+    let queue = enqueueSignature([], signatureBody("s1"), "d1", 1000);
+    queue = enqueueSignature(queue, signatureBody("s2"), "d2", 1001);
+    const store = memoryStore(queue);
+    const transport = recordingTransport([
+      { kind: "ok", status: 201, body: {} },
+      { kind: "ok", status: 201, body: {} },
+    ]);
+    const report = await syncOnce({ store, transport, now });
+
+    expect(transport.signatures.map((s) => s.body.id)).toEqual(["s1", "s2"]);
+    expect(transport.calls).toEqual(["signature:d1", "signature:d2"]);
+    expect(report.accepted).toEqual(["s1", "s2"]);
+  });
+
+  it("drains visits before disbursements before signatures", async () => {
+    let queue = enqueueSignature(
+      enqueueDisbursement(enqueueVisit([], body("v1"), 1000), disbursementBody("d1"), 1000),
+      signatureBody("s1"),
+      "d1",
+      1000,
+    );
+    queue = [...queue];
+    const store = memoryStore(queue);
+    const transport = recordingTransport([ok(["v1"]), ok(["d1"]), { kind: "ok", status: 201, body: {} }]);
+    await syncOnce({ store, transport, now });
+    expect(transport.calls).toEqual(["visits", "disbursements", "signature:d1"]);
+  });
+
+  it("stops the whole drain on a deleted tenant, before reaching later kinds", async () => {
+    const store = memoryStore(bothQueued());
+    const transport = recordingTransport([
+      { kind: "status", status: 403, problemKind: "tenant_deleted", detail: "deleted in the ERP" },
+    ]);
+    const report = await syncOnce({ store, transport, now });
+    expect(transport.calls).toEqual(["disbursements"]);
+    expect(report.stopped).toEqual({ reason: "deleted in the ERP" });
+    expect(store.entries.every((e) => e.state === "blocked")).toBe(true);
   });
 });

@@ -1,15 +1,33 @@
-import { SYNC_BATCH_MAX, SyncResponse, type VisitBody } from "./api.js";
-import { applyBatchFailure, applySyncResults, dueEntries, rejectUnreconcilable, reviveDue, DEFAULT_BACKOFF, type ApplyResult, type BackoffPolicy, type OutboxEntry } from "./outbox.js";
+import { SYNC_BATCH_MAX, SyncResponse, type DisbursementBody, type SignatureBody, type VisitBody } from "./api.js";
+import {
+  applyBatchFailure,
+  applySyncResults,
+  dueEntries,
+  rejectOrphanedDependents,
+  rejectUnreconcilable,
+  reviveDue,
+  DEFAULT_BACKOFF,
+  type ApplyResult,
+  type BackoffPolicy,
+  type OutboxEntry,
+  type OutboxKind,
+  type SignatureEntry,
+} from "./outbox.js";
 import { classifyTransportOutcome } from "./outcome.js";
 import type { ClientStore } from "./store.js";
 
 /**
- * The drain loop: read the queue, send one batch, fold the answer back, repeat.
+ * The drain loop: read the queue, send one batch per kind in order, fold each answer back.
  *
- * Impure only through what is injected. `transport` is the single seam the browser fills
- * with `fetch`, and it returns a tagged result rather than throwing, because "the network
- * is gone" is the NORMAL case for this client and an exception is the wrong shape for a
- * normal case.
+ * Impure only through what is injected. `transport` returns a tagged result rather than
+ * throwing, because "the network is gone" is the NORMAL case for this client and an
+ * exception is the wrong shape for a normal case.
+ *
+ * THE ORDER OF KINDS IS LOAD-BEARING. A signature's upload route answers 404 until its
+ * disbursement row exists, and a 404 is permanent — so signatures go last, and in the same
+ * pass: a disbursement accepted at the top of the drain leaves the queue, which is what
+ * `dueEntries` reads as "its dependency is satisfied". A rep who signed at a clinic desk
+ * with no signal gets both halves in one reconnection.
  */
 export type TransportResult =
   | { readonly kind: "ok"; readonly status: number; readonly body: unknown }
@@ -18,6 +36,9 @@ export type TransportResult =
 
 export interface SyncTransport {
   postVisits(visits: readonly VisitBody[]): Promise<TransportResult>;
+  postDisbursements(disbursements: readonly DisbursementBody[]): Promise<TransportResult>;
+  /** One at a time: the route takes one signature for one disbursement. */
+  putSignature(disbursementId: string, body: SignatureBody): Promise<TransportResult>;
 }
 
 export interface SyncDeps {
@@ -26,9 +47,9 @@ export interface SyncDeps {
   readonly now: () => number;
   readonly random?: () => number;
   readonly backoff?: BackoffPolicy;
-  /** Batch size, capped at the server's maximum however large this is. */
+  /** Batch size for the batched kinds, capped at the server's maximum however large. */
   readonly batchSize?: number;
-  /** Safety valve on the loop, not on the queue: how many batches one call may send. */
+  /** Safety valve on the loop, not on the queue: how many requests one call may send. */
   readonly maxBatches?: number;
   /**
    * Void the backoff on every pending row before draining.
@@ -52,10 +73,48 @@ export interface SyncReport {
   readonly remaining: number;
 }
 
+/** How many of each kind may ride in one request. */
+const BATCH_MAX: Readonly<Record<OutboxKind, number>> = {
+  visit: SYNC_BATCH_MAX,
+  disbursement: SYNC_BATCH_MAX,
+  // The signature route takes one signature for one disbursement, so a "batch" is one.
+  signature: 1,
+};
+
+/** Dependencies last, so one drain can land a disbursement and then its signature. */
+const SEND_ORDER: readonly OutboxKind[] = ["visit", "disbursement", "signature"];
+
+/**
+ * A single-item route's answer, in the per-row shape the fold already understands.
+ *
+ * Normalising here rather than in the transport keeps every decision in the tested layer:
+ * the transport reports what HTTP said, and what that means for a queued row is decided
+ * once, in `classifyRowOutcome`, for all three kinds.
+ */
+function rowsFromSingle(entry: OutboxEntry, result: TransportResult):
+  | { readonly rows: readonly { id: string; ok: boolean; type?: string; error?: string }[] }
+  | { readonly failure: TransportResult } {
+  if (result.kind === "ok") return { rows: [{ id: entry.id, ok: true }] };
+  if (result.kind === "network") return { failure: result };
+  // A status refusal IS about this row — it is the only row in the request — so it becomes
+  // a per-row verdict rather than a batch failure, and the classifier decides whether it
+  // is permanent. A 401 or a tenant_deleted still reaches the queue-wide dispositions
+  // through the same path.
+  return {
+    rows: [
+      {
+        id: entry.id,
+        ok: false,
+        ...(result.problemKind !== undefined ? { type: result.problemKind } : {}),
+        ...(result.detail !== undefined ? { error: result.detail } : {}),
+      },
+    ],
+  };
+}
+
 export async function syncOnce(deps: SyncDeps): Promise<SyncReport> {
   const random = deps.random ?? Math.random;
   const policy = deps.backoff ?? DEFAULT_BACKOFF;
-  const batchSize = Math.min(deps.batchSize ?? SYNC_BATCH_MAX, SYNC_BATCH_MAX);
   const maxBatches = deps.maxBatches ?? 25;
 
   const accepted: string[] = [];
@@ -67,15 +126,18 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncReport> {
 
   let entries = await deps.store.readOutbox();
 
-  // Before anything is sent: a row that cannot be reconciled is refused here, visibly,
-  // rather than sent forever and reported nowhere.
+  // Before anything is sent: rows that can never be reconciled, and rows whose
+  // prerequisite has already been refused, are refused here — visibly — rather than sent
+  // forever and reported nowhere.
   const screened = rejectUnreconcilable(entries);
-  if (screened.refused.length > 0) {
-    entries = screened.entries;
+  const orphaned = rejectOrphanedDependents(screened.entries);
+  if (screened.refused.length > 0 || orphaned.refused.length > 0) {
+    entries = orphaned.entries;
     await deps.store.replaceOutbox(entries);
     for (const id of screened.refused) {
       rejected.push({ id, reason: entries.find((e) => e.id === id)?.lastReason ?? "unreconcilable queue entry" });
     }
+    rejected.push(...orphaned.refused.map((r) => ({ id: r.id, reason: r.reason })));
   }
 
   if (deps.revive === true) {
@@ -86,53 +148,82 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncReport> {
     }
   }
 
-  while (batches < maxBatches) {
-    const now = deps.now();
-    const batch = dueEntries(entries, now, batchSize);
-    if (batch.length === 0) break;
+  for (const kind of SEND_ORDER) {
+    while (batches < maxBatches) {
+      const now = deps.now();
+      const limit = Math.min(deps.batchSize ?? SYNC_BATCH_MAX, BATCH_MAX[kind]);
+      const batch = dueEntries(entries, now, limit, kind);
+      if (batch.length === 0) break;
 
-    const response = await deps.transport.postVisits(batch.map((e) => e.body));
-    batches += 1;
-
-    let applied: ApplyResult;
-    if (response.kind === "ok") {
-      const parsed = SyncResponse.safeParse(response.body);
-      if (!parsed.success) {
-        // A 200 whose body is not the contract is not success. Treating it as one would
-        // silently drop the batch from the queue on the strength of a response nobody
-        // could read, so it is a transport failure and the rows stay.
-        applied = applyBatchFailure(
-          entries,
-          batch,
-          { disposition: "retry", reason: "the server's reply did not match the sync contract" },
-          now,
-          policy,
-          random,
-        );
+      let applied: ApplyResult;
+      if (kind === "signature") {
+        const entry = batch[0] as SignatureEntry;
+        const result = await deps.transport.putSignature(entry.dependsOn, entry.body);
+        batches += 1;
+        const normalised = rowsFromSingle(entry, result);
+        applied =
+          "failure" in normalised
+            ? applyBatchFailure(entries, batch, classifyTransportOutcome(normalised.failure as { kind: "network" }), now, policy, random)
+            : applySyncResults(entries, batch, normalised.rows, now, policy, random);
       } else {
-        applied = applySyncResults(entries, batch, parsed.data.results, now, policy, random);
+        const bodies = batch.map((e) => e.body);
+        const result =
+          kind === "visit"
+            ? await deps.transport.postVisits(bodies as readonly VisitBody[])
+            : await deps.transport.postDisbursements(bodies as readonly DisbursementBody[]);
+        batches += 1;
+
+        if (result.kind === "ok") {
+          const parsed = SyncResponse.safeParse(result.body);
+          applied = parsed.success
+            ? applySyncResults(entries, batch, parsed.data.results, now, policy, random)
+            : // A 200 whose body is not the contract is not success. Treating it as one
+              // would silently drop the batch from the queue on the strength of a response
+              // nobody could read, so it is a transport failure and the rows stay.
+              applyBatchFailure(
+                entries,
+                batch,
+                { disposition: "retry", reason: "the server's reply did not match the sync contract" },
+                now,
+                policy,
+                random,
+              );
+        } else {
+          applied = applyBatchFailure(entries, batch, classifyTransportOutcome(result), now, policy, random);
+        }
       }
-    } else {
-      applied = applyBatchFailure(entries, batch, classifyTransportOutcome(response), now, policy, random);
-    }
 
-    entries = applied.entries;
-    await deps.store.replaceOutbox(entries);
+      entries = applied.entries;
+      await deps.store.replaceOutbox(entries);
 
-    accepted.push(...applied.accepted);
-    rejected.push(...applied.rejected);
-    retrying.push(...applied.retrying);
-    reauthenticate = reauthenticate || applied.reauthenticate;
-    if (applied.stopped !== null) {
-      stopped = applied.stopped;
-      break;
+      accepted.push(...applied.accepted);
+      rejected.push(...applied.rejected);
+      retrying.push(...applied.retrying);
+      reauthenticate = reauthenticate || applied.reauthenticate;
+
+      // A refusal that condemns a prerequisite condemns what waits on it, in the same
+      // pass: otherwise a signature whose disbursement was just refused stays pending
+      // until the next drain, counted as "waiting to send" on a screen that is wrong.
+      if (applied.rejected.length > 0) {
+        const cascade = rejectOrphanedDependents(entries);
+        if (cascade.refused.length > 0) {
+          entries = cascade.entries;
+          await deps.store.replaceOutbox(entries);
+          rejected.push(...cascade.refused.map((r) => ({ id: r.id, reason: r.reason })));
+        }
+      }
+
+      if (applied.stopped !== null) {
+        stopped = applied.stopped;
+        break;
+      }
+      // A 401 stops the loop too: every further request would draw the same answer, and
+      // burning the queue's attempt counts against an expired token is how a session
+      // refresh turns into a backed-off queue that looks broken.
+      if (applied.reauthenticate) break;
+      if (applied.accepted.length === 0 && applied.rejected.length === 0 && applied.retrying.length === 0) break;
     }
-    // A 401 stops the loop too: every further batch would draw the same answer, and
-    // burning the queue's attempt counts against an expired token is how a session
-    // refresh turns into a backed-off queue that looks broken.
-    if (applied.reauthenticate) break;
-    // Nothing accepted and nothing retried means no progress is available this pass.
-    if (applied.accepted.length === 0 && applied.rejected.length === 0 && applied.retrying.length === 0) break;
+    if (stopped !== null || reauthenticate) break;
   }
 
   return {

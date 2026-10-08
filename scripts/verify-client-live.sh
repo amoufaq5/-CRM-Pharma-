@@ -140,6 +140,21 @@ COMMIT;
 SQL
 ok "rep-ada holds T-LIVE, which covers acc-live-1 and acc-live-2 — and acc-not-mine is covered by nobody"
 
+# A lot for the sample half of the run. The STOCK is not inserted: holdings are maintained
+# by the ledger's triggers (0018), so the rep is given material the way a rep is given
+# material — by confirming receipt through the API, after it is listening. That happens in
+# §6 below, once there is a port to talk to.
+LOT_ID="$(psql -At -c "SELECT gen_random_uuid()")"
+psql -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL || fail "could not seed the sample lot"
+BEGIN;
+SET ROLE crm_app;
+SELECT set_config('app.current_tenant_id', '$TENANT', true);
+INSERT INTO crm.sample_lot (id, tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+VALUES ('$LOT_ID', '$TENANT', 'itm-live-1', 'LOT-FIELD-1', CURRENT_DATE + 365, 'drug_sample');
+COMMIT;
+SQL
+ok "lot LOT-FIELD-1 of itm-live-1 exists, expiring in a year"
+
 # ---------------------------------------------------------------------------
 echo "--- 5. the CRM's own API binary ---"
 export LIVE_IDP_PEM="$WORK/idp.pem"
@@ -180,10 +195,22 @@ THROUGH="$(curl -s -o /dev/null -w '%{http_code}' "${APP_URL%/}/v1/accounts")"
 ok "the app is served at $APP_URL and /v1 reaches the API, which still refuses an anonymous call"
 
 # ---------------------------------------------------------------------------
-echo "--- 7. drive the app in a real browser ---"
+echo "--- 6b. the rep is given stock, through the route a rep uses ---"
 CRM_FIELD_TOKEN="$(node "$ROOT/scripts/live-erp/human-token.mjs" rep-ada)" || fail "could not mint a human token"
+RECEIPT_ID="$(psql -At -c "SELECT gen_random_uuid()")"
+RECEIPT_CODE="$(curl -s -o "$WORK/receipt.json" -w '%{http_code}' -X POST "${APP_URL%/}/v1/samples/receipts" \
+  -H "authorization: Bearer $CRM_FIELD_TOKEN" -H "x-tenant-id: $TENANT" -H 'content-type: application/json' \
+  -d "{\"id\":\"$RECEIPT_ID\",\"lotId\":\"$LOT_ID\",\"quantity\":\"10\",\"occurredAt\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"erpWarehouseId\":\"wh-live-1\"}")"
+[ "$RECEIPT_CODE" = "201" ] || { cat "$WORK/receipt.json" >&2; fail "the receipt was refused with $RECEIPT_CODE"; }
+ON_HAND="$(psql -At -c "SELECT quantity_on_hand FROM crm.sample_holding WHERE tenant_id = '$TENANT' AND lot_id = '$LOT_ID'")"
+[ "$ON_HAND" = "10.000" ] || fail "the rep holds '$ON_HAND' of LOT-FIELD-1, expected 10.000"
+ok "a receipt through the API gives rep-ada 10 units, and the holding trigger agrees"
+
+# ---------------------------------------------------------------------------
+echo "--- 7. drive the app in a real browser ---"
 export CRM_FIELD_TOKEN
 export CRM_FIELD_TENANT="$TENANT"
+export CRM_FIELD_LOT_ID="$LOT_ID"
 export CRM_PGDATABASE="$CLIENT_DB"
 node "$ROOT/scripts/client/drive-app.mjs" "$APP_URL" "$WORK" | tee "$WORK/drive.log" \
   || fail "the browser run reported failures (see the ok:/FAIL: lines above)"
@@ -204,6 +231,22 @@ ok "4 visits, 4 distinct device-minted v7 ids, no duplicates"
 REP_OWNED="$(psql -At -c "SELECT count(*) FROM crm.visit v JOIN crm.rep_profile r ON r.id = v.rep_profile_id WHERE v.tenant_id = '$TENANT' AND r.subject = 'rep-ada'")"
 [ "$REP_OWNED" = "4" ] || fail "$REP_OWNED of 4 visits are attributed to rep-ada"
 ok "every visit is attributed to the CALLER, which the API takes from the token and never from the body"
+
+# The two halves of a signature, compared in SQL. The ledger committed to a digest before
+# the image existed anywhere but a canvas; the blob trigger recomputed it from the stored
+# bytes. If these ever differ the API answers `signature_mismatch`, so equality here is
+# the whole commitment working.
+MATCHED="$(psql -At -c "
+  SELECT count(*) FROM crm.sample_transaction t
+    JOIN crm.attachment a
+      ON a.subject_table = 'crm.sample_transaction' AND a.subject_id = t.id AND a.purpose = 'disbursement_signature'
+   WHERE t.tenant_id = '$TENANT' AND t.kind = 'disbursement' AND a.content_sha256 = t.signature_sha256")"
+[ "$MATCHED" = "1" ] || fail "$MATCHED disbursements have a signature whose stored bytes hash to the ledger's commitment, expected 1"
+ok "the stored signature hashes to exactly what the ledger committed to before it was uploaded"
+
+REMAINING="$(psql -At -c "SELECT quantity_on_hand FROM crm.sample_holding WHERE tenant_id = '$TENANT' AND lot_id = '$LOT_ID'")"
+[ "$REMAINING" = "8.000" ] || fail "the rep holds '$REMAINING' after disbursing 2 of 10, expected 8.000"
+ok "and the holding fell from 10 to 8, by the ledger's own trigger"
 
 echo
 echo "ok: $CHECKS checks in a real browser, against the real API binary and a real Postgres"

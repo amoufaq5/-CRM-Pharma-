@@ -32,7 +32,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/role/` | The administrative roles: dated grants, four eyes, and the guard against locking a tenant out. |
 | `packages/expense/` | Expense claims: the lifecycle, the category-to-account map, and the ERP posting. Refuses until Finance maps the category. |
 | `packages/client/` | The field client's pure layer: the wire schemas, the outbox state machine, the backoff, device-minted ids, and the classifier that decides what a refusal MEANS for a queue. No DOM, no `fetch`, no clock. |
-| `apps/field/` | The app a rep uses. A framework-free PWA: IndexedDB outbox, PKCE sign-in, a service worker for the offline shell. Sign in, see my accounts, record a visit with no network, watch it sync. |
+| `apps/field/` | The app a rep uses. A framework-free PWA: IndexedDB outbox, PKCE sign-in, a canvas signature pad, a service worker for the offline shell. Visits and sample disbursements, offline, with the signature the ledger commits to. |
 | `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints, plus a `web` target that serves the app from the same origin — which is why nothing here has CORS. See [`deploy/README.md`](deploy/README.md). |
 | `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres), `verify-client-live.sh` (the app, in a real Chromium, taken offline). |
 
@@ -1153,16 +1153,16 @@ pass vacuously. **83 files / 2,123 tests green on both transports.**
 
 ## The app
 
-`apps/field` is the client, and it is a first slice rather than the product: **sign in, see
-my accounts, record a visit with no network, watch it sync, read a refusal.** Roughly 90 of
-the 104 routes still have no screen — samples, call plans, expenses, notifications, the
-manager's views, all of admin.
+`apps/field` is the client, and it is a slice rather than the product: **sign in, see my
+accounts, record a visit with no network, disburse samples with a signature on glass, watch
+both sync, read a refusal.** Roughly 85 of the 104 routes still have no screen — the rest of
+sample custody, call plans, expenses, notifications, the manager's views, all of admin.
 
 What it settles is the part that was a guess. Everything built for an offline device —
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **41 checks in a real
+and `pnpm client:verify` proves it the only way that means anything: **62 checks in a real
 Chromium, taken offline mid-session, against the real API binary, counting rows in
 Postgres.** The sequence it drives:
 
@@ -1177,6 +1177,14 @@ Postgres.** The sequence it drives:
   with the server's own sentence, and is deleted by nobody but a person;
 - the app **opens with no network at all**, served by its own service worker, saying how
   stale its cached accounts are rather than implying they are live;
+- a disbursement with **no signature is refused at the keyboard**, because the ledger row
+  commits to one;
+- a stroke **drawn on the canvas with real pointer input** becomes 11 KB of PNG, and the
+  disbursement and its signature queue as two rows in a fixed order — the signature held
+  back until its disbursement has landed, since the upload route 404s until then;
+- both go up on one reconnection, and in SQL `a.content_sha256 = t.signature_sha256`: the
+  ledger committed to that digest before the image existed anywhere but a canvas;
+- the lot's balance falls from `10.000` to `8.000` by the ledger's own trigger;
 - and when the ERP deletes the tenant — a tombstone recorded against the registry row,
   which `tenant_erp_deleted_needs_receipt` makes the only way to reach that status — the
   app **stops**, says why in the server's words, holds the queue, disables Sync now, and
@@ -1186,8 +1194,19 @@ Postgres.** The sequence it drives:
 Two layers, split the way the rest of this repo splits: `@crm/client` is pure — schemas,
 the outbox state machine, the backoff, and `classifyRowOutcome`, which maps every problem
 kind the API can answer with onto `retry`, `permanent`, `reauthenticate` or `stop` — and
-`apps/field` is the impure sibling that owns IndexedDB, `fetch`, PKCE and the DOM. 126
-tests cover the protocol without a browser; the browser run covers what they cannot.
+`apps/field` is the impure sibling that owns IndexedDB, `fetch`, PKCE, the canvas and the
+DOM. 158 tests cover the protocol without a browser; the browser run covers what they
+cannot.
+
+**The outbox has kinds and dependencies**, because a signature forced it to. A
+disbursement's ledger row commits to the digest of the signature, and the image uploads
+separately to a route that 404s until that row exists — so the queue drains visits, then
+disbursements, then signatures, and a signature is only due once its disbursement has left
+the queue. "Left the queue" is the test, not a flag: the queue is the device's whole memory
+of what is unsent, so absence is acceptance, and that survives a restart. A dependent whose
+prerequisite was refused is refused in the same pass, carrying the parent's own sentence —
+otherwise it waits forever behind something that will never land, counted as "waiting to
+send" on a screen telling a rep their day has not gone in.
 
 **No framework.** The bundle is zod and the app, for the reason the rest of this repo has
 no runtime dependencies: a rep's phone on rural 3G should not download a framework to show

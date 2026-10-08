@@ -1,4 +1,4 @@
-import type { Account, Me, Visit } from "./api.js";
+import type { Account, Holding, Me, Visit } from "./api.js";
 import type { OutboxEntry } from "./outbox.js";
 
 /**
@@ -27,6 +27,15 @@ export interface CachedReference {
   readonly me: Me;
   readonly accounts: readonly Account[];
   readonly visits: readonly Visit[];
+  /**
+   * What the rep is carrying, cached for the same reason the accounts are: a disbursement
+   * at a clinic desk with no signal needs the lot, its expiry and its balance, and none of
+   * those can be fetched there.
+   *
+   * Optional, because a cache written by an earlier build has none — and a store that
+   * throws on an older record would lose a rep's whole queue on an upgrade.
+   */
+  readonly holdings?: readonly Holding[];
   /** Epoch ms of the fetch, so the UI can say how stale it is instead of implying fresh. */
   readonly fetchedAt: number;
 }

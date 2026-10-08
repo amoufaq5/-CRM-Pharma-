@@ -99,7 +99,15 @@ export async function launchBrowser({ headless = true } = {}) {
       }
       connection.socket.close();
       child.kill("SIGKILL");
-      rmSync(profile, { recursive: true, force: true });
+      // The profile directory is still being written as the process dies, so a plain
+      // rmdir races it and throws ENOTEMPTY — which would fail a run whose checks all
+      // passed. Retries, and a failure to tidy up is not a failure of the check.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      try {
+        rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      } catch {
+        /* a leftover temp profile is not worth failing a verification over */
+      }
     },
     connection,
   };
@@ -242,6 +250,43 @@ export async function newPage(browser) {
          return true;`,
       );
       if (filled !== true) throw new Error(`nothing to fill at ${selector}`);
+    },
+
+    /**
+     * Draw on the page with REAL input events.
+     *
+     * `Input.dispatchMouseEvent` is synthesized by the browser into the same pointer
+     * events a finger produces, so the signature pad's own `pointerdown`/`pointermove`
+     * handlers run. Calling the handlers directly would test the test: the thing worth
+     * knowing is whether a stroke drawn on glass becomes bytes.
+     */
+    async draw(selector, points) {
+      // SCROLLED INTO VIEW FIRST, and this is not a convenience: `Input.dispatchMouseEvent`
+      // takes VIEWPORT coordinates, and the signature pad sits below a header, an outbox
+      // summary and a form. Off-screen, the events landed on whatever happened to be at
+      // those coordinates and the canvas stayed blank — which read as "pointer events do
+      // not reach it" and sent me looking in the wrong place. A rep scrolls to it too.
+      const box = await page.evaluate(
+        `const el = document.querySelector(${JSON.stringify(selector)});
+         if (el === null) return null;
+         el.scrollIntoView({ block: "center", inline: "center" });
+         await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+         const r = el.getBoundingClientRect();
+         return { x: r.left, y: r.top, width: r.width, height: r.height };`,
+      );
+      if (box === null) throw new Error(`nothing to draw on at ${selector}`);
+      if (box.y < 0 || box.y + box.height > (await page.evaluate("return window.innerHeight;"))) {
+        throw new Error(`${selector} is not fully in the viewport after scrolling; input events would miss it`);
+      }
+
+      const at = (p) => ({ x: Math.round(box.x + p[0] * box.width), y: Math.round(box.y + p[1] * box.height) });
+      const first = at(points[0]);
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", button: "left", buttons: 1, clickCount: 1, ...first });
+      for (const point of points.slice(1)) {
+        await send("Input.dispatchMouseEvent", { type: "mouseMoved", button: "left", buttons: 1, ...at(point) });
+      }
+      const last = at(points[points.length - 1]);
+      await send("Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...last });
     },
 
     async screenshot(path) {

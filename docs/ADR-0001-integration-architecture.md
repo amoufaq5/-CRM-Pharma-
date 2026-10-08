@@ -959,6 +959,64 @@ Concretely, and these specifics are the decision, not commentary on it:
     fix. Push is polling. There is no Capacitor wrapper, no iOS Safari run, and no device
     under memory pressure.
 
+26. **Samples on the device, and the two-stage sync a signature forces.**
+    `apps/field` now covers the act at the centre of a pharma field visit: see what I am
+    carrying, disburse a quantity to an account, take the recipient's signature on glass,
+    offline, and sync. It is also the first thing in this repo that needed the outbox to be
+    more than a list.
+
+    **The server's design is what makes it interesting.** `DisbursementBody.signatureSha256`
+    is required, so the LEDGER commits to the digest of bytes the device captured; the
+    image itself goes up separately, to `POST /v1/samples/disbursements/:id/signature`,
+    which answers 404 until that ledger row exists — and a 404 is permanent. So one
+    disbursement recorded at a clinic desk with no signal is TWO queued rows in a fixed
+    order, and the second cannot be attempted until the first has been accepted.
+
+    **The outbox grew kinds and dependencies.** `OutboxEntry` is a discriminated union now
+    (`visit | disbursement | signature`), the engine drains kinds in a declared order with
+    dependencies last, and `dependsOn` names the row that must land first. "Landed" is read
+    as "no longer in the queue", which is the only definition that survives a restart: the
+    queue is this device's whole memory of what is unsent, so absence is acceptance. A
+    disbursement accepted at the top of a drain unblocks its signature within the same
+    pass, so a rep gets both halves on one reconnection.
+
+    **And a dependent whose prerequisite was refused is refused too, in the same pass**
+    (`rejectOrphanedDependents`). Without that it is the immortal row in another costume: a
+    signature behind a refused disbursement would never be sent — its dependency is still
+    in the queue — never reported, and counted as "waiting to send" on a screen telling a
+    rep their day has not gone in yet. The refusal propagates with the parent's own
+    sentence attached, because "your signature could not be filed because the disbursement
+    was refused: lot LOT-1 expired" is what a person can act on. Discarding cascades for
+    the same reason.
+
+    **The signature is hashed once, from the bytes that are uploaded.** `capture()` returns
+    the digest and the base64 together, from one `Uint8Array`, rather than offering two
+    functions a caller could pair up wrongly — because the mismatch they would produce is
+    `signature_mismatch`, which is permanent, and which the API's own comment describes as
+    the case where "re-sending the same bytes can never work".
+
+    **Verified by drawing.** `scripts/verify-client-live.sh` now takes the browser offline,
+    draws a stroke on the canvas with real synthesized pointer input, and checks the result
+    in SQL: one `crm.sample_transaction` row at `2.000`, one `crm.attachment` of 11 KB of
+    PNG attached to it, the holding fallen from `10.000` to `8.000` by the ledger's own
+    trigger — and `a.content_sha256 = t.signature_sha256`, which is the commitment working:
+    the ledger committed to that digest before the image existed anywhere but a canvas, and
+    the blob trigger recomputed it from the stored bytes. The rep's stock was granted
+    through the real receipt route rather than inserted, because holdings are maintained by
+    0018's triggers and a fixture that wrote them directly would be verifying its own
+    arithmetic. **62 browser checks, 0 failures.**
+
+    Three harness mistakes worth keeping, because each named a real property:
+    `Input.dispatchMouseEvent` takes VIEWPORT coordinates and the pad sits below the fold,
+    so the first stroke landed on nothing and read as "pointer events do not reach a
+    canvas"; the samples step was written after the tenant-deletion step, which 0053 made
+    terminal, so nothing could sync after it; and the UI printed `8` where the server prints
+    `8.000`, which is two spellings of one `numeric(16,3)` on the same screen.
+
+    **Still not built:** transfers, counts, write-offs, returns, the disposal obligations
+    with their regulatory deadlines, and the expiry sweep — the rest of custody. Roughly 85
+    of the 104 routes still have no screen.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1372,7 +1430,7 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 41 checks in a real Chromium taken offline mid-session, against the real API binary, counting rows in Postgres. **What is NOT built is most of the product**: samples (disbursements, counts, transfers, returns, obligations), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 90 of the 104 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
+| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 62 checks in a real Chromium taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26). **What is NOT built is still most of the product**: the rest of custody (transfers, counts, write-offs, returns, disposal obligations), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 85 of the 104 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 

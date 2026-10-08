@@ -1,4 +1,4 @@
-import { Problem, SyncResponse, problemKind, type VisitBody } from "@crm/client";
+import { Problem, SyncResponse, problemKind, type DisbursementBody, type SignatureBody, type VisitBody } from "@crm/client";
 import type { SyncTransport, TransportResult } from "@crm/client";
 
 /**
@@ -76,6 +76,21 @@ export class ApiTransport implements SyncTransport {
 
   async postVisits(visits: readonly VisitBody[]): Promise<TransportResult> {
     return this.request("POST", "/v1/sync/visits", { visits: [...visits] });
+  }
+
+  async postDisbursements(disbursements: readonly DisbursementBody[]): Promise<TransportResult> {
+    return this.request("POST", "/v1/sync/disbursements", { disbursements: [...disbursements] });
+  }
+
+  /**
+   * The signature bytes, for a disbursement that must already exist.
+   *
+   * One request per signature, because the route takes one — and the engine knows that,
+   * which is why it sends this kind with a batch size of one and only after the
+   * disbursement has left the queue.
+   */
+  async putSignature(disbursementId: string, body: SignatureBody): Promise<TransportResult> {
+    return this.request("POST", `/v1/samples/disbursements/${encodeURIComponent(disbursementId)}/signature`, body);
   }
 
   /**
