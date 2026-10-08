@@ -122,6 +122,11 @@ export function createSignaturePad(
     // from a canvas sized the same way. It is also the whole point of carrying pixels:
     // the pad holds the strokes before this function returns, so `empty === false` is
     // never a lie about a blank canvas.
+    //
+    // It clips rather than scales, so a device ROTATED mid-signature keeps the strokes
+    // that fit the narrower canvas and loses the rest. That is the honest trade against
+    // an asynchronous redraw, which loses all of them to the next render; and a rep whose
+    // signature is clipped can see it and clear it, which is not true of one that vanished.
     empty = true;
     try {
       context.putImageData(opts.restore, 0, 0);
