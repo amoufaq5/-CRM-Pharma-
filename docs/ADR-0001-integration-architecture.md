@@ -926,6 +926,21 @@ Concretely, and these specifics are the decision, not commentary on it:
        bundle step had nothing to bundle. Caught by `verify-image-build.sh` before Docker
        ever ran it.
 
+    **A FOURTH defect, found by reading the service worker a second time.** Its one rule
+    is "cache the app's files, never an API answer" — a stale bundle is an inconvenience,
+    a stale answer is a lie — and it enforced it with
+    `pathname.startsWith("/v1/")`. `apiBaseUrl: "/"` is a plausible way for an operator to
+    write "same origin, at the root", and it makes every request `//v1/accounts`: the same
+    resource to any proxy, a different string to a prefix test. The worker would have
+    started caching API responses, silently. Fixed on both sides — `loadConfig` strips a
+    trailing slash so the URL cannot be built, and the prefix test now collapses repeated
+    slashes — and the prefix list itself moved into `@crm/client` as
+    `isApiPath`, because four things need that answer and three of them are code (the
+    worker, the harness's static server, and the Caddyfile). The fourth cannot import it,
+    being Caddy configuration, so a test parses the Caddyfile's `@api path` matcher and
+    compares the two. The same single-declaration pattern migration 0049 established for
+    SQL vocabularies.
+
     **Deployment is one origin, and that is why there is no CORS anywhere.** The
     Dockerfile's new `web` target is caddy:2 plus the bundle the build stage produced;
     Caddy serves `/srv` and proxies `/v1`, `/healthz` and `/.well-known` to the API. A

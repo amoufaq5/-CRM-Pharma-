@@ -1190,7 +1190,14 @@ eight accounts and a form.
 
 **One origin.** Caddy serves the app and proxies `/v1` to the API, so the browser never
 makes a cross-origin request — which is why neither side has a line of CORS, and why
-putting the app on a second host would need one.
+putting the app on a second host would need one. Which paths belong to the API is declared
+once, in `@crm/client`'s `isApiPath`, and used by the service worker and the test harness's
+server; the Caddyfile cannot import it, so a test parses its `@api path` matcher and
+compares the two.
+
+**The app is ~25 KB gzipped**, all in: 23.4 KB of bundle (most of it zod, which earns its
+place by validating every response at the boundary), 1.2 KB of CSS, a 0.6 KB service
+worker and 0.5 KB of HTML.
 
 **The paste-a-token login is compiled out of a production bundle**, not disabled by a flag:
 `NODE_ENV=production` removes the branch at build time, and `verify-image-build.sh` greps

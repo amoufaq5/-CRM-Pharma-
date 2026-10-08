@@ -1,5 +1,7 @@
 /// <reference lib="webworker" />
 
+import { isApiPath } from "@crm/client";
+
 /**
  * The offline shell. Cache the app's own files; never cache the API.
  *
@@ -58,7 +60,11 @@ sw.addEventListener("fetch", (event) => {
   // Anything that is not this app's own origin and path is the API or a third party:
   // left alone entirely, so no answer is ever served from a cache.
   if (url.origin !== sw.location.origin) return;
-  if (url.pathname.startsWith("/v1/") || url.pathname === "/healthz" || url.pathname.startsWith("/.well-known/")) return;
+  // `isApiPath` rather than a prefix test written here, and it collapses repeated
+  // slashes before deciding. `apiBaseUrl: "/"` in config.json is a plausible way to write
+  // "same origin, at the root", and it makes every request `//v1/accounts` — which a bare
+  // startsWith misses, and this worker would then cache API answers as app files.
+  if (isApiPath(url.pathname)) return;
 
   event.respondWith(
     (async () => {

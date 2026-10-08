@@ -25,9 +25,11 @@ const TYPES = {
   ".map": "application/json; charset=utf-8",
 };
 
-// The same split the Caddyfile makes: these prefixes are the API, everything else is the
-// app's own files.
-const isApi = (path) => path.startsWith("/v1/") || path === "/healthz" || path.startsWith("/.well-known/");
+// The same split the Caddyfile makes, from the same declaration the service worker uses
+// (@crm/client's `isApiPath`) rather than a third copy of the prefix list. Imported from
+// dist, as the live-ERP harness imports the packages it drives: the thing under test is
+// what ships.
+import { isApiPath } from "../../packages/client/dist/index.js";
 
 const server = createServer((req, res) => {
   void (async () => {
@@ -38,7 +40,7 @@ const server = createServer((req, res) => {
     // of mistake this harness exists to catch.
     const path = url.pathname.replace(/\/{2,}/g, "/");
 
-    if (isApi(path)) {
+    if (isApiPath(path)) {
       if (apiBase === "") {
         res.writeHead(502).end("no API base url given to the static server");
         return;

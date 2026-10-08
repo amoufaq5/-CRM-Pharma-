@@ -23,6 +23,7 @@ export {
   type VisitType,
 } from "./api.js";
 export { DISPOSITIONS, classifyRowOutcome, classifyTransportOutcome, type Disposition, type RowOutcome } from "./outcome.js";
+export { API_PATHS_EXACT, API_PATH_PREFIXES, isApiPath, normalizePath } from "./paths.js";
 export { mintUuidV7, uuidV7Timestamp, type MintDeps } from "./ids.js";
 export {
   DEFAULT_BACKOFF,
