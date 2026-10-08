@@ -1116,7 +1116,7 @@ it drives a real Chromium over the DevTools Protocol, with no test framework: No
 ships a WebSocket client, and `Network.emulateNetworkConditions {offline: true}` is the
 one capability that matters here.
 
-**32 checks, 0 failures.** The sequence, in one session:
+**41 checks, 0 failures.** The sequence, in one session:
 
 ```
 ok: an unauthenticated device is offered a sign-in, not a blank screen
@@ -1139,6 +1139,28 @@ ok: the app opens with NO network, served by its own service worker
 ok: with how old it is stated, rather than implied to be live
 ok: the page threw no uncaught errors throughout
 ```
+
+```
+ok: the ERP's tombstone is recorded against the tenant, which is the only way to reach that status
+ok: the app says syncing has STOPPED, rather than showing a spinner forever
+ok: and says why, in the server's words (… has been deleted at the ERP …)
+ok: and that nothing on the device has been thrown away
+ok: the queue is blocked on the device, not drained and not dropped
+ok: Sync now is disabled, so a rep cannot be told to keep trying something that cannot work
+```
+
+That last block is the whole deletion chain, end to end, for the first time: the ERP signs
+a tombstone, 0050's watcher marks the registry row, the API refuses every request for that
+tenant with `tenant_deleted`, and the client — the part that had never existed — stops
+rather than spinning. `problems.ts` asked for precisely that behaviour when it gave the
+kind its own problem type: *"an offline client holding a queue of unsent visits needs to
+stop retrying and say so rather than spin on a refusal it reads as transient
+permissions."* Something now holds such a queue, and it stops.
+
+Worth noting what refused the first attempt at that fixture:
+`tenant_erp_tombstone_id_shape`, because it wrote `tomb-live-1` where the constraint
+requires `^tomb_[A-Za-z0-9_-]{12,40}$`. The receipt requirement is not decorative even in
+a harness.
 
 And from outside the app, as the admin so RLS cannot flatter the result: **4 visits, 4
 distinct device-minted v7 ids, no duplicates**, every one attributed to the caller the

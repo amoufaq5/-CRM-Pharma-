@@ -204,7 +204,14 @@ async function main() {
     await page.waitFor(`document.querySelector("#sync") !== null`, { label: "the app to reload with the queue" });
     await page.click("#sync");
     await page.waitFor(`/Refused by the server/.test(document.body.textContent ?? "")`, { timeoutMs: 15_000, label: "the refusal section" });
-    const refusalText = await page.evaluate(`return document.querySelector("section:has(> h2) .meta.error")?.textContent?.trim() ?? document.body.textContent;`);
+    // Scoped to the refusal section. Falling back to document.body.textContent — which
+    // the first version did — would pass if the word appeared anywhere at all, including
+    // in a heading this test wrote itself.
+    const refusalText = await page.evaluate(`
+      const heading = [...document.querySelectorAll("h2")].find((h) => /Refused by the server/.test(h.textContent ?? ""));
+      if (heading === undefined) return null;
+      return heading.closest("section")?.querySelector(".meta.error")?.textContent?.trim() ?? null;`);
+    is(refusalText !== null, true, "the refusal is rendered inside the Refused-by-the-server section");
     is(/territor/i.test(String(refusalText)), true, `the server's own words are on screen (${String(refusalText).slice(0, 80)})`);
     is(visitRows().length, 4, "and the refused visit did not reach the database");
     const stillQueued = await page.evaluate(`
@@ -227,6 +234,52 @@ async function main() {
     is(staleness, true, "with how old it is stated, rather than implied to be live");
     await shot("9-offline-cold-start");
     await page.offline(false);
+
+    // ---- 10. the ERP deletes the tenant, and the queue STOPS ---------------
+    // The whole chain, end to end, for the first time: the ERP signs a tombstone, 0050's
+    // watcher marks the registry row, the API refuses every request for that tenant with
+    // `tenant_deleted`, and the client — which is the only part of this that had never
+    // existed — stops retrying and says so. `problems.ts` asked for exactly this
+    // behaviour in as many words: "an offline client holding a queue of unsent visits
+    // needs to stop retrying and say so rather than spin on a refusal it reads as
+    // transient permissions."
+    await page.offline(true);
+    await page.click(`button[data-visit="acc-live-1"]`);
+    await page.waitFor(`document.querySelector("#visit-form") !== null`);
+    await page.fill(`textarea[name="notes"]`, "recorded just before the tenant was deleted");
+    await page.click("#save-visit");
+    await page.waitFor(`document.querySelector("#visit-form") === null`);
+    const beforeDeletion = visitRows().length;
+
+    // The registry row the ERP's deletion would produce. `tenant_erp_deleted_needs_receipt`
+    // makes the status unreachable without a receipt, so the fixture has to carry one —
+    // which is the constraint doing its job even here.
+    sql(`INSERT INTO crm.tenant (tenant_id, display_name, status, erp_tombstone_id, erp_tombstone_kind,
+           erp_tombstone_deleted_at, erp_tombstone_proof_sha256, erp_tombstone_observed_at)
+         VALUES ('${tenant}', 'Live tenant', 'erp_deleted', 'tomb_live_tenant_0001', 'tenant_deletion',
+                 now(), repeat('a', 64), now())`);
+    ok("the ERP's tombstone is recorded against the tenant, which is the only way to reach that status");
+
+    await page.offline(false);
+    await page.waitFor(`document.querySelector("header.bar .pill.blocked") !== null`, { timeoutMs: 20_000, label: "the stopped pill" });
+    const stopped = await page.evaluate(`
+      const heading = [...document.querySelectorAll("h2")].find((h) => /Syncing has stopped/.test(h.textContent ?? ""));
+      return heading === undefined ? null : heading.closest("section")?.textContent?.replace(/\\s+/g, " ").trim() ?? null;`);
+    is(stopped !== null, true, "the app says syncing has STOPPED, rather than showing a spinner forever");
+    is(/deleted/i.test(String(stopped)), true, `and says why, in the server's words (${String(stopped).slice(0, 90)})`);
+    is(/will not be sent/.test(String(stopped)), true, "and that the records are held rather than sent");
+    is(/Nothing is deleted/.test(String(stopped)), true, "and that nothing on the device has been thrown away");
+
+    const blocked = await page.evaluate(`
+      const db = await new Promise((res) => { const r = indexedDB.open("crm-field", 1); r.onsuccess = () => res(r.result); });
+      const rows = await new Promise((res) => { const t = db.transaction("outbox", "readonly").objectStore("outbox").getAll(); t.onsuccess = () => res(t.result); });
+      return rows.map((r) => r.state).sort();`);
+    is(blocked.includes("blocked"), true, "the queue is blocked on the device, not drained and not dropped");
+    is(visitRows().length, beforeDeletion, "and no further visit reached the database after the deletion");
+
+    const syncDisabled = await page.evaluate(`return document.querySelector("#sync")?.disabled === true;`);
+    is(syncDisabled, true, "Sync now is disabled, so a rep cannot be told to keep trying something that cannot work");
+    await shot("10-tenant-deleted");
 
     if (page.pageErrors.length > 0) {
       fail(`the page threw ${page.pageErrors.length} error(s): ${page.pageErrors.join(" | ")}`);

@@ -1162,7 +1162,7 @@ What it settles is the part that was a guess. Everything built for an offline de
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **32 checks in a real
+and `pnpm client:verify` proves it the only way that means anything: **41 checks in a real
 Chromium, taken offline mid-session, against the real API binary, counting rows in
 Postgres.** The sequence it drives:
 
@@ -1175,8 +1175,13 @@ Postgres.** The sequence it drives:
 - three visits across a round with no signal go up in one batch;
 - a visit for an account outside the rep's territory comes back refused, stays on screen
   with the server's own sentence, and is deleted by nobody but a person;
-- and the app **opens with no network at all**, served by its own service worker, saying
-  how stale its cached accounts are rather than implying they are live.
+- the app **opens with no network at all**, served by its own service worker, saying how
+  stale its cached accounts are rather than implying they are live;
+- and when the ERP deletes the tenant — a tombstone recorded against the registry row,
+  which `tenant_erp_deleted_needs_receipt` makes the only way to reach that status — the
+  app **stops**, says why in the server's words, holds the queue, disables Sync now, and
+  deletes nothing. That chain runs from the ERP's signature to a rep's screen for the
+  first time.
 
 Two layers, split the way the rest of this repo splits: `@crm/client` is pure — schemas,
 the outbox state machine, the backoff, and `classifyRowOutcome`, which maps every problem
