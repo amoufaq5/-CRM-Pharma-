@@ -124,6 +124,7 @@ import {
   expiringHoldings,
   getLot,
   holdingsFor,
+  incomingTransfers,
   ledgerFor,
   disposalHistory,
   disposalPolicy,
@@ -142,6 +143,7 @@ import {
   teamExposure,
   teamObligations,
   transferOut,
+  transferPeers,
   writeOff,
 } from "@crm/sample";
 import type { Pool, PoolClient } from "pg";
@@ -995,6 +997,49 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       const data = await inTenant(deps, ctx.principal, (tx) =>
         recallableTransfers(tx, ctx.principal.repProfileId),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Material on its way to the caller that they have not accepted yet — the list an
+   * accept acts on, and the mirror of `/recallable` above.
+   *
+   * Receiver-scoped in SQL (`crm.incoming_transfers`), for the same reason that one is
+   * sender-scoped: only the receiver may accept, so offering this for a transfer the
+   * caller SENT would be a button the database refuses. Before it existed, the receiving
+   * half of a transfer was reachable only as a notification and as raw ids from
+   * `GET /v1/samples/transfers`, so no screen could say what was being accepted.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/transfers/incoming",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        incomingTransfers(tx, ctx.principal.repProfileId),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Who a transfer can be addressed to: active reps in the caller's tenant, except the
+   * caller.
+   *
+   * As wide as the write deliberately — `POST /v1/samples/transfers` accepts any rep in
+   * the tenant, because 0017's only rule is a foreign key and
+   * `counterparty_rep_profile_id <> rep_profile_id`. A narrower picker would restrict the
+   * screen and not the system. The reasoning, and the one place it IS narrower (a
+   * departed rep is not offered), is on `transferPeers`.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/transfer-peers",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const q = ctx.query.get("q");
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        transferPeers(tx, ctx.principal.repProfileId, { query: q }),
       );
       return { status: 200, body: { data } };
     },

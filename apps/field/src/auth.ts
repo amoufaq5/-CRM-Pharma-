@@ -50,6 +50,18 @@ export interface Session {
   readonly refreshToken?: string | undefined;
   readonly tenantId?: string | undefined;
   readonly subject?: string | undefined;
+  /**
+   * Which rep this session turned out to be, once `/v1/me` has said so.
+   *
+   * Absent until then, and that absence is load-bearing. The device caches a rep's
+   * identity and reference data so the app opens offline — but a cache belongs to the
+   * person it was fetched for, and a SHARED DEVICE breaks the assumption that there is
+   * only ever one. Without this field, signing in as a second rep with no network left
+   * the previous rep's name, accounts and `repProfileId` on screen, and anything recorded
+   * would have been attributed to them. So the cached identity is adopted only when this
+   * matches it, and a session that has never reached `/v1/me` adopts nothing.
+   */
+  readonly repProfileId?: string | undefined;
 }
 
 const VERIFIER_KEY = "crm.pkce.verifier";

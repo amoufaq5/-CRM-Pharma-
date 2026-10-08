@@ -24,6 +24,7 @@ const Stored = z.object({
   refreshToken: z.string().optional(),
   tenantId: z.string().optional(),
   subject: z.string().optional(),
+  repProfileId: z.string().optional(),
 });
 
 export function readSession(storage: Pick<Storage, "getItem"> = localStorage): Session | null {

@@ -1,14 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import type { DisbursementBody, VisitBody } from "./api.js";
+import type { DisbursementBody, TransferBody, VisitBody } from "./api.js";
 import {
   DEFAULT_BACKOFF,
   applyBatchFailure,
   applySyncResults,
   backoffMs,
   dueEntries,
+  enqueueAcceptance,
+  enqueueRecall,
+  enqueueTransfer,
   enqueueVisit,
+  heldForOthers,
   rejectUnreconcilable,
+  splitByAuthor,
   reviveDue,
   summariseOutbox,
   enqueueDisbursement,
@@ -17,10 +22,15 @@ import {
   type DisbursementEntry,
   type OutboxEntry,
   type SignatureEntry,
+  type TransferEntry,
   type VisitEntry,
 } from "./outbox.js";
 
 const body = (id: string, account = "ACC-1"): VisitBody => ({ id, erpAccountId: account });
+
+/** The rep every fixture row is recorded by, unless the test is about who recorded it. */
+const REP = "11111111-1111-4111-8111-111111111111";
+const MINE = { createdBy: REP } as const;
 
 /**
  * A visit entry. Typed as `VisitEntry` rather than `OutboxEntry` deliberately: under the
@@ -71,7 +81,7 @@ const signatureEntry = (
 
 describe("enqueueVisit", () => {
   it("adds a visit and makes it due immediately", () => {
-    const out = enqueueVisit([], body("a"), 1000);
+    const out = enqueueVisit([], body("a"), 1000, MINE);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({ id: "a", state: "pending", attempts: 0, nextAttemptAt: 1000, queuedAt: 1000 });
   });
@@ -79,8 +89,8 @@ describe("enqueueVisit", () => {
   it("REPLACES the entry for a visit already queued, rather than queuing it twice", () => {
     // One queue slot per visit: the id is the record id, the server upserts by it, and a
     // rep correcting a visit before it syncs must not file two call reports.
-    const first = enqueueVisit([], body("a", "ACC-1"), 1000);
-    const second = enqueueVisit(first, body("a", "ACC-2"), 5000);
+    const first = enqueueVisit([], body("a", "ACC-1"), 1000, MINE);
+    const second = enqueueVisit(first, body("a", "ACC-2"), 5000, MINE);
     expect(second).toHaveLength(1);
     const replaced = second[0];
     expect(replaced?.kind).toBe("visit");
@@ -91,7 +101,7 @@ describe("enqueueVisit", () => {
     // Queued-at is how long the rep has been waiting, which an edit does not reset.
     // Attempts are about a body the server has now never seen, which an edit does.
     const first = [entry({ id: "a", attempts: 4, nextAttemptAt: 900_000, queuedAt: 1000, lastReason: "500" })];
-    const second = enqueueVisit(first, body("a", "ACC-9"), 60_000);
+    const second = enqueueVisit(first, body("a", "ACC-9"), 60_000, MINE);
     expect(second[0]).toMatchObject({ queuedAt: 1000, attempts: 0, nextAttemptAt: 60_000 });
   });
 });
@@ -302,7 +312,7 @@ describe("rejectUnreconcilable", () => {
   });
 
   it("cannot be produced by enqueueVisit, which is the point", () => {
-    const out = enqueueVisit([], body("x"), 1);
+    const out = enqueueVisit([], body("x"), 1, MINE);
     expect(out[0]?.id).toBe(out[0]?.body.id);
     expect(rejectUnreconcilable(out).refused).toEqual([]);
   });
@@ -335,12 +345,12 @@ describe("dependencies", () => {
   });
 
   it("enqueueSignature records which disbursement it belongs to", () => {
-    const queued = enqueueSignature([], { id: "s1", contentType: "image/png", contentBase64: "aGk=" }, "d1", 500);
+    const queued = enqueueSignature([], { id: "s1", contentType: "image/png", contentBase64: "aGk=" }, 500, { ...MINE, disbursementId: "d1" });
     expect(queued[0]).toMatchObject({ kind: "signature", dependsOn: "d1", state: "pending", queuedAt: 500 });
   });
 
   it("queues a disbursement like any other record, keyed by its own id", () => {
-    const queued = enqueueDisbursement([], disbursement("d1"), 500);
+    const queued = enqueueDisbursement([], disbursement("d1"), 500, MINE);
     expect(queued[0]).toMatchObject({ kind: "disbursement", id: "d1", state: "pending" });
     expect(queued[0]?.id).toBe(queued[0]?.body.id);
   });
@@ -386,5 +396,139 @@ describe("rejectOrphanedDependents", () => {
     const entries = [signatureEntry({ id: "s1", dependsOn: "d1" })];
     expect(rejectOrphanedDependents(entries).refused).toEqual([]);
     expect(rejectOrphanedDependents(entries).entries[0]?.state).toBe("pending");
+  });
+});
+
+// ---- transfers ------------------------------------------------------------
+
+describe("the transfer kinds", () => {
+  const LOT = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c1e";
+  const GRACE = "22222222-2222-4222-8222-222222222222";
+  const transferBody = (id: string, quantity = "4"): TransferBody => ({
+    id,
+    lotId: LOT,
+    quantity,
+    occurredAt: "2026-10-08T09:00:00.000Z",
+    toRepProfileId: GRACE,
+  });
+
+  it("queues a transfer under its own id, with no dependency", () => {
+    const [queued] = enqueueTransfer([], transferBody("t1"), 1000, MINE);
+    expect(queued).toMatchObject({ id: "t1", kind: "transfer", createdBy: REP });
+    // Absent rather than present-and-undefined: these entries are stored as JSON, where
+    // the two are not the same thing on the way back in.
+    expect(queued).not.toHaveProperty("dependsOn");
+  });
+
+  it("queues an acceptance with the transfer's id and NO dependency on it", () => {
+    // The transfer was recorded on somebody else's device and is already on the server —
+    // it is how this device heard of it. A dependency would wait for a row that will
+    // never be in this queue, which is a permanent stall rather than a safety check.
+    const [queued] = enqueueAcceptance([], { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" }, 1000, {
+      ...MINE,
+      transferOf: "t-from-grace",
+    });
+    expect(queued).toMatchObject({ id: "a1", kind: "acceptance", transferOf: "t-from-grace" });
+    expect(queued?.dependsOn).toBeUndefined();
+    expect(dueEntries([...enqueueAcceptance([], { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" }, 1000, { ...MINE, transferOf: "t-from-grace" })], 2000)).toHaveLength(1);
+  });
+
+  it("queues a recall of a LANDED transfer with no dependency", () => {
+    const [queued] = enqueueRecall([], { id: "r1", occurredAt: "2026-10-08T11:00:00.000Z" }, 1000, {
+      ...MINE,
+      transferOf: "t1",
+    });
+    expect(queued).toMatchObject({ id: "r1", kind: "recall", transferOf: "t1" });
+    expect(queued?.dependsOn).toBeUndefined();
+  });
+
+  it("makes a recall of an UNSENT transfer wait for it", () => {
+    // The route takes the transfer's id in its path and answers 404 while that row does
+    // not exist — and a 404 is permanent. Without the dependency the recall would be
+    // refused forever for a reason that was only ever about order.
+    const queue = enqueueRecall(enqueueTransfer([], transferBody("t1"), 1000, MINE), { id: "r1", occurredAt: "2026-10-08T11:00:00.000Z" }, 1001, {
+      ...MINE,
+      transferOf: "t1",
+      transferUnsent: true,
+    });
+    expect(queue.find((e) => e.id === "r1")?.dependsOn).toBe("t1");
+    expect(dueEntries(queue, 2000).map((e) => e.id)).toEqual(["t1"]);
+    // Once the transfer has left the queue — which is this device's whole memory of what
+    // is unsent — the recall is due.
+    expect(dueEntries(queue.filter((e) => e.id !== "t1"), 2000).map((e) => e.id)).toEqual(["r1"]);
+  });
+
+  it("refuses a recall whose transfer was refused, naming the transfer", () => {
+    const queue = [
+      { ...transferEntryOf("t1"), state: "rejected" as const, lastReason: "insufficient stock" },
+      ...enqueueRecall([], { id: "r1", occurredAt: "2026-10-08T11:00:00.000Z" }, 1001, {
+        ...MINE,
+        transferOf: "t1",
+        transferUnsent: true,
+      }),
+    ];
+    const out = rejectOrphanedDependents(queue);
+    expect(out.refused).toEqual([
+      { id: "r1", reason: "the transfer it belongs to was refused: insufficient stock" },
+    ]);
+  });
+
+  const transferEntryOf = (id: string): TransferEntry => ({
+    kind: "transfer",
+    body: transferBody(id),
+    id,
+    state: "pending",
+    attempts: 0,
+    nextAttemptAt: 0,
+    queuedAt: 0,
+    createdBy: REP,
+  });
+
+  it("says which KIND a mismatched entry holds, not always 'visit'", () => {
+    const broken: TransferEntry = { ...transferEntryOf("t1"), id: "not-t1" };
+    const out = rejectUnreconcilable([broken]);
+    expect(out.refused).toEqual(["not-t1"]);
+    expect(out.entries[0]?.lastReason).toContain("holding a transfer with id t1");
+  });
+});
+
+describe("whose rows these are", () => {
+  const OTHER = "99999999-9999-4999-8999-999999999999";
+
+  it("sends only the signed-in rep's rows, and holds the rest", () => {
+    const entries = [
+      entry({ id: "mine", createdBy: REP }),
+      entry({ id: "theirs", createdBy: OTHER }),
+    ];
+    const split = splitByAuthor(entries, REP);
+    expect(split.mine.map((e) => e.id)).toEqual(["mine"]);
+    expect(split.held.map((e) => e.id)).toEqual(["theirs"]);
+  });
+
+  it("holds an UNATTRIBUTED row rather than claiming it", () => {
+    // Written by a build from before rows named their author. Holding it is the fail-closed
+    // half: every write route attributes the record to the caller, so guessing "the person
+    // in front of the device" would file somebody else's hand-over under this rep's name.
+    const legacy = entry({ id: "legacy" });
+    expect(splitByAuthor([legacy], REP).held.map((e) => e.id)).toEqual(["legacy"]);
+  });
+
+  it("holds nothing when every row is this rep's", () => {
+    expect(heldForOthers([entry({ id: "a", createdBy: REP })], REP)).toBe(0);
+  });
+
+  it("counts only PENDING held rows, since a rejected one is not waiting to be sent", () => {
+    const entries = [
+      entry({ id: "p", createdBy: OTHER }),
+      entry({ id: "r", createdBy: OTHER, state: "rejected" }),
+    ];
+    expect(heldForOthers(entries, REP)).toBe(1);
+  });
+
+  it("leaves a held row completely untouched — state, attempts and backoff", () => {
+    // It is not refused and not deleted: there is nothing wrong with it, and a record of a
+    // controlled hand-over is not this app's to throw away.
+    const theirs = entry({ id: "theirs", createdBy: OTHER, attempts: 3, nextAttemptAt: 50_000 });
+    expect(splitByAuthor([theirs], REP).held[0]).toBe(theirs);
   });
 });

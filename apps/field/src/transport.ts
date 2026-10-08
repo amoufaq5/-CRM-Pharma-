@@ -1,4 +1,14 @@
-import { Problem, SyncResponse, problemKind, type DisbursementBody, type SignatureBody, type VisitBody } from "@crm/client";
+import {
+  Problem,
+  SyncResponse,
+  problemKind,
+  type AcceptBody,
+  type DisbursementBody,
+  type RecallBody,
+  type SignatureBody,
+  type TransferBody,
+  type VisitBody,
+} from "@crm/client";
 import type { SyncTransport, TransportResult } from "@crm/client";
 
 /**
@@ -91,6 +101,27 @@ export class ApiTransport implements SyncTransport {
    */
   async putSignature(disbursementId: string, body: SignatureBody): Promise<TransportResult> {
     return this.request("POST", `/v1/samples/disbursements/${encodeURIComponent(disbursementId)}/signature`, body);
+  }
+
+  /**
+   * The three transfer movements, one request each.
+   *
+   * Each goes to its own route and answers 201 with the ledger row it wrote; there is no
+   * batch endpoint to send them to, which is why the engine gives all three a batch size
+   * of one. The transfer id is in the PATH for the last two, encoded here rather than
+   * interpolated raw — it comes from a server response, but a client that trusts that
+   * blindly is one bad row away from a request to a path it did not mean.
+   */
+  async postTransfer(body: TransferBody): Promise<TransportResult> {
+    return this.request("POST", "/v1/samples/transfers", body);
+  }
+
+  async postAcceptance(transferId: string, body: AcceptBody): Promise<TransportResult> {
+    return this.request("POST", `/v1/samples/transfers/${encodeURIComponent(transferId)}/accept`, body);
+  }
+
+  async postRecall(transferId: string, body: RecallBody): Promise<TransportResult> {
+    return this.request("POST", `/v1/samples/transfers/${encodeURIComponent(transferId)}/recall`, body);
   }
 
   /**

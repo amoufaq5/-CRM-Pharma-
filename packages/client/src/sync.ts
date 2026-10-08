@@ -1,4 +1,13 @@
-import { SYNC_BATCH_MAX, SyncResponse, type DisbursementBody, type SignatureBody, type VisitBody } from "./api.js";
+import {
+  SYNC_BATCH_MAX,
+  SyncResponse,
+  type AcceptBody,
+  type DisbursementBody,
+  type RecallBody,
+  type SignatureBody,
+  type TransferBody,
+  type VisitBody,
+} from "./api.js";
 import {
   applyBatchFailure,
   applySyncResults,
@@ -6,6 +15,7 @@ import {
   rejectOrphanedDependents,
   rejectUnreconcilable,
   reviveDue,
+  splitByAuthor,
   DEFAULT_BACKOFF,
   type ApplyResult,
   type BackoffPolicy,
@@ -38,6 +48,16 @@ export interface SyncTransport {
   postDisbursements(disbursements: readonly DisbursementBody[]): Promise<TransportResult>;
   /** One at a time: the route takes one signature for one disbursement. */
   putSignature(disbursementId: string, body: SignatureBody): Promise<TransportResult>;
+  /**
+   * The three transfer routes, each taking one movement.
+   *
+   * There is no `/v1/sync/transfers` to batch into, and that is the server's shape rather
+   * than an omission here: a transfer, an acceptance and a recall each answer 201 with the
+   * ledger row they wrote. So a batch is one, as it is for a signature.
+   */
+  postTransfer(body: TransferBody): Promise<TransportResult>;
+  postAcceptance(transferId: string, body: AcceptBody): Promise<TransportResult>;
+  postRecall(transferId: string, body: RecallBody): Promise<TransportResult>;
 }
 
 export interface SyncDeps {
@@ -59,6 +79,14 @@ export interface SyncDeps {
    * does nothing.
    */
   readonly revive?: boolean;
+  /**
+   * The signed-in rep, and the only author whose rows this call may send.
+   *
+   * Required, not optional: a drain that does not know who is signed in cannot tell its
+   * own rows from a colleague's, and the route it posts to attributes whatever it sends to
+   * the token's rep. `splitByAuthor` has the whole argument.
+   */
+  readonly repProfileId: string;
 }
 
 export interface SyncReport {
@@ -70,18 +98,136 @@ export interface SyncReport {
   readonly reauthenticate: boolean;
   /** Rows still pending after this call — not an error, just how much is left. */
   readonly remaining: number;
+  /**
+   * Pending rows recorded by somebody else on this device, which were not sent.
+   *
+   * Reported rather than silently skipped: a rep looking at "3 waiting to send" that never
+   * moves deserves to be told why, and the reason is that they are not that rep's to send.
+   */
+  readonly heldForOthers: number;
 }
 
-/** How many of each kind may ride in one request. */
-const BATCH_MAX: Readonly<Record<OutboxKind, number>> = {
-  visit: SYNC_BATCH_MAX,
-  disbursement: SYNC_BATCH_MAX,
+/**
+ * How each kind is sent, in one table instead of a chain of special cases.
+ *
+ * It started as `if (kind === "signature")` around a cast, which was fine for one
+ * single-item route and would have become four of them. The table makes the two things
+ * that vary per kind — how many rows may ride in one request, and which route they go to —
+ * declarations rather than control flow, and `Record<OutboxKind, …>` means the compiler
+ * refuses a new kind that nobody taught the engine to send.
+ *
+ * `reply` is the other axis: a batched route answers with a per-row verdict for everything
+ * it was handed, while a single-item route answers 201 or a problem document about the one
+ * row. Normalising the second into the first (`rowsFromSingle`) keeps every disposition
+ * decision in `classifyRowOutcome`, for all six kinds.
+ */
+export interface KindPlan {
+  readonly batchMax: number;
+  readonly reply: "per_row" | "single";
+  readonly send: (batch: readonly OutboxEntry[], transport: SyncTransport) => Promise<TransportResult>;
+}
+
+/**
+ * Narrow a single-item batch to its kind, or throw.
+ *
+ * `dueEntries` filtered by kind, so this cannot fail today — which is exactly why it is a
+ * check and not a cast. A wrong `SEND_ORDER` or a future kind sharing a plan would
+ * otherwise post one kind's body to another kind's route and be told, correctly, that it
+ * is malformed.
+ */
+function only<K extends OutboxKind>(
+  batch: readonly OutboxEntry[],
+  kind: K,
+): Extract<OutboxEntry, { kind: K }> {
+  const entry = batch[0];
+  if (entry === undefined || entry.kind !== kind) {
+    throw new Error(`the ${kind} pass was handed a ${entry?.kind ?? "missing"} entry`);
+  }
+  return entry as Extract<OutboxEntry, { kind: K }>;
+}
+
+/** The same check for a batched kind: every row, narrowed, or a throw. */
+function allOf<K extends OutboxKind>(
+  batch: readonly OutboxEntry[],
+  kind: K,
+): readonly Extract<OutboxEntry, { kind: K }>[] {
+  return batch.map((entry) => {
+    if (entry.kind !== kind) {
+      throw new Error(`the ${kind} pass was handed a ${entry.kind} entry`);
+    }
+    return entry as Extract<OutboxEntry, { kind: K }>;
+  });
+}
+
+/**
+ * The first row of a batch the caller has already established is non-empty.
+ *
+ * `batch[0]` is `T | undefined` under `noUncheckedIndexedAccess`, and the honest ways to
+ * discharge that are a throw or a branch that cannot be taken. A throw says what would
+ * have to be wrong for it to happen.
+ */
+function firstOf(batch: readonly OutboxEntry[]): OutboxEntry {
+  const entry = batch[0];
+  if (entry === undefined) throw new Error("a batch reported non-empty had no first entry");
+  return entry;
+}
+
+export const SEND_PLANS: Readonly<Record<OutboxKind, KindPlan>> = {
+  visit: {
+    batchMax: SYNC_BATCH_MAX,
+    reply: "per_row",
+    send: (batch, transport) => transport.postVisits(allOf(batch, "visit").map((e) => e.body)),
+  },
+  disbursement: {
+    batchMax: SYNC_BATCH_MAX,
+    reply: "per_row",
+    send: (batch, transport) =>
+      transport.postDisbursements(allOf(batch, "disbursement").map((e) => e.body)),
+  },
   // The signature route takes one signature for one disbursement, so a "batch" is one.
-  signature: 1,
+  signature: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => {
+      const entry = only(batch, "signature");
+      return transport.putSignature(entry.dependsOn, entry.body);
+    },
+  },
+  transfer: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => transport.postTransfer(only(batch, "transfer").body),
+  },
+  acceptance: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => {
+      const entry = only(batch, "acceptance");
+      return transport.postAcceptance(entry.transferOf, entry.body);
+    },
+  },
+  recall: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => {
+      const entry = only(batch, "recall");
+      return transport.postRecall(entry.transferOf, entry.body);
+    },
+  },
 };
 
-/** Dependencies last, so one drain can land a disbursement and then its signature. */
-const SEND_ORDER: readonly OutboxKind[] = ["visit", "disbursement", "signature"];
+/**
+ * Dependencies last, so one drain can land a disbursement and then its signature, and a
+ * transfer and then the recall that takes it back.
+ */
+const SEND_ORDER: readonly OutboxKind[] = [
+  "visit",
+  "disbursement",
+  "signature",
+  "transfer",
+  "acceptance",
+  "recall",
+];
 
 /**
  * A single-item route's answer, in the per-row shape the fold already understands.
@@ -148,54 +294,42 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncReport> {
   }
 
   for (const kind of SEND_ORDER) {
+    const plan = SEND_PLANS[kind];
     while (batches < maxBatches) {
       const now = deps.now();
-      const limit = Math.min(deps.batchSize ?? SYNC_BATCH_MAX, BATCH_MAX[kind]);
-      const batch = dueEntries(entries, now, limit, kind);
+      const limit = Math.min(deps.batchSize ?? SYNC_BATCH_MAX, plan.batchMax);
+      // Only this rep's rows are candidates. Everything else on the device is held, and
+      // reported as held rather than counted as waiting.
+      const batch = dueEntries(splitByAuthor(entries, deps.repProfileId).mine, now, limit, kind);
       if (batch.length === 0) break;
 
+      const result = await plan.send(batch, deps.transport);
+      batches += 1;
+
       let applied: ApplyResult;
-      if (kind === "signature") {
-        // Narrowed, not cast. `dueEntries` filtered by kind so the cast would have been
-        // correct today — and a future kind with a dependency would have made it quietly
-        // wrong, sending someone else's body to the signature route.
-        const entry = batch[0];
-        if (entry === undefined || entry.kind !== "signature") {
-          throw new Error(`the signature pass was handed a ${entry?.kind ?? "missing"} entry`);
-        }
-        const result = await deps.transport.putSignature(entry.dependsOn, entry.body);
-        batches += 1;
-        const normalised = rowsFromSingle(entry, result);
+      if (plan.reply === "single") {
+        const normalised = rowsFromSingle(firstOf(batch), result);
         applied =
           "failure" in normalised
             ? applyBatchFailure(entries, batch, classifyTransportOutcome(normalised.failure as { kind: "network" }), now, policy, random)
             : applySyncResults(entries, batch, normalised.rows, now, policy, random);
+      } else if (result.kind === "ok") {
+        const parsed = SyncResponse.safeParse(result.body);
+        applied = parsed.success
+          ? applySyncResults(entries, batch, parsed.data.results, now, policy, random)
+          : // A 200 whose body is not the contract is not success. Treating it as one
+            // would silently drop the batch from the queue on the strength of a response
+            // nobody could read, so it is a transport failure and the rows stay.
+            applyBatchFailure(
+              entries,
+              batch,
+              { disposition: "retry", reason: "the server's reply did not match the sync contract" },
+              now,
+              policy,
+              random,
+            );
       } else {
-        const bodies = batch.map((e) => e.body);
-        const result =
-          kind === "visit"
-            ? await deps.transport.postVisits(bodies as readonly VisitBody[])
-            : await deps.transport.postDisbursements(bodies as readonly DisbursementBody[]);
-        batches += 1;
-
-        if (result.kind === "ok") {
-          const parsed = SyncResponse.safeParse(result.body);
-          applied = parsed.success
-            ? applySyncResults(entries, batch, parsed.data.results, now, policy, random)
-            : // A 200 whose body is not the contract is not success. Treating it as one
-              // would silently drop the batch from the queue on the strength of a response
-              // nobody could read, so it is a transport failure and the rows stay.
-              applyBatchFailure(
-                entries,
-                batch,
-                { disposition: "retry", reason: "the server's reply did not match the sync contract" },
-                now,
-                policy,
-                random,
-              );
-        } else {
-          applied = applyBatchFailure(entries, batch, classifyTransportOutcome(result), now, policy, random);
-        }
+        applied = applyBatchFailure(entries, batch, classifyTransportOutcome(result), now, policy, random);
       }
 
       entries = applied.entries;
@@ -231,6 +365,11 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncReport> {
     if (stopped !== null || reauthenticate) break;
   }
 
+  // Counted from the final queue, so "remaining" is what is left to SEND and the held
+  // rows are named separately. One number covering both would be the screen saying a
+  // rep's day has not gone in when there is nothing they can do about it.
+  const { mine, held } = splitByAuthor(entries, deps.repProfileId);
+
   return {
     batches,
     accepted,
@@ -238,6 +377,7 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncReport> {
     retrying,
     stopped,
     reauthenticate,
-    remaining: entries.filter((e: OutboxEntry) => e.state === "pending").length,
+    remaining: mine.filter((e: OutboxEntry) => e.state === "pending").length,
+    heldForOthers: held.filter((e: OutboxEntry) => e.state === "pending").length,
   };
 }

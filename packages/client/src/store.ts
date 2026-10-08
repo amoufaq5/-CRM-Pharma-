@@ -1,4 +1,4 @@
-import type { Account, Holding, Me, Visit } from "./api.js";
+import type { Account, Holding, IncomingTransfer, Me, RecallableTransfer, TransferPeer, Visit } from "./api.js";
 import type { OutboxEntry } from "./outbox.js";
 
 /**
@@ -36,6 +36,22 @@ export interface CachedReference {
    * throws on an older record would lose a rep's whole queue on an upgrade.
    */
   readonly holdings?: readonly Holding[];
+  /**
+   * The two halves of an open transfer, and who one can be addressed to.
+   *
+   * Cached for the same reason as the holdings, with one difference worth stating: these
+   * are the only cached lists a rep ACTS on rather than reads. Accepting from a stale list
+   * is safe — the acceptance carries the transfer's id, and the server refuses an id that
+   * has already been settled — but the screen has to say how old the list is, because
+   * "accept" on a transfer somebody recalled an hour ago will be refused and the rep
+   * deserves to know why.
+   *
+   * All optional: a cache written by an earlier build has none, and refusing it would cost
+   * a rep their queue on an upgrade.
+   */
+  readonly incoming?: readonly IncomingTransfer[];
+  readonly recallable?: readonly RecallableTransfer[];
+  readonly peers?: readonly TransferPeer[];
   /** Epoch ms of the fetch, so the UI can say how stale it is instead of implying fresh. */
   readonly fetchedAt: number;
 }

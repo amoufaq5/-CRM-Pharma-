@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import type { DisbursementBody, SignatureBody, VisitBody } from "./api.js";
-import { DEFAULT_BACKOFF, enqueueDisbursement, enqueueSignature, enqueueVisit, type OutboxEntry } from "./outbox.js";
+import type { AcceptBody, DisbursementBody, RecallBody, SignatureBody, TransferBody, VisitBody } from "./api.js";
+import {
+  DEFAULT_BACKOFF,
+  OUTBOX_KINDS,
+  enqueueAcceptance,
+  enqueueDisbursement,
+  enqueueRecall,
+  enqueueSignature,
+  enqueueTransfer,
+  enqueueVisit,
+  type OutboxEntry,
+} from "./outbox.js";
 import type { CachedReference, ClientStore } from "./store.js";
-import { syncOnce, type SyncTransport, type TransportResult } from "./sync.js";
+import { SEND_PLANS, syncOnce, type SyncTransport, type TransportResult } from "./sync.js";
 
 /** A store in memory: the whole reason `ClientStore` is an interface with no storage. */
 function memoryStore(entries: readonly OutboxEntry[] = []): ClientStore & { entries: readonly OutboxEntry[]; writes: number } {
@@ -30,10 +40,16 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
   disbursementBatches: DisbursementBody[][];
   signatures: { disbursementId: string; body: SignatureBody }[];
   calls: string[];
+  transfers: TransferBody[];
+  acceptances: { transferId: string; body: AcceptBody }[];
+  recalls: { transferId: string; body: RecallBody }[];
 } {
   const batches: VisitBody[][] = [];
   const disbursementBatches: DisbursementBody[][] = [];
   const signatures: { disbursementId: string; body: SignatureBody }[] = [];
+  const transfers: TransferBody[] = [];
+  const acceptances: { transferId: string; body: AcceptBody }[] = [];
+  const recalls: { transferId: string; body: RecallBody }[] = [];
   const calls: string[] = [];
   let i = 0;
   const next = (): TransportResult => {
@@ -45,6 +61,9 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
     batches,
     disbursementBatches,
     signatures,
+    transfers,
+    acceptances,
+    recalls,
     calls,
     postVisits: async (visits) => {
       batches.push([...visits]);
@@ -59,6 +78,21 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
     putSignature: async (disbursementId, body) => {
       signatures.push({ disbursementId, body });
       calls.push(`signature:${disbursementId}`);
+      return next();
+    },
+    postTransfer: async (body) => {
+      transfers.push(body);
+      calls.push(`transfer:${body.id}`);
+      return next();
+    },
+    postAcceptance: async (transferId, body) => {
+      acceptances.push({ transferId, body });
+      calls.push(`accept:${transferId}`);
+      return next();
+    },
+    postRecall: async (transferId, body) => {
+      recalls.push({ transferId, body });
+      calls.push(`recall:${transferId}`);
       return next();
     },
   };
@@ -76,8 +110,22 @@ const ok = (ids: readonly string[], rejected: readonly { id: string; type: strin
 
 const body = (id: string): VisitBody => ({ id, erpAccountId: "ACC-1" });
 
+/** The signed-in rep for every test that is not about who recorded a row. */
+const REP = "11111111-1111-4111-8111-111111111111";
+const MINE = { createdBy: REP } as const;
+
+/**
+ * The engine, with the signed-in rep supplied.
+ *
+ * A wrapper rather than twenty literals: `repProfileId` is required on `SyncDeps` so that
+ * no caller can drain a queue without knowing whose rows it holds, and the tests that are
+ * ABOUT that pass their own.
+ */
+const sync = (deps: Omit<Parameters<typeof syncOnce>[0], "repProfileId"> & { repProfileId?: string }) =>
+  syncOnce({ repProfileId: REP, ...deps });
+
 const queue = (ids: readonly string[], now = 1000): readonly OutboxEntry[] =>
-  ids.reduce<readonly OutboxEntry[]>((acc, id) => enqueueVisit(acc, body(id), now), []);
+  ids.reduce<readonly OutboxEntry[]>((acc, id) => enqueueVisit(acc, body(id), now, MINE), []);
 
 describe("syncOnce", () => {
   const now = (): number => 10_000;
@@ -85,7 +133,7 @@ describe("syncOnce", () => {
   it("drains a queue and empties it", async () => {
     const store = memoryStore(queue(["a", "b"]));
     const transport = recordingTransport([ok(["a", "b"])]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
 
     expect(report.accepted).toEqual(["a", "b"]);
     expect(report.remaining).toBe(0);
@@ -97,7 +145,7 @@ describe("syncOnce", () => {
     // A write per idle tick would churn IndexedDB on every foreground poll.
     const store = memoryStore(queue(["a"]).map((e) => ({ ...e, nextAttemptAt: 9_999_999 })));
     const transport = recordingTransport([ok([])]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
     expect(report.batches).toBe(0);
     expect(store.writes).toBe(0);
     expect(transport.batches).toEqual([]);
@@ -107,7 +155,7 @@ describe("syncOnce", () => {
     const ids = Array.from({ length: 205 }, (_, i) => `v${String(i).padStart(3, "0")}`);
     const store = memoryStore(queue(ids));
     const transport = recordingTransport([ok(ids.slice(0, 200)), ok(ids.slice(200))]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
 
     expect(transport.batches.map((b) => b.length)).toEqual([200, 5]);
     expect(report.accepted).toHaveLength(205);
@@ -117,7 +165,7 @@ describe("syncOnce", () => {
   it("keeps every row when the network is gone", async () => {
     const store = memoryStore(queue(["a", "b"]));
     const transport = recordingTransport([{ kind: "network" }]);
-    const report = await syncOnce({ store, transport, now, random: () => 0.5 });
+    const report = await sync({ store, transport, now, random: () => 0.5 });
 
     expect(report.accepted).toEqual([]);
     expect(report.retrying).toEqual(["a", "b"]);
@@ -133,7 +181,7 @@ describe("syncOnce", () => {
     const transport = recordingTransport([
       { kind: "status", status: 403, problemKind: "tenant_deleted", detail: "deleted in the ERP" },
     ]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
 
     expect(report.stopped).toEqual({ reason: "deleted in the ERP" });
     expect(transport.batches).toHaveLength(1);
@@ -143,7 +191,7 @@ describe("syncOnce", () => {
   it("stops the loop on a 401 rather than burning the queue's attempts", async () => {
     const store = memoryStore(queue(["a", "b", "c"]));
     const transport = recordingTransport([{ kind: "status", status: 401 }]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
 
     expect(report.reauthenticate).toBe(true);
     expect(transport.batches).toHaveLength(1);
@@ -159,7 +207,7 @@ describe("syncOnce", () => {
       ]),
       ok(["c"]),
     ]);
-    const report = await syncOnce({ store, transport, now, random: () => 0.5 });
+    const report = await sync({ store, transport, now, random: () => 0.5 });
 
     expect(report.accepted).toEqual(["a"]);
     expect(report.rejected).toEqual([{ id: "b", reason: "not your account" }]);
@@ -178,7 +226,7 @@ describe("syncOnce", () => {
     // nobody could parse.
     const store = memoryStore(queue(["a"]));
     const transport = recordingTransport([{ kind: "ok", status: 200, body: { hello: "portal" } }]);
-    const report = await syncOnce({ store, transport, now, random: () => 0.5 });
+    const report = await sync({ store, transport, now, random: () => 0.5 });
 
     expect(report.accepted).toEqual([]);
     expect(report.retrying).toEqual(["a"]);
@@ -191,7 +239,7 @@ describe("syncOnce", () => {
     const store = memoryStore(queue(ids));
     // Every batch succeeds, so without a limit this would send five.
     const transport = recordingTransport([ok(ids)]);
-    const report = await syncOnce({ store, transport, now, maxBatches: 2 });
+    const report = await sync({ store, transport, now, maxBatches: 2 });
     expect(report.batches).toBe(2);
     expect(transport.batches).toHaveLength(2);
   });
@@ -201,7 +249,7 @@ describe("syncOnce", () => {
     const ids = Array.from({ length: 205 }, (_, i) => `v${String(i).padStart(3, "0")}`);
     const store = memoryStore(queue(ids));
     const transport = recordingTransport([ok(ids.slice(0, 200)), ok(ids.slice(200))]);
-    await syncOnce({ store, transport, now });
+    await sync({ store, transport, now });
     expect(store.writes).toBe(2);
   });
 
@@ -212,13 +260,13 @@ describe("syncOnce", () => {
 
     const quiet = memoryStore(backedOff);
     const quietTransport = recordingTransport([ok(["a"])]);
-    const quietReport = await syncOnce({ store: quiet, transport: quietTransport, now });
+    const quietReport = await sync({ store: quiet, transport: quietTransport, now });
     expect(quietTransport.batches).toEqual([]);
     expect(quietReport.remaining).toBe(1);
 
     const revived = memoryStore(backedOff);
     const revivedTransport = recordingTransport([ok(["a"])]);
-    const revivedReport = await syncOnce({ store: revived, transport: revivedTransport, now, revive: true });
+    const revivedReport = await sync({ store: revived, transport: revivedTransport, now, revive: true });
     expect(revivedTransport.batches).toHaveLength(1);
     expect(revivedReport.accepted).toEqual(["a"]);
   });
@@ -226,7 +274,7 @@ describe("syncOnce", () => {
   it("does not write the queue when reviving changes nothing", async () => {
     const store = memoryStore(queue(["a"]));
     const transport = recordingTransport([ok(["a"])]);
-    await syncOnce({ store, transport, now, revive: true });
+    await sync({ store, transport, now, revive: true });
     // One write, for the drain — not two.
     expect(store.writes).toBe(1);
   });
@@ -234,7 +282,7 @@ describe("syncOnce", () => {
   it("uses the injected backoff policy", async () => {
     const store = memoryStore(queue(["a"]));
     const transport = recordingTransport([{ kind: "network" }]);
-    await syncOnce({
+    await sync({
       store,
       transport,
       now,
@@ -261,8 +309,8 @@ describe("syncOnce with samples", () => {
   const signatureBody = (id: string): SignatureBody => ({ id, contentType: "image/png", contentBase64: "aGk=" });
 
   const bothQueued = (now = 1000): readonly OutboxEntry[] => {
-    const withDisbursement = enqueueDisbursement([], disbursementBody("d1"), now);
-    return enqueueSignature(withDisbursement, signatureBody("s1"), "d1", now);
+    const withDisbursement = enqueueDisbursement([], disbursementBody("d1"), now, MINE);
+    return enqueueSignature(withDisbursement, signatureBody("s1"), now, { ...MINE, disbursementId: "d1" });
   };
 
   it("sends the disbursement FIRST and then its signature, in one drain", async () => {
@@ -271,7 +319,7 @@ describe("syncOnce with samples", () => {
     // what makes the signature due.
     const store = memoryStore(bothQueued());
     const transport = recordingTransport([ok(["d1"]), { kind: "ok", status: 201, body: { id: "s1" } }]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
 
     expect(transport.calls).toEqual(["disbursements", "signature:d1"]);
     expect(transport.disbursementBatches[0]?.map((d) => d.id)).toEqual(["d1"]);
@@ -283,7 +331,7 @@ describe("syncOnce with samples", () => {
   it("does not attempt the signature when the disbursement could not be sent", async () => {
     const store = memoryStore(bothQueued());
     const transport = recordingTransport([{ kind: "network" }]);
-    const report = await syncOnce({ store, transport, now, random: () => 0.5 });
+    const report = await sync({ store, transport, now, random: () => 0.5 });
 
     expect(transport.calls).toEqual(["disbursements"]);
     expect(report.retrying).toEqual(["d1"]);
@@ -295,7 +343,7 @@ describe("syncOnce with samples", () => {
     // "waiting to send" on a screen that is telling the rep something false.
     const store = memoryStore(bothQueued());
     const transport = recordingTransport([ok([], [{ id: "d1", type: "lot_expired", error: "lot LOT-1 expired" }])]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
 
     expect(transport.calls).toEqual(["disbursements"]);
     expect(report.rejected.map((r) => r.id).sort()).toEqual(["d1", "s1"]);
@@ -307,25 +355,25 @@ describe("syncOnce with samples", () => {
     // One row per request, so a 409 is about this signature — `signature_mismatch` says
     // the bytes do not hash to what the ledger committed, and re-sending them can never
     // work.
-    const store = memoryStore([...enqueueSignature([], signatureBody("s1"), "d1", 1000)]);
+    const store = memoryStore([...enqueueSignature([], signatureBody("s1"), 1000, { ...MINE, disbursementId: "d1" })]);
     const transport = recordingTransport([
       { kind: "status", status: 409, problemKind: "signature_mismatch", detail: "the stored image does not match the committed digest" },
     ]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
 
     expect(report.rejected).toEqual([{ id: "s1", reason: "the stored image does not match the committed digest" }]);
     expect(store.entries[0]?.state).toBe("rejected");
   });
 
   it("sends signatures one at a time, because the route takes one", async () => {
-    let queue = enqueueSignature([], signatureBody("s1"), "d1", 1000);
-    queue = enqueueSignature(queue, signatureBody("s2"), "d2", 1001);
+    let queue = enqueueSignature([], signatureBody("s1"), 1000, { ...MINE, disbursementId: "d1" });
+    queue = enqueueSignature(queue, signatureBody("s2"), 1001, { ...MINE, disbursementId: "d2" });
     const store = memoryStore(queue);
     const transport = recordingTransport([
       { kind: "ok", status: 201, body: {} },
       { kind: "ok", status: 201, body: {} },
     ]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
 
     expect(transport.signatures.map((s) => s.body.id)).toEqual(["s1", "s2"]);
     expect(transport.calls).toEqual(["signature:d1", "signature:d2"]);
@@ -334,15 +382,15 @@ describe("syncOnce with samples", () => {
 
   it("drains visits before disbursements before signatures", async () => {
     let queue = enqueueSignature(
-      enqueueDisbursement(enqueueVisit([], body("v1"), 1000), disbursementBody("d1"), 1000),
+      enqueueDisbursement(enqueueVisit([], body("v1"), 1000, MINE), disbursementBody("d1"), 1000, MINE),
       signatureBody("s1"),
-      "d1",
       1000,
+      { ...MINE, disbursementId: "d1" },
     );
     queue = [...queue];
     const store = memoryStore(queue);
     const transport = recordingTransport([ok(["v1"]), ok(["d1"]), { kind: "ok", status: 201, body: {} }]);
-    await syncOnce({ store, transport, now });
+    await sync({ store, transport, now });
     expect(transport.calls).toEqual(["visits", "disbursements", "signature:d1"]);
   });
 
@@ -351,9 +399,250 @@ describe("syncOnce with samples", () => {
     const transport = recordingTransport([
       { kind: "status", status: 403, problemKind: "tenant_deleted", detail: "deleted in the ERP" },
     ]);
-    const report = await syncOnce({ store, transport, now });
+    const report = await sync({ store, transport, now });
     expect(transport.calls).toEqual(["disbursements"]);
     expect(report.stopped).toEqual({ reason: "deleted in the ERP" });
     expect(store.entries.every((e) => e.state === "blocked")).toBe(true);
+  });
+});
+
+describe("syncOnce with transfers", () => {
+  const now = (): number => 10_000;
+  const REP2 = "99999999-9999-4999-8999-999999999999";
+  const LOT = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c1e";
+  const created = { kind: "ok", status: 201, body: {} } as const satisfies TransportResult;
+
+  const transferBody = (id: string): TransferBody => ({
+    id,
+    lotId: LOT,
+    quantity: "4",
+    occurredAt: "2026-10-08T09:00:00.000Z",
+    toRepProfileId: REP2,
+  });
+
+  const disbursementBodyFor = (id: string): DisbursementBody => ({
+    id,
+    lotId: LOT,
+    quantity: "2",
+    occurredAt: "2026-10-08T09:00:00.000Z",
+    erpAccountId: "ACC-1",
+    recipientName: "Dr Ada",
+    signatureSha256: "c".repeat(64),
+  });
+
+  it("posts a transfer to its own route, one at a time", async () => {
+    const store = memoryStore(enqueueTransfer([], transferBody("t1"), 1000, MINE));
+    const transport = recordingTransport([created]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.transfers).toEqual([transferBody("t1")]);
+    expect(report.accepted).toEqual(["t1"]);
+    expect(store.entries).toEqual([]);
+  });
+
+  it("posts an acceptance to the transfer's path, carrying only its own id and clock", async () => {
+    // The route reads the lot and the quantity off the transfer. A client that sent them
+    // could disagree with what was sent, and the server would refuse it — so the body
+    // cannot express the disagreement at all.
+    const store = memoryStore(
+      enqueueAcceptance([], { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" }, 1000, {
+        ...MINE,
+        transferOf: "t-from-grace",
+      }),
+    );
+    const transport = recordingTransport([created]);
+    await sync({ store, transport, now });
+
+    expect(transport.acceptances).toEqual([
+      { transferId: "t-from-grace", body: { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" } },
+    ]);
+  });
+
+  it("posts a recall to the transfer's path", async () => {
+    const store = memoryStore(
+      enqueueRecall([], { id: "r1", occurredAt: "2026-10-08T11:00:00.000Z", reason: "wrong colleague" }, 1000, {
+        ...MINE,
+        transferOf: "t1",
+      }),
+    );
+    const transport = recordingTransport([created]);
+    await sync({ store, transport, now });
+    expect(transport.recalls[0]?.transferId).toBe("t1");
+    expect(transport.recalls[0]?.body.reason).toBe("wrong colleague");
+  });
+
+  it("sends a transfer BEFORE the recall that takes it back, in one drain", async () => {
+    // Offline all afternoon: the transfer and the change of mind are both on the device,
+    // and the recall's route cannot find a transfer the server has not been told about.
+    let queue = enqueueTransfer([], transferBody("t1"), 1000, MINE);
+    queue = enqueueRecall(queue, { id: "r1", occurredAt: "2026-10-08T11:00:00.000Z" }, 1001, {
+      ...MINE,
+      transferOf: "t1",
+      transferUnsent: true,
+    });
+    const store = memoryStore(queue);
+    const transport = recordingTransport([created, created]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.calls).toEqual(["transfer:t1", "recall:t1"]);
+    expect(report.accepted).toEqual(["t1", "r1"]);
+    expect(store.entries).toEqual([]);
+  });
+
+  it("refuses the recall in the same pass when its transfer is refused", async () => {
+    let queue = enqueueTransfer([], transferBody("t1"), 1000, MINE);
+    queue = enqueueRecall(queue, { id: "r1", occurredAt: "2026-10-08T11:00:00.000Z" }, 1001, {
+      ...MINE,
+      transferOf: "t1",
+      transferUnsent: true,
+    });
+    const store = memoryStore(queue);
+    const transport = recordingTransport([
+      { kind: "status", status: 409, problemKind: "insufficient_stock", detail: "rep holds 1.000 of lot LOT-1" },
+    ]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.calls).toEqual(["transfer:t1"]);
+    expect(report.rejected).toEqual([
+      { id: "t1", reason: "rep holds 1.000 of lot LOT-1" },
+      { id: "r1", reason: "the transfer it belongs to was refused: rep holds 1.000 of lot LOT-1" },
+    ]);
+  });
+
+  it("drains all six kinds in the declared order", async () => {
+    let queue = enqueueVisit([], body("v1"), 1000, MINE);
+    queue = enqueueDisbursement(queue, disbursementBodyFor("d1"), 1000, MINE);
+    queue = enqueueSignature(queue, { id: "s1", contentType: "image/png", contentBase64: "aGk=" }, 1000, {
+      ...MINE,
+      disbursementId: "d1",
+    });
+    queue = enqueueTransfer(queue, transferBody("t1"), 1000, MINE);
+    queue = enqueueAcceptance(queue, { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" }, 1000, {
+      ...MINE,
+      transferOf: "t-from-grace",
+    });
+    queue = enqueueRecall(queue, { id: "r1", occurredAt: "2026-10-08T11:00:00.000Z" }, 1000, {
+      ...MINE,
+      transferOf: "t-landed",
+    });
+    const store = memoryStore(queue);
+    const transport = recordingTransport([ok(["v1"]), ok(["d1"]), created, created, created, created]);
+    await sync({ store, transport, now });
+
+    expect(transport.calls).toEqual([
+      "visits",
+      "disbursements",
+      "signature:d1",
+      "transfer:t1",
+      "accept:t-from-grace",
+      "recall:t-landed",
+    ]);
+  });
+
+  it("does NOT send another rep's rows, and says how many it is holding", async () => {
+    // The defect this prevents: every write route attributes the record to the caller, so
+    // draining a colleague's unsent disbursement under this rep's token files a drug-sample
+    // hand-over against the wrong person, with nothing downstream able to tell.
+    const store = memoryStore([
+      ...enqueueTransfer([], transferBody("mine"), 1000, MINE),
+      ...enqueueTransfer([], transferBody("theirs"), 1000, { createdBy: REP2 }),
+    ]);
+    const transport = recordingTransport([created]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.transfers.map((t) => t.id)).toEqual(["mine"]);
+    expect(report.accepted).toEqual(["mine"]);
+    expect(report.heldForOthers).toBe(1);
+    expect(report.remaining).toBe(0);
+    // Still there, untouched, for the rep who recorded it.
+    expect(store.entries.map((e) => e.id)).toEqual(["theirs"]);
+    expect(store.entries[0]?.state).toBe("pending");
+    expect(store.entries[0]?.attempts).toBe(0);
+  });
+
+  it("sends nothing at all when the whole queue belongs to somebody else", async () => {
+    const store = memoryStore(enqueueTransfer([], transferBody("theirs"), 1000, { createdBy: REP2 }));
+    const transport = recordingTransport([created]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.calls).toEqual([]);
+    expect(report.batches).toBe(0);
+    expect(report.heldForOthers).toBe(1);
+    expect(store.writes).toBe(0);
+  });
+
+  it("treats a 404 on an acceptance as permanent, not as something to retry", async () => {
+    // Somebody recalled it first, or it was already accepted. The id cannot become valid
+    // again, so retrying is a loop and the rep needs to be told.
+    const store = memoryStore(
+      enqueueAcceptance([], { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" }, 1000, {
+        ...MINE,
+        transferOf: "gone",
+      }),
+    );
+    const transport = recordingTransport([
+      { kind: "status", status: 404, problemKind: "not_found", detail: "transfer_of gone does not exist" },
+    ]);
+    const report = await sync({ store, transport, now });
+
+    expect(report.rejected).toEqual([{ id: "a1", reason: "transfer_of gone does not exist" }]);
+    expect(store.entries[0]?.state).toBe("rejected");
+  });
+
+  it("treats a conflict on an acceptance as permanent — somebody settled it first", async () => {
+    const store = memoryStore(
+      enqueueAcceptance([], { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" }, 1000, {
+        ...MINE,
+        transferOf: "t1",
+      }),
+    );
+    const transport = recordingTransport([
+      { kind: "status", status: 409, problemKind: "conflict", detail: "transfer t1 has already been settled" },
+    ]);
+    const report = await sync({ store, transport, now });
+    expect(report.rejected).toEqual([{ id: "a1", reason: "transfer t1 has already been settled" }]);
+  });
+
+  it("keeps a transfer queued when the network is gone, like every other kind", async () => {
+    const store = memoryStore(enqueueTransfer([], transferBody("t1"), 1000, MINE));
+    const transport = recordingTransport([{ kind: "network" }]);
+    const report = await sync({ store, transport, now, random: () => 0.5 });
+
+    expect(report.retrying).toEqual(["t1"]);
+    expect(store.entries[0]?.state).toBe("pending");
+    expect(store.entries[0]?.nextAttemptAt).toBeGreaterThan(now());
+  });
+
+  it("throws rather than posting one kind's body to another kind's route", () => {
+    // Unreachable through `dueEntries`, which filters by kind — and that is exactly why it
+    // is a check rather than a cast. A wrong SEND_ORDER, or a future kind sharing a plan,
+    // would otherwise post one kind's body to another kind's route and be told, correctly,
+    // that a well-formed request is malformed.
+    const transport = recordingTransport([created]);
+    const [transfer] = enqueueTransfer([], transferBody("t1"), 1000, MINE);
+    if (transfer === undefined) throw new Error("expected a queued transfer");
+
+    // Synchronously, before anything is sent: the guard runs on the batch, not on the
+    // answer, so a mismatched kind never becomes a request at all.
+    expect(() => SEND_PLANS.acceptance.send([transfer], transport)).toThrow(
+      /the acceptance pass was handed a transfer entry/,
+    );
+    expect(() => SEND_PLANS.visit.send([transfer], transport)).toThrow(
+      /the visit pass was handed a transfer entry/,
+    );
+    expect(() => SEND_PLANS.recall.send([], transport)).toThrow(
+      /the recall pass was handed a missing entry/,
+    );
+    // Nothing reached the network on any of those.
+    expect(transport.calls).toEqual([]);
+  });
+
+  it("declares a plan for every kind, so a new one cannot be forgotten", () => {
+    expect(Object.keys(SEND_PLANS).sort()).toEqual([...OUTBOX_KINDS].sort());
+    // A single-item route must declare a batch of one: handing it two would send the
+    // first and silently accept the second's verdict from the first's answer.
+    for (const [kind, plan] of Object.entries(SEND_PLANS)) {
+      if (plan.reply === "single") expect(plan.batchMax, kind).toBe(1);
+    }
   });
 });

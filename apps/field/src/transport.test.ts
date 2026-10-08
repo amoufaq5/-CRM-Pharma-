@@ -91,6 +91,41 @@ describe("ApiTransport", () => {
     expect(result.kind).toBe("ok");
   });
 
+  it("posts each transfer movement to its own route, with the id in the path", async () => {
+    const { impl, calls } = stubFetch([
+      new Response("{}", { status: 201 }),
+      new Response("{}", { status: 201 }),
+      new Response("{}", { status: 201 }),
+    ]);
+    const t = new ApiTransport({ baseUrl: "", accessToken: () => "t", fetchImpl: impl });
+    await t.postTransfer({
+      id: "t1",
+      lotId: "lot",
+      quantity: "4",
+      occurredAt: "2026-10-08T09:00:00.000Z",
+      toRepProfileId: "rep2",
+    });
+    await t.postAcceptance("t1", { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" });
+    await t.postRecall("t1", { id: "r1", occurredAt: "2026-10-08T11:00:00.000Z" });
+
+    expect(calls.map((c) => c.url)).toEqual([
+      "/v1/samples/transfers",
+      "/v1/samples/transfers/t1/accept",
+      "/v1/samples/transfers/t1/recall",
+    ]);
+    // The body is the movement itself, not an envelope: these are single-item routes.
+    expect(JSON.parse(String(calls[0]?.init?.body))).toMatchObject({ id: "t1", toRepProfileId: "rep2" });
+  });
+
+  it("encodes a transfer id into the path rather than interpolating it raw", async () => {
+    // The id comes from a server response, and a client that pastes one straight into a
+    // URL is one malformed row away from requesting a path it did not mean.
+    const { impl, calls } = stubFetch([new Response("{}", { status: 201 })]);
+    const t = new ApiTransport({ baseUrl: "", accessToken: () => "t", fetchImpl: impl });
+    await t.postAcceptance("../../v1/admin?x=1", { id: "a1", occurredAt: "2026-10-08T10:00:00.000Z" });
+    expect(calls[0]?.url).toBe("/v1/samples/transfers/..%2F..%2Fv1%2Fadmin%3Fx%3D1/accept");
+  });
+
   it("treats an unparseable 200 as ok-with-unreadable-body, for the engine to refuse", async () => {
     // The transport does not decide what a bad body means — `syncOnce` does, by parsing
     // it against the contract and keeping the rows. Two layers, one decision each.

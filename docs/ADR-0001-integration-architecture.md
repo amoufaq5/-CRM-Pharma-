@@ -1045,6 +1045,99 @@ Concretely, and these specifics are the decision, not commentary on it:
     with their regulatory deadlines, and the expiry sweep — the rest of custody. Roughly 85
     of the 104 routes still have no screen.
 
+27. **Transfers on the device, and the two things a shared phone breaks.**
+    `apps/field` now covers the whole of a rep-to-rep hand-over: send material to a
+    colleague, see what is on its way to you, accept it, and take back what nobody
+    accepted. It is the first act in this product that needs TWO people, and that is what
+    made it worth doing next — every screen before it belonged to one rep on one device.
+
+    **The server could already do it; nobody could see it.** `POST /v1/samples/transfers`,
+    `/:id/accept` and `/:id/recall` have existed since 0017 and 0025, and so has
+    `crm.recallable_transfers(rep)` — a sender-scoped list with the lot, the expiry and the
+    receiver's name, exactly what a recall button needs. The RECEIVER had no equivalent.
+    Their half was reachable only as a notification and as raw ids from
+    `GET /v1/samples/transfers`, which returns `crm.sample_transaction` rows for either
+    side: no names, no lot number, no expiry. So no screen could say "Grace sent you 3 of
+    LOT-FIELD-1, expiring next year — accept it?", and the material sat in the sender's
+    `quantity_in_transit` indefinitely, which is the open end 0025 closed for the sender
+    and left open here. Migration 0055 adds `crm.incoming_transfers(rep)` as its mirror
+    image, scoped in SQL for the reason 0025 gives about its own: only the receiver may
+    accept, so a list offering the action to the sender would be a button the database
+    refuses, and scoping after the fact in a route is one forgotten `AND` from showing a
+    rep somebody else's work. Two mirrored functions beat one with a direction flag,
+    because the flag has to be trusted by every caller.
+
+    **The peer list is as wide as the write, deliberately.**
+    `GET /v1/samples/transfer-peers` offers every ACTIVE rep in the tenant except the
+    caller, because that is precisely what the write accepts: 0017's rules are a foreign
+    key to `crm.rep_profile` and `counterparty_rep_profile_id <> rep_profile_id`, and RLS
+    is what makes "in the tenant" true. A narrower picker — territory peers, a manager's
+    team — would restrict the screen and not the system, and narrowing the RULE would
+    refuse hand-overs that really happen: a congress, a colleague covering a district, a
+    manager taking stock off somebody who is leaving. The consequence is stated rather than
+    hidden: every rep can read every active colleague's name and employee number inside
+    their own tenant. The one place the list IS narrower is `status = 'active'`, which is
+    not a rule either — a departed rep is a destination nobody should be offered, while the
+    write stays open because material already sitting with one has to be movable.
+
+    **The queue grew three kinds and learned who wrote each row.** `transfer`, `acceptance`
+    and `recall`, and the engine's `if (kind === "signature")` special case became a
+    `Record<OutboxKind, KindPlan>` table — `batchMax`, `reply`, `send` — so a new kind that
+    nobody taught the engine to send does not compile. The interesting one is the
+    ACCEPTANCE: it carries the transfer's id and does NOT depend on it, because that
+    transfer was recorded on somebody else's device and is already on the server; a
+    dependency would have been a wait for a row this queue can never hold. A recall is the
+    opposite and depends on its transfer only when the transfer is still unsent here.
+
+    **And a shared device turned out to break two different ways.** Both were found by the
+    browser run, both were real, and neither was visible to any unit test:
+
+    - *The queue belongs to a device; the record belongs to a person.* Every write route
+      attributes a record to the caller in the token, so a second rep signing in on a
+      shared phone would have drained the first rep's unsent rows under their own name. For
+      a drug-sample hand-over that is a false custody record naming a real person, and
+      nothing downstream could detect it. Rows now carry `createdBy`, the engine sends only
+      the signed-in rep's rows, and everything else is HELD — not sent, not deleted, and
+      said out loud on screen, because the two tidy-looking alternatives are misattributing
+      somebody's work and destroying a record a regulator may ask for. An unattributed row
+      from an older build is held too: a device that cannot say whose a record is must not
+      guess.
+    - *The CACHE belongs to a person as well.* This one was worse and was found by the
+      first defect's own test timing out. The device caches a rep's identity, accounts,
+      stock and transfers so the app opens offline — and after a sign-in with no network,
+      `/v1/me` never answers, so the app carried on with the PREVIOUS rep's identity: their
+      name in the header, their stock on screen, and `authorId()` returning their id, which
+      would have stamped the new rep's work with it. The same misattribution, arriving
+      through the cache instead of the queue. A session now records which rep it turned out
+      to be once `/v1/me` has said so, the cache is adopted only when the two agree, and a
+      session that has never reached the server adopts nothing and says so. A drain that
+      finds itself unidentified asks again rather than waiting for somebody to press
+      Refresh — without that the queue stays unsendable for as long as nobody notices.
+
+    **Verified by two browsers.** `pnpm client:verify` is **117 checks, 0 failures**: two
+    reps, two Chromium profiles (two devices, not two tabs — separate IndexedDB and
+    separate `localStorage`), and the arithmetic checked in SQL at every step. 10 received,
+    2 disbursed, a transfer of 2 queued and cancelled before it was ever sent, 3
+    transferred and accepted, 1 transferred and recalled: the sender ends on
+    `5.000|0.000`, the receiver on `3.000|0.000`, the two balances still sum to the 8 that
+    were left after the disbursement, and no transfer is left without its one terminal
+    event. The cancel is not a recall and the run proves the difference — a cancelled
+    transfer leaves NO ledger rows, where a recall writes the second half of a round trip
+    for material that never moved.
+
+    Three things the gate taught us about itself, each a rule it had forgotten: a fixture
+    injecting a raw IndexedDB row had to start carrying `createdBy` or the row it was
+    testing was simply never sent; "the queue is empty" is never true, because §8's refused
+    visit is deliberately kept for a person to look at; and a transfer can be queued and on
+    the server AT THE SAME TIME — a reply lost after the row was written leaves it pending
+    for a retry — so an assertion about what the screen offers has to wait for the steady
+    state rather than catch it mid-drain.
+
+    **Still not built:** counts, write-offs, returns, the disposal obligations with their
+    regulatory deadlines, and the expiry sweep. The peer picker is a plain select of the
+    first 500 colleagues by name: the route takes a `?q=` filter and no screen uses it yet,
+    so a rep in a tenant larger than that cannot reach everybody.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1459,7 +1552,7 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 63 checks in a real Chromium taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26). **What is NOT built is still most of the product**: the rest of custody (transfers, counts, write-offs, returns, disposal obligations), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 85 of the 104 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
+| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 117 checks across TWO browsers, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27). **What is NOT built is still most of the product**: the rest of custody (counts, write-offs, returns, disposal obligations, the expiry sweep), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 80 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 

@@ -89,7 +89,9 @@ authorisation on its own.
 | `GET /v1/samples/expiring` | what is about to go out of date in their bag |
 | `POST /v1/samples/receipts` | confirm stock from a warehouse — the one route that mirrors to the ERP |
 | `POST /v1/samples/disbursements` | a hand-over, with recipient and signature hash |
-| `GET\|POST /v1/samples/transfers` | outstanding transfers / send to another rep |
+| `GET\|POST /v1/samples/transfers` | outstanding transfers, either side / send to another rep |
+| `GET /v1/samples/transfers/incoming` | material on its way TO the caller — the list an accept acts on |
+| `GET /v1/samples/transfer-peers` | who a transfer can be addressed to: active reps in the tenant |
 | `POST /v1/samples/transfers/:id/accept` | the receiving rep accepts |
 | `GET /v1/samples/transfers/recallable` | material the caller sent that nobody has accepted |
 | `POST /v1/samples/transfers/:id/recall` | take it back — **sender only**; a new ledger row, never an edit |
@@ -1154,17 +1156,18 @@ pass vacuously. **83 files / 2,123 tests green on both transports.**
 ## The app
 
 `apps/field` is the client, and it is a slice rather than the product: **sign in, see my
-accounts, record a visit with no network, disburse samples with a signature on glass, watch
-both sync, read a refusal.** Roughly 85 of the 104 routes still have no screen — the rest of
-sample custody, call plans, expenses, notifications, the manager's views, all of admin.
+accounts, record a visit with no network, disburse samples with a signature on glass, hand
+material to a colleague and accept theirs, watch all of it sync, read a refusal.** Roughly
+80 of the 106 routes still have no screen — the rest of sample custody, call plans,
+expenses, notifications, the manager's views, all of admin.
 
 What it settles is the part that was a guess. Everything built for an offline device —
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **63 checks in a real
-Chromium, taken offline mid-session, against the real API binary, counting rows in
-Postgres.** The sequence it drives:
+and `pnpm client:verify` proves it the only way that means anything: **117 checks in two
+real Chromium profiles — two devices, two reps — taken offline mid-session, against the
+real API binary, counting rows in Postgres.** The sequence it drives:
 
 - a visit recorded with the network down lands in IndexedDB, pending, with a device-minted
   v7 id — and **nothing** in `crm.visit`;
@@ -1185,6 +1188,20 @@ Postgres.** The sequence it drives:
 - both go up on one reconnection, and in SQL `a.content_sha256 = t.signature_sha256`: the
   ledger committed to that digest before the image existed anywhere but a canvas;
 - the lot's balance falls from `10.000` to `8.000` by the ledger's own trigger;
+- a lot is **handed to a colleague with no signal**: the quantity leaves the balance and
+  appears in transit the moment it is queued, cancelling before it is sent puts it straight
+  back and writes **nothing** to the ledger, and a transfer of more than the rep carries is
+  refused at the keyboard rather than hours later from inside a queue;
+- the colleague's **own device** (a second browser profile — separate IndexedDB, separate
+  `localStorage`) is shown `3.000 × LOT-FIELD-1 from Ada Lovelace` with the item and the
+  expiry, accepts it offline, and syncs: `transfer_in` linked to the `transfer_out`, the
+  receiver holding `3.000`, the sender's in-transit clear, and the two balances still
+  summing to what was there before;
+- the sender takes back a transfer nobody accepted, and the recall is a **new movement**:
+  both halves of the round trip stay in the log;
+- a **shared device** refuses to file one rep's work under another's. A rep signing in with
+  no network is not handed the previous rep's identity from the cache, and a queue holding
+  somebody else's unsent record says so instead of sending it;
 - the signal returns **while the signature is being drawn** and the stroke is still there
   afterwards — the same 1,473 dark pixels. `render()` replaces the DOM from thirty-one
   call sites and three of them fire untouched (`online`, `offline`, returning to a

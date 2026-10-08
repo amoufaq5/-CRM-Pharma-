@@ -173,6 +173,17 @@ export function problemKind(type: string): string {
 // ---- samples --------------------------------------------------------------
 
 /**
+ * A quantity on the wire, as the server's `numeric(16,3)` columns accept it.
+ *
+ * Named once here because three bodies now carry one, and the rule is not obvious: it is
+ * TEXT, not a number, because a float cannot represent 0.1 and a third decimal place of a
+ * drug sample is not a rounding detail.
+ */
+export const DecimalQuantity = z
+  .string()
+  .regex(/^\d{1,13}(\.\d{1,3})?$/, "expected a decimal quantity");
+
+/**
  * What `POST /v1/samples/disbursements` and each element of `POST /v1/sync/disbursements`
  * accept — the act at the centre of a pharma field visit, and the one with legal weight.
  *
@@ -190,7 +201,7 @@ export function problemKind(type: string): string {
 export const DisbursementBody = z.object({
   id: Uuid,
   lotId: Uuid,
-  quantity: z.string().regex(/^\d{1,13}(\.\d{1,3})?$/, "expected a decimal quantity"),
+  quantity: DecimalQuantity,
   occurredAt: z.string().datetime(),
   erpAccountId: ErpRecordId,
   erpContactId: ErpRecordId.nullish(),
@@ -240,3 +251,97 @@ export const HoldingList = z.object({ data: z.array(Holding) });
 export const Disbursement = z
   .object({ id: Uuid, lot_id: Uuid, quantity: z.string(), signature_sha256: z.string() })
   .passthrough();
+
+// ---- transfers ------------------------------------------------------------
+
+/**
+ * What `POST /v1/samples/transfers` accepts: material leaving this rep for another.
+ *
+ * `toRepProfileId` is the only field naming a person, and the server supplies the sender
+ * from the token — so a device cannot transfer somebody else's stock even by asking.
+ *
+ * A transfer is NOT the end of the story on either device. It moves the quantity out of
+ * `quantity_on_hand` and into `quantity_in_transit`, where it stays until the receiver
+ * accepts it or the sender recalls it. Both of those are separate movements, which is why
+ * this client has three transfer-shaped outbox kinds rather than one.
+ */
+export const TransferBody = z.object({
+  id: Uuid,
+  lotId: Uuid,
+  quantity: DecimalQuantity,
+  occurredAt: z.string().datetime(),
+  toRepProfileId: Uuid,
+});
+export type TransferBody = z.infer<typeof TransferBody>;
+
+/**
+ * What `POST /v1/samples/transfers/:id/accept` accepts — and what it deliberately does not.
+ *
+ * No lot and no quantity: both are read off the transfer by the server, because an
+ * acceptance that disagreed with what was sent would not be an acceptance. The route's own
+ * comment says it removes the chance to try, and this body is the shape of that decision.
+ */
+export const AcceptBody = z.object({ id: Uuid, occurredAt: z.string().datetime() });
+export type AcceptBody = z.infer<typeof AcceptBody>;
+
+/** What `POST /v1/samples/transfers/:id/recall` accepts: the sender taking it back. */
+export const RecallBody = z.object({
+  id: Uuid,
+  occurredAt: z.string().datetime(),
+  reason: z.string().max(500).nullish(),
+});
+export type RecallBody = z.infer<typeof RecallBody>;
+
+/** A row of `GET /v1/samples/transfer-peers`: somebody a transfer can be addressed to. */
+export const TransferPeer = z.object({
+  rep_profile_id: Uuid,
+  display_name: z.string(),
+  employee_number: z.string(),
+});
+export type TransferPeer = z.infer<typeof TransferPeer>;
+
+export const TransferPeerList = z.object({ data: z.array(TransferPeer) });
+
+/**
+ * A row of `GET /v1/samples/transfers/incoming`: material on its way TO this rep.
+ *
+ * `occurred_at` is a string because that is what JSON carries; it is not parsed into a
+ * `Date` here, since the only thing the screen does with it is show it and the only thing
+ * the server does with it is order by it.
+ */
+export const IncomingTransfer = z.object({
+  transaction_id: Uuid,
+  lot_id: Uuid,
+  lot_number: z.string(),
+  erp_item_id: z.string(),
+  expiry_date: z.string().nullable(),
+  quantity: z.string(),
+  sent_by: Uuid,
+  sent_by_name: z.string(),
+  occurred_at: z.string(),
+  days_in_transit: z.number().int(),
+});
+export type IncomingTransfer = z.infer<typeof IncomingTransfer>;
+
+export const IncomingTransferList = z.object({ data: z.array(IncomingTransfer) });
+
+/**
+ * A row of `GET /v1/samples/transfers/recallable`: material this rep sent that nobody has
+ * taken yet. The mirror of the row above, and the two are separate lists because only one
+ * side can act on each.
+ */
+export const RecallableTransfer = z.object({
+  transaction_id: Uuid,
+  lot_id: Uuid,
+  lot_number: z.string(),
+  erp_item_id: z.string(),
+  expiry_date: z.string().nullable(),
+  quantity: z.string(),
+  sent_to: Uuid,
+  sent_to_name: z.string(),
+  occurred_at: z.string(),
+  days_in_transit: z.number().int(),
+});
+export type RecallableTransfer = z.infer<typeof RecallableTransfer>;
+
+export const RecallableTransferList = z.object({ data: z.array(RecallableTransfer) });

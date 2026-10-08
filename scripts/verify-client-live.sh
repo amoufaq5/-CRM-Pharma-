@@ -118,7 +118,15 @@ SET ROLE crm_app;
 SELECT set_config('app.current_tenant_id', '$TENANT', true);
 
 INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, erp_employee_id, display_name, status)
-VALUES ('$TENANT', 'rep-ada', 'E-1', 'emp-1', 'Ada Lovelace', 'active');
+VALUES ('$TENANT', 'rep-ada', 'E-1', 'emp-1', 'Ada Lovelace', 'active'),
+       -- A SECOND REP, with no territory of her own. A transfer needs a colleague and
+       -- nothing else: 0017's only rule for a counterparty is that they are a rep in this
+       -- tenant and not the sender. Leaving her out of T-LIVE keeps every assertion above
+       -- about Ada's accounts true, and proves the peer list is not territory-scoped.
+       ('$TENANT', 'rep-grace', 'E-2', 'emp-2', 'Grace Hopper', 'active'),
+       -- Departed, and therefore never offered as a destination, though the write would
+       -- still accept her. The picker's one narrowing, visible in the run.
+       ('$TENANT', 'rep-gone', 'E-3', NULL, 'Departed Rep', 'departed');
 
 INSERT INTO crm.territory (tenant_id, code, name)
 VALUES ('$TENANT', 'T-LIVE', 'Live territory');
@@ -139,6 +147,7 @@ VALUES ('$TENANT', 'acc-live-1', 'St Mary''s Hospital', 'active', 'GB', now(), n
 COMMIT;
 SQL
 ok "rep-ada holds T-LIVE, which covers acc-live-1 and acc-live-2 — and acc-not-mine is covered by nobody"
+ok "rep-grace exists to hand material to, and rep-gone has departed"
 
 # A lot for the sample half of the run. The STOCK is not inserted: holdings are maintained
 # by the ledger's triggers (0018), so the rep is given material the way a rep is given
@@ -209,6 +218,12 @@ ok "a receipt through the API gives rep-ada 10 units, and the holding trigger ag
 # ---------------------------------------------------------------------------
 echo "--- 7. drive the app in a real browser ---"
 export CRM_FIELD_TOKEN
+# Grace's own token, for the second browser. A transfer is the first thing in this app that
+# takes two people, and one device signed in as one rep cannot prove it: the receiving half
+# runs in a separate browser with its own profile, which is its own IndexedDB and its own
+# localStorage — a second device, not a second tab.
+CRM_FIELD_TOKEN_2="$(node "$ROOT/scripts/live-erp/human-token.mjs" rep-grace)" || fail "could not mint a token for rep-grace"
+export CRM_FIELD_TOKEN_2
 export CRM_FIELD_TENANT="$TENANT"
 export CRM_FIELD_LOT_ID="$LOT_ID"
 export CRM_PGDATABASE="$CLIENT_DB"
@@ -244,9 +259,41 @@ MATCHED="$(psql -At -c "
 [ "$MATCHED" = "1" ] || fail "$MATCHED disbursements have a signature whose stored bytes hash to the ledger's commitment, expected 1"
 ok "the stored signature hashes to exactly what the ledger committed to before it was uploaded"
 
-REMAINING="$(psql -At -c "SELECT quantity_on_hand FROM crm.sample_holding WHERE tenant_id = '$TENANT' AND lot_id = '$LOT_ID'")"
-[ "$REMAINING" = "8.000" ] || fail "the rep holds '$REMAINING' after disbursing 2 of 10, expected 8.000"
-ok "and the holding fell from 10 to 8, by the ledger's own trigger"
+# The whole run's arithmetic, in one place, because the number is only meaningful as the
+# sum of what the browser did: received 10, disbursed 2, queued a transfer of 2 and
+# cancelled it before it was ever sent, transferred 3 to Grace and had it accepted,
+# transferred 1 more and recalled it. 10 − 2 − 3 = 5 on hand, nothing left in transit.
+REMAINING="$(psql -At -c "
+  SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
+    FROM crm.sample_holding h JOIN crm.rep_profile r ON r.id = h.rep_profile_id
+   WHERE h.tenant_id = '$TENANT' AND h.lot_id = '$LOT_ID' AND r.subject = 'rep-ada'")"
+[ "$REMAINING" = "5.000|0.000" ] || fail "rep-ada holds '$REMAINING' (on hand|in transit) at the end of the run, expected 5.000|0.000"
+ok "the sender's balance is 10 received, 2 disbursed, 3 transferred away — 5 on hand, none in transit"
+
+GRACE="$(psql -At -c "
+  SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
+    FROM crm.sample_holding h JOIN crm.rep_profile r ON r.id = h.rep_profile_id
+   WHERE h.tenant_id = '$TENANT' AND h.lot_id = '$LOT_ID' AND r.subject = 'rep-grace'")"
+[ "$GRACE" = "3.000|0.000" ] || fail "rep-grace holds '$GRACE', expected 3.000|0.000"
+ok "and the receiver holds exactly what she accepted, on her own balance"
+
+# The total across both reps is the one invariant a custody chain must never break: every
+# movement in this run moved material between columns, and none of it created or destroyed
+# any. 10 received, 2 disbursed to a doctor, 8 left somewhere.
+TOTAL="$(psql -At -c "
+  SELECT COALESCE(SUM(quantity_on_hand + quantity_in_transit), 0)
+    FROM crm.sample_holding WHERE tenant_id = '$TENANT' AND lot_id = '$LOT_ID'")"
+[ "$TOTAL" = "8.000" ] || fail "the two reps hold '$TOTAL' between them, expected 8.000 — a transfer created or destroyed material"
+ok "and the two balances still sum to the 8 that were left after the disbursement"
+
+# A transfer that was never accepted and never recalled would sit in transit forever, which
+# is the open end 0025 closed for the sender. Nothing may be left outstanding here.
+OUTSTANDING="$(psql -At -c "
+  SELECT count(*) FROM crm.sample_transaction t
+   WHERE t.tenant_id = '$TENANT' AND t.kind = 'transfer_out'
+     AND NOT EXISTS (SELECT 1 FROM crm.sample_transaction x WHERE x.transfer_of = t.id)")"
+[ "$OUTSTANDING" = "0" ] || fail "$OUTSTANDING transfer(s) are still unsettled, expected 0"
+ok "every transfer the run made has its one terminal event — an acceptance or a recall"
 
 echo
 echo "ok: $CHECKS checks in a real browser, against the real API binary and a real Postgres"

@@ -1,4 +1,11 @@
-import type { DisbursementBody, SignatureBody, VisitBody } from "./api.js";
+import type {
+  AcceptBody,
+  DisbursementBody,
+  RecallBody,
+  SignatureBody,
+  TransferBody,
+  VisitBody,
+} from "./api.js";
 import { SYNC_BATCH_MAX } from "./api.js";
 import { classifyRowOutcome, type Disposition, type RowOutcome } from "./outcome.js";
 
@@ -26,8 +33,22 @@ export type OutboxState = (typeof OUTBOX_STATES)[number];
  * disbursement accepted at the top of a drain leaves the queue and unblocks its signature
  * before the loop reaches it. A rep who signed at a clinic desk with no signal gets both
  * halves in one reconnection rather than two.
+ *
+ * A recall comes after a transfer for the same reason, and it is the only other pair with
+ * a dependency: `POST /v1/samples/transfers/:id/recall` cannot find a transfer the server
+ * has not been told about. An ACCEPTANCE has no dependency at all, because the transfer it
+ * settles was sent from somebody else's device and is already on the server by the time
+ * this rep can see it — which is why an acceptance carries the transfer's id without
+ * waiting for it.
  */
-export const OUTBOX_KINDS = ["visit", "disbursement", "signature"] as const;
+export const OUTBOX_KINDS = [
+  "visit",
+  "disbursement",
+  "signature",
+  "transfer",
+  "acceptance",
+  "recall",
+] as const;
 export type OutboxKind = (typeof OUTBOX_KINDS)[number];
 
 interface OutboxEntryBase {
@@ -49,6 +70,25 @@ interface OutboxEntryBase {
    * took.
    */
   readonly dependsOn?: string;
+  /**
+   * The rep this row was recorded by, from `/v1/me` at the moment it was queued.
+   *
+   * THE QUEUE IS PER DEVICE AND THE RECORD IS PER PERSON, and those are not the same
+   * thing. Every write route attributes the record to the CALLER — the rep in the token,
+   * never anything in the body — so a second rep signing in on a shared device would have
+   * sent the first rep's unsent visits and sample disbursements under their own name. For
+   * a drug-sample hand-over that is a false custody record with a real person's name on
+   * it, and nothing downstream could ever tell.
+   *
+   * So a row names its author and the engine sends only rows whose author is signed in.
+   * Rows belonging to anybody else are HELD — not sent, not deleted, and visible — because
+   * the two safe-looking alternatives are both wrong: sending them misattributes somebody's
+   * work, and dropping them destroys a record a regulator may ask for.
+   *
+   * Optional only because a row written before this field existed has none, and such a row
+   * is held for the same reason: a device that cannot say whose a record is must not guess.
+   */
+  readonly createdBy?: string;
 }
 
 export interface VisitEntry extends OutboxEntryBase {
@@ -68,7 +108,48 @@ export interface SignatureEntry extends OutboxEntryBase {
   readonly dependsOn: string;
 }
 
-export type OutboxEntry = VisitEntry | DisbursementEntry | SignatureEntry;
+export interface TransferEntry extends OutboxEntryBase {
+  readonly kind: "transfer";
+  readonly body: TransferBody;
+}
+
+/**
+ * An acceptance of a transfer somebody else sent.
+ *
+ * `transferOf` is the path parameter, and it is NOT `dependsOn`: the transfer was recorded
+ * on the sender's device and reached this one through `GET /v1/samples/transfers/incoming`,
+ * so it already exists on the server. Making it a dependency would have been a lie this
+ * queue could never satisfy — nothing in this device's outbox will ever land it.
+ */
+export interface AcceptanceEntry extends OutboxEntryBase {
+  readonly kind: "acceptance";
+  readonly body: AcceptBody;
+  readonly transferOf: string;
+}
+
+/**
+ * A recall of a transfer this rep sent.
+ *
+ * Carries the id as `transferOf` like an acceptance, and MAY also carry it as `dependsOn` —
+ * when the transfer is still in this device's own queue, because it was sent offline and
+ * recalled before it ever reached the server. The screen prefers discarding an unsent
+ * transfer outright in that case, which is cheaper and leaves no ledger rows at all; the
+ * dependency is here so that a recall queued behind an unsent transfer waits for it rather
+ * than drawing a 404 that is only ever about timing.
+ */
+export interface RecallEntry extends OutboxEntryBase {
+  readonly kind: "recall";
+  readonly body: RecallBody;
+  readonly transferOf: string;
+}
+
+export type OutboxEntry =
+  | VisitEntry
+  | DisbursementEntry
+  | SignatureEntry
+  | TransferEntry
+  | AcceptanceEntry
+  | RecallEntry;
 
 export interface BackoffPolicy {
   /** First delay, doubled per attempt. */
@@ -122,18 +203,37 @@ type OutboxEntryStatus = Pick<OutboxEntryBase, "state" | "attempts" | "nextAttem
 export type NewOutboxEntry =
   | Omit<VisitEntry, keyof OutboxEntryStatus>
   | Omit<DisbursementEntry, keyof OutboxEntryStatus>
-  | Omit<SignatureEntry, keyof OutboxEntryStatus>;
+  | Omit<SignatureEntry, keyof OutboxEntryStatus>
+  | Omit<TransferEntry, keyof OutboxEntryStatus>
+  | Omit<AcceptanceEntry, keyof OutboxEntryStatus>
+  | Omit<RecallEntry, keyof OutboxEntryStatus>;
 
-export function enqueueVisit(entries: readonly OutboxEntry[], body: VisitBody, now: number): readonly OutboxEntry[] {
-  return enqueue(entries, { id: body.id, kind: "visit", body }, now);
+/**
+ * Every helper takes the rep, and takes it as a REQUIRED option rather than an optional
+ * field, so that adding a kind cannot quietly produce rows nobody can attribute. The
+ * compiler is the thing enforcing it: a new call site that forgets does not build.
+ */
+export interface Attribution {
+  /** `/v1/me`'s `repProfileId` for the signed-in rep. */
+  readonly createdBy: string;
+}
+
+export function enqueueVisit(
+  entries: readonly OutboxEntry[],
+  body: VisitBody,
+  now: number,
+  opts: Attribution,
+): readonly OutboxEntry[] {
+  return enqueue(entries, { id: body.id, kind: "visit", body, createdBy: opts.createdBy }, now);
 }
 
 export function enqueueDisbursement(
   entries: readonly OutboxEntry[],
   body: DisbursementBody,
   now: number,
+  opts: Attribution,
 ): readonly OutboxEntry[] {
-  return enqueue(entries, { id: body.id, kind: "disbursement", body }, now);
+  return enqueue(entries, { id: body.id, kind: "disbursement", body, createdBy: opts.createdBy }, now);
 }
 
 /**
@@ -147,10 +247,70 @@ export function enqueueDisbursement(
 export function enqueueSignature(
   entries: readonly OutboxEntry[],
   body: SignatureBody,
-  disbursementId: string,
   now: number,
+  opts: Attribution & { readonly disbursementId: string },
 ): readonly OutboxEntry[] {
-  return enqueue(entries, { id: body.id, kind: "signature", body, dependsOn: disbursementId }, now);
+  return enqueue(
+    entries,
+    { id: body.id, kind: "signature", body, dependsOn: opts.disbursementId, createdBy: opts.createdBy },
+    now,
+  );
+}
+
+/** Material leaving this rep. Nothing depends on it until a recall does. */
+export function enqueueTransfer(
+  entries: readonly OutboxEntry[],
+  body: TransferBody,
+  now: number,
+  opts: Attribution,
+): readonly OutboxEntry[] {
+  return enqueue(entries, { id: body.id, kind: "transfer", body, createdBy: opts.createdBy }, now);
+}
+
+/**
+ * Accepting material somebody else sent.
+ *
+ * No `dependsOn`: the transfer is already on the server — it is how this device heard of
+ * it — so waiting would be waiting for a row that will never be in this queue.
+ */
+export function enqueueAcceptance(
+  entries: readonly OutboxEntry[],
+  body: AcceptBody,
+  now: number,
+  opts: Attribution & { readonly transferOf: string },
+): readonly OutboxEntry[] {
+  return enqueue(
+    entries,
+    { id: body.id, kind: "acceptance", body, transferOf: opts.transferOf, createdBy: opts.createdBy },
+    now,
+  );
+}
+
+/**
+ * Taking back material nobody accepted.
+ *
+ * `dependsOn` is set only when the transfer is still unsent on this device, which is the
+ * one case where the recall would otherwise race its own prerequisite and draw a permanent
+ * 404 for a reason that was only ever about order.
+ */
+export function enqueueRecall(
+  entries: readonly OutboxEntry[],
+  body: RecallBody,
+  now: number,
+  opts: Attribution & { readonly transferOf: string; readonly transferUnsent?: boolean },
+): readonly OutboxEntry[] {
+  return enqueue(
+    entries,
+    {
+      id: body.id,
+      kind: "recall",
+      body,
+      transferOf: opts.transferOf,
+      createdBy: opts.createdBy,
+      ...(opts.transferUnsent === true ? { dependsOn: opts.transferOf } : {}),
+    },
+    now,
+  );
 }
 
 /**
@@ -184,6 +344,41 @@ export function dueEntries(
     .slice()
     .sort((a, b) => a.queuedAt - b.queuedAt || (a.id < b.id ? -1 : 1))
     .slice(0, Math.max(0, Math.min(limit, SYNC_BATCH_MAX)));
+}
+
+/**
+ * Split the queue by who recorded it: what the signed-in rep may send, and what is held.
+ *
+ * This is the other half of "may this row be sent", and it is not a filter in the engine
+ * by accident — it is here, pure and testable, because the failure it prevents is silent.
+ * Every write route attributes a record to the caller in the token, so sending another
+ * rep's queued row files their visit, or their drug-sample hand-over, under the name of
+ * whoever happens to be signed in. Nothing downstream can detect it afterwards: the row
+ * is perfectly well-formed and names a real person who did not do it.
+ *
+ * Held rows are left exactly as they are — pending, with their attempt counts and their
+ * backoff intact — so that the rep they belong to can sign back in and send them. Nothing
+ * is deleted, because a record of a controlled hand-over is not this app's to throw away,
+ * and nothing is rejected, because there is nothing wrong with the row.
+ */
+export function splitByAuthor(
+  entries: readonly OutboxEntry[],
+  repProfileId: string,
+): { readonly mine: readonly OutboxEntry[]; readonly held: readonly OutboxEntry[] } {
+  const mine: OutboxEntry[] = [];
+  const held: OutboxEntry[] = [];
+  for (const entry of entries) {
+    // An unattributed row (written before `createdBy` existed) is held rather than
+    // claimed. A device that cannot say whose a record is must not guess, and guessing
+    // "the person in front of it" is exactly the mistake this function exists to stop.
+    (entry.createdBy === repProfileId ? mine : held).push(entry);
+  }
+  return { mine, held };
+}
+
+/** How many rows are held for somebody else, for a screen that has to say so. */
+export function heldForOthers(entries: readonly OutboxEntry[], repProfileId: string): number {
+  return splitByAuthor(entries, repProfileId).held.filter((e) => e.state === "pending").length;
 }
 
 /**
@@ -390,7 +585,7 @@ export function rejectUnreconcilable(
     return {
       ...entry,
       state: "rejected" as const,
-      lastReason: `this device stored a queue entry keyed ${entry.id} holding a visit with id ${entry.body.id}; the two must match or the server's answer can never be matched to it`,
+      lastReason: `this device stored a queue entry keyed ${entry.id} holding a ${entry.kind} with id ${entry.body.id}; the two must match or the server's answer can never be matched to it`,
     };
   });
   return { entries: next, refused };

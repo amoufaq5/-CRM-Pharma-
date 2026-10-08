@@ -800,13 +800,54 @@ describe("the API, end to end", () => {
 
       expect((await call("GET", "/v1/samples/transfers")).body.data).toHaveLength(1);
 
+      // What the RECEIVER's screen reads, and the only list that can tell them what they
+      // are being handed: the sender's name, the lot number and its expiry. Before it
+      // existed their half of the transfer was a notification and a bag of ids.
+      const theirs = token({ sub: "idp|rep2", tenant: TENANT });
+      const incoming = await call("GET", "/v1/samples/transfers/incoming", { auth: theirs });
+      expect(incoming.status).toBe(200);
+      expect(incoming.body.data).toHaveLength(1);
+      expect(incoming.body.data[0]).toMatchObject({
+        transaction_id: sent.body.id,
+        quantity: "5.000",
+        sent_by: rep,
+        sent_by_name: "Rep One",
+        lot_number: expect.any(String),
+      });
+
+      // And the sender is NOT offered it: they can recall it, not accept it. The two
+      // lists are mirror images, scoped in SQL, so each rep sees the side they can act on.
+      expect((await call("GET", "/v1/samples/transfers/incoming")).body.data).toHaveLength(0);
+      expect((await call("GET", "/v1/samples/transfers/recallable")).body.data).toHaveLength(1);
+
       // The other rep accepts it, with their own token.
       const accepted = await call("POST", `/v1/samples/transfers/${sent.body.id}/accept`, {
-        auth: token({ sub: "idp|rep2", tenant: TENANT }),
+        auth: theirs,
         body: { id: randomUUID(), occurredAt: "2026-10-07T08:00:00.000Z" },
       });
       expect(accepted.status).toBe(201);
       expect((await call("GET", "/v1/samples/transfers")).body.data).toHaveLength(0);
+      expect((await call("GET", "/v1/samples/transfers/incoming", { auth: theirs })).body.data).toHaveLength(0);
+    });
+
+    it("offers the colleagues a transfer can be addressed to, and never the caller", async () => {
+      const res = await call("GET", "/v1/samples/transfer-peers");
+      expect(res.status).toBe(200);
+      const ids = res.body.data.map((p: { rep_profile_id: string }) => p.rep_profile_id);
+      expect(ids).toContain(otherRep);
+      expect(ids).toContain(manager);
+      // The caller is excluded by the database's own rule for a transfer
+      // (`counterparty_rep_profile_id <> rep_profile_id`), so the picker cannot offer the
+      // one destination that is always refused.
+      expect(ids).not.toContain(rep);
+      expect(res.body.data).toEqual(
+        [...res.body.data].sort((a: { display_name: string }, b: { display_name: string }) =>
+          a.display_name < b.display_name ? -1 : 1,
+        ),
+      );
+
+      const filtered = await call("GET", "/v1/samples/transfer-peers?q=Rep%20Two");
+      expect(filtered.body.data.map((p: { rep_profile_id: string }) => p.rep_profile_id)).toEqual([otherRep]);
     });
 
     /**

@@ -22,6 +22,7 @@ import { launchBrowser, newPage } from "./cdp.mjs";
 const appUrl = process.argv[2];
 const work = process.argv[3] ?? ".";
 const token = process.env["CRM_FIELD_TOKEN"];
+const token2 = process.env["CRM_FIELD_TOKEN_2"];
 const tenant = process.env["CRM_FIELD_TENANT"];
 const database = process.env["CRM_PGDATABASE"];
 const lotId = process.env["CRM_FIELD_LOT_ID"];
@@ -72,6 +73,46 @@ function disbursementRows() {
   });
 }
 
+/**
+ * The device's own queue, read out of IndexedDB inside the page.
+ *
+ * A snippet rather than a function because `evaluate` ships an expression to the browser:
+ * there is no shared scope between this file and the page, so the helper has to travel
+ * with each call.
+ */
+const READ_OUTBOX = `
+  const db = await new Promise((res) => { const r = indexedDB.open("crm-field", 1); r.onsuccess = () => res(r.result); });
+  const rows = await new Promise((res) => { const t = db.transaction("outbox", "readonly").objectStore("outbox").getAll(); t.onsuccess = () => res(t.result); });`;
+
+/**
+ * The transfer side of the ledger, joined to the names a transfer is about.
+ *
+ * Joined here rather than asserted on ids because the ids are minted by the device and
+ * the assertion that matters is about PEOPLE: this quantity, from this rep, to that one.
+ */
+function transferRows(kind = "transfer_out") {
+  const out = sql(
+    `SELECT t.id, t.quantity, COALESCE(t.transfer_of::text, ''), r.subject, COALESCE(c.subject, ''), COALESCE(c.display_name, '')
+       FROM crm.sample_transaction t
+       JOIN crm.rep_profile r ON r.id = t.rep_profile_id
+       LEFT JOIN crm.rep_profile c ON c.id = t.counterparty_rep_profile_id
+      WHERE t.tenant_id = '${tenant}' AND t.kind = '${kind}' ORDER BY t.recorded_at, t.id`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [id, quantity, transfer_of, rep, counterparty, counterparty_name] = line.split("|");
+    return { id, quantity, transfer_of, rep, counterparty, counterparty_name };
+  });
+}
+
+/** One rep's balance for the lot under test, as `on_hand|in_transit`, or "" if they hold no row. */
+function holding(subject) {
+  return sql(
+    `SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
+       FROM crm.sample_holding h JOIN crm.rep_profile r ON r.id = h.rep_profile_id
+      WHERE h.tenant_id = '${tenant}' AND h.lot_id = '${lotId}' AND r.subject = '${subject}'`,
+  );
+}
+
 function signatureRows() {
   const out = sql(
     `SELECT id, subject_id, content_sha256, byte_size, content_type FROM crm.attachment
@@ -86,6 +127,9 @@ function signatureRows() {
 async function main() {
   if (token === undefined || tenant === undefined || database === undefined || appUrl === undefined) {
     throw new Error("drive-app.mjs needs <app-url>, CRM_FIELD_TOKEN, CRM_FIELD_TENANT and CRM_PGDATABASE");
+  }
+  if (token2 === undefined) {
+    throw new Error("drive-app.mjs needs CRM_FIELD_TOKEN_2 — the transfer chapter needs a second rep");
   }
 
   const browser = await launchBrowser();
@@ -211,6 +255,14 @@ async function main() {
       // two, and the row became immortal — never matched, never reported. That bug is now
       // refused by rejectUnreconcilable in @crm/client, and this fixture is simply correct.
       const id = crypto.randomUUID().replace(/-4(?=[0-9a-f]{3}-)/, "-7");
+      // AND the rep who recorded it, read out of the device's own reference cache. A row
+      // without one is held rather than sent — which is the point of the field, and which
+      // this fixture discovered by being written without it: the visit was never sent at
+      // all, so the refusal it exists to test never arrived.
+      const cached = await new Promise((res) => {
+        const t = db.transaction("cache", "readonly").objectStore("cache").get("reference");
+        t.onsuccess = () => res(t.result);
+      });
       await new Promise((res, rej) => {
         const tx = db.transaction("outbox", "readwrite");
         tx.objectStore("outbox").put({
@@ -218,11 +270,12 @@ async function main() {
           kind: "visit",
           body: { id, erpAccountId: "acc-not-mine", status: "completed" },
           state: "pending", attempts: 0, nextAttemptAt: 0, queuedAt: Date.now(),
+          createdBy: cached?.me?.repProfileId,
         });
         tx.oncomplete = res; tx.onerror = () => rej(tx.error);
       });
-      return true;`);
-    is(refused, true, "a visit for an account outside the rep's territory is queued");
+      return cached?.me?.repProfileId !== undefined;`);
+    is(refused, true, "a visit for an account outside the rep's territory is queued, attributed to this rep");
     await page.goto(appUrl);
     await page.waitFor(`document.querySelector("#sync") !== null`, { label: "the app to reload with the queue" });
     await page.click("#sync");
@@ -364,7 +417,256 @@ async function main() {
     // canvas; the blob trigger recomputed this digest from the stored bytes.
     is(signatures[0]?.sha, ledger[0]?.sha, "and its stored bytes hash to exactly what the ledger committed to");
 
-    // ---- 11. the ERP deletes the tenant, and the queue STOPS ---------------
+    // ---- 11. transfers: two reps, two devices ------------------------------
+    // The first thing in this app that takes two people. One device signed in as one rep
+    // cannot prove a transfer: the sender's half and the receiver's half are different
+    // routes, scoped to different reps, and the material is in neither rep's hands in
+    // between — it is in `quantity_in_transit`, which is the column this whole chapter is
+    // really about.
+    await page.offline(true);
+    await page.click("button[data-transfer]");
+    await page.waitFor(`document.querySelector("#transfer-form") !== null`, { label: "the transfer form" });
+
+    const peerOptions = await page.evaluate(`
+      return [...document.querySelectorAll("#transfer-form select[name=toRepProfileId] option")].map((o) => o.textContent.trim());`);
+    is(peerOptions.length, 1, `the picker offers one colleague (${JSON.stringify(peerOptions)})`);
+    is(/Grace Hopper/.test(String(peerOptions[0])), true, "which is the active one, by name and employee number");
+    // The two it must NOT offer: the departed rep, who would be a destination nobody
+    // should be given, and the rep themselves, which the database refuses outright.
+    is(/Departed/.test(peerOptions.join(" ")), false, "and never the departed rep");
+    is(/Ada/.test(peerOptions.join(" ")), false, "and never the sender");
+    await shot("12-transfer-form");
+
+    // A transfer of more than the rep holds is refused at the keyboard, not hours later as
+    // a 409 from inside a queue.
+    await page.fill(`#transfer-form input[name="quantity"]`, "99");
+    await page.click("#save-transfer");
+    await page.waitFor(`/cannot be sent/.test(document.body.textContent ?? "")`, { label: "the over-balance refusal" });
+    is(await page.evaluate(`${READ_OUTBOX} return rows.filter((r) => r.kind === "transfer").length;`), 0,
+      "a transfer of more than the rep is carrying is refused at the keyboard, and queues nothing");
+
+    // And the form is still there, with the refusal above it. A rep who mistyped a
+    // quantity must not be sent back to the list to start again.
+    is(await page.evaluate(`return document.querySelector("#transfer-form") !== null;`), true,
+      "and the form survives the refusal, so the rep can correct the quantity rather than start again");
+
+    // Queued, then CANCELLED — which is not a recall. The server has never heard of this
+    // transfer, so discarding the row leaves no ledger movement at all, where a recall
+    // would write two for material that never moved.
+    await page.fill(`#transfer-form input[name="quantity"]`, "2");
+    await page.click("#save-transfer");
+    await page.waitFor(`document.querySelector("button[data-unsend]") !== null`, { label: "the unsent transfer" });
+    const afterQueued = await page.textOf("li:has(button[data-disburse]) .meta");
+    is(/6\.000 on hand/.test(String(afterQueued)), true, `the quantity leaves the balance as soon as it is queued (${String(afterQueued).slice(0, 48)})`);
+    is(/2\.000 in transit/.test(String(afterQueued)), true, "and appears in transit, which is where the ledger will put it");
+    await page.click("button[data-unsend]");
+    await page.waitFor(`/never sent/.test(document.body.textContent ?? "")`, { label: "the cancellation" });
+    const afterCancel = await page.textOf("li:has(button[data-disburse]) .meta");
+    is(/8\.000 on hand/.test(String(afterCancel)), true, "cancelling an unsent transfer puts it straight back on the balance");
+    is(await page.evaluate(`${READ_OUTBOX} return rows.filter((r) => r.kind === "transfer").length;`), 0,
+      "and leaves nothing queued to send");
+    is(transferRows().length, 0, "nothing reached the ledger, because nothing ever left");
+
+    // Now the real one: 3 units to Grace, recorded with no network.
+    await page.click("button[data-transfer]");
+    await page.waitFor(`document.querySelector("#transfer-form") !== null`, { label: "the transfer form once more" });
+    await page.fill(`#transfer-form input[name="quantity"]`, "3");
+    await page.click("#save-transfer");
+    await page.waitFor(`document.querySelector("button[data-unsend]") !== null`, { label: "the queued transfer" });
+    const queuedTransfer = await page.evaluate(
+      `${READ_OUTBOX} const t = rows.find((r) => r.kind === "transfer"); return t === undefined ? null : { state: t.state, createdBy: t.createdBy ?? null };`,
+    );
+    is(queuedTransfer?.state, "pending", "the transfer is queued on the device, pending");
+    is(typeof queuedTransfer?.createdBy, "string", "and names the rep who recorded it, which is what stops another sign-in sending it");
+    is(transferRows().length, 0, "and the database still has nothing");
+
+    await page.offline(false);
+    await page.waitFor(`/1 sent/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the transfer to land" });
+    const sent = transferRows();
+    is(sent.length, 1, "one transfer_out in crm.sample_transaction");
+    is(sent[0]?.quantity, "3.000", "for the quantity the form sent");
+    is(sent[0]?.counterparty_name, "Grace Hopper", "addressed to the colleague the rep picked");
+    is(holding("rep-ada"), "5.000|3.000", "the sender's balance moved from on-hand into IN TRANSIT, by the ledger's trigger");
+    is(holding("rep-grace"), "", "and the receiver holds nothing yet, because nobody has accepted it");
+    await shot("13-transfer-sent");
+
+    // ---- 12. the other rep's device ----------------------------------------
+    // A second browser with its own profile: its own IndexedDB and its own localStorage.
+    // A second tab would have shared both and proved nothing about two devices.
+    const graceBrowser = await launchBrowser();
+    const grace = await newPage(graceBrowser);
+    try {
+      await grace.goto(appUrl);
+      await grace.waitFor(`document.querySelector("#app")?.getAttribute("aria-busy") === "false"`, { label: "Grace's app to boot" });
+      await grace.fill("#dev-token", token2);
+      await grace.fill("#dev-tenant", tenant);
+      await grace.click("#dev-login");
+      await grace.waitFor(`document.querySelector("button[data-accept]") !== null`, { timeoutMs: 20_000, label: "the incoming transfer" });
+
+      const offered = await grace.textOf("li:has(button[data-accept]) .name");
+      is(offered, "3.000 × LOT-FIELD-1 from Ada Lovelace", "the receiver is shown what it is and who sent it, not a pair of ids");
+      const offeredMeta = await grace.textOf("li:has(button[data-accept]) .meta");
+      is(/itm-live-1/.test(String(offeredMeta)) && /expires 20/.test(String(offeredMeta)), true,
+        `with the item and the expiry a rep needs before taking custody (${String(offeredMeta).slice(0, 60)})`);
+      // The mirror property, on a real screen: the SENDER is never offered an accept, and
+      // the receiver is never offered a recall.
+      is(await grace.evaluate(`return document.querySelector("button[data-recall]") !== null;`), false,
+        "and no recall button, because only the sender may take it back");
+      is(await page.evaluate(`return document.querySelector("button[data-accept]") !== null;`), false,
+        "while the sender is offered no accept, because only the receiver may take it");
+      await grace.screenshot(join(work, "app-14-incoming.png"));
+
+      // Accepted with no network, like everything else in this app.
+      await grace.offline(true);
+      await grace.click("button[data-accept]");
+      await grace.waitFor(`/accepting 3/.test(document.body.textContent ?? "")`, { label: "the queued acceptance" });
+      const queuedAcceptance = await grace.evaluate(`
+        const db = await new Promise((res) => { const r = indexedDB.open("crm-field", 1); r.onsuccess = () => res(r.result); });
+        const rows = await new Promise((res) => { const t = db.transaction("outbox", "readonly").objectStore("outbox").getAll(); t.onsuccess = () => res(t.result); });
+        return rows.map((r) => ({ kind: r.kind, transferOf: r.transferOf ?? null, dependsOn: r.dependsOn ?? null }));`);
+      is(queuedAcceptance.length, 1, "one row is queued on the receiver's device");
+      is(queuedAcceptance[0]?.kind, "acceptance", "an acceptance");
+      is(queuedAcceptance[0]?.transferOf, sent[0]?.id, "naming the transfer it settles");
+      // THE DISTINCTION THAT MATTERS: it carries the transfer's id without depending on it.
+      // The transfer was recorded on Ada's device and is already on the server, so a
+      // dependency would be a wait for a row this queue will never hold.
+      is(queuedAcceptance[0]?.dependsOn, null, "and NOT waiting for it, because it is already on the server");
+      is(transferRows("transfer_in").length, 0, "and the database has no acceptance yet");
+
+      await grace.offline(false);
+      await grace.waitFor(`/1 sent/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the acceptance to land" });
+      const accepted = transferRows("transfer_in");
+      is(accepted.length, 1, "one transfer_in in crm.sample_transaction");
+      is(accepted[0]?.quantity, "3.000", "for the quantity the SENDER declared, which the receiver cannot alter");
+      is(accepted[0]?.transfer_of, sent[0]?.id, "linked to the transfer it accepts, which is what makes it a pair");
+      is(holding("rep-grace"), "3.000|0.000", "the receiver now holds the material");
+      is(holding("rep-ada"), "5.000|0.000", "and the sender's in-transit is clear — the total across both reps never changed");
+      await grace.waitFor(`document.querySelector("button[data-accept]") === null`, { timeoutMs: 20_000, label: "the incoming list to empty" });
+      ok("the transfer leaves the receiver's screen once it is accepted");
+      await grace.screenshot(join(work, "app-15-accepted.png"));
+
+      // ---- 13. a shared device, and a queue that is not yours --------------
+      // Grace records a transfer back to Ada and does not send it. Then ADA signs in on
+      // this same device — which is what happens when a phone is shared, or a rep hands
+      // their tablet to a colleague. Every write route attributes the record to the
+      // caller in the token, so draining Grace's row under Ada's session would file
+      // Grace's sample movement under Ada's name, and nothing downstream could tell.
+      await grace.offline(true);
+      await grace.click("button[data-transfer]");
+      await grace.waitFor(`document.querySelector("#transfer-form") !== null`, { label: "Grace's transfer form" });
+      await grace.fill(`#transfer-form input[name="quantity"]`, "1");
+      await grace.click("#save-transfer");
+      await grace.waitFor(`document.querySelector("button[data-unsend]") !== null`, { label: "Grace's unsent transfer" });
+
+      await grace.evaluate(`localStorage.removeItem("crm.field.session"); return true;`);
+      await grace.goto(appUrl);
+      await grace.waitFor(`document.querySelector("#dev-token") !== null`, { label: "the sign-in after the session was cleared" });
+      await grace.fill("#dev-token", token);
+      await grace.fill("#dev-tenant", tenant);
+      await grace.click("#dev-login");
+
+      // STILL OFFLINE, so `/v1/me` has never answered for this session. The device does
+      // not know who is in front of it — and the cached identity belongs to the previous
+      // rep, so adopting it would have put her name on screen and, worse, stamped
+      // anything Ada recorded with Grace's `repProfileId`. Found by this very step: the
+      // first version of it waited for the held notice and timed out, because the app had
+      // quietly carried on as Grace.
+      await grace.waitFor(`/Waiting to know who is signed in/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the unknown-identity notice" });
+      ok("a new sign-in with no network does not inherit the previous rep's identity from the cache");
+      is(await grace.textOf("header.bar .who"), null, "and shows nobody's name rather than the wrong person's");
+      is(await grace.evaluate(`return document.querySelector("button[data-transfer]") !== null;`), false,
+        "and offers no stock to move, because the stock on this device is not known to be this rep's");
+      await grace.screenshot(join(work, "app-16-unknown.png"));
+
+      await grace.offline(false);
+      await grace.waitFor(`/Held for another sign-in/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the held notice" });
+      ok("and once it can ask, it says plainly that it is holding somebody else's record");
+      await grace.click("#sync");
+      await grace.waitFor(`/will not send|Nothing to send|sent/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the sync verdict" });
+      // The proof is in the database, not on the screen: Grace's transfer is still the
+      // only one she never sent, and no transfer_out exists from her.
+      is(transferRows().filter((r) => r.rep === "rep-grace").length, 0,
+        "and pressing Sync as the other rep sends nothing of hers — the row is held, not filed under the wrong name");
+      const stillQueued = await grace.evaluate(`
+        const db = await new Promise((res) => { const r = indexedDB.open("crm-field", 1); r.onsuccess = () => res(r.result); });
+        const rows = await new Promise((res) => { const t = db.transaction("outbox", "readonly").objectStore("outbox").getAll(); t.onsuccess = () => res(t.result); });
+        return rows.map((r) => ({ kind: r.kind, state: r.state, attempts: r.attempts }));`);
+      is(stillQueued.length, 1, "her record is still on the device");
+      is(stillQueued[0]?.state, "pending", "pending, not refused — there is nothing wrong with it");
+      is(stillQueued[0]?.attempts, 0, "and it has not been tried, so its backoff is untouched for when she signs back in");
+      await grace.screenshot(join(work, "app-17-held.png"));
+    } finally {
+      await graceBrowser.close();
+    }
+
+    // ---- 14. the sender takes material back --------------------------------
+    // A recall is a new ledger movement, never an edit: the material went out and came
+    // back, and both halves stay in the log. Before it existed, a transfer nobody accepted
+    // left the quantity in `quantity_in_transit` with no way out.
+    await page.click("#refresh");
+    await page.waitFor(`document.querySelector("button[data-transfer]") !== null`, { timeoutMs: 20_000, label: "Ada's screen to refresh" });
+    await page.click("button[data-transfer]");
+    await page.waitFor(`document.querySelector("#transfer-form") !== null`, { label: "the transfer form for the recall case" });
+    await page.fill(`#transfer-form input[name="quantity"]`, "1");
+    await page.click("#save-transfer");
+    await page.waitFor(`document.querySelector("button[data-recall]") !== null`, { timeoutMs: 20_000, label: "the sent transfer, now recallable" });
+    ok("a transfer that has LANDED is offered as a recall rather than a cancel, because the server has it now");
+    // ONCE THE QUEUE HAS DRAINED, and not before. A transfer can legitimately be both
+    // queued and on the server at the same time — a reply lost after the row was written
+    // leaves it pending for a retry while the ledger already has it — so asserting this
+    // the instant a recall appears is a race, and one run caught it being one. What must
+    // be true is the steady state: a transfer the server holds is offered as a recall and
+    // not as a cancel, because cancelling would discard this device's copy and leave the
+    // server's behind.
+    // Until the TRANSFER has left the queue — not until the queue is empty, which it never
+    // is: the refused out-of-territory visit from §8 is deliberately still there, kept for
+    // a person to look at. An assertion written as "the queue is empty" failed on exactly
+    // that, which is the gate telling the truth about a rule the gate had forgotten.
+    for (let i = 0; i < 100; i += 1) {
+      const gone = await page.evaluate(`${READ_OUTBOX} return rows.every((r) => r.kind !== "transfer");`);
+      if (gone === true) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    const atRecall = await page.evaluate(
+      `${READ_OUTBOX} return { unsend: document.querySelector("button[data-unsend]") !== null, recall: document.querySelector("button[data-recall]") !== null, queue: rows.map((r) => r.kind + ":" + r.state) };`,
+    );
+    is(atRecall.queue.filter((k) => k.startsWith("transfer")), [],
+      "no transfer is left on the device once it has been sent");
+    is(atRecall.unsend, false,
+      `and it is no longer offered as a cancel (queue: ${JSON.stringify(atRecall.queue)})`);
+    is(atRecall.recall, true, "while the recall stays on offer, because the server is the one holding it now");
+    const sentAgain = transferRows().filter((r) => r.quantity === "1.000");
+    is(sentAgain.length, 1, "the second transfer is in the ledger, which is why it can only be recalled");
+
+    // Decided with no signal, like everything else a rep decides. The recall is queued
+    // against a transfer the server already has, so it carries that id and waits for
+    // nothing.
+    await page.offline(true);
+    await page.click("button[data-recall]");
+    // An IIFE because `waitFor` takes an EXPRESSION — it wraps what it is given in a
+    // `return (…)`, so a multi-statement snippet has to be a call rather than a body.
+    await page.waitFor(
+      `(async () => { ${READ_OUTBOX} return rows.some((r) => r.kind === "recall"); })()`,
+      { label: "the queued recall" },
+    );
+    const queuedRecall = await page.evaluate(
+      `${READ_OUTBOX} const r = rows.find((x) => x.kind === "recall"); return r === undefined ? null : { transferOf: r.transferOf ?? null, dependsOn: r.dependsOn ?? null };`,
+    );
+    is(queuedRecall?.transferOf, sentAgain[0]?.id, "the queued recall names the transfer it takes back");
+    is(queuedRecall?.dependsOn, null, "and waits for nothing, because that transfer has already landed");
+    is(transferRows("transfer_recall").length, 0, "with nothing in the ledger while there is no signal");
+
+    await page.offline(false);
+    await page.waitFor(`document.querySelector("button[data-recall]") === null`, { timeoutMs: 20_000, label: "the recall to land" });
+
+    const recalls = transferRows("transfer_recall");
+    is(recalls.length, 1, "one transfer_recall in crm.sample_transaction");
+    is(recalls[0]?.quantity, "1.000", "for the quantity that was in transit, read off the transfer rather than from the client");
+    is(holding("rep-ada"), "5.000|0.000", "and the material is back on the sender's balance, out of transit");
+    is(holding("rep-grace"), "3.000|0.000", "with the receiver untouched — they never had it");
+    await shot("18-recalled");
+
+    // ---- 15. the ERP deletes the tenant, and the queue STOPS ---------------
     // The whole chain, end to end, for the first time: the ERP signs a tombstone, 0050's
     // watcher marks the registry row, the API refuses every request for that tenant with
     // `tenant_deleted`, and the client — which is the only part of this that had never

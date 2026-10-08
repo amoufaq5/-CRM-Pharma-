@@ -1218,7 +1218,7 @@ typechecks green while `event.respondWith` does not exist.
 - **A real identity provider.** The token is minted by the same harness stand-in §10 uses.
   The PKCE implementation is tested against RFC 7636's own vector, and no live issuer has
   ever answered it.
-- **Most of the product.** Roughly 90 of the 104 routes have no screen.
+- **Most of the product.** Roughly 80 of the 106 routes have no screen.
 - **Any browser but Chromium**, and iOS Safari is the one that matters most for a field
   app. No Capacitor wrapper, no device under memory pressure, no push.
 - **A real ERP behind the outbox.** `ERP_BASE_URL` points nowhere in this run; §1–§7 cover
@@ -1226,7 +1226,8 @@ typechecks green while `event.respondWith` does not exist.
 
 ## Samples, and a signature drawn on glass
 
-*2026-10-08, same script. `pnpm client:verify` is 63 checks now.*
+*2026-10-08, same script. `pnpm client:verify` is 63 checks at this point, and 117 once
+transfers landed (below).*
 
 The disbursement is the act at the centre of a pharma field visit and the one with legal
 weight, and it is the first thing in this repo that needed the outbox to be more than a
@@ -1303,8 +1304,83 @@ the count after the re-render is the same 1,473 rather than merely non-zero.
   screen. `toFixed(3)` matches the column's own form, which is also the form the server
   sends.
 
+## Transfers, and the two things a shared phone breaks
+
+*2026-10-08, same script, now driving TWO browsers. `pnpm client:verify` is 117 checks.*
+
+A transfer is the first act in this product that needs two people, and one device signed in
+as one rep cannot prove it: the sending half and the receiving half are different routes
+scoped to different reps, and in between the material is in neither rep's hands — it is in
+`quantity_in_transit`, which is what the whole chapter is really about. So the run launches
+a second Chromium with its own profile: its own IndexedDB and its own `localStorage`, which
+is a second DEVICE. A second tab would have shared both and proved nothing.
+
+What the run drives, in order, with the ledger checked at every step:
+
+```
+ok: the picker offers one colleague (["Grace Hopper · E-2"])
+ok: and never the departed rep
+ok: and never the sender
+ok: a transfer of more than the rep is carrying is refused at the keyboard, and queues nothing
+ok: and the form survives the refusal, so the rep can correct the quantity rather than start again
+ok: the quantity leaves the balance as soon as it is queued (6.000 on hand · 2.000 in transit)
+ok: cancelling an unsent transfer puts it straight back on the balance
+ok: nothing reached the ledger, because nothing ever left
+ok: one transfer_out in crm.sample_transaction
+ok: the sender's balance moved from on-hand into IN TRANSIT, by the ledger's trigger
+ok: and the receiver holds nothing yet, because nobody has accepted it
+ok: the receiver is shown what it is and who sent it, not a pair of ids
+ok: and NOT waiting for it, because it is already on the server
+ok: one transfer_in in crm.sample_transaction
+ok: and the sender's in-transit is clear — the total across both reps never changed
+ok: a new sign-in with no network does not inherit the previous rep's identity from the cache
+ok: and once it can ask, it says plainly that it is holding somebody else's record
+ok: and pressing Sync as the other rep sends nothing of hers
+ok: one transfer_recall in crm.sample_transaction
+ok: and the material is back on the sender's balance, out of transit
+```
+
+And the arithmetic from outside the app, which is the assertion that matters most:
+
+```
+ok: the sender's balance is 10 received, 2 disbursed, 3 transferred away — 5 on hand, none in transit
+ok: and the receiver holds exactly what she accepted, on her own balance
+ok: and the two balances still sum to the 8 that were left after the disbursement
+ok: every transfer the run made has its one terminal event — an acceptance or a recall
+```
+
+### The two defects a shared device exposed
+
+Neither was visible to any unit test, and the second was found by the first one's test
+timing out.
+
+- **The queue belongs to a device; the record belongs to a person.** Every write route
+  attributes a record to the caller in the token, so a second rep signing in on a shared
+  phone would have drained the first rep's unsent rows under their own name — a false
+  custody record for a drug-sample hand-over, naming a real person, undetectable
+  downstream. Rows carry `createdBy` now, only the signed-in rep's rows are sent, and the
+  rest are held: not sent, not deleted, and said out loud on screen.
+- **The cache belongs to a person too.** After a sign-in with no network `/v1/me` never
+  answers, and the app carried on with the PREVIOUS rep's identity — their name in the
+  header, their stock on screen, and the id that would have been stamped on anything the
+  new rep recorded. A session now records which rep it turned out to be, the cache is
+  adopted only when the two agree, and a session that has never reached the server adopts
+  nothing and says so.
+
+### Three things the gate taught us about itself
+
+- A fixture that injects a raw IndexedDB row had to start carrying `createdBy`, or the row
+  it was testing was simply never sent — the new rule held it, exactly as designed.
+- "The queue is empty" is never true: §8's refused out-of-territory visit is deliberately
+  kept for a person to look at.
+- A transfer can be queued AND on the server at the same time, because a reply lost after
+  the row was written leaves it pending for a retry. An assertion about what the screen
+  offers has to wait for the steady state instead of catching it mid-drain — one run caught
+  the first version doing exactly that.
+
 ### What is still not built
 
-Transfers, counts, write-offs, returns, the disposal obligations with their regulatory
-deadlines, and the expiry sweep — the rest of custody. Roughly 85 of the 104 routes have no
-screen.
+Counts, write-offs, returns, the disposal obligations with their regulatory deadlines, and
+the expiry sweep — the rest of custody. The peer picker is a plain select of the first 500
+colleagues; the route takes a `?q=` filter and no screen uses it yet. Roughly 80 of the 106
+routes have no screen.

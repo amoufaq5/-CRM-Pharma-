@@ -253,6 +253,15 @@ export const TENANT_ERASE_EXEC = "ee520000-0000-4000-8000-000000000021";
 export const TENANT_ERASE_BYSTANDER = "ef520000-0000-4000-8000-000000000022";
 
 /**
+ * packages/sample — incoming.contract (migration 0055).
+ *
+ * Its own tenant because the peer list is tenant-wide by design: a suite sharing a tenant
+ * with another would see that suite's reps appear in the picker and the count assertions
+ * would drift with whatever else was seeded.
+ */
+export const TENANT_INCOMING = "f0550000-0000-4000-8000-000000000023";
+
+/**
  * Runs `fn` with `crm.tenant`'s protective triggers off, for test cleanup only.
  *
  * Migration 0053 made a stopped tenant's registry row undeletable, because deleting it

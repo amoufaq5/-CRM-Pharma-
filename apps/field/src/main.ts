@@ -1,21 +1,34 @@
 import {
+  AcceptBody,
   Account,
   AccountList,
   DisbursementBody,
   Holding,
   HoldingList,
+  IncomingTransferList,
   Me,
+  RecallBody,
+  RecallableTransferList,
+  TransferBody,
+  TransferPeerList,
   VisitBody,
+  enqueueAcceptance,
   enqueueDisbursement,
+  enqueueRecall,
   enqueueSignature,
+  enqueueTransfer,
   enqueueVisit,
+  heldForOthers,
   mintUuidV7,
   summariseOutbox,
   syncOnce,
   type CachedReference,
   type ClientStore,
+  type IncomingTransfer,
   type OutboxEntry,
+  type RecallableTransfer,
   type SyncReport,
+  type TransferPeer,
 } from "@crm/client";
 
 import { capture, createSignaturePad, type SignaturePad } from "./signature.js";
@@ -49,6 +62,10 @@ interface State {
   me: Me | null;
   accounts: readonly Account[];
   holdings: readonly Holding[];
+  /** The two open halves of a transfer, and who one can be addressed to. */
+  incoming: readonly IncomingTransfer[];
+  recallable: readonly RecallableTransfer[];
+  peers: readonly TransferPeer[];
   cachedAt: number | null;
   outbox: readonly OutboxEntry[];
   online: boolean;
@@ -56,6 +73,8 @@ interface State {
   recording: Account | null;
   /** The lot being disbursed, if that form is open. */
   disbursing: Holding | null;
+  /** The lot being transferred to a colleague, if that form is open. */
+  transferring: Holding | null;
   message: { kind: "good" | "warn" | "error"; text: string } | null;
   blocked: string | null;
   syncing: boolean;
@@ -68,11 +87,15 @@ const state: State = {
   me: null,
   accounts: [],
   holdings: [],
+  incoming: [],
+  recallable: [],
+  peers: [],
   cachedAt: null,
   outbox: [],
   online: navigator.onLine,
   recording: null,
   disbursing: null,
+  transferring: null,
   message: null,
   blocked: null,
   syncing: false,
@@ -122,7 +145,40 @@ function describeEntry(entry: OutboxEntry): string {
       return `Samples to ${entry.body.recipientName} — ${entry.body.quantity} unit(s)`;
     case "signature":
       return `Signature for disbursement ${entry.dependsOn.slice(0, 8)}`;
+    case "transfer":
+      return `${entry.body.quantity} unit(s) to ${nameOfPeer(entry.body.toRepProfileId)}`;
+    case "acceptance":
+      return `Accepting transfer ${entry.transferOf.slice(0, 8)}`;
+    case "recall":
+      return `Taking back transfer ${entry.transferOf.slice(0, 8)}`;
   }
+}
+
+/**
+ * A rep id as a name, where the device knows one.
+ *
+ * Falls back to a short id rather than to nothing: a queued transfer whose recipient has
+ * since left the peer list still has to be describable, and "to 3f2b91c4" is a worse
+ * sentence than a name but a much better one than "to undefined".
+ */
+function nameOfPeer(repProfileId: string): string {
+  const peer = state.peers.find((p) => p.rep_profile_id === repProfileId);
+  if (peer !== undefined) return peer.display_name;
+  const incoming = state.incoming.find((t) => t.sent_by === repProfileId);
+  if (incoming !== undefined) return incoming.sent_by_name;
+  const sent = state.recallable.find((t) => t.sent_to === repProfileId);
+  return sent?.sent_to_name ?? repProfileId.slice(0, 8);
+}
+
+/**
+ * Who is signed in, for a row that has to name its author.
+ *
+ * Null is a refusal rather than a default: every write route attributes the record to the
+ * caller, so a row queued without an author either gets sent under whoever signs in next —
+ * misattributing it — or is held forever. Both are worse than declining to record it.
+ */
+function authorId(): string | null {
+  return state.me?.repProfileId ?? null;
 }
 
 function ago(from: number | null, now: number): string {
@@ -189,9 +245,12 @@ function render(): void {
     parts.push(renderVisitForm(state.recording));
   } else if (state.disbursing !== null) {
     parts.push(renderDisburseForm(state.disbursing));
+  } else if (state.transferring !== null) {
+    parts.push(renderTransferForm(state.transferring));
   } else {
     parts.push(renderAccounts(now));
     parts.push(renderHoldings(now));
+    parts.push(renderTransfers(now));
   }
 
   root.innerHTML = parts.join("");
@@ -228,10 +287,36 @@ function renderOutbox(summary: ReturnType<typeof summariseOutbox>, now: number):
   const rejected = state.outbox.filter((e) => e.state === "rejected");
   const lines: string[] = [];
 
+  // Rows this device is holding for somebody else, said out loud. Without this line a rep
+  // sees a count that never moves and no reason for it — and the reason matters, because
+  // the remedy is for the other rep to sign in, not for this one to keep pressing Sync.
+  const held = state.me === null ? 0 : heldForOthers(state.outbox, state.me.repProfileId);
+  if (state.me === null && state.outbox.length > 0) {
+    // Signed in, offline, and `/v1/me` has never answered for this session — so the
+    // device genuinely does not know who is here. The queue is not sent and the count is
+    // not silently stuck: this says why, and what fixes it.
+    lines.push(`<section>
+      <h2>Waiting to know who is signed in (${state.outbox.length})</h2>
+      <p class="note">This device is holding ${state.outbox.length} record(s) and cannot
+        send them yet: every record is filed against whoever is signed in, and this
+        sign-in has not reached the server once. Connect, and they will be sorted by who
+        recorded them.</p>
+    </section>`);
+  }
+  if (held > 0) {
+    lines.push(`<section>
+      <h2>Held for another sign-in (${held})</h2>
+      <p class="note">${held} record(s) on this device were recorded under a different
+        sign-in. They are not sent — every record is filed against whoever is signed in, so
+        sending them would put somebody else's name on them — and they are not deleted.
+        That rep can sign in here and send them.</p>
+    </section>`);
+  }
+
   lines.push(`<section>
     <h2>On this device</h2>
     <ul class="list">
-      <li><span class="grow"><span class="name">${summary.pending} visit(s) waiting to send</span>
+      <li><span class="grow"><span class="name">${summary.pending} record(s) waiting to send</span>
         <span class="meta">${summary.pending === 0 ? "everything recorded here has been accepted" : `oldest ${ago(summary.oldestQueuedAt, now)}${summary.dueNow < summary.pending ? `, ${summary.pending - summary.dueNow} backing off` : ""}`}</span></span>
         <button id="sync" class="secondary" ${state.syncing || state.blocked !== null ? "disabled" : ""}>${state.syncing ? "Syncing…" : "Sync now"}</button></li>
     </ul>
@@ -299,7 +384,8 @@ function renderHoldings(now: number): string {
             <span class="name">${escapeHtml(h.lot_number)} · ${escapeHtml(h.erp_item_id)}</span>
             <span class="meta${expired ? " error" : ""}">${escapeHtml(h.quantity_on_hand)} on hand${h.expiry_date !== null ? ` · expires ${escapeHtml(h.expiry_date)}${expired ? " — EXPIRED" : ""}` : ""}${Number(h.quantity_in_transit) > 0 ? ` · ${escapeHtml(h.quantity_in_transit)} in transit` : ""}</span>
           </span>
-          <button data-disburse="${escapeHtml(h.lot_id)}" ${expired || Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Disburse</button></li>`;
+          <button data-disburse="${escapeHtml(h.lot_id)}" ${expired || Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Disburse</button>
+          <button class="secondary" data-transfer="${escapeHtml(h.lot_id)}" ${Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Transfer</button></li>`;
         })
         .join("")}
     </ul>
@@ -340,6 +426,115 @@ function renderDisburseForm(holding: Holding): string {
         the disbursement itself has been accepted. Both are saved on this device first.</p>
     </form>
   </section>`;
+}
+
+/**
+ * Hand material to a colleague.
+ *
+ * An EXPIRED lot can still be transferred, unlike disbursed. That asymmetry is the
+ * database's, and it is right: a rep must not give expired material to a doctor, but they
+ * may well have to hand it to the colleague who is taking it back to a warehouse for
+ * destruction. Blocking the transfer would strand it in a bag with no legal way out.
+ */
+function renderTransferForm(holding: Holding): string {
+  const expired = holding.expiry_date !== null && holding.expiry_date <= new Date().toISOString().slice(0, 10);
+  return `<section>
+    <h2>Transfer — ${escapeHtml(holding.lot_number)}</h2>
+    ${state.peers.length === 0
+      ? `<p class="warn">This device has no colleague list cached, so there is nobody to
+           address a transfer to. Connect once and refresh.</p>
+         <div class="actions"><button id="cancel-transfer" type="button" class="secondary">Back</button></div>`
+      : `<form id="transfer-form">
+          <div class="row">
+            <label>To colleague
+              <select name="toRepProfileId">
+                ${state.peers
+                  .map(
+                    (p) => `<option value="${escapeHtml(p.rep_profile_id)}">${escapeHtml(p.display_name)} · ${escapeHtml(p.employee_number)}</option>`,
+                  )
+                  .join("")}
+              </select>
+            </label>
+            <label>Quantity (of ${escapeHtml(holding.quantity_on_hand)})
+              <input name="quantity" type="text" inputmode="decimal" value="1" autocomplete="off" />
+            </label>
+          </div>
+          ${expired ? `<p class="warn">This lot has expired. It can still be handed over — for return or destruction — and the ledger records who had it.</p>` : ""}
+          <div class="actions">
+            <button id="save-transfer" type="submit">Send to colleague</button>
+            <button id="cancel-transfer" type="button" class="secondary">Cancel</button>
+          </div>
+          <p class="note">The quantity leaves your balance and sits in transit until they
+            accept it. Until then you can take it back.</p>
+        </form>`}
+  </section>`;
+}
+
+/**
+ * The two open halves of a transfer, each on the side that can act on it.
+ *
+ * Deliberately two lists from two routes rather than one list with a direction: only the
+ * receiver may accept and only the sender may recall, and the server scopes each list in
+ * SQL. A single list would put both buttons in front of both reps and let the database
+ * decide, which is a 403 a rep cannot do anything about.
+ */
+function renderTransfers(now: number): string {
+  const sections: string[] = [];
+  const queuedAcceptances = new Set(
+    state.outbox.filter((e) => e.kind === "acceptance").map((e) => e.transferOf),
+  );
+  const queuedRecalls = new Set(state.outbox.filter((e) => e.kind === "recall").map((e) => e.transferOf));
+  const unsentTransfers = state.outbox.filter((e) => e.kind === "transfer");
+
+  if (state.incoming.length > 0) {
+    sections.push(`<section>
+      <h2>Sent to me (${state.incoming.length})</h2>
+      <p class="note">Cached ${ago(state.cachedAt, now)}. Accepting adds it to your own balance.</p>
+      <ul class="list">
+        ${state.incoming
+          .map((t) => {
+            const queued = queuedAcceptances.has(t.transaction_id);
+            return `<li><span class="grow">
+              <span class="name">${escapeHtml(t.quantity)} × ${escapeHtml(t.lot_number)} from ${escapeHtml(t.sent_by_name)}</span>
+              <span class="meta">${escapeHtml(t.erp_item_id)}${t.expiry_date !== null ? ` · expires ${escapeHtml(t.expiry_date)}` : ""} · ${t.days_in_transit} day(s) in transit${queued ? " · acceptance queued on this device" : ""}</span>
+            </span>
+            <button data-accept="${escapeHtml(t.transaction_id)}" ${queued ? "disabled" : ""}>Accept</button></li>`;
+          })
+          .join("")}
+      </ul>
+    </section>`);
+  }
+
+  if (state.recallable.length > 0 || unsentTransfers.length > 0) {
+    sections.push(`<section>
+      <h2>Sent by me, not yet accepted (${state.recallable.length + unsentTransfers.length})</h2>
+      <ul class="list">
+        ${unsentTransfers
+          .map(
+            (e) => `<li><span class="grow">
+              <span class="name">${escapeHtml(describeEntry(e))}</span>
+              <span class="meta">not sent yet — this device still has it</span>
+            </span>
+            <button class="secondary" data-unsend="${escapeHtml(e.id)}">Cancel</button></li>`,
+          )
+          .join("")}
+        ${state.recallable
+          .map((t) => {
+            const queued = queuedRecalls.has(t.transaction_id);
+            return `<li><span class="grow">
+              <span class="name">${escapeHtml(t.quantity)} × ${escapeHtml(t.lot_number)} to ${escapeHtml(t.sent_to_name)}</span>
+              <span class="meta">${t.days_in_transit} day(s) in transit${queued ? " · recall queued on this device" : ""}</span>
+            </span>
+            <button class="secondary" data-recall="${escapeHtml(t.transaction_id)}" ${queued ? "disabled" : ""}>Recall</button></li>`;
+          })
+          .join("")}
+      </ul>
+      <p class="note">A recall is a new ledger movement, never an edit: the material went
+        out and came back, and both halves stay in the log.</p>
+    </section>`);
+  }
+
+  return sections.join("");
 }
 
 function renderVisitForm(account: Account): string {
@@ -466,6 +661,41 @@ function wireReady(): void {
     });
   }
 
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-transfer]")) {
+    button.addEventListener("click", () => {
+      const lotId = button.dataset["transfer"];
+      state.transferring = state.holdings.find((h) => h.lot_id === lotId) ?? null;
+      state.message = null;
+      render();
+    });
+  }
+  on("cancel-transfer", "click", () => {
+    state.transferring = null;
+    render();
+  });
+  document.getElementById("transfer-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveTransfer(event.target as HTMLFormElement);
+  });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-accept]")) {
+    button.addEventListener("click", () => {
+      const id = button.dataset["accept"];
+      if (id !== undefined) void acceptIncoming(id);
+    });
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-recall]")) {
+    button.addEventListener("click", () => {
+      const id = button.dataset["recall"];
+      if (id !== undefined) void recallSent(id);
+    });
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-unsend]")) {
+    button.addEventListener("click", () => {
+      const id = button.dataset["unsend"];
+      if (id !== undefined) void unsendTransfer(id);
+    });
+  }
+
   on("cancel-disbursement", "click", () => {
     state.disbursing = null;
     signatureInProgress = null;
@@ -550,7 +780,13 @@ async function saveVisit(form: HTMLFormElement): Promise<void> {
     return;
   }
 
-  state.outbox = enqueueVisit(state.outbox, parsed.data, Date.now());
+  const author = authorId();
+  if (author === null) {
+    state.message = { kind: "error", text: "This device does not know who is signed in yet, so it cannot record who made this visit. Connect once and try again." };
+    render();
+    return;
+  }
+  state.outbox = enqueueVisit(state.outbox, parsed.data, Date.now(), { createdBy: author });
   await store.replaceOutbox(state.outbox);
   state.recording = null;
   state.message = { kind: "good", text: "Saved on this device. It will sync when there is a network." };
@@ -614,13 +850,19 @@ async function saveDisbursement(form: HTMLFormElement): Promise<void> {
     return;
   }
 
+  const author = authorId();
+  if (author === null) {
+    state.message = { kind: "error", text: "This device does not know who is signed in yet, so it cannot record who handed this over. Connect once and try again." };
+    render();
+    return;
+  }
   const signatureId = mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) });
-  let queue = enqueueDisbursement(state.outbox, parsed.data, Date.now());
+  let queue = enqueueDisbursement(state.outbox, parsed.data, Date.now(), { createdBy: author });
   queue = enqueueSignature(
     queue,
     { id: signatureId, contentType: signature.contentType, contentBase64: signature.base64 },
-    disbursementId,
     Date.now(),
+    { createdBy: author, disbursementId },
   );
   state.outbox = queue;
   await store.replaceOutbox(state.outbox);
@@ -653,6 +895,243 @@ async function saveDisbursement(form: HTMLFormElement): Promise<void> {
   void drain({ manual: false });
 }
 
+/**
+ * Hand a quantity to a colleague: one queued movement, and the balance moved on screen.
+ *
+ * Nothing waits on anything here. A transfer is a single route that answers 201, so unlike
+ * a disbursement there is no second half to order — the receiver's acceptance happens on
+ * THEIR device, and the sender's screen stops being responsible for it the moment this row
+ * lands.
+ */
+async function saveTransfer(form: HTMLFormElement): Promise<void> {
+  const holding = state.transferring;
+  const author = authorId();
+  if (holding === null || store === null) return;
+  if (author === null) {
+    state.message = { kind: "error", text: "This device does not know who is signed in yet, so it cannot record who sent this. Connect once and try again." };
+    render();
+    return;
+  }
+
+  const data = new FormData(form);
+  const quantity = String(data.get("quantity") ?? "").trim();
+  const toRepProfileId = String(data.get("toRepProfileId") ?? "");
+
+  const parsed = TransferBody.safeParse({
+    id: mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) }),
+    lotId: holding.lot_id,
+    quantity,
+    occurredAt: new Date().toISOString(),
+    toRepProfileId,
+  });
+  if (!parsed.success) {
+    state.message = {
+      kind: "error",
+      text: `This transfer cannot be saved: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`,
+    };
+    render();
+    return;
+  }
+
+  // At the keyboard, not as a queued refusal hours later: the database refuses a transfer
+  // of more than the rep holds (`InsufficientHoldingError` → 409), and a rep who finds
+  // that out from a sync report has already told a colleague the material is coming.
+  //
+  // Checked against the LIVE holding rather than the snapshot the form was opened with.
+  // A drain that settles another movement refreshes the balances, and a form left open
+  // across that would otherwise be judged against a number that is no longer true — in
+  // either direction: refusing a transfer that now fits, or queueing one that no longer
+  // does.
+  const live = state.holdings.find((h) => h.lot_id === holding.lot_id) ?? holding;
+  if (Number(quantity) > Number(live.quantity_on_hand)) {
+    state.message = {
+      kind: "error",
+      text: `You are carrying ${live.quantity_on_hand} of ${live.lot_number}, so ${quantity} cannot be sent.`,
+    };
+    render();
+    return;
+  }
+
+  state.outbox = enqueueTransfer(state.outbox, parsed.data, Date.now(), { createdBy: author });
+  await store.replaceOutbox(state.outbox);
+
+  // Optimistic, and in BOTH columns: the quantity leaves `on_hand` and appears
+  // `in_transit`, which is exactly what the ledger's trigger will do. Showing only the
+  // decrement would make the material look lost until the next refresh.
+  const onHand = Number(live.quantity_on_hand) - Number(quantity);
+  const inTransit = Number(live.quantity_in_transit) + Number(quantity);
+  state.holdings = state.holdings.map((h) =>
+    h.lot_id === holding.lot_id
+      ? {
+          ...h,
+          quantity_on_hand: Number.isFinite(onHand) ? Math.max(0, onHand).toFixed(3) : h.quantity_on_hand,
+          quantity_in_transit: Number.isFinite(inTransit) ? inTransit.toFixed(3) : h.quantity_in_transit,
+        }
+      : h,
+  );
+
+  state.transferring = null;
+  state.message = {
+    kind: "good",
+    text: `Saved on this device: ${quantity} of ${holding.lot_number} to ${nameOfPeer(toRepProfileId)}. It syncs when there is a network.`,
+  };
+  render();
+  void drain({ manual: false });
+}
+
+/**
+ * Accept material a colleague sent.
+ *
+ * The body carries this movement's own id and a clock and nothing else: the lot and the
+ * quantity are read off the transfer by the server, so an acceptance cannot disagree with
+ * what was sent. The transfer's id goes in the path.
+ */
+async function acceptIncoming(transferId: string): Promise<void> {
+  const author = authorId();
+  if (store === null || author === null) return;
+  const transfer = state.incoming.find((t) => t.transaction_id === transferId);
+  if (transfer === undefined) return;
+
+  const parsed = AcceptBody.safeParse({
+    id: mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) }),
+    occurredAt: new Date().toISOString(),
+  });
+  if (!parsed.success) return;
+
+  state.outbox = enqueueAcceptance(state.outbox, parsed.data, Date.now(), {
+    createdBy: author,
+    transferOf: transferId,
+  });
+  await store.replaceOutbox(state.outbox);
+
+  // The lot may be one this rep has never carried, so there is no row to increment —
+  // which is why the optimistic update ADDS a holding when it is missing rather than
+  // skipping it. Without that, accepting offline shows nothing at all until a refresh.
+  const existing = state.holdings.find((h) => h.lot_id === transfer.lot_id);
+  state.holdings =
+    existing === undefined
+      ? [
+          ...state.holdings,
+          {
+            rep_profile_id: author,
+            lot_id: transfer.lot_id,
+            erp_item_id: transfer.erp_item_id,
+            lot_number: transfer.lot_number,
+            expiry_date: transfer.expiry_date,
+            // Not carried by the transfer row, and not guessable: shown as unknown rather
+            // than asserted, and the next refresh replaces the whole list anyway.
+            material_kind: "unknown",
+            quantity_on_hand: Number(transfer.quantity).toFixed(3),
+            quantity_in_transit: "0.000",
+          },
+        ]
+      : state.holdings.map((h) =>
+          h.lot_id === transfer.lot_id
+            ? { ...h, quantity_on_hand: (Number(h.quantity_on_hand) + Number(transfer.quantity)).toFixed(3) }
+            : h,
+        );
+
+  state.message = {
+    kind: "good",
+    text: `Saved on this device: accepting ${transfer.quantity} of ${transfer.lot_number} from ${transfer.sent_by_name}.`,
+  };
+  render();
+  void drain({ manual: false });
+}
+
+/** Take back material nobody accepted. A new movement, never an edit. */
+async function recallSent(transferId: string): Promise<void> {
+  const author = authorId();
+  if (store === null || author === null) return;
+  const transfer = state.recallable.find((t) => t.transaction_id === transferId);
+  if (transfer === undefined) return;
+
+  const parsed = RecallBody.safeParse({
+    id: mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) }),
+    occurredAt: new Date().toISOString(),
+  });
+  if (!parsed.success) return;
+
+  // `transferUnsent` only when this device is still holding the transfer itself. The
+  // screen offers "Cancel" rather than "Recall" in that case, so reaching here with an
+  // unsent transfer means the lists disagreed — and the dependency is what keeps the
+  // recall from drawing a 404 that is only ever about order.
+  const unsent = state.outbox.some((e) => e.kind === "transfer" && e.id === transferId);
+  state.outbox = enqueueRecall(state.outbox, parsed.data, Date.now(), {
+    createdBy: author,
+    transferOf: transferId,
+    ...(unsent ? { transferUnsent: true } : {}),
+  });
+  await store.replaceOutbox(state.outbox);
+
+  const back = state.holdings.find((h) => h.lot_id === transfer.lot_id);
+  if (back !== undefined) {
+    state.holdings = state.holdings.map((h) =>
+      h.lot_id === transfer.lot_id
+        ? {
+            ...h,
+            quantity_on_hand: (Number(h.quantity_on_hand) + Number(transfer.quantity)).toFixed(3),
+            quantity_in_transit: Math.max(0, Number(h.quantity_in_transit) - Number(transfer.quantity)).toFixed(3),
+          }
+        : h,
+    );
+  }
+
+  state.message = {
+    kind: "good",
+    text: `Saved on this device: taking back ${transfer.quantity} of ${transfer.lot_number} from ${transfer.sent_to_name}.`,
+  };
+  render();
+  void drain({ manual: false });
+}
+
+/**
+ * Cancel a transfer this device has not sent yet.
+ *
+ * Not a recall: there is nothing to recall. The server has never heard of this transfer,
+ * so discarding the queued row leaves no ledger movement at all — where a recall would
+ * write two (out, then back) for material that never moved. The cascade takes any recall
+ * queued against it, for the reason the discard path already does: a dependent whose
+ * prerequisite has vanished would be due immediately and refused with a 404 that says
+ * nothing about what happened.
+ */
+async function unsendTransfer(entryId: string): Promise<void> {
+  const author = authorId();
+  if (store === null) return;
+  const entry = state.outbox.find((e) => e.id === entryId);
+  if (entry === undefined || entry.kind !== "transfer") return;
+  if (author !== null && entry.createdBy !== author) {
+    state.message = { kind: "error", text: "That transfer was recorded under a different sign-in on this device." };
+    render();
+    return;
+  }
+
+  state.outbox = state.outbox.filter((e) => e.id !== entryId && e.dependsOn !== entryId);
+  await store.replaceOutbox(state.outbox);
+
+  // The quantity goes back where it was, since nothing ever left.
+  state.holdings = state.holdings.map((h) =>
+    h.lot_id === entry.body.lotId
+      ? {
+          ...h,
+          quantity_on_hand: (Number(h.quantity_on_hand) + Number(entry.body.quantity)).toFixed(3),
+          quantity_in_transit: Math.max(0, Number(h.quantity_in_transit) - Number(entry.body.quantity)).toFixed(3),
+        }
+      : h,
+  );
+  state.message = { kind: "good", text: "That transfer was never sent, so nothing was recorded anywhere." };
+  render();
+
+  // The arithmetic above assumes the balance on screen still carries the optimistic
+  // deduction this transfer made. That holds while the device is offline, because a
+  // refresh that fails changes nothing — but a transfer stuck behind a 500 could have had
+  // the server's own numbers (which never knew about it) land in between, and adding the
+  // quantity back would then overstate it. One read settles it where a read is possible.
+  if (state.online && state.blocked === null && state.phase === "ready") {
+    await refreshReference();
+  }
+}
+
 async function currentPosition(): Promise<{ latitude: number; longitude: number; accuracyM?: number } | null> {
   if (!("geolocation" in navigator)) return null;
   return new Promise((resolve) => {
@@ -675,8 +1154,32 @@ async function drain(opts: { manual: boolean; revive?: boolean }): Promise<void>
   if (store === null || transport === null || state.blocked !== null || state.syncing) return;
   if (!state.online && !opts.manual) return;
 
-  // Which disbursements are in flight, named before they can leave the queue.
-  const disbursementIdsBefore = state.outbox.filter((e) => e.kind === "disbursement").map((e) => e.id);
+  let author = authorId();
+  if (author === null && state.online && state.session !== null && state.phase === "ready") {
+    // A session signed in with no network has never reached `/v1/me`, so this device does
+    // not know whose rows it is holding. The moment it CAN ask, it must — otherwise the
+    // queue stays unsendable until somebody notices the Refresh button, which is how a
+    // rep's day sits on a device for a week. Asked here rather than in the `online`
+    // handler so that every path into a drain gets it: the browser's event, the Sync
+    // button, and coming back to a backgrounded tab.
+    await refreshReference();
+    author = authorId();
+  }
+  if (author === null) {
+    // Nothing can be sent without knowing whose rows these are, and nothing should be: a
+    // row sent under the wrong rep is a record naming somebody who did not do it.
+    if (opts.manual) {
+      state.message = { kind: "warn", text: "This device does not know who is signed in yet, so it will not send anything under the wrong name." };
+      render();
+    }
+    return;
+  }
+
+  // Which CUSTODY movements are in flight, named before they can leave the queue. Any of
+  // them settling changes a balance the screen is showing from its own arithmetic.
+  const custodyIdsBefore = state.outbox
+    .filter((e) => e.kind === "disbursement" || e.kind === "transfer" || e.kind === "acceptance" || e.kind === "recall")
+    .map((e) => e.id);
 
   state.syncing = true;
   render();
@@ -690,6 +1193,7 @@ async function drain(opts: { manual: boolean; revive?: boolean }): Promise<void>
       // backoff does not have. Without this, Sync now does nothing for up to half an
       // hour after one failure — which the live run caught doing exactly that.
       revive: opts.revive === true || opts.manual,
+      repProfileId: author,
     });
   } finally {
     state.syncing = false;
@@ -713,17 +1217,19 @@ async function drain(opts: { manual: boolean; revive?: boolean }): Promise<void>
     state.message = { kind: report.rejected.length > 0 ? "warn" : "good", text: bits.join(", ") };
   }
 
-  // A drain that settled a disbursement makes the local balances stale — an accepted one
-  // confirms the optimistic decrement, and a REFUSED one means the stock was never spent
-  // and the screen is now understating what the rep holds. The server is the authority on
-  // both, so one read puts it right rather than leaving a number nobody can trust.
+  // A drain that settled a custody movement makes the local balances stale — an accepted
+  // one confirms the optimistic arithmetic, and a REFUSED one means the stock never moved
+  // and the screen is now wrong in the other direction. The server is the authority on
+  // both, so one read puts it right rather than leaving a number nobody can trust. It also
+  // re-reads the two transfer lists, which is how an acceptance or a recall disappears
+  // from the screen that offered it.
   //
   // The ids are collected BEFORE the drain, because an accepted row is gone from the
   // queue afterwards and its kind with it. The first version of this asked the queue
   // after the fact and so refreshed after every accepted visit too.
   const settled = new Set([...report.accepted, ...report.rejected.map((r) => r.id)]);
   if (
-    disbursementIdsBefore.some((id) => settled.has(id)) &&
+    custodyIdsBefore.some((id) => settled.has(id)) &&
     state.online &&
     state.blocked === null &&
     state.phase === "ready"
@@ -773,15 +1279,40 @@ async function refreshReference(): Promise<void> {
     return;
   }
 
+  // The transfer lists are fetched after the three above and treated as OPTIONAL: a server
+  // older than these routes answers 404, and a device that refused to show a rep their
+  // accounts and stock because of that would be broken by a feature it does not need.
+  // Unreadable means "keep what the cache had" rather than "the list is empty", because an
+  // empty list is a claim — "nothing is waiting for you" — and this code has no grounds
+  // for it.
+  const incomingResult = await transport.get("/v1/samples/transfers/incoming");
+  const incoming = incomingResult.kind === "ok" ? IncomingTransferList.safeParse(incomingResult.body) : null;
+  const recallableResult = await transport.get("/v1/samples/transfers/recallable");
+  const recallable = recallableResult.kind === "ok" ? RecallableTransferList.safeParse(recallableResult.body) : null;
+  const peersResult = await transport.get("/v1/samples/transfer-peers");
+  const peers = peersResult.kind === "ok" ? TransferPeerList.safeParse(peersResult.body) : null;
+
   state.me = me.data;
+  // Stamp the session with the rep it turned out to be, so a later cold start can tell
+  // whether the cache on this device belongs to whoever is signed in now.
+  if (state.session !== null && state.session.repProfileId !== me.data.repProfileId) {
+    state.session = { ...state.session, repProfileId: me.data.repProfileId };
+    writeSession(state.session);
+  }
   state.accounts = accounts.data.data;
   state.holdings = holdings.data.data;
+  if (incoming !== null && incoming.success) state.incoming = incoming.data.data;
+  if (recallable !== null && recallable.success) state.recallable = recallable.data.data;
+  if (peers !== null && peers.success) state.peers = peers.data.data;
   state.cachedAt = Date.now();
   const cache: CachedReference = {
     me: me.data,
     accounts: accounts.data.data,
     visits: [],
     holdings: holdings.data.data,
+    incoming: state.incoming,
+    recallable: state.recallable,
+    peers: state.peers,
     fetchedAt: state.cachedAt,
   };
   await store.writeCache(cache);
@@ -789,6 +1320,18 @@ async function refreshReference(): Promise<void> {
 }
 
 function adoptSession(session: Session): void {
+  // A new session is a new person until the server says otherwise. Whatever reference
+  // data is on screen belongs to whoever was signed in before, so it goes now rather
+  // than lingering until `/v1/me` answers — which, offline, is never.
+  if (state.me !== null && state.me.repProfileId !== session.repProfileId) {
+    state.me = null;
+    state.accounts = [];
+    state.holdings = [];
+    state.incoming = [];
+    state.recallable = [];
+    state.peers = [];
+    state.cachedAt = null;
+  }
   writeSession(session);
   state.session = session;
   state.phase = "ready";
@@ -827,12 +1370,29 @@ async function boot(): Promise<void> {
     state.blocked = state.outbox.find((e) => e.state === "blocked")?.lastReason ?? "syncing has been stopped";
   }
   const cached = await store.readCache();
-  if (cached !== null) {
+  // WHOSE CACHE IS IT. A device is shared, and the cache holds one rep's identity, their
+  // accounts, their stock and the transfers addressed to them. Adopting it for whoever
+  // signs in next is wrong in two directions at once: it shows one rep another rep's
+  // round, and `authorId()` would stamp anything recorded with the wrong
+  // `repProfileId` — the exact misattribution the queue's author field exists to stop,
+  // arriving through the cache instead of the queue. So it is adopted only when the
+  // stored session says it was fetched for this session's rep, and a session that has
+  // never reached `/v1/me` has no claim on it at all.
+  const sessionOnDisk = readSession();
+  const cacheIsOurs =
+    cached !== null &&
+    sessionOnDisk !== null &&
+    sessionOnDisk.repProfileId !== undefined &&
+    sessionOnDisk.repProfileId === cached.me.repProfileId;
+  if (cached !== null && cacheIsOurs) {
     state.me = cached.me;
     state.accounts = cached.accounts;
     // `?? []` rather than a required field: a cache written before holdings existed is
     // still a usable cache, and refusing it would lose a rep's accounts on an upgrade.
     state.holdings = cached.holdings ?? [];
+    state.incoming = cached.incoming ?? [];
+    state.recallable = cached.recallable ?? [];
+    state.peers = cached.peers ?? [];
     state.cachedAt = cached.fetchedAt;
   }
 
