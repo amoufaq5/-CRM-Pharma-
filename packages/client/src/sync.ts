@@ -11,7 +11,6 @@ import {
   type BackoffPolicy,
   type OutboxEntry,
   type OutboxKind,
-  type SignatureEntry,
 } from "./outbox.js";
 import { classifyTransportOutcome } from "./outcome.js";
 import type { ClientStore } from "./store.js";
@@ -157,7 +156,13 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncReport> {
 
       let applied: ApplyResult;
       if (kind === "signature") {
-        const entry = batch[0] as SignatureEntry;
+        // Narrowed, not cast. `dueEntries` filtered by kind so the cast would have been
+        // correct today — and a future kind with a dependency would have made it quietly
+        // wrong, sending someone else's body to the signature route.
+        const entry = batch[0];
+        if (entry === undefined || entry.kind !== "signature") {
+          throw new Error(`the signature pass was handed a ${entry?.kind ?? "missing"} entry`);
+        }
         const result = await deps.transport.putSignature(entry.dependsOn, entry.body);
         batches += 1;
         const normalised = rowsFromSingle(entry, result);

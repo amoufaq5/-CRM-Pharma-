@@ -1162,7 +1162,7 @@ What it settles is the part that was a guess. Everything built for an offline de
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **62 checks in a real
+and `pnpm client:verify` proves it the only way that means anything: **63 checks in a real
 Chromium, taken offline mid-session, against the real API binary, counting rows in
 Postgres.** The sequence it drives:
 
@@ -1185,6 +1185,14 @@ Postgres.** The sequence it drives:
 - both go up on one reconnection, and in SQL `a.content_sha256 = t.signature_sha256`: the
   ledger committed to that digest before the image existed anywhere but a canvas;
 - the lot's balance falls from `10.000` to `8.000` by the ledger's own trigger;
+- the signal returns **while the signature is being drawn** and the stroke is still there
+  afterwards — the same 1,473 dark pixels. `render()` replaces the DOM from thirty-one
+  call sites and three of them fire untouched (`online`, `offline`, returning to a
+  backgrounded tab), so the canvas, the one part of this app whose content lives only in
+  the DOM, used to be wiped mid-signature with no message. It carries its pixels across a
+  render now, with `putImageData` rather than a redrawn data URL, because an asynchronous
+  restore leaves a pad that is not empty while it is still blank — and the next render
+  snapshots the blank;
 - and when the ERP deletes the tenant — a tombstone recorded against the registry row,
   which `tenant_erp_deleted_needs_receipt` makes the only way to reach that status — the
   app **stops**, says why in the server's words, holds the queue, disables Sync now, and

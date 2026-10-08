@@ -299,6 +299,28 @@ async function main() {
     is(drawn > 100, true, `a stroke drawn with pointer events leaves ink on the canvas (${drawn} dark pixels)`);
     await shot("11-signature-drawn");
 
+    // THE RE-RENDER THAT USED TO ERASE IT. This app re-renders from state on every
+    // online/offline transition, and each render replaces the DOM — including the canvas,
+    // and the strokes on it. A rep in a clinic regaining signal mid-signature would have
+    // watched their signature vanish with no message. Firing the event here is the only
+    // way to know it survives.
+    await page.evaluate(`window.dispatchEvent(new Event("online")); return true;`);
+    await page.waitFor(`document.querySelector("#signature-pad") !== null`, { label: "the form to survive the render" });
+    // The settle matters as much as the event: `online` renders, then drains, and the
+    // drain renders AGAIN. The first implementation of the restore survived one render
+    // and lost the strokes on the second, because it redrew from a data URL
+    // asynchronously and the second render snapshotted the still-blank canvas.
+    const survived = await page.evaluate(`
+      await new Promise((r) => setTimeout(r, 400));
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const canvas = document.querySelector("#signature-pad");
+      const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+      let ink = 0;
+      for (let i = 0; i < data.length; i += 4) { if (data[i] < 200) ink += 1; }
+      return ink;`);
+    is(survived > 100, true, `the signature survives a re-render triggered by regaining signal (${survived} dark pixels)`);
+    await page.offline(true);
+
     await page.fill(`input[name="quantity"]`, "2");
     await page.fill(`input[name="recipientName"]`, "Dr Ada Lovelace");
     await page.click("#save-disbursement");

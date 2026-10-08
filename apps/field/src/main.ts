@@ -82,6 +82,15 @@ let store: ClientStore | null = null;
 let transport: ApiTransport | null = null;
 /** The live pad, so a re-render can detach the old canvas's listeners. */
 let pad: SignaturePad | null = null;
+/**
+ * The strokes drawn so far, carried across a re-render.
+ *
+ * `render()` replaces the DOM, which replaces the canvas, which discards what was drawn
+ * on it — and the events that trigger a render include `online`, which is exactly what
+ * fires when a rep in a clinic regains signal mid-signature. Snapshotting here and
+ * restoring in `wireReady` is what stops their signature disappearing without a word.
+ */
+let signatureInProgress: ImageData | null = null;
 
 const app = (): HTMLElement => {
   const el = document.getElementById("app");
@@ -129,6 +138,9 @@ function ago(from: number | null, now: number): string {
 
 function render(): void {
   const now = Date.now();
+  // BEFORE the DOM goes. Synchronous, because anything async would resolve after the
+  // canvas it was reading had been replaced.
+  if (pad !== null) signatureInProgress = pad.snapshot() ?? signatureInProgress;
   const root = app();
   root.setAttribute("aria-busy", state.phase === "booting" ? "true" : "false");
 
@@ -446,22 +458,30 @@ function wireReady(): void {
       const lotId = button.dataset["disburse"];
       state.disbursing = state.holdings.find((h) => h.lot_id === lotId) ?? null;
       state.message = null;
+      // A fresh form starts blank. Every exit from the form already clears this, so the
+      // line is belt and braces — but it keeps the invariant local to the form's opening
+      // rather than resting on every path out of it staying correct.
+      signatureInProgress = null;
       render();
     });
   }
 
   on("cancel-disbursement", "click", () => {
     state.disbursing = null;
+    signatureInProgress = null;
     pad?.detach();
     pad = null;
     render();
   });
-  on("clear-signature", "click", () => pad?.clear());
+  on("clear-signature", "click", () => {
+    signatureInProgress = null;
+    pad?.clear();
+  });
 
   const canvas = document.getElementById("signature-pad");
   if (canvas instanceof HTMLCanvasElement) {
     pad?.detach();
-    pad = createSignaturePad(canvas);
+    pad = createSignaturePad(canvas, signatureInProgress !== null ? { restore: signatureInProgress } : {});
   }
   document.getElementById("disburse-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -623,6 +643,7 @@ async function saveDisbursement(form: HTMLFormElement): Promise<void> {
 
   pad.detach();
   pad = null;
+  signatureInProgress = null;
   state.disbursing = null;
   state.message = {
     kind: "good",
@@ -653,6 +674,9 @@ async function currentPosition(): Promise<{ latitude: number; longitude: number;
 async function drain(opts: { manual: boolean; revive?: boolean }): Promise<void> {
   if (store === null || transport === null || state.blocked !== null || state.syncing) return;
   if (!state.online && !opts.manual) return;
+
+  // Which disbursements are in flight, named before they can leave the queue.
+  const disbursementIdsBefore = state.outbox.filter((e) => e.kind === "disbursement").map((e) => e.id);
 
   state.syncing = true;
   render();
@@ -687,7 +711,27 @@ async function drain(opts: { manual: boolean; revive?: boolean }): Promise<void>
     if (report.rejected.length > 0) bits.push(`${report.rejected.length} refused`);
     if (report.retrying.length > 0) bits.push(`${report.retrying.length} will retry`);
     state.message = { kind: report.rejected.length > 0 ? "warn" : "good", text: bits.join(", ") };
-  } else if (opts.manual) {
+  }
+
+  // A drain that settled a disbursement makes the local balances stale — an accepted one
+  // confirms the optimistic decrement, and a REFUSED one means the stock was never spent
+  // and the screen is now understating what the rep holds. The server is the authority on
+  // both, so one read puts it right rather than leaving a number nobody can trust.
+  //
+  // The ids are collected BEFORE the drain, because an accepted row is gone from the
+  // queue afterwards and its kind with it. The first version of this asked the queue
+  // after the fact and so refreshed after every accepted visit too.
+  const settled = new Set([...report.accepted, ...report.rejected.map((r) => r.id)]);
+  if (
+    disbursementIdsBefore.some((id) => settled.has(id)) &&
+    state.online &&
+    state.blocked === null &&
+    state.phase === "ready"
+  ) {
+    await refreshReference();
+  }
+
+  if (report.accepted.length === 0 && report.rejected.length === 0 && opts.manual) {
     state.message = report.retrying.length > 0
       ? { kind: "warn", text: `Could not reach the server; ${report.retrying.length} record(s) still waiting.` }
       : { kind: "good", text: "Nothing to send." };

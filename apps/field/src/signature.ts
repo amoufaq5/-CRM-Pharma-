@@ -59,6 +59,18 @@ export interface SignaturePad {
   isEmpty(): boolean;
   /** The PNG the canvas holds. Rejects if the browser will not encode it. */
   toPng(): Promise<Uint8Array>;
+  /**
+   * The strokes so far, as raw pixels, or null if nothing has been drawn.
+   *
+   * Pixels rather than a data URL, and synchronous rather than a promise, for one reason:
+   * `render()` calls this immediately before it replaces the DOM, and the restore on the
+   * other side has to be synchronous too. A data URL would have to be decoded by an
+   * `Image`, which is asynchronous — and a pad restored from one is *not empty* while it
+   * is still blank, so a second `render()` arriving before the decode would snapshot the
+   * blank and overwrite the strokes it was meant to preserve. The `online` handler does
+   * exactly that: it renders, then drains, which renders again.
+   */
+  snapshot(): ImageData | null;
   detach(): void;
 }
 
@@ -69,7 +81,20 @@ export interface SignaturePad {
  * a trackpad, which is what a clinic desk actually presents. `touch-action: none` on the
  * element is what stops a drawn stroke scrolling the page instead.
  */
-export function createSignaturePad(canvas: HTMLCanvasElement): SignaturePad {
+/**
+ * `restore` is what keeps a signature alive across a re-render, and it is not a nicety.
+ *
+ * This app re-renders from state on 31 different occasions, and three of them can fire
+ * while a rep is mid-signature: the browser's `online` and `offline` events, and coming
+ * back to a backgrounded tab. Each replaces the DOM, which replaces the canvas element —
+ * and the strokes on the old one go with it. A rep in a clinic regaining signal halfway
+ * through a signature would have watched it vanish with no message, drawn it again, and
+ * never known why.
+ */
+export function createSignaturePad(
+  canvas: HTMLCanvasElement,
+  opts: { readonly restore?: ImageData } = {},
+): SignaturePad {
   const context = canvas.getContext("2d");
   if (context === null) throw new Error("this browser would not give the signature pad a 2d context");
 
@@ -90,6 +115,22 @@ export function createSignaturePad(canvas: HTMLCanvasElement): SignaturePad {
 
   let drawing = false;
   let empty = true;
+
+  if (opts.restore !== undefined) {
+    // `putImageData` writes the backing store directly, so it ignores the scale set
+    // above and lands pixel-for-pixel — which is what we want, because the pixels came
+    // from a canvas sized the same way. It is also the whole point of carrying pixels:
+    // the pad holds the strokes before this function returns, so `empty === false` is
+    // never a lie about a blank canvas.
+    empty = true;
+    try {
+      context.putImageData(opts.restore, 0, 0);
+      empty = false;
+    } catch {
+      // A tainted or zero-sized source. Losing the strokes is bad; throwing here would
+      // lose the whole form.
+    }
+  }
 
   const positionOf = (event: PointerEvent): { x: number; y: number } => {
     const rect = canvas.getBoundingClientRect();
@@ -130,6 +171,10 @@ export function createSignaturePad(canvas: HTMLCanvasElement): SignaturePad {
     },
     isEmpty(): boolean {
       return empty;
+    },
+    snapshot(): ImageData | null {
+      if (empty || canvas.width === 0 || canvas.height === 0) return null;
+      return context.getImageData(0, 0, canvas.width, canvas.height);
     },
     async toPng(): Promise<Uint8Array> {
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));

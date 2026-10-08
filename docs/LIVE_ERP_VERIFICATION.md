@@ -1226,7 +1226,7 @@ typechecks green while `event.respondWith` does not exist.
 
 ## Samples, and a signature drawn on glass
 
-*2026-10-08, same script. `pnpm client:verify` is 62 checks now.*
+*2026-10-08, same script. `pnpm client:verify` is 63 checks now.*
 
 The disbursement is the act at the centre of a pharma field visit and the one with legal
 weight, and it is the first thing in this repo that needed the outbox to be more than a
@@ -1242,6 +1242,7 @@ ok: the rep's own stock reaches the screen from /v1/samples/holdings
 ok: with the balance the ledger's trigger computed (10.000 on hand · expires 2027-10-08)
 ok: a disbursement with no signature is refused at the keyboard, not queued
 ok: a stroke drawn with pointer events leaves ink on the canvas (1473 dark pixels)
+ok: the signature survives a re-render triggered by regaining signal (1473 dark pixels)
 ok: with a signature it is saved on the device, and the screen says both halves are queued
 ok: two rows are queued for one disbursement, not one
 ok: the disbursement carries the digest of a signature that has not been uploaded yet
@@ -1270,6 +1271,20 @@ which is permanent, so equality is not a nicety.
 maintained by 0018's triggers, so a fixture writing `sample_holding` directly would be
 verifying its own arithmetic; `POST /v1/samples/receipts` is how a rep gets material, and
 the harness checks the trigger agreed (`10.000`).
+
+### The check that was added last, and failed
+
+`the signature survives a re-render triggered by regaining signal` dispatches the
+browser's own `online` event with a stroke on the canvas, waits for the drain the handler
+starts, and counts dark pixels again. It was written because `render()` replaces the DOM
+from thirty-one call sites and three of them fire with nobody touching the screen — and
+the canvas is the one part of this app whose content is not in state. It reported `0 dark
+pixels` on the implementation written to satisfy it: that one snapshotted a data URL and
+redrew it through an `Image`, which decodes asynchronously, so the restored pad was *not
+empty* while still blank and the second render of the reconnection (the handler renders,
+then drains, and the drain renders again) snapshotted the blank over the strokes. Carrying
+`ImageData` and restoring with `putImageData` is synchronous and pixel-exact, which is why
+the count after the re-render is the same 1,473 rather than merely non-zero.
 
 ### Three harness mistakes, each of which named a real property
 
