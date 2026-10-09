@@ -262,13 +262,15 @@ ok "the stored signature hashes to exactly what the ledger committed to before i
 # The whole run's arithmetic, in one place, because the number is only meaningful as the
 # sum of what the browser did: received 10, disbursed 2, queued a transfer of 2 and
 # cancelled it before it was ever sent, transferred 3 to Grace and had it accepted,
-# transferred 1 more and recalled it. 10 − 2 − 3 = 5 on hand, nothing left in transit.
+# transferred 1 more and recalled it, received 2 more while a count sat unsent on the
+# device — and then COUNTED 4, which the commit made true. The count is the only step here
+# that sets a balance rather than moving it, and it is why this is 4 and not 7.
 REMAINING="$(psql -At -c "
   SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
     FROM crm.sample_holding h JOIN crm.rep_profile r ON r.id = h.rep_profile_id
    WHERE h.tenant_id = '$TENANT' AND h.lot_id = '$LOT_ID' AND r.subject = 'rep-ada'")"
-[ "$REMAINING" = "5.000|0.000" ] || fail "rep-ada holds '$REMAINING' (on hand|in transit) at the end of the run, expected 5.000|0.000"
-ok "the sender's balance is 10 received, 2 disbursed, 3 transferred away — 5 on hand, none in transit"
+[ "$REMAINING" = "4.000|0.000" ] || fail "rep-ada holds '$REMAINING' (on hand|in transit) at the end of the run, expected 4.000|0.000"
+ok "the sender's balance ends at what the COUNT said: 10 received, 2 disbursed, 3 transferred, 2 received again, counted 4"
 
 GRACE="$(psql -At -c "
   SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
@@ -283,11 +285,43 @@ ok "and the receiver holds exactly what she accepted, on her own balance"
 TOTAL="$(psql -At -c "
   SELECT COALESCE(SUM(quantity_on_hand + quantity_in_transit), 0)
     FROM crm.sample_holding WHERE tenant_id = '$TENANT' AND lot_id = '$LOT_ID'")"
-[ "$TOTAL" = "8.000" ] || fail "the two reps hold '$TOTAL' between them, expected 8.000 — a transfer created or destroyed material"
-ok "and the two balances still sum to the 8 that were left after the disbursement"
+[ "$TOTAL" = "7.000" ] || fail "the two reps hold '$TOTAL' between them, expected 7.000"
+ok "and the two balances sum to 7: 8 left after the disbursement, 2 received, 3 written off by the count"
+
+# Every balance in this run is still the sum of its own movements. The count did not edit a
+# number; it posted an adjustment, which is the property that makes the ledger the record.
+DRIFT="$(psql -At -c "
+  SELECT count(*) FROM crm.sample_holding h
+   WHERE h.tenant_id = '$TENANT'
+     AND h.quantity_on_hand <> (
+       SELECT COALESCE(SUM(CASE
+         WHEN t.kind IN ('receipt','transfer_in','adjustment_in','transfer_recall') THEN t.quantity
+         WHEN t.kind IN ('disbursement','transfer_out','adjustment_out','destruction','expiry_writeoff','return_to_warehouse') THEN -t.quantity
+         ELSE 0 END), 0)
+         FROM crm.sample_transaction t
+        WHERE t.tenant_id = h.tenant_id AND t.lot_id = h.lot_id AND t.rep_profile_id = h.rep_profile_id)")"
+[ "$DRIFT" = "0" ] || fail "$DRIFT holding(s) disagree with the sum of their own movements"
+ok "and every balance still equals the sum of its movements — the count adjusted, it did not edit"
 
 # A transfer that was never accepted and never recalled would sit in transit forever, which
 # is the open end 0025 closed for the sender. Nothing may be left outstanding here.
+# The count, from outside the app. Two numbers that must differ and one that must not: the
+# ledger's variance is against what was HELD when the line arrived, the device's against
+# what the rep was shown — and the balance afterwards is exactly what they counted.
+COUNT_STATE="$(psql -At -c "
+  SELECT c.status || '|' || cl.counted_quantity || '|' || cl.expected_quantity || '|' ||
+         COALESCE(cl.device_expected_quantity::text, 'null')
+    FROM crm.sample_count c JOIN crm.sample_count_line cl ON cl.count_id = c.id
+   WHERE c.tenant_id = '$TENANT'")"
+[ "$COUNT_STATE" = "committed|4.000|7.000|5.000" ] || fail "the count reads '$COUNT_STATE', expected committed|4.000|7.000|5.000"
+ok "the count committed with all three figures kept: counted 4, server held 7, device had shown 5"
+
+LINKED="$(psql -At -c "
+  SELECT count(*) FROM crm.sample_transaction t JOIN crm.sample_count c ON c.id = t.count_id
+   WHERE t.tenant_id = '$TENANT' AND t.kind = 'adjustment_out' AND t.quantity = 3.000")"
+[ "$LINKED" = "1" ] || fail "$LINKED adjustments are linked to a count, expected 1"
+ok "and its adjustment is linked to the count structurally, not parsed out of a reason string"
+
 OUTSTANDING="$(psql -At -c "
   SELECT count(*) FROM crm.sample_transaction t
    WHERE t.tenant_id = '$TENANT' AND t.kind = 'transfer_out'

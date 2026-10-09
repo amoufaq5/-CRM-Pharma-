@@ -19,7 +19,9 @@ import { inbox } from "@crm/notify";
 import {
   acceptTransfer,
   adjust,
+  cancelCount,
   commitCount,
+  countLines,
   disburseSamples,
   expiringHoldings,
   getCount,
@@ -93,9 +95,13 @@ describe("sample custody", () => {
       try {
         await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
+        // ORDER MATTERS, children before parents: an adjustment written by a count
+        // references it (0056, ON DELETE RESTRICT), so the ledger goes first. The
+        // production erasure derives this order from the live FK graph; a fixture has to
+        // be told, and this one was the first thing the new key caught.
         await tx.query("DELETE FROM crm.sample_count_line WHERE tenant_id = $1", [TENANT]);
-        await tx.query("DELETE FROM crm.sample_count WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [TENANT]);
+        await tx.query("DELETE FROM crm.sample_count WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_holding WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.sample_lot WHERE tenant_id = $1", [TENANT]);
         await tx.query("DELETE FROM crm.visit WHERE tenant_id = $1", [TENANT]);
@@ -810,7 +816,14 @@ describe("sample custody", () => {
       });
     });
 
-    it("refuses committing a count twice", async () => {
+    /**
+     * CHANGED BY 0056, deliberately. This used to assert that a second commit is refused,
+     * which was right for an interactive caller and wrong for a queue: an offline client
+     * cannot tell a lost reply from a refusal, so it retries — and a 409 told the rep their
+     * count was refused while the ledger held the adjustments it had already written. The
+     * screen and the database disagreeing, with the rep believing the screen.
+     */
+    it("commits twice with the same answer, because a lost reply is not a refusal", async () => {
       await inTenant(async (tx) => {
         const lot = await aLot(tx);
         await stock(tx, lot, 5);
@@ -820,8 +833,221 @@ describe("sample custody", () => {
           countedAt: DAY("2026-10-20"),
         });
         await recordCountLine(tx, TENANT, { countId: count.id, lotId: lot.id, countedQuantity: 4 });
+        expect(await commitCount(tx, count.id)).toBe(1);
+
+        // The replay: the same number, and nothing written the second time.
+        expect(await commitCount(tx, count.id)).toBe(1);
+        expect(await commitCount(tx, count.id)).toBe(1);
+        expect(await onHand(tx, lot.id)).toBe("4.000");
+        const ledger = await ledgerFor(tx, { lotId: lot.id });
+        expect(ledger.filter((t) => t.kind === "adjustment_out")).toHaveLength(1);
+      });
+    });
+
+    it("answers a repeated commit of a count that found NOTHING with zero, not with a refusal", async () => {
+      await inTenant(async (tx) => {
+        const lot = await aLot(tx);
+        await stock(tx, lot, 5);
+        const count = await openCount(tx, TENANT, {
+          repProfileId: REP,
+          countedBy: OTHER_REP,
+          countedAt: DAY("2026-10-20"),
+        });
+        await recordCountLine(tx, TENANT, { countId: count.id, lotId: lot.id, countedQuantity: 5 });
+        expect(await commitCount(tx, count.id)).toBe(0);
+        // Zero adjustments is a real answer, and it has to survive the replay as itself
+        // rather than becoming a conflict.
+        expect(await commitCount(tx, count.id)).toBe(0);
+      });
+    });
+
+    it("still refuses to commit a CANCELLED count, which is a repeat of nothing", async () => {
+      await inTenant(async (tx) => {
+        const lot = await aLot(tx);
+        await stock(tx, lot, 5);
+        const count = await openCount(tx, TENANT, {
+          repProfileId: REP,
+          countedBy: OTHER_REP,
+          countedAt: DAY("2026-10-20"),
+        });
+        await recordCountLine(tx, TENANT, { countId: count.id, lotId: lot.id, countedQuantity: 4 });
+        await cancelCount(tx, count.id);
+        expect((await refuses(tx, () => commitCount(tx, count.id))).message).toMatch(/is cancelled, not open/);
+        expect(await onHand(tx, lot.id)).toBe("5.000");
+      });
+    });
+
+    it("cancels twice without complaining, because that is a rep's only way out", async () => {
+      await inTenant(async (tx) => {
+        // The dead end this closes: a count whose LINE was refused permanently stays open,
+        // `uq_sample_count_one_open` then refuses every later count for that rep, and a
+        // cancel that answered 409 on the retry would leave them with no action that works.
+        const count = await openCount(tx, TENANT, {
+          repProfileId: REP,
+          countedBy: REP,
+          countedAt: DAY("2026-10-20"),
+        });
+        await cancelCount(tx, count.id);
+        await cancelCount(tx, count.id);
+        expect((await getCount(tx, count.id))?.status).toBe("cancelled");
+
+        // And the rep is free to count again, which is the point.
+        const next = await openCount(tx, TENANT, {
+          repProfileId: REP,
+          countedBy: REP,
+          countedAt: DAY("2026-10-21"),
+        });
+        expect(next.status).toBe("open");
+      });
+    });
+
+    it("refuses to cancel a COMMITTED count, which would withdraw findings already in the ledger", async () => {
+      await inTenant(async (tx) => {
+        const lot = await aLot(tx);
+        await stock(tx, lot, 5);
+        const count = await openCount(tx, TENANT, {
+          repProfileId: REP,
+          countedBy: REP,
+          countedAt: DAY("2026-10-20"),
+        });
+        await recordCountLine(tx, TENANT, { countId: count.id, lotId: lot.id, countedQuantity: 4 });
         await commitCount(tx, count.id);
-        expect((await refuses(tx, () => commitCount(tx, count.id))).message).toMatch(/is committed, not open/);
+        expect((await refuses(tx, () => cancelCount(tx, count.id))).message).toMatch(/is committed, not open/);
+      });
+    });
+
+    it("links each adjustment to the count that produced it, structurally", async () => {
+      await inTenant(async (tx) => {
+        // The link was prose — `cycle count <uuid>: counted 17, held 20` — and parsing it
+        // back is what works until somebody rewords the message. 0056 gives it a column,
+        // which is also what makes the repeated commit answerable with the same number.
+        const lot = await aLot(tx);
+        await stock(tx, lot, 20);
+        const count = await openCount(tx, TENANT, {
+          repProfileId: REP,
+          countedBy: OTHER_REP,
+          countedAt: DAY("2026-10-20"),
+        });
+        await recordCountLine(tx, TENANT, { countId: count.id, lotId: lot.id, countedQuantity: 17 });
+        await commitCount(tx, count.id);
+
+        const { rows } = await tx.query<{ kind: string; count_id: string | null }>(
+          `SELECT kind, count_id FROM crm.sample_transaction
+            WHERE tenant_id = $1 AND count_id = $2`,
+          [TENANT, count.id],
+        );
+        expect(rows).toEqual([{ kind: "adjustment_out", count_id: count.id }]);
+
+        // And nothing else carries one: a disbursement that claimed to come from a count
+        // would be a movement the count never found.
+        const refused = await refuses(tx, () =>
+          tx.query(
+            `INSERT INTO crm.sample_transaction (id, tenant_id, lot_id, rep_profile_id, kind, quantity, erp_account_id, recipient_name, signature_sha256, occurred_at, count_id)
+             VALUES (gen_random_uuid(), $1, $2, $3, 'disbursement', 1, 'SM-ACC-1', 'Dr Ada', $4, now(), $5)`,
+            [TENANT, lot.id, REP, SIG, count.id],
+          ),
+        );
+        expect(refused.message).toMatch(/sample_tx_count_only_adjustments|count_only_adjustments/);
+      });
+    });
+
+    it("opens a count under an id the DEVICE minted, and a replayed open collapses onto it", async () => {
+      await inTenant(async (tx) => {
+        // The reason the whole of 0056 exists: the line route needs this id in its path, so
+        // a rep with no signal has to be able to mint it before there is anywhere to send
+        // it. And a queue that retries has to be able to send the same open twice.
+        const id = randomUUID();
+        const first = await openCount(tx, TENANT, {
+          id,
+          repProfileId: REP,
+          countedBy: REP,
+          countedAt: DAY("2026-10-20"),
+          note: "counted in the car park",
+        });
+        expect(first.id).toBe(id);
+
+        const again = await openCount(tx, TENANT, {
+          id,
+          repProfileId: REP,
+          countedBy: REP,
+          countedAt: DAY("2026-10-20"),
+        });
+        expect(again).toEqual(first);
+        const { rows } = await tx.query<{ n: string }>(
+          `SELECT count(*)::text AS n FROM crm.sample_count WHERE tenant_id = $1 AND rep_profile_id = $2`,
+          [TENANT, REP],
+        );
+        expect(rows[0]?.n).toBe("1");
+        // The note from the first open stands: the second is the same request arriving
+        // twice, not an edit.
+        expect(again.note).toBe("counted in the car park");
+      });
+    });
+
+    it("still refuses a SECOND open count for one rep, however the id was minted", async () => {
+      await inTenant(async (tx) => {
+        await openCount(tx, TENANT, { id: randomUUID(), repProfileId: REP, countedBy: REP, countedAt: DAY("2026-10-20") });
+        // A different id is a different document, and `uq_sample_count_one_open` refuses
+        // it — the idempotency above is keyed on the id and must not widen into "any open
+        // count will do".
+        expect(
+          await refuses(tx, () =>
+            openCount(tx, TENANT, { id: randomUUID(), repProfileId: REP, countedBy: REP, countedAt: DAY("2026-10-21") }),
+          ),
+        ).toBeTruthy();
+      });
+    });
+
+    it("records what the DEVICE showed the counter beside what the server held", async () => {
+      await inTenant(async (tx) => {
+        const lot = await aLot(tx);
+        await stock(tx, lot, 20);
+        const count = await openCount(tx, TENANT, {
+          id: randomUUID(),
+          repProfileId: REP,
+          countedBy: REP,
+          countedAt: DAY("2026-10-20"),
+        });
+        // The count was taken when the device thought there were 18 — a cached balance from
+        // before something moved. It arrives when the server holds 20.
+        const line = await recordCountLine(tx, TENANT, {
+          countId: count.id,
+          lotId: lot.id,
+          countedQuantity: 17,
+          deviceExpectedQuantity: 18,
+        });
+        expect(line.expected_quantity).toBe("20.000");
+        expect(line.device_expected_quantity).toBe("18.000");
+
+        const lines = await countLines(tx, count.id);
+        expect(lines[0]).toMatchObject({
+          counted_quantity: "17.000",
+          expected_quantity: "20.000",
+          variance: "-3.000",
+          device_expected_quantity: "18.000",
+          device_variance: "-1.000",
+        });
+
+        // The ledger reconciles against what is HELD, not against either snapshot, so the
+        // balance afterwards is what was counted.
+        expect(await commitCount(tx, count.id)).toBe(1);
+        expect(await onHand(tx, lot.id)).toBe("17.000");
+      });
+    });
+
+    it("leaves both device columns null for a count taken at a desk", async () => {
+      await inTenant(async (tx) => {
+        const lot = await aLot(tx);
+        await stock(tx, lot, 6);
+        const count = await openCount(tx, TENANT, {
+          repProfileId: REP,
+          countedBy: OTHER_REP,
+          countedAt: DAY("2026-10-20"),
+        });
+        await recordCountLine(tx, TENANT, { countId: count.id, lotId: lot.id, countedQuantity: 6 });
+        const lines = await countLines(tx, count.id);
+        expect(lines[0]?.device_expected_quantity).toBeNull();
+        expect(lines[0]?.device_variance).toBeNull();
       });
     });
 

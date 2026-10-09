@@ -1,15 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import type { DisbursementBody, TransferBody, VisitBody } from "./api.js";
+import type { CountBody, DisbursementBody, TransferBody, VisitBody } from "./api.js";
 import {
   DEFAULT_BACKOFF,
   applyBatchFailure,
   applySyncResults,
   backoffMs,
   dueEntries,
+  countLineKey,
   enqueueAcceptance,
+  enqueueCount,
+  enqueueCountCommit,
+  enqueueCountLine,
   enqueueRecall,
   enqueueTransfer,
+  normalizeStoredEntry,
+  normalizeStoredOutbox,
   enqueueVisit,
   heldForOthers,
   rejectUnreconcilable,
@@ -67,8 +73,13 @@ const disbursementEntry = (over: Partial<DisbursementEntry> & { id: string }): D
   ...over,
 });
 
+/**
+ * `disbursementOf` is the path parameter and `dependsOn` the wait, and the helper takes one
+ * id for both because that is how `enqueueSignature` builds them. They were ONE field until
+ * a count's commit needed to wait for several things at once.
+ */
 const signatureEntry = (
-  over: Partial<SignatureEntry> & { id: string; dependsOn: string },
+  over: Partial<SignatureEntry> & { id: string; disbursementOf: string },
 ): SignatureEntry => ({
   kind: "signature",
   body: { id: over.id, contentType: "image/png", contentBase64: "aGk=" },
@@ -76,6 +87,7 @@ const signatureEntry = (
   attempts: 0,
   nextAttemptAt: 0,
   queuedAt: 0,
+  dependsOn: [over.disbursementOf],
   ...over,
 });
 
@@ -313,7 +325,10 @@ describe("rejectUnreconcilable", () => {
 
   it("cannot be produced by enqueueVisit, which is the point", () => {
     const out = enqueueVisit([], body("x"), 1, MINE);
-    expect(out[0]?.id).toBe(out[0]?.body.id);
+    const queuedVisit = out[0];
+    // Narrowed rather than reached into: `body` is a union now, and a count line's has no
+    // id at all — which is the case `rejectUnreconcilable` had to learn to skip.
+    expect(queuedVisit?.kind === "visit" ? queuedVisit.body.id : null).toBe(queuedVisit?.id);
     expect(rejectUnreconcilable(out).refused).toEqual([]);
   });
 });
@@ -323,7 +338,7 @@ describe("dependencies", () => {
     // `POST /v1/samples/disbursements/:id/signature` answers 404 until that row exists,
     // and a 404 is permanent. A signature sent early would be refused forever for a
     // reason that was only ever about timing.
-    const entries = [disbursementEntry({ id: "d1" }), signatureEntry({ id: "s1", dependsOn: "d1" })];
+    const entries = [disbursementEntry({ id: "d1" }), signatureEntry({ id: "s1", disbursementOf: "d1" })];
     expect(dueEntries(entries, 1000).map((e) => e.id)).toEqual(["d1"]);
     expect(dueEntries(entries, 1000, 200, "signature")).toEqual([]);
   });
@@ -332,27 +347,28 @@ describe("dependencies", () => {
     // Absence IS acceptance: the queue is this device's whole memory of what is unsent, so
     // a row that is gone is a row the server took — and that reading survives a restart
     // where a flag would not.
-    const entries = [signatureEntry({ id: "s1", dependsOn: "d1" })];
+    const entries = [signatureEntry({ id: "s1", disbursementOf: "d1" })];
     expect(dueEntries(entries, 1000).map((e) => e.id)).toEqual(["s1"]);
   });
 
   it("does not release a signature whose disbursement is merely backed off", () => {
     const entries = [
       disbursementEntry({ id: "d1", nextAttemptAt: 9_000_000, attempts: 2 }),
-      signatureEntry({ id: "s1", dependsOn: "d1" }),
+      signatureEntry({ id: "s1", disbursementOf: "d1" }),
     ];
     expect(dueEntries(entries, 1000)).toEqual([]);
   });
 
   it("enqueueSignature records which disbursement it belongs to", () => {
     const queued = enqueueSignature([], { id: "s1", contentType: "image/png", contentBase64: "aGk=" }, 500, { ...MINE, disbursementId: "d1" });
-    expect(queued[0]).toMatchObject({ kind: "signature", dependsOn: "d1", state: "pending", queuedAt: 500 });
+    expect(queued[0]).toMatchObject({ kind: "signature", disbursementOf: "d1", dependsOn: ["d1"], state: "pending", queuedAt: 500 });
   });
 
   it("queues a disbursement like any other record, keyed by its own id", () => {
     const queued = enqueueDisbursement([], disbursement("d1"), 500, MINE);
-    expect(queued[0]).toMatchObject({ kind: "disbursement", id: "d1", state: "pending" });
-    expect(queued[0]?.id).toBe(queued[0]?.body.id);
+    const first = queued[0];
+    expect(first).toMatchObject({ kind: "disbursement", id: "d1", state: "pending" });
+    expect(first?.kind === "disbursement" ? first.body.id : null).toBe(first?.id);
   });
 });
 
@@ -363,7 +379,7 @@ describe("rejectOrphanedDependents", () => {
     // telling a rep their day has not gone in yet.
     const entries = [
       disbursementEntry({ id: "d1", state: "rejected", lastReason: "lot LOT-1 expired on 2026-09-01" }),
-      signatureEntry({ id: "s1", dependsOn: "d1" }),
+      signatureEntry({ id: "s1", disbursementOf: "d1" }),
     ];
     const out = rejectOrphanedDependents(entries);
     expect(out.refused).toHaveLength(1);
@@ -378,14 +394,14 @@ describe("rejectOrphanedDependents", () => {
     // rep whether anything can ever be done about it.
     const entries = [
       disbursementEntry({ id: "d1", state: "blocked", lastReason: "tenant deleted" }),
-      signatureEntry({ id: "s1", dependsOn: "d1" }),
+      signatureEntry({ id: "s1", disbursementOf: "d1" }),
     ];
     const out = rejectOrphanedDependents(entries);
     expect(out.entries.find((e) => e.id === "s1")?.state).toBe("blocked");
   });
 
   it("leaves a signature alone while its disbursement is still pending", () => {
-    const entries = [disbursementEntry({ id: "d1" }), signatureEntry({ id: "s1", dependsOn: "d1" })];
+    const entries = [disbursementEntry({ id: "d1" }), signatureEntry({ id: "s1", disbursementOf: "d1" })];
     expect(rejectOrphanedDependents(entries).refused).toEqual([]);
   });
 
@@ -393,7 +409,7 @@ describe("rejectOrphanedDependents", () => {
     // Gone from the queue is the success case, and it must not be read as a missing
     // prerequisite — that would refuse the signature at the exact moment it became
     // sendable.
-    const entries = [signatureEntry({ id: "s1", dependsOn: "d1" })];
+    const entries = [signatureEntry({ id: "s1", disbursementOf: "d1" })];
     expect(rejectOrphanedDependents(entries).refused).toEqual([]);
     expect(rejectOrphanedDependents(entries).entries[0]?.state).toBe("pending");
   });
@@ -451,7 +467,7 @@ describe("the transfer kinds", () => {
       transferOf: "t1",
       transferUnsent: true,
     });
-    expect(queue.find((e) => e.id === "r1")?.dependsOn).toBe("t1");
+    expect(queue.find((e) => e.id === "r1")?.dependsOn).toEqual(["t1"]);
     expect(dueEntries(queue, 2000).map((e) => e.id)).toEqual(["t1"]);
     // Once the transfer has left the queue — which is this device's whole memory of what
     // is unsent — the recall is due.
@@ -530,5 +546,154 @@ describe("whose rows these are", () => {
     // controlled hand-over is not this app's to throw away.
     const theirs = entry({ id: "theirs", createdBy: OTHER, attempts: 3, nextAttemptAt: 50_000 });
     expect(splitByAuthor([theirs], REP).held[0]).toBe(theirs);
+  });
+});
+
+// ---- counts ---------------------------------------------------------------
+
+describe("the count kinds", () => {
+  const COUNT = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c99";
+  const LOT_A = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c01";
+  const LOT_B = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c02";
+  const countBody = (id = COUNT): CountBody => ({
+    id,
+    countedAt: "2026-10-09T09:00:00.000Z",
+    note: "counted in the car park",
+  });
+
+  const wholeCount = (): readonly OutboxEntry[] => {
+    let q = enqueueCount([], countBody(), 1000, MINE);
+    q = enqueueCountLine(q, { lotId: LOT_A, countedQuantity: "7", deviceExpectedQuantity: "8" }, 1001, {
+      ...MINE,
+      countOf: COUNT,
+    });
+    q = enqueueCountLine(q, { lotId: LOT_B, countedQuantity: "3" }, 1002, { ...MINE, countOf: COUNT });
+    return enqueueCountCommit(q, 1003, {
+      ...MINE,
+      id: "commit-1",
+      countOf: COUNT,
+      lineIds: [countLineKey(COUNT, LOT_A), countLineKey(COUNT, LOT_B)],
+    });
+  };
+
+  it("keys a line by (count, lot), so recounting a lot replaces the figure", () => {
+    // The server's line has no id: its identity is the UNIQUE (count_id, lot_id) and an
+    // upsert. A fresh key per attempt would queue two lines for one shelf and send both.
+    let q = enqueueCountLine([], { lotId: LOT_A, countedQuantity: "7" }, 1000, { ...MINE, countOf: COUNT });
+    q = enqueueCountLine(q, { lotId: LOT_A, countedQuantity: "9" }, 2000, { ...MINE, countOf: COUNT });
+    expect(q).toHaveLength(1);
+    expect(q[0]?.id).toBe(countLineKey(COUNT, LOT_A));
+    expect(q[0]?.kind === "count_line" ? q[0].body.countedQuantity : null).toBe("9");
+  });
+
+  it("makes every line wait for the count document", () => {
+    const q = wholeCount();
+    const line = q.find((e) => e.id === countLineKey(COUNT, LOT_A));
+    expect(line?.dependsOn).toEqual([COUNT]);
+    // Only the count is due: a line for a count the server has never heard of is refused.
+    expect(dueEntries(q, 5000).map((e) => e.kind)).toEqual(["count"]);
+  });
+
+  it("makes the COMMIT wait for the count AND every line", () => {
+    const q = wholeCount();
+    const commit = q.find((e) => e.id === "commit-1");
+    expect(commit?.dependsOn).toEqual([COUNT, countLineKey(COUNT, LOT_A), countLineKey(COUNT, LOT_B)]);
+
+    // The count has landed; the lines have not. The commit must not go — it would write
+    // adjustments for whatever arrived and leave the rest of the bag unreconciled.
+    const afterCount = q.filter((e) => e.id !== COUNT);
+    expect(dueEntries(afterCount, 5000).map((e) => e.kind)).toEqual(["count_line", "count_line"]);
+
+    // One line still out. Still not the commit.
+    const oneLineLeft = afterCount.filter((e) => e.id !== countLineKey(COUNT, LOT_A));
+    expect(dueEntries(oneLineLeft, 5000).map((e) => e.id)).toEqual([countLineKey(COUNT, LOT_B)]);
+
+    // Everything landed: now it is due.
+    const onlyCommit = oneLineLeft.filter((e) => e.id !== countLineKey(COUNT, LOT_B));
+    expect(dueEntries(onlyCommit, 5000).map((e) => e.kind)).toEqual(["count_commit"]);
+  });
+
+  it("holds the commit while a line is merely BACKED OFF, not gone", () => {
+    // The case order alone cannot express: a line that failed and is waiting out its
+    // backoff is not due, so its kind's pass finds nothing — and a commit that depended on
+    // the pass rather than on the row would sail straight past it.
+    const q = wholeCount()
+      .filter((e) => e.id !== COUNT)
+      .map((e) => (e.id === countLineKey(COUNT, LOT_B) ? { ...e, nextAttemptAt: 9_999_999 } : e));
+    expect(dueEntries(q, 5000).map((e) => e.id)).toEqual([countLineKey(COUNT, LOT_A)]);
+    expect(dueEntries(q, 5000).some((e) => e.kind === "count_commit")).toBe(false);
+  });
+
+  it("refuses the whole document when the count itself is refused", () => {
+    const q = wholeCount().map((e) =>
+      e.id === COUNT ? { ...e, state: "rejected" as const, lastReason: "you already have an open count" } : e,
+    );
+    const out = rejectOrphanedDependents(q);
+    expect(out.refused.map((r) => r.id).sort()).toEqual(
+      ["commit-1", countLineKey(COUNT, LOT_A), countLineKey(COUNT, LOT_B)].sort(),
+    );
+    expect(out.refused[0]?.reason).toContain("the count it belongs to was refused");
+  });
+
+  it("refuses the commit when ONE line is refused, because a partial count is not a count", () => {
+    const q = wholeCount()
+      .filter((e) => e.id !== COUNT)
+      .map((e) =>
+        e.id === countLineKey(COUNT, LOT_B)
+          ? { ...e, state: "rejected" as const, lastReason: "lot has been written off" }
+          : e,
+      );
+    const out = rejectOrphanedDependents(q);
+    expect(out.refused.map((r) => r.id)).toEqual(["commit-1"]);
+    expect(out.refused[0]?.reason).toBe("the count_line it belongs to was refused: lot has been written off");
+  });
+
+  it("never calls a line unreconcilable, because its body carries no id", () => {
+    // `rejectUnreconcilable` compares a body's id to its key. A line has no id — the
+    // server's does not either — so there is nothing to disagree about, and a check that
+    // did not know the difference would refuse every line in every count.
+    const q = wholeCount();
+    expect(rejectUnreconcilable(q).refused).toEqual([]);
+  });
+});
+
+describe("normalizeStoredEntry", () => {
+  it("turns an older build's single dependency into a list", () => {
+    const legacy = { ...entry({ id: "r1" }), kind: "recall", dependsOn: "t1" } as unknown as OutboxEntry;
+    expect(normalizeStoredEntry(legacy).dependsOn).toEqual(["t1"]);
+  });
+
+  it("recovers a signature's path parameter from the dependency it used to be", () => {
+    // `dependsOn` WAS the path parameter. A stored signature has no `disbursementOf`, and
+    // without this its upload would be posted to `/disbursements/undefined/signature`.
+    const legacy = {
+      id: "s1",
+      kind: "signature",
+      body: { id: "s1", contentType: "image/png", contentBase64: "aGk=" },
+      state: "pending",
+      attempts: 0,
+      nextAttemptAt: 0,
+      queuedAt: 0,
+      dependsOn: "d1",
+    } as unknown as OutboxEntry;
+    const fixed = normalizeStoredEntry(legacy);
+    expect(fixed.kind === "signature" ? fixed.disbursementOf : null).toBe("d1");
+    expect(fixed.dependsOn).toEqual(["d1"]);
+  });
+
+  it("leaves a row that is already current exactly as it is", () => {
+    const current = entry({ id: "v1", createdBy: REP });
+    expect(normalizeStoredEntry(current)).toBe(current);
+  });
+
+  it("does not invent an empty dependency list for a row that has none", () => {
+    // These are stored as JSON: an absent key reads back cheaper than one holding nothing,
+    // and every consumer already treats undefined as "no dependencies".
+    expect(normalizeStoredEntry(entry({ id: "v1" }))).not.toHaveProperty("dependsOn");
+  });
+
+  it("normalizes a whole queue in one pass", () => {
+    const legacy = { ...entry({ id: "r1" }), kind: "recall", dependsOn: "t1" } as unknown as OutboxEntry;
+    expect(normalizeStoredOutbox([legacy, entry({ id: "v1" })])[0]?.dependsOn).toEqual(["t1"]);
   });
 });

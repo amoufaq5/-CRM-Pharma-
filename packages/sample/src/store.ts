@@ -480,19 +480,41 @@ export interface SampleCount {
   readonly note: string | null;
 }
 
+/**
+ * Opens a count — with an id the caller may have minted itself.
+ *
+ * A count is the one custody document whose purpose is to happen away from a desk, and
+ * `POST /v1/samples/counts/:id/lines` needs the id in its path. Without a device-minted id
+ * a rep with no signal cannot start one at all, which is why this takes an optional `id`
+ * like every other movement in this package.
+ *
+ * And because it does, a REPLAY has to collapse: a queue that cannot tell a lost reply from
+ * a refusal will send the same open twice. `ON CONFLICT DO NOTHING` returns no row, so the
+ * existing one is read back — the row that is there is the answer, whoever wrote it.
+ */
 export async function openCount(
   tx: PoolClient,
   tenantId: string,
-  input: { repProfileId: string; countedBy: string; countedAt: Date; note?: string | null },
+  input: { id?: string; repProfileId: string; countedBy: string; countedAt: Date; note?: string | null },
 ): Promise<SampleCount> {
   try {
     const { rows } = await tx.query<SampleCount>(
-      `INSERT INTO crm.sample_count (tenant_id, rep_profile_id, counted_by, counted_at, note)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO crm.sample_count (id, tenant_id, rep_profile_id, counted_by, counted_at, note)
+       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6)
+       ON CONFLICT (id) DO NOTHING
        RETURNING id, rep_profile_id, counted_by, status, counted_at, committed_at, note`,
-      [tenantId, input.repProfileId, input.countedBy, input.countedAt, input.note ?? null],
+      [input.id ?? null, tenantId, input.repProfileId, input.countedBy, input.countedAt, input.note ?? null],
     );
-    return rows[0]!;
+    const inserted = rows[0];
+    if (inserted !== undefined) return inserted;
+    // The conflict path. Read back rather than reporting a duplicate: the second open of
+    // one count is the same request arriving twice, and the row already there is what both
+    // of them asked for.
+    const existing = input.id === undefined ? null : await getCount(tx, input.id);
+    if (existing === null) {
+      throw new SampleCountError(`sample count ${input.id ?? "(unnamed)"} could not be opened or read back`);
+    }
+    return existing;
   } catch (err) {
     throw translateSampleError(err);
   }
@@ -509,18 +531,56 @@ export async function openCount(
 export async function recordCountLine(
   tx: PoolClient,
   tenantId: string,
-  input: { countId: string; lotId: string; countedQuantity: string | number },
-): Promise<{ readonly lot_id: string; readonly counted_quantity: string; readonly expected_quantity: string }> {
+  input: {
+    countId: string;
+    lotId: string;
+    countedQuantity: string | number;
+    /**
+     * What the counter was SHOWN, when the counter was a device.
+     *
+     * Kept beside the server's own snapshot rather than over it (0056). A count taken
+     * offline snapshots a balance that is hours old by the time the line arrives, so the
+     * two numbers can honestly differ — and a client allowed to overwrite the server's
+     * figure could make any variance vanish from review while the ledger still wrote the
+     * adjustment.
+     */
+    deviceExpectedQuantity?: string | number | null;
+  },
+): Promise<{
+  readonly lot_id: string;
+  readonly counted_quantity: string;
+  readonly expected_quantity: string;
+  readonly device_expected_quantity: string | null;
+}> {
   try {
-    const { rows } = await tx.query<{ lot_id: string; counted_quantity: string; expected_quantity: string }>(
-      `INSERT INTO crm.sample_count_line (tenant_id, count_id, lot_id, counted_quantity, expected_quantity)
+    const { rows } = await tx.query<{
+      lot_id: string;
+      counted_quantity: string;
+      expected_quantity: string;
+      device_expected_quantity: string | null;
+    }>(
+      `INSERT INTO crm.sample_count_line
+         (tenant_id, count_id, lot_id, counted_quantity, expected_quantity, device_expected_quantity)
        SELECT $1, $2, $3, $4,
               COALESCE((SELECT h.quantity_on_hand FROM crm.sample_holding h
                          JOIN crm.sample_count c ON c.id = $2
-                        WHERE h.rep_profile_id = c.rep_profile_id AND h.lot_id = $3), 0)
-       ON CONFLICT (count_id, lot_id) DO UPDATE SET counted_quantity = EXCLUDED.counted_quantity
-       RETURNING lot_id, counted_quantity::text AS counted_quantity, expected_quantity::text AS expected_quantity`,
-      [tenantId, input.countId, input.lotId, String(input.countedQuantity)],
+                        WHERE h.rep_profile_id = c.rep_profile_id AND h.lot_id = $3), 0),
+              $5
+       ON CONFLICT (count_id, lot_id) DO UPDATE
+         SET counted_quantity = EXCLUDED.counted_quantity,
+             device_expected_quantity = EXCLUDED.device_expected_quantity
+       RETURNING lot_id, counted_quantity::text AS counted_quantity,
+                 expected_quantity::text AS expected_quantity,
+                 device_expected_quantity::text AS device_expected_quantity`,
+      [
+        tenantId,
+        input.countId,
+        input.lotId,
+        String(input.countedQuantity),
+        input.deviceExpectedQuantity === undefined || input.deviceExpectedQuantity === null
+          ? null
+          : String(input.deviceExpectedQuantity),
+      ],
     );
     return rows[0]!;
   } catch (err) {
@@ -534,6 +594,12 @@ export async function recordCountLine(
  * Returns how many adjustments it wrote. The balance afterwards still equals the sum
  * of its movements, which is the property that makes the count auditable rather than
  * a quiet correction.
+ *
+ * Safe to call twice (0056). A count that is already committed answers with the number of
+ * adjustments it wrote the first time, read back from `count_id`, because an offline queue
+ * cannot distinguish a lost reply from a refusal — and being told a committed count was
+ * refused is the one failure where the screen and the ledger disagree and the rep believes
+ * the screen. A CANCELLED count still refuses: that is a repeat of nothing.
  */
 export async function commitCount(tx: PoolClient, countId: string): Promise<number> {
   try {
@@ -544,12 +610,30 @@ export async function commitCount(tx: PoolClient, countId: string): Promise<numb
   }
 }
 
+/**
+ * Abandons a count, and says so the same way however many times it is asked.
+ *
+ * Idempotent for the same reason the commit is (0056): an offline queue cannot tell a lost
+ * reply from a refusal, and a cancel is the only way out of a count whose line was refused
+ * permanently — that count stays OPEN, `uq_sample_count_one_open` refuses every later
+ * count for that rep, and a rep whose exit route answered 409 on the retry would be stuck
+ * for good with no action left that works.
+ *
+ * A COMMITTED count still refuses. Cancelling it would claim to withdraw findings that are
+ * already adjustments in the ledger.
+ */
 export async function cancelCount(tx: PoolClient, countId: string): Promise<void> {
   const { rowCount } = await tx.query(
     `UPDATE crm.sample_count SET status = 'cancelled' WHERE id = $1 AND status = 'open'`,
     [countId],
   );
-  if ((rowCount ?? 0) === 0) throw new SampleCountError(`sample count ${countId} is not open`);
+  if ((rowCount ?? 0) > 0) return;
+  const existing = await getCount(tx, countId);
+  if (existing === null) throw new SampleCountError(`no sample count ${countId}`);
+  // Already cancelled: the same request arriving twice, and the row already says what both
+  // of them asked for.
+  if (existing.status === "cancelled") return;
+  throw new SampleCountError(`sample count ${countId} is ${existing.status}, not open`);
 }
 
 export async function getCount(tx: PoolClient, countId: string): Promise<SampleCount | null> {
@@ -623,15 +707,33 @@ export interface SampleCountLine {
   readonly counted_quantity: string;
   readonly expected_quantity: string;
   readonly variance: string;
+  /** What the device showed the counter, null for a count taken at a desk (0056). */
+  readonly device_expected_quantity: string | null;
+  /**
+   * Counted minus what the DEVICE showed — the variance the counter actually saw, which
+   * for an offline count is a different number from `variance` and the one they could have
+   * acted on at the time. Null when the device sent nothing.
+   */
+  readonly device_variance: string | null;
 }
 
-/** A count's lines with the variance a reviewer approves, computed once in SQL. */
+/**
+ * A count's lines with the variance a reviewer approves, computed once in SQL.
+ *
+ * Two variances, not one, and the pair is the point (0056): `variance` is against the
+ * balance the server snapshotted when the line arrived, `device_variance` against what the
+ * counter was looking at. A count taken at a desk has them equal; a count taken in a car
+ * park and synced that evening may not, and the gap between them is a real finding — it is
+ * everything that moved while the count was in a bag.
+ */
 export async function countLines(tx: PoolClient, countId: string): Promise<readonly SampleCountLine[]> {
   const { rows } = await tx.query<SampleCountLine>(
     `SELECT cl.lot_id, l.lot_number,
             cl.counted_quantity::text AS counted_quantity,
             cl.expected_quantity::text AS expected_quantity,
-            (cl.counted_quantity - cl.expected_quantity)::text AS variance
+            (cl.counted_quantity - cl.expected_quantity)::text AS variance,
+            cl.device_expected_quantity::text AS device_expected_quantity,
+            (cl.counted_quantity - cl.device_expected_quantity)::text AS device_variance
        FROM crm.sample_count_line cl
        JOIN crm.sample_lot l ON l.id = cl.lot_id
       WHERE cl.count_id = $1

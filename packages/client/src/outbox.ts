@@ -1,5 +1,7 @@
 import type {
   AcceptBody,
+  CountBody,
+  CountLineBody,
   DisbursementBody,
   RecallBody,
   SignatureBody,
@@ -48,6 +50,10 @@ export const OUTBOX_KINDS = [
   "transfer",
   "acceptance",
   "recall",
+  "count",
+  "count_line",
+  "count_commit",
+  "count_cancel",
 ] as const;
 export type OutboxKind = (typeof OUTBOX_KINDS)[number];
 
@@ -62,14 +68,20 @@ interface OutboxEntryBase {
   readonly lastReason?: string;
   readonly lastType?: string;
   /**
-   * Another entry's id that must be ACCEPTED before this one can be sent.
+   * Entry ids that must all be ACCEPTED before this one can be sent.
    *
-   * Only a signature has one today, and it names its disbursement. "Accepted" is read as
-   * "no longer in the queue", which is the only definition that survives a restart: the
-   * queue is the whole of this device's memory, so a row that left it is a row the server
-   * took.
+   * "Accepted" is read as "no longer in the queue", which is the only definition that
+   * survives a restart: the queue is the whole of this device's memory, so a row that left
+   * it is a row the server took.
+   *
+   * A LIST because a count made it one. A signature waits for its disbursement and a
+   * recall for its transfer — one parent each — but a count's COMMIT must wait for the
+   * count and for every line in it, or it commits a document with some of its findings
+   * missing: adjustments written for the lots that arrived, and the rest never reconciled.
+   * Order alone cannot express that, because a line that fails and backs off leaves the
+   * kind's pass empty and the commit would sail past it.
    */
-  readonly dependsOn?: string;
+  readonly dependsOn?: readonly string[];
   /**
    * The rep this row was recorded by, from `/v1/me` at the moment it was queued.
    *
@@ -104,8 +116,17 @@ export interface DisbursementEntry extends OutboxEntryBase {
 export interface SignatureEntry extends OutboxEntryBase {
   readonly kind: "signature";
   readonly body: SignatureBody;
-  /** The disbursement this signature belongs to. Required, unlike the base's. */
-  readonly dependsOn: string;
+  /**
+   * The disbursement this signature belongs to — the id in the route's PATH.
+   *
+   * Its own field rather than a second use of `dependsOn`, which is what it was. The two
+   * happened to be the same id and so the dependency doubled as the path parameter; that
+   * is an accident, not a reason, and the accident only held because every dependent had
+   * exactly one parent. A count's commit has several.
+   */
+  readonly disbursementOf: string;
+  /** Always set, to the disbursement: the upload route 404s until that row exists. */
+  readonly dependsOn: readonly string[];
 }
 
 export interface TransferEntry extends OutboxEntryBase {
@@ -143,13 +164,67 @@ export interface RecallEntry extends OutboxEntryBase {
   readonly transferOf: string;
 }
 
+/**
+ * A count: the document, its lines, and the commit that closes it.
+ *
+ * Three kinds for one act, because the server is three routes — and that is the right
+ * shape rather than an awkward one: the open establishes the id the lines are addressed
+ * to, each line is independently refusable (a lot that has since been written off), and
+ * the commit is the moment the ledger moves. What the device adds is that all three are
+ * recorded at once, where the stock is, and drain in order whenever a signal returns.
+ */
+export interface CountEntry extends OutboxEntryBase {
+  readonly kind: "count";
+  readonly body: CountBody;
+}
+
+export interface CountLineEntry extends OutboxEntryBase {
+  readonly kind: "count_line";
+  readonly body: CountLineBody;
+  /** The count this line belongs to — the id in the route's path. */
+  readonly countOf: string;
+  /** The count itself: a line for a count the server has never heard of is refused. */
+  readonly dependsOn: readonly string[];
+}
+
+export interface CountCommitEntry extends OutboxEntryBase {
+  readonly kind: "count_commit";
+  /** The route takes no body: which count to commit is in the path. */
+  readonly body: Record<string, never>;
+  readonly countOf: string;
+  /** The count AND every line in it. This is why `dependsOn` is a list. */
+  readonly dependsOn: readonly string[];
+}
+
+/**
+ * Abandoning a count, which is a rep's only way out of one.
+ *
+ * It exists because a count whose LINE was refused permanently stays open on the server,
+ * and `uq_sample_count_one_open` then refuses every count that rep tries afterwards.
+ * Without a cancel that works offline, a rep in that state has no action left that does:
+ * the commit will not go (its line is refused), a new count will not open, and the only
+ * screen that could fix it is one they may not reach for days.
+ *
+ * Depends on the count only when the count is still unsent here — the same rule as a
+ * recall's — because a cancel of a count the server has never seen is a 404 about timing.
+ */
+export interface CountCancelEntry extends OutboxEntryBase {
+  readonly kind: "count_cancel";
+  readonly body: Record<string, never>;
+  readonly countOf: string;
+}
+
 export type OutboxEntry =
   | VisitEntry
   | DisbursementEntry
   | SignatureEntry
   | TransferEntry
   | AcceptanceEntry
-  | RecallEntry;
+  | RecallEntry
+  | CountEntry
+  | CountLineEntry
+  | CountCommitEntry
+  | CountCancelEntry;
 
 export interface BackoffPolicy {
   /** First delay, doubled per attempt. */
@@ -206,7 +281,11 @@ export type NewOutboxEntry =
   | Omit<SignatureEntry, keyof OutboxEntryStatus>
   | Omit<TransferEntry, keyof OutboxEntryStatus>
   | Omit<AcceptanceEntry, keyof OutboxEntryStatus>
-  | Omit<RecallEntry, keyof OutboxEntryStatus>;
+  | Omit<RecallEntry, keyof OutboxEntryStatus>
+  | Omit<CountEntry, keyof OutboxEntryStatus>
+  | Omit<CountLineEntry, keyof OutboxEntryStatus>
+  | Omit<CountCommitEntry, keyof OutboxEntryStatus>
+  | Omit<CountCancelEntry, keyof OutboxEntryStatus>;
 
 /**
  * Every helper takes the rep, and takes it as a REQUIRED option rather than an optional
@@ -252,7 +331,14 @@ export function enqueueSignature(
 ): readonly OutboxEntry[] {
   return enqueue(
     entries,
-    { id: body.id, kind: "signature", body, dependsOn: opts.disbursementId, createdBy: opts.createdBy },
+    {
+      id: body.id,
+      kind: "signature",
+      body,
+      disbursementOf: opts.disbursementId,
+      dependsOn: [opts.disbursementId],
+      createdBy: opts.createdBy,
+    },
     now,
   );
 }
@@ -307,8 +393,115 @@ export function enqueueRecall(
       body,
       transferOf: opts.transferOf,
       createdBy: opts.createdBy,
-      ...(opts.transferUnsent === true ? { dependsOn: opts.transferOf } : {}),
+      ...(opts.transferUnsent === true ? { dependsOn: [opts.transferOf] } : {}),
     },
+    now,
+  );
+}
+
+/**
+ * The key a count line is stored under: one slot per (count, lot).
+ *
+ * Deliberately not a fresh uuid. The server's line has no id of its own — its identity is
+ * `(count_id, lot_id)`, a UNIQUE constraint and an upsert — so a rep who recounts a lot
+ * must REPLACE the figure rather than queue a second line for the same shelf. Keying the
+ * queue the way the server keys the row is what makes that automatic.
+ */
+export function countLineKey(countId: string, lotId: string): string {
+  return `${countId}:${lotId}`;
+}
+
+/** The count document itself. Its lines and its commit both wait for this. */
+export function enqueueCount(
+  entries: readonly OutboxEntry[],
+  body: CountBody,
+  now: number,
+  opts: Attribution,
+): readonly OutboxEntry[] {
+  return enqueue(entries, { id: body.id, kind: "count", body, createdBy: opts.createdBy }, now);
+}
+
+export function enqueueCountLine(
+  entries: readonly OutboxEntry[],
+  body: CountLineBody,
+  now: number,
+  opts: Attribution & { readonly countOf: string },
+): readonly OutboxEntry[] {
+  return enqueue(
+    entries,
+    {
+      id: countLineKey(opts.countOf, body.lotId),
+      kind: "count_line",
+      body,
+      countOf: opts.countOf,
+      dependsOn: [opts.countOf],
+      createdBy: opts.createdBy,
+    },
+    now,
+  );
+}
+
+/**
+ * The commit, which waits for the count and for every line.
+ *
+ * `lineIds` is taken from the caller rather than derived from the queue, because the queue
+ * at commit time is the only moment the document is complete: the rep has finished
+ * counting, and nothing else will be added. Deriving it later — from whatever happens to
+ * be queued when the commit becomes due — would let a line refused in the meantime
+ * silently drop out of the wait.
+ */
+export function enqueueCountCommit(
+  entries: readonly OutboxEntry[],
+  now: number,
+  opts: Attribution & { readonly id: string; readonly countOf: string; readonly lineIds: readonly string[] },
+): readonly OutboxEntry[] {
+  return enqueue(
+    entries,
+    {
+      id: opts.id,
+      kind: "count_commit",
+      body: {},
+      countOf: opts.countOf,
+      dependsOn: [opts.countOf, ...opts.lineIds],
+      createdBy: opts.createdBy,
+    },
+    now,
+  );
+}
+
+/**
+ * Everything this device still holds for one count: the document, its lines, its commit.
+ *
+ * Used by both ways out of a count, which are deliberately different things. A count that
+ * never left this device is DISCARDED — the server has never heard of it, so there is
+ * nothing to cancel and no ledger rows either way. A count the server already holds open
+ * is CANCELLED, which is a real request, and whatever is still queued for it is moot the
+ * moment that request is made.
+ */
+export function partsOfCount(entries: readonly OutboxEntry[], countId: string): readonly OutboxEntry[] {
+  return entries.filter((e) => e.id === countId || ("countOf" in e && e.countOf === countId));
+}
+
+/** Drop a count that never left this device, with its lines and its commit. */
+export function discardCount(entries: readonly OutboxEntry[], countId: string): readonly OutboxEntry[] {
+  const parts = new Set(partsOfCount(entries, countId).map((e) => e.id));
+  return entries.filter((e) => !parts.has(e.id));
+}
+
+/**
+ * Abandon a count the SERVER holds open, dropping anything still queued for it.
+ *
+ * No dependency: a cancel only makes sense for a count that has already landed, which is
+ * what distinguishes it from the discard above.
+ */
+export function enqueueCountCancel(
+  entries: readonly OutboxEntry[],
+  now: number,
+  opts: Attribution & { readonly id: string; readonly countOf: string },
+): readonly OutboxEntry[] {
+  return enqueue(
+    discardCount(entries, opts.countOf),
+    { id: opts.id, kind: "count_cancel", body: {}, countOf: opts.countOf, createdBy: opts.createdBy },
     now,
   );
 }
@@ -339,7 +532,10 @@ export function dueEntries(
         e.state === "pending" &&
         e.nextAttemptAt <= now &&
         (kind === undefined || e.kind === kind) &&
-        (e.dependsOn === undefined || !present.has(e.dependsOn)),
+        // EVERY dependency, not the first: a count's commit waits for the count and for
+        // each of its lines, and a commit that went early would write adjustments for the
+        // lots that happened to arrive and leave the rest unreconciled.
+        (e.dependsOn ?? []).every((id) => !present.has(id)),
     )
     .slice()
     .sort((a, b) => a.queuedAt - b.queuedAt || (a.id < b.id ? -1 : 1))
@@ -397,9 +593,14 @@ export function rejectOrphanedDependents(
   const byId = new Map(entries.map((e) => [e.id, e]));
   const refused: { id: string; reason: string }[] = [];
   const next = entries.map((entry) => {
-    if (entry.state !== "pending" || entry.dependsOn === undefined) return entry;
-    const parent = byId.get(entry.dependsOn);
-    if (parent === undefined || parent.state === "pending") return entry;
+    if (entry.state !== "pending") return entry;
+    // The FIRST dependency that is in the queue and no longer pending. One is enough to
+    // condemn this row, and naming one gives the rep a sentence; listing all of them would
+    // give them a paragraph about a document they cannot repair either way.
+    const parent = (entry.dependsOn ?? [])
+      .map((id) => byId.get(id))
+      .find((p) => p !== undefined && p.state !== "pending");
+    if (parent === undefined) return entry;
     const reason = `the ${parent.kind} it belongs to was ${parent.state === "blocked" ? "blocked" : "refused"}: ${parent.lastReason ?? "no reason given"}`;
     refused.push({ id: entry.id, reason });
     return { ...entry, state: parent.state, lastReason: reason };
@@ -580,12 +781,17 @@ export function rejectUnreconcilable(
 ): { readonly entries: readonly OutboxEntry[]; readonly refused: readonly string[] } {
   const refused: string[] = [];
   const next = entries.map((entry) => {
-    if (entry.state !== "pending" || entry.body.id === entry.id) return entry;
+    // Only a body that CARRIES an id can disagree with its key. A count line has none —
+    // its identity on the server is (count, lot), which is exactly how this queue keys it —
+    // and a commit has no body at all; both are reconciled by the entry's own id, because
+    // their routes answer about the one row they were sent.
+    const bodyId = "id" in entry.body ? entry.body.id : undefined;
+    if (entry.state !== "pending" || bodyId === undefined || bodyId === entry.id) return entry;
     refused.push(entry.id);
     return {
       ...entry,
       state: "rejected" as const,
-      lastReason: `this device stored a queue entry keyed ${entry.id} holding a ${entry.kind} with id ${entry.body.id}; the two must match or the server's answer can never be matched to it`,
+      lastReason: `this device stored a queue entry keyed ${entry.id} holding a ${entry.kind} with id ${String(bodyId)}; the two must match or the server's answer can never be matched to it`,
     };
   });
   return { entries: next, refused };
@@ -610,4 +816,46 @@ export function summariseOutbox(entries: readonly OutboxEntry[], now: number): O
     dueNow: pending.filter((e) => e.nextAttemptAt <= now).length,
     oldestQueuedAt: oldest,
   };
+}
+
+/**
+ * Bring a row stored by an older build into the current shape.
+ *
+ * `dependsOn` used to be a single id, and a signature used it as the route's path
+ * parameter as well. A queue written before that changed would otherwise break in two
+ * silent ways: `dependsOn.every` is not a function on a string, so every row would look
+ * undue forever, and a signature's `disbursementOf` would be undefined, so its upload
+ * would go to `/v1/samples/disbursements/undefined/signature`.
+ *
+ * Applied where the store is read, once, rather than defended against at every use. It is
+ * deliberately a named function with a date attached to its reason: when there are no
+ * devices left holding a pre-`0056` queue it can be deleted outright, and the way to tell
+ * is that this function stops finding anything.
+ */
+export function normalizeStoredEntry(entry: OutboxEntry): OutboxEntry {
+  const raw = entry as OutboxEntry & { dependsOn?: unknown; disbursementOf?: unknown };
+  const deps =
+    typeof raw.dependsOn === "string"
+      ? [raw.dependsOn]
+      : Array.isArray(raw.dependsOn)
+        ? (raw.dependsOn as readonly string[])
+        : undefined;
+
+  if (entry.kind === "signature") {
+    const path = typeof raw.disbursementOf === "string" ? raw.disbursementOf : deps?.[0];
+    if (path === undefined) return entry;
+    return { ...entry, disbursementOf: path, dependsOn: deps ?? [path] };
+  }
+  if (deps === undefined) {
+    // No dependency at all, which is most rows. `dependsOn` is left ABSENT rather than set
+    // to an empty array: these are stored as JSON and a key that is not there is cheaper
+    // to read back than one holding nothing.
+    return entry;
+  }
+  return { ...entry, dependsOn: deps };
+}
+
+/** Every row, normalized. What a store's read hands to the engine. */
+export function normalizeStoredOutbox(entries: readonly OutboxEntry[]): readonly OutboxEntry[] {
+  return entries.map(normalizeStoredEntry);
 }

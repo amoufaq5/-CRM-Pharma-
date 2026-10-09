@@ -95,11 +95,14 @@ authorisation on its own.
 | `POST /v1/samples/transfers/:id/accept` | the receiving rep accepts |
 | `GET /v1/samples/transfers/recallable` | material the caller sent that nobody has accepted |
 | `POST /v1/samples/transfers/:id/recall` | take it back — **sender only**; a new ledger row, never an edit |
+| `GET\|POST /v1/samples/counts` | the rep's cycle counts / open one, under a device-minted id |
+| `POST /v1/samples/counts/:id/lines` | one counted lot; keeps the device's own expected figure beside the server's |
+| `POST /v1/samples/counts/:id/commit` | one adjustment per difference — **idempotent**, so a lost reply is not a refusal |
+| `POST /v1/samples/counts/:id/cancel` | abandon it; the only way out of a count whose line was refused |
 | `GET /v1/samples/ledger` | the append-only custody log |
 | `POST /v1/sync/disbursements` | offline flush, **per-row** results |
 | `POST /v1/call-plans` | create, for self or a supervised rep; then `/targets`, `/products` |
 | `POST /v1/call-plans/:id/{submit,approve,return,withdraw,supersede}` | the lifecycle |
-| `POST /v1/samples/counts` | open a count — self or supervised; then `/lines`, `/commit` |
 | `GET /v1/team` | the roster, through the territory hierarchy |
 | `GET /v1/team/call-plans` | the team's plans; `?status=submitted` is the approval queue |
 | `GET /v1/team/adherence` | the territory review: one row per rep, **including reps with no plan** |
@@ -1157,15 +1160,15 @@ pass vacuously. **83 files / 2,123 tests green on both transports.**
 
 `apps/field` is the client, and it is a slice rather than the product: **sign in, see my
 accounts, record a visit with no network, disburse samples with a signature on glass, hand
-material to a colleague and accept theirs, watch all of it sync, read a refusal.** Roughly
-80 of the 106 routes still have no screen — the rest of sample custody, call plans,
-expenses, notifications, the manager's views, all of admin.
+material to a colleague and accept theirs, count the bag, watch all of it sync, read a
+refusal.** Roughly 76 of the 106 routes still have no screen — the rest of sample custody,
+call plans, expenses, notifications, the manager's views, all of admin.
 
 What it settles is the part that was a guess. Everything built for an offline device —
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **117 checks in two
+and `pnpm client:verify` proves it the only way that means anything: **148 checks in two
 real Chromium profiles — two devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
@@ -1199,6 +1202,18 @@ real API binary, counting rows in Postgres.** The sequence it drives:
   summing to what was there before;
 - the sender takes back a transfer nobody accepted, and the recall is a **new movement**:
   both halves of the round trip stay in the log;
+- a **count of the whole bag** is taken with no signal and lands as one document — the
+  count, a line per lot, then the commit, in that order, with the commit waiting for every
+  line: a commit that went early would write adjustments for the lots that arrived and
+  leave the rest unreconciled. Every field starts **empty**, because a form pre-filled with
+  the answer is one a tired rep taps through;
+- and the count proves the thing the second expected-quantity column exists for: the rep
+  counts `4` where the device shows `5`, a receipt of `2` lands from elsewhere while the
+  count sits unsent, and the stored line keeps all three figures — counted `4.000`, held
+  `7.000`, device-shown `5.000` — so the reviewer sees both the variance against the books
+  (`-3.000`) and the one the counter could actually see (`-1.000`). One adjustment of
+  `3.000`, linked to the count by a column rather than by prose, and the balance ends at
+  exactly what was counted;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

@@ -1218,7 +1218,7 @@ typechecks green while `event.respondWith` does not exist.
 - **A real identity provider.** The token is minted by the same harness stand-in §10 uses.
   The PKCE implementation is tested against RFC 7636's own vector, and no live issuer has
   ever answered it.
-- **Most of the product.** Roughly 80 of the 106 routes have no screen.
+- **Most of the product.** Roughly 76 of the 106 routes have no screen.
 - **Any browser but Chromium**, and iOS Safari is the one that matters most for a field
   app. No Capacitor wrapper, no device under memory pressure, no push.
 - **A real ERP behind the outbox.** `ERP_BASE_URL` points nowhere in this run; §1–§7 cover
@@ -1378,9 +1378,75 @@ timing out.
   offers has to wait for the steady state instead of catching it mid-drain — one run caught
   the first version doing exactly that.
 
+## Counting the bag, where the bag is
+
+*2026-10-09, same script. `pnpm client:verify` is 148 checks.*
+
+A count is the one custody document whose whole purpose is to happen away from a desk, and
+it is the first thing in this app that is a DOCUMENT rather than a movement: four routes,
+three of them addressed to an id the device had to mint before there was anywhere to send
+it. 0056 is what made that possible — a device-minted count id, an idempotent commit, and a
+`count_id` on the adjustments so a repeated commit can answer with the same number.
+
+The run arranges the case the second expected-quantity column exists for: **something moves
+while the count is in the bag.**
+
+```
+ok: every count field starts EMPTY, so nothing is confirmed by tapping through
+ok: with the balance shown beside it instead (device shows 5.000 · expires 2027-10-09)
+ok: a count with an impossible quantity is refused at the keyboard, and queues nothing
+ok: and a count with nothing filled in writes off nothing — a blank field is not a zero
+ok: one count queues THREE rows: the document, a line, and the commit
+ok: the line is keyed by (count, lot), the way the server keys its row
+ok: and carries what the DEVICE showed, not only what was counted
+ok: and the COMMIT waits for the document AND every line
+ok: the screen shows what was counted, because that is what the ledger will say
+ok: and a second count cannot be started while this one is unsent
+ok: a receipt lands from somewhere else while the count sits unsent on the device
+ok: one row in crm.sample_count
+ok: under the id the DEVICE minted, which is what let the line be addressed at all
+ok: committed, because the commit went last and after every line
+ok: holding what the rep counted                        (4.000)
+ok: the balance the SERVER held when the line arrived    (7.000)
+ok: and the balance the DEVICE had shown them           (5.000)
+ok: so the reviewer sees the variance against what was held   (-3.000)
+ok: AND the variance the counter could actually see           (-1.000)
+ok: one adjustment in the ledger, not an edit to a balance
+ok: linked to the count that found it, structurally rather than in prose
+ok: and the balance is exactly what the rep counted
+```
+
+The `2` between the two variances is the receipt. One column could not have said that, and
+letting the device overwrite the server's figure would have hidden it — send expected equal
+to counted and the ledger still writes the real adjustment while the reviewer sees a clean
+count.
+
+From outside the app, two assertions that matter more than the rest:
+
+```
+ok: the count committed with all three figures kept: counted 4, server held 7, device had shown 5
+ok: and every balance still equals the sum of its movements — the count adjusted, it did not edit
+```
+
+### What the guards caught, within the hour
+
+- **`count_id` was written single-column** and the composite-key contract refused it: a
+  reference into a tenant-scoped table is stopped from naming another tenant's row by RLS
+  alone, and referential checks bypass RLS. The registry then demanded a live probe proving
+  the key refuses an adjustment citing another tenant's count, which it now has.
+- **Two fixtures deleted `sample_count` before `sample_transaction`** and the new key
+  stopped them — the ordering hazard made visible. The production erasure was never at
+  risk: it derives its order from the live FK graph and refuses a retained child of an
+  erased parent, naming the edge.
+- **The strict test typecheck caught `entry.body.id`** on a union where a count line's body
+  has no id at all, which is the same fact that made `rejectUnreconcilable` need to learn
+  the difference between a body that carries an id and one that cannot.
+
 ### What is still not built
 
-Counts, write-offs, returns, the disposal obligations with their regulatory deadlines, and
-the expiry sweep — the rest of custody. The peer picker is a plain select of the first 500
-colleagues; the route takes a `?q=` filter and no screen uses it yet. Roughly 80 of the 106
-routes have no screen.
+Write-offs, returns, the disposal obligations with their regulatory deadlines, and the
+expiry sweep — the rest of custody. A count covers only the lots the device has cached, so
+material a rep holds that the device has never heard of cannot be counted into existence:
+the right conservative default, and still a gap. The peer picker is a plain select of the
+first 500 colleagues; the route takes a `?q=` filter and no screen uses it yet. Roughly 76
+of the 106 routes have no screen.

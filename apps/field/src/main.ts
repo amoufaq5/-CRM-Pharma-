@@ -2,6 +2,9 @@ import {
   AcceptBody,
   Account,
   AccountList,
+  Count,
+  CountBody,
+  CountList,
   DisbursementBody,
   Holding,
   HoldingList,
@@ -12,7 +15,13 @@ import {
   TransferBody,
   TransferPeerList,
   VisitBody,
+  countLineKey,
+  discardCount,
   enqueueAcceptance,
+  enqueueCount,
+  enqueueCountCancel,
+  enqueueCountCommit,
+  enqueueCountLine,
   enqueueDisbursement,
   enqueueRecall,
   enqueueSignature,
@@ -20,6 +29,7 @@ import {
   enqueueVisit,
   heldForOthers,
   mintUuidV7,
+  partsOfCount,
   summariseOutbox,
   syncOnce,
   type CachedReference,
@@ -66,6 +76,8 @@ interface State {
   incoming: readonly IncomingTransfer[];
   recallable: readonly RecallableTransfer[];
   peers: readonly TransferPeer[];
+  /** Counts the server knows about, which is how an OPEN one becomes visible here. */
+  counts: readonly Count[];
   cachedAt: number | null;
   outbox: readonly OutboxEntry[];
   online: boolean;
@@ -75,6 +87,8 @@ interface State {
   disbursing: Holding | null;
   /** The lot being transferred to a colleague, if that form is open. */
   transferring: Holding | null;
+  /** True while the count form is open. A count is the whole bag, not one lot. */
+  counting: boolean;
   message: { kind: "good" | "warn" | "error"; text: string } | null;
   blocked: string | null;
   syncing: boolean;
@@ -90,12 +104,14 @@ const state: State = {
   incoming: [],
   recallable: [],
   peers: [],
+  counts: [],
   cachedAt: null,
   outbox: [],
   online: navigator.onLine,
   recording: null,
   disbursing: null,
   transferring: null,
+  counting: false,
   message: null,
   blocked: null,
   syncing: false,
@@ -151,7 +167,20 @@ function describeEntry(entry: OutboxEntry): string {
       return `Accepting transfer ${entry.transferOf.slice(0, 8)}`;
     case "recall":
       return `Taking back transfer ${entry.transferOf.slice(0, 8)}`;
+    case "count":
+      return `Stock count of ${new Date(entry.body.countedAt).toLocaleDateString()}`;
+    case "count_line":
+      return `Counted ${entry.body.countedQuantity} of ${nameOfLot(entry.body.lotId)}`;
+    case "count_commit":
+      return `Committing the count — one adjustment per difference`;
+    case "count_cancel":
+      return `Abandoning the count of ${entry.countOf.slice(0, 8)}`;
   }
+}
+
+/** A lot id as a lot number, where the device still has the holding that names it. */
+function nameOfLot(lotId: string): string {
+  return state.holdings.find((h) => h.lot_id === lotId)?.lot_number ?? lotId.slice(0, 8);
 }
 
 /**
@@ -247,10 +276,13 @@ function render(): void {
     parts.push(renderDisburseForm(state.disbursing));
   } else if (state.transferring !== null) {
     parts.push(renderTransferForm(state.transferring));
+  } else if (state.counting) {
+    parts.push(renderCountForm(now));
   } else {
     parts.push(renderAccounts(now));
     parts.push(renderHoldings(now));
     parts.push(renderTransfers(now));
+    parts.push(renderCounts(now));
   }
 
   root.innerHTML = parts.join("");
@@ -389,7 +421,29 @@ function renderHoldings(now: number): string {
         })
         .join("")}
     </ul>
+    <div class="actions">
+      <button id="start-count" class="secondary" ${countBlocked() !== null ? "disabled" : ""}>Count my samples</button>
+    </div>
+    ${countBlocked() !== null ? `<p class="note">${escapeHtml(countBlocked() ?? "")}</p>` : ""}
   </section>`;
+}
+
+/**
+ * Why a count cannot be started, or null when one can.
+ *
+ * Said on the screen rather than discovered as a refusal. `uq_sample_count_one_open`
+ * permits one open count per rep, so both of these are states the rep can see and settle —
+ * and neither is guessable from a button that has simply stopped working.
+ */
+function countBlocked(): string | null {
+  if (state.outbox.some((e) => e.kind === "count")) {
+    return "A count recorded on this device is still waiting to send. Sync it, or discard it below, before counting again.";
+  }
+  const mine = state.me?.repProfileId ?? null;
+  if (state.counts.some((c) => c.status === "open" && (mine === null || c.rep_profile_id === mine))) {
+    return "A count of your bag is still open. Settle it below before starting another.";
+  }
+  return null;
 }
 
 function renderDisburseForm(holding: Holding): string {
@@ -537,6 +591,119 @@ function renderTransfers(now: number): string {
   return sections.join("");
 }
 
+/**
+ * Count the whole bag.
+ *
+ * ONE SCREEN FOR THE WHOLE DOCUMENT, not a lot at a time, because that is how a count
+ * happens: a rep empties the bag, counts what is in it, and writes the numbers down. The
+ * server's routes are an interactive document; the device assembles it offline and drains
+ * it in order when a signal returns.
+ *
+ * EVERY FIELD STARTS EMPTY, and that is the most important decision on this screen. The
+ * expected figure is SHOWN beside each lot and never pre-filled: a form that arrives
+ * holding the answer is a form a tired rep taps through, and what that produces is a
+ * document saying somebody counted when nobody did. A blank field means "not counted", and
+ * no line is sent for it.
+ */
+function renderCountForm(now: number): string {
+  if (state.holdings.length === 0) {
+    return `<section><h2>Count my samples</h2>
+      <p class="note">There is no stock on this device to count.</p>
+      <div class="actions"><button id="cancel-count" type="button" class="secondary">Back</button></div></section>`;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  return `<section>
+    <h2>Count my samples</h2>
+    <p class="note">Counting ${state.holdings.length} lot(s). Leave a lot blank if you did not
+      count it — only the ones you fill in are recorded. The balances shown are what this
+      device last heard, ${ago(state.cachedAt, now)}.</p>
+    <form id="count-form">
+      <ul class="list">
+        ${state.holdings
+          .map((h) => {
+            const expired = h.expiry_date !== null && h.expiry_date <= today;
+            return `<li><span class="grow">
+              <span class="name">${escapeHtml(h.lot_number)} · ${escapeHtml(h.erp_item_id)}</span>
+              <span class="meta${expired ? " error" : ""}">device shows ${escapeHtml(h.quantity_on_hand)}${h.expiry_date !== null ? ` · expires ${escapeHtml(h.expiry_date)}${expired ? " — EXPIRED" : ""}` : ""}</span>
+            </span>
+            <input name="count:${escapeHtml(h.lot_id)}" type="text" inputmode="decimal" autocomplete="off"
+                   placeholder="counted" style="max-width:7rem" /></li>`;
+          })
+          .join("")}
+      </ul>
+      <label>Note
+        <input name="note" type="text" maxlength="2000" autocomplete="off" placeholder="Where and why, for whoever reviews it" />
+      </label>
+      <div class="actions">
+        <button id="save-count" type="submit">Record this count</button>
+        <button id="cancel-count" type="button" class="secondary">Cancel</button>
+      </div>
+      <p class="note">Each difference becomes an adjustment in the ledger, never an edit to a
+        balance — so the count and what it corrected both stay in the log. The figures this
+        device showed you are sent as well, beside the server's own, because for a count
+        taken offline the two can honestly differ.</p>
+    </form>
+  </section>`;
+}
+
+/**
+ * The count section: what is queued here, and what is open on the server.
+ *
+ * The open-count line is not decoration. `uq_sample_count_one_open` permits one open count
+ * per rep, so a count left open — by a line that was refused, or by a manager counting this
+ * rep's bag — refuses every count afterwards. Showing it WITH A WAY OUT is the difference
+ * between a rep who can fix it and a rep whose button has stopped working for a reason they
+ * cannot see.
+ */
+function renderCounts(now: number): string {
+  const queued = state.outbox.filter((e) => e.kind === "count");
+  const queuedLines = state.outbox.filter((e) => e.kind === "count_line");
+  const mine = state.me?.repProfileId ?? null;
+  const open = state.counts.filter((c) => c.status === "open" && (mine === null || c.rep_profile_id === mine));
+  const openUnqueued = open.filter((c) => !queued.some((q) => q.id === c.id));
+  if (queued.length === 0 && openUnqueued.length === 0) return "";
+
+  const sections: string[] = [];
+  if (queued.length > 0) {
+    sections.push(`<section>
+      <h2>A count on this device</h2>
+      <ul class="list">
+        ${queued
+          .map(
+            (e) => `<li><span class="grow">
+              <span class="name">${escapeHtml(describeEntry(e))}</span>
+              <span class="meta">${queuedLines.filter((l) => l.kind === "count_line" && l.countOf === e.id).length} lot(s) counted · waiting to send</span>
+            </span>
+            <button class="secondary" data-discard-count="${escapeHtml(e.id)}">Discard</button></li>`,
+          )
+          .join("")}
+      </ul>
+      <p class="note">Discarding it here writes nothing anywhere: the server has never seen it.</p>
+    </section>`);
+  }
+  if (openUnqueued.length > 0) {
+    sections.push(`<section>
+      <h2>A count left open (${openUnqueued.length})</h2>
+      <p class="warn">One count can be open at a time, so another cannot be started until
+        this one is settled.</p>
+      <ul class="list">
+        ${openUnqueued
+          .map(
+            (c) => `<li><span class="grow">
+              <span class="name">Count of ${escapeHtml(new Date(c.counted_at).toLocaleDateString())}</span>
+              <span class="meta">${c.note === null ? "no note" : escapeHtml(c.note)} · still open on the server, cached ${ago(state.cachedAt, now)}</span>
+            </span>
+            <button class="secondary" data-cancel-count="${escapeHtml(c.id)}">Abandon it</button></li>`,
+          )
+          .join("")}
+      </ul>
+      <p class="note">Abandoning a count discards its findings and writes no adjustments.
+        Counting again is how a balance gets corrected.</p>
+    </section>`);
+  }
+  return sections.join("");
+}
+
 function renderVisitForm(account: Account): string {
   return `<section>
     <h2>Visit — ${escapeHtml(text(account.name, account.erp_account_id))}</h2>
@@ -661,6 +828,32 @@ function wireReady(): void {
     });
   }
 
+  on("start-count", "click", () => {
+    state.counting = true;
+    state.message = null;
+    render();
+  });
+  on("cancel-count", "click", () => {
+    state.counting = false;
+    render();
+  });
+  document.getElementById("count-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveCount(event.target as HTMLFormElement);
+  });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-discard-count]")) {
+    button.addEventListener("click", () => {
+      const id = button.dataset["discardCount"];
+      if (id !== undefined) void discardQueuedCount(id);
+    });
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-cancel-count]")) {
+    button.addEventListener("click", () => {
+      const id = button.dataset["cancelCount"];
+      if (id !== undefined) void abandonOpenCount(id);
+    });
+  }
+
   for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-transfer]")) {
     button.addEventListener("click", () => {
       const lotId = button.dataset["transfer"];
@@ -728,7 +921,7 @@ function wireReady(): void {
         // disbursement has been thrown away can never be filed, and leaving it would make
         // it due the moment its prerequisite vanished, then refused with a 404 that says
         // nothing about what actually happened.
-        state.outbox = state.outbox.filter((e) => e.id !== id && e.dependsOn !== id);
+        state.outbox = state.outbox.filter((e) => e.id !== id && !(e.dependsOn ?? []).includes(id));
         await store.replaceOutbox(state.outbox);
         render();
       })();
@@ -1106,7 +1299,7 @@ async function unsendTransfer(entryId: string): Promise<void> {
     return;
   }
 
-  state.outbox = state.outbox.filter((e) => e.id !== entryId && e.dependsOn !== entryId);
+  state.outbox = state.outbox.filter((e) => e.id !== entryId && !(e.dependsOn ?? []).includes(entryId));
   await store.replaceOutbox(state.outbox);
 
   // The quantity goes back where it was, since nothing ever left.
@@ -1130,6 +1323,156 @@ async function unsendTransfer(entryId: string): Promise<void> {
   if (state.online && state.blocked === null && state.phase === "ready") {
     await refreshReference();
   }
+}
+
+/**
+ * Record the count: one document, a line per lot the rep filled in, and the commit.
+ *
+ * Four things worth knowing about this function, each of which is a decision rather than a
+ * mechanism:
+ *
+ *   - A BLANK FIELD IS NOT A ZERO. Only lots the rep typed a number into become lines, so a
+ *     count of three lots out of eleven is a count of three lots and says so. Treating
+ *     blanks as zero would write off eight lots nobody looked at.
+ *   - THE DEVICE'S OWN FIGURE GOES WITH EACH LINE. It is what the rep was looking at when
+ *     they counted, which for a count taken offline is not what the server will hold when
+ *     the line lands — and the server keeps both rather than letting either overwrite the
+ *     other (0056).
+ *   - THE COMMIT WAITS FOR EVERY LINE, by naming them. A commit that went early would write
+ *     adjustments for the lots that happened to arrive and leave the rest of the bag
+ *     unreconciled, with the late lines landing against a closed count where nothing would
+ *     ever reconcile them.
+ *   - NOTHING IS SENT HERE. The three rows are queued and the engine drains them in order
+ *     whenever there is a network, which is the whole reason a count can be taken where the
+ *     stock is.
+ */
+async function saveCount(form: HTMLFormElement): Promise<void> {
+  const author = authorId();
+  if (store === null) return;
+  if (author === null) {
+    state.message = { kind: "error", text: "This device does not know who is signed in yet, so it cannot record who counted. Connect once and try again." };
+    render();
+    return;
+  }
+
+  const data = new FormData(form);
+  const counted: { lotId: string; quantity: string; deviceExpected: string }[] = [];
+  const bad: string[] = [];
+  for (const holding of state.holdings) {
+    const raw = String(data.get(`count:${holding.lot_id}`) ?? "").trim();
+    if (raw === "") continue;
+    if (!/^\d{1,13}(\.\d{1,3})?$/.test(raw)) {
+      bad.push(`${holding.lot_number} ("${raw}")`);
+      continue;
+    }
+    counted.push({ lotId: holding.lot_id, quantity: raw, deviceExpected: holding.quantity_on_hand });
+  }
+
+  if (bad.length > 0) {
+    // At the keyboard. Inside a queue this is a `validation_failed` on one line hours
+    // later, which refuses the commit and takes the whole count with it.
+    state.message = { kind: "error", text: `These counts are not numbers the ledger can hold: ${bad.join(", ")}.` };
+    render();
+    return;
+  }
+  if (counted.length === 0) {
+    state.message = { kind: "warn", text: "Nothing was counted, so there is nothing to record. Fill in at least one lot." };
+    render();
+    return;
+  }
+
+  const mint = (): string => mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) });
+  const note = String(data.get("note") ?? "").trim();
+  const countId = mint();
+  const parsed = CountBody.safeParse({
+    id: countId,
+    countedAt: new Date().toISOString(),
+    ...(note !== "" ? { note } : {}),
+  });
+  if (!parsed.success) {
+    state.message = {
+      kind: "error",
+      text: `This count cannot be saved: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`,
+    };
+    render();
+    return;
+  }
+
+  let queue = enqueueCount(state.outbox, parsed.data, Date.now(), { createdBy: author });
+  const lineIds: string[] = [];
+  for (const line of counted) {
+    queue = enqueueCountLine(
+      queue,
+      { lotId: line.lotId, countedQuantity: line.quantity, deviceExpectedQuantity: line.deviceExpected },
+      Date.now(),
+      { createdBy: author, countOf: countId },
+    );
+    lineIds.push(countLineKey(countId, line.lotId));
+  }
+  queue = enqueueCountCommit(queue, Date.now(), {
+    createdBy: author,
+    id: mint(),
+    countOf: countId,
+    lineIds,
+  });
+  state.outbox = queue;
+  await store.replaceOutbox(state.outbox);
+
+  // Optimistic, and it is the counted figure rather than an arithmetic adjustment: a count
+  // asserts what is in the bag, and the commit will make the balance equal exactly that.
+  // Lots the rep did not count are left alone, because nothing has been said about them.
+  const byLot = new Map(counted.map((c) => [c.lotId, c.quantity]));
+  state.holdings = state.holdings.map((h) => {
+    const q = byLot.get(h.lot_id);
+    return q === undefined ? h : { ...h, quantity_on_hand: Number(q).toFixed(3) };
+  });
+
+  state.counting = false;
+  state.message = {
+    kind: "good",
+    text: `Saved on this device: a count of ${counted.length} lot(s). It syncs as one document — the count, each line, then the commit.`,
+  };
+  render();
+  void drain({ manual: false });
+}
+
+/** Throw away a count this device never sent. No ledger rows exist to undo. */
+async function discardQueuedCount(countId: string): Promise<void> {
+  if (store === null) return;
+  const parts = partsOfCount(state.outbox, countId);
+  if (parts.length === 0) return;
+  state.outbox = discardCount(state.outbox, countId);
+  await store.replaceOutbox(state.outbox);
+  state.message = {
+    kind: "good",
+    text: `That count was never sent, so nothing was recorded anywhere. ${parts.length} queued row(s) discarded.`,
+  };
+  render();
+  // The optimistic figures it wrote were a claim about the bag that is now withdrawn, and
+  // only the server can say what the balances really are.
+  if (state.online && state.blocked === null && state.phase === "ready") await refreshReference();
+}
+
+/**
+ * Abandon a count the server holds open.
+ *
+ * The exit from the one state a rep can otherwise get stuck in: a count whose line was
+ * refused stays open, and `uq_sample_count_one_open` then refuses every count afterwards.
+ * Queued rather than sent directly, so it works from the car park where the problem is
+ * discovered — and the server makes a repeated cancel mean the same thing as the first.
+ */
+async function abandonOpenCount(countId: string): Promise<void> {
+  const author = authorId();
+  if (store === null || author === null) return;
+  state.outbox = enqueueCountCancel(state.outbox, Date.now(), {
+    createdBy: author,
+    id: mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) }),
+    countOf: countId,
+  });
+  await store.replaceOutbox(state.outbox);
+  state.message = { kind: "good", text: "Saved on this device: that count will be abandoned, and no adjustments written." };
+  render();
+  void drain({ manual: false });
 }
 
 async function currentPosition(): Promise<{ latitude: number; longitude: number; accuracyM?: number } | null> {
@@ -1177,9 +1520,18 @@ async function drain(opts: { manual: boolean; revive?: boolean }): Promise<void>
 
   // Which CUSTODY movements are in flight, named before they can leave the queue. Any of
   // them settling changes a balance the screen is showing from its own arithmetic.
-  const custodyIdsBefore = state.outbox
-    .filter((e) => e.kind === "disbursement" || e.kind === "transfer" || e.kind === "acceptance" || e.kind === "recall")
-    .map((e) => e.id);
+  const CUSTODY_KINDS = new Set([
+    "disbursement",
+    "transfer",
+    "acceptance",
+    "recall",
+    // A commit is the one that moves a balance for a count; the lines and the document
+    // itself write nothing. A CANCEL is here too, because the optimistic figures a count
+    // wrote on this screen are a claim that abandoning it withdraws.
+    "count_commit",
+    "count_cancel",
+  ]);
+  const custodyIdsBefore = state.outbox.filter((e) => CUSTODY_KINDS.has(e.kind)).map((e) => e.id);
 
   state.syncing = true;
   render();
@@ -1291,6 +1643,11 @@ async function refreshReference(): Promise<void> {
   const recallable = recallableResult.kind === "ok" ? RecallableTransferList.safeParse(recallableResult.body) : null;
   const peersResult = await transport.get("/v1/samples/transfer-peers");
   const peers = peersResult.kind === "ok" ? TransferPeerList.safeParse(peersResult.body) : null;
+  // The counts matter for one reason: an OPEN one refuses every count afterwards
+  // (`uq_sample_count_one_open`), so a rep whose last count was left open needs to see it
+  // rather than meet it as a conflict.
+  const countsResult = await transport.get("/v1/samples/counts");
+  const counts = countsResult.kind === "ok" ? CountList.safeParse(countsResult.body) : null;
 
   state.me = me.data;
   // Stamp the session with the rep it turned out to be, so a later cold start can tell
@@ -1304,6 +1661,7 @@ async function refreshReference(): Promise<void> {
   if (incoming !== null && incoming.success) state.incoming = incoming.data.data;
   if (recallable !== null && recallable.success) state.recallable = recallable.data.data;
   if (peers !== null && peers.success) state.peers = peers.data.data;
+  if (counts !== null && counts.success) state.counts = counts.data.data;
   state.cachedAt = Date.now();
   const cache: CachedReference = {
     me: me.data,
@@ -1313,6 +1671,7 @@ async function refreshReference(): Promise<void> {
     incoming: state.incoming,
     recallable: state.recallable,
     peers: state.peers,
+    counts: state.counts,
     fetchedAt: state.cachedAt,
   };
   await store.writeCache(cache);
@@ -1330,6 +1689,7 @@ function adoptSession(session: Session): void {
     state.incoming = [];
     state.recallable = [];
     state.peers = [];
+    state.counts = [];
     state.cachedAt = null;
   }
   writeSession(session);
@@ -1393,6 +1753,7 @@ async function boot(): Promise<void> {
     state.incoming = cached.incoming ?? [];
     state.recallable = cached.recallable ?? [];
     state.peers = cached.peers ?? [];
+    state.counts = cached.counts ?? [];
     state.cachedAt = cached.fetchedAt;
   }
 

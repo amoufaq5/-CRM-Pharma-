@@ -345,3 +345,64 @@ export const RecallableTransfer = z.object({
 export type RecallableTransfer = z.infer<typeof RecallableTransfer>;
 
 export const RecallableTransferList = z.object({ data: z.array(RecallableTransfer) });
+
+// ---- counts ---------------------------------------------------------------
+
+/**
+ * What `POST /v1/samples/counts` accepts: the count DOCUMENT, opened before its lines.
+ *
+ * `id` is required here, unlike on the server, where it is optional for a caller that has
+ * a network. A device has to mint it: `POST /v1/samples/counts/:id/lines` needs the id in
+ * its path, and a count is the one custody document whose whole purpose is to happen where
+ * the stock is — a car park, a clinic corridor — rather than where the signal is. Sending
+ * the same open twice opens one count: the server reads the existing row back (0056).
+ *
+ * `countedAt` is when the counting happened, not when it synced, and it is the clock the
+ * resulting adjustments are dated with.
+ */
+export const CountBody = z.object({
+  id: Uuid,
+  countedAt: z.string().datetime(),
+  note: z.string().max(2000).nullish(),
+});
+export type CountBody = z.infer<typeof CountBody>;
+
+/**
+ * One counted lot, for `POST /v1/samples/counts/:id/lines`.
+ *
+ * No id of its own, and that is the server's shape rather than an omission: a line's
+ * identity is `(count_id, lot_id)`, which is a UNIQUE constraint and an upsert — so
+ * counting a lot twice replaces the figure instead of adding a second line. This client
+ * keys its queue the same way for the same reason.
+ *
+ * `deviceExpectedQuantity` is what the screen was showing when the rep counted. It is kept
+ * BESIDE the server's own snapshot, never over it (0056): a count taken offline snapshots
+ * a balance that is hours stale by the time the line arrives, and a client able to
+ * overwrite the server's figure could make any variance disappear from review while the
+ * ledger still wrote the adjustment.
+ */
+export const CountLineBody = z.object({
+  lotId: Uuid,
+  countedQuantity: DecimalQuantity,
+  deviceExpectedQuantity: DecimalQuantity.nullish(),
+});
+export type CountLineBody = z.infer<typeof CountLineBody>;
+
+/** A row of `GET /v1/samples/counts`. */
+export const Count = z
+  .object({
+    id: Uuid,
+    rep_profile_id: Uuid,
+    counted_by: Uuid,
+    status: z.enum(["open", "committed", "cancelled"]),
+    counted_at: z.string(),
+    committed_at: z.string().nullable(),
+    note: z.string().nullable(),
+  })
+  .passthrough();
+export type Count = z.infer<typeof Count>;
+
+export const CountList = z.object({ data: z.array(Count) });
+
+/** What `POST /v1/samples/counts/:id/commit` answers: the finding, as a number. */
+export const CommitResult = z.object({ adjustments: z.number().int() });

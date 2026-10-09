@@ -1,10 +1,24 @@
 import { describe, expect, it } from "vitest";
 
-import type { AcceptBody, DisbursementBody, RecallBody, SignatureBody, TransferBody, VisitBody } from "./api.js";
+import type {
+  AcceptBody,
+  CountBody,
+  CountLineBody,
+  DisbursementBody,
+  RecallBody,
+  SignatureBody,
+  TransferBody,
+  VisitBody,
+} from "./api.js";
 import {
   DEFAULT_BACKOFF,
   OUTBOX_KINDS,
+  countLineKey,
   enqueueAcceptance,
+  enqueueCount,
+  enqueueCountCancel,
+  enqueueCountCommit,
+  enqueueCountLine,
   enqueueDisbursement,
   enqueueRecall,
   enqueueSignature,
@@ -43,6 +57,10 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
   transfers: TransferBody[];
   acceptances: { transferId: string; body: AcceptBody }[];
   recalls: { transferId: string; body: RecallBody }[];
+  counts: CountBody[];
+  countLines: { countId: string; body: CountLineBody }[];
+  commits: string[];
+  cancels: string[];
 } {
   const batches: VisitBody[][] = [];
   const disbursementBatches: DisbursementBody[][] = [];
@@ -50,6 +68,10 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
   const transfers: TransferBody[] = [];
   const acceptances: { transferId: string; body: AcceptBody }[] = [];
   const recalls: { transferId: string; body: RecallBody }[] = [];
+  const counts: CountBody[] = [];
+  const countLines: { countId: string; body: CountLineBody }[] = [];
+  const commits: string[] = [];
+  const cancels: string[] = [];
   const calls: string[] = [];
   let i = 0;
   const next = (): TransportResult => {
@@ -64,6 +86,10 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
     transfers,
     acceptances,
     recalls,
+    counts,
+    countLines,
+    commits,
+    cancels,
     calls,
     postVisits: async (visits) => {
       batches.push([...visits]);
@@ -93,6 +119,26 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
     postRecall: async (transferId, body) => {
       recalls.push({ transferId, body });
       calls.push(`recall:${transferId}`);
+      return next();
+    },
+    postCount: async (body) => {
+      counts.push(body);
+      calls.push(`count:${body.id}`);
+      return next();
+    },
+    postCountLine: async (countId, body) => {
+      countLines.push({ countId, body });
+      calls.push(`line:${body.lotId}`);
+      return next();
+    },
+    postCountCommit: async (countId) => {
+      commits.push(countId);
+      calls.push(`commit:${countId}`);
+      return next();
+    },
+    postCountCancel: async (countId) => {
+      cancels.push(countId);
+      calls.push(`cancel:${countId}`);
       return next();
     },
   };
@@ -644,5 +690,153 @@ describe("syncOnce with transfers", () => {
     for (const [kind, plan] of Object.entries(SEND_PLANS)) {
       if (plan.reply === "single") expect(plan.batchMax, kind).toBe(1);
     }
+  });
+});
+
+describe("syncOnce with a count", () => {
+  const now = (): number => 10_000;
+  const created = { kind: "ok", status: 201, body: {} } as const satisfies TransportResult;
+  const committed = { kind: "ok", status: 200, body: { adjustments: 2 } } as const satisfies TransportResult;
+  const COUNT = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c99";
+  const LOT_A = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c01";
+  const LOT_B = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c02";
+
+  const wholeCount = (): readonly OutboxEntry[] => {
+    let q = enqueueCount([], { id: COUNT, countedAt: "2026-10-09T09:00:00.000Z", note: null }, 1000, MINE);
+    q = enqueueCountLine(q, { lotId: LOT_A, countedQuantity: "7", deviceExpectedQuantity: "8" }, 1001, {
+      ...MINE,
+      countOf: COUNT,
+    });
+    q = enqueueCountLine(q, { lotId: LOT_B, countedQuantity: "3" }, 1002, { ...MINE, countOf: COUNT });
+    return enqueueCountCommit(q, 1003, {
+      ...MINE,
+      id: "commit-1",
+      countOf: COUNT,
+      lineIds: [countLineKey(COUNT, LOT_A), countLineKey(COUNT, LOT_B)],
+    });
+  };
+
+  it("lands a whole count — document, lines, commit — in ONE drain, in order", async () => {
+    // What a rep gets for emptying their bag in a car park: the entire document goes up on
+    // the next reconnection, and the commit is last because the ledger must not move until
+    // every line it reconciles has arrived.
+    const store = memoryStore(wholeCount());
+    const transport = recordingTransport([created, created, created, committed]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.calls).toEqual([`count:${COUNT}`, `line:${LOT_A}`, `line:${LOT_B}`, `commit:${COUNT}`]);
+    expect(report.accepted).toEqual([COUNT, countLineKey(COUNT, LOT_A), countLineKey(COUNT, LOT_B), "commit-1"]);
+    expect(store.entries).toEqual([]);
+  });
+
+  it("sends the device's own expected figure with the line", async () => {
+    const store = memoryStore(wholeCount());
+    const transport = recordingTransport([created, created, created, committed]);
+    await sync({ store, transport, now });
+    expect(transport.countLines[0]).toEqual({
+      countId: COUNT,
+      body: { lotId: LOT_A, countedQuantity: "7", deviceExpectedQuantity: "8" },
+    });
+    // And omits it where the device had nothing to say.
+    expect(transport.countLines[1]?.body.deviceExpectedQuantity).toBeUndefined();
+  });
+
+  it("does NOT commit when a line could not be sent", async () => {
+    // The hazard this design exists to prevent. A commit that went early would write
+    // adjustments for the lots that arrived and leave the rest of the bag unreconciled —
+    // and the missing line would land afterwards against a committed count, where nothing
+    // would ever reconcile it.
+    const store = memoryStore(wholeCount());
+    const transport = recordingTransport([created, created, { kind: "network" }]);
+    const report = await sync({ store, transport, now, random: () => 0.5 });
+
+    expect(transport.calls).toEqual([`count:${COUNT}`, `line:${LOT_A}`, `line:${LOT_B}`]);
+    expect(transport.commits).toEqual([]);
+    expect(report.retrying).toEqual([countLineKey(COUNT, LOT_B)]);
+    // The commit is still there, still pending, waiting for the line.
+    expect(store.entries.map((e) => e.id)).toEqual([countLineKey(COUNT, LOT_B), "commit-1"]);
+    expect(store.entries.find((e) => e.id === "commit-1")?.state).toBe("pending");
+  });
+
+  it("refuses the commit when a line is refused, in the same pass", async () => {
+    const store = memoryStore(wholeCount());
+    const transport = recordingTransport([
+      created,
+      created,
+      { kind: "status", status: 409, problemKind: "conflict", detail: "lot LOT-2 has been written off" },
+    ]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.commits).toEqual([]);
+    expect(report.rejected).toEqual([
+      { id: countLineKey(COUNT, LOT_B), reason: "lot LOT-2 has been written off" },
+      { id: "commit-1", reason: "the count_line it belongs to was refused: lot LOT-2 has been written off" },
+    ]);
+  });
+
+  it("refuses every part when the count document itself is refused", async () => {
+    const store = memoryStore(wholeCount());
+    const transport = recordingTransport([
+      { kind: "status", status: 409, problemKind: "conflict", detail: "you already have an open count" },
+    ]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.calls).toEqual([`count:${COUNT}`]);
+    expect(report.rejected.map((r) => r.id).sort()).toEqual(
+      [COUNT, "commit-1", countLineKey(COUNT, LOT_A), countLineKey(COUNT, LOT_B)].sort(),
+    );
+  });
+
+  it("accepts the commit's 200 and reports the count as sent", async () => {
+    // The commit answers with the FINDING — how many adjustments it wrote — rather than an
+    // acknowledgement, and a 200 is as much an acceptance as a 201 is.
+    const store = memoryStore(wholeCount());
+    const transport = recordingTransport([created, created, created, committed]);
+    const report = await sync({ store, transport, now });
+    expect(report.accepted).toContain("commit-1");
+    expect(report.rejected).toEqual([]);
+  });
+
+  it("treats a repeated commit's answer as acceptance, since the server makes it idempotent", async () => {
+    // A reply lost after the commit committed is retried, and 0056 made the second answer
+    // the same as the first. Were it still a 409 this row would be marked refused and the
+    // rep told their count failed while the ledger held its adjustments.
+    const store = memoryStore(
+      enqueueCountCommit([], 1000, { ...MINE, id: "commit-1", countOf: COUNT, lineIds: [] }),
+    );
+    const transport = recordingTransport([{ kind: "ok", status: 200, body: { adjustments: 1 } }]);
+    const report = await sync({ store, transport, now });
+    expect(report.accepted).toEqual(["commit-1"]);
+    expect(store.entries).toEqual([]);
+  });
+});
+
+describe("abandoning a count", () => {
+  const now = (): number => 10_000;
+  const COUNT = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c99";
+  const LOT_A = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c01";
+
+  it("sends the cancel, and nothing else for that count", async () => {
+    // The exit from the one state a rep can otherwise be stuck in: a count whose line was
+    // refused stays open, and `uq_sample_count_one_open` refuses every count afterwards.
+    // Queueing the cancel discards the document's own parts, because they are moot.
+    let q = enqueueCount([], { id: COUNT, countedAt: "2026-10-09T09:00:00.000Z", note: null }, 1000, MINE);
+    q = enqueueCountLine(q, { lotId: LOT_A, countedQuantity: "7" }, 1001, { ...MINE, countOf: COUNT });
+    q = enqueueCountCancel(q, 1002, { ...MINE, id: "cancel-1", countOf: COUNT });
+    expect(q.map((e) => e.kind)).toEqual(["count_cancel"]);
+
+    const store = memoryStore(q);
+    const transport = recordingTransport([{ kind: "ok", status: 204, body: null }]);
+    const report = await sync({ store, transport, now });
+    expect(transport.calls).toEqual([`cancel:${COUNT}`]);
+    expect(report.accepted).toEqual(["cancel-1"]);
+    expect(store.entries).toEqual([]);
+  });
+
+  it("accepts a 204, which carries no body at all", async () => {
+    const store = memoryStore(enqueueCountCancel([], 1000, { ...MINE, id: "cancel-1", countOf: COUNT }));
+    const transport = recordingTransport([{ kind: "ok", status: 204, body: null }]);
+    const report = await sync({ store, transport, now });
+    expect(report.accepted).toEqual(["cancel-1"]);
   });
 });

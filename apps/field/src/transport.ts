@@ -3,6 +3,8 @@ import {
   SyncResponse,
   problemKind,
   type AcceptBody,
+  type CountBody,
+  type CountLineBody,
   type DisbursementBody,
   type RecallBody,
   type SignatureBody,
@@ -122,6 +124,31 @@ export class ApiTransport implements SyncTransport {
 
   async postRecall(transferId: string, body: RecallBody): Promise<TransportResult> {
     return this.request("POST", `/v1/samples/transfers/${encodeURIComponent(transferId)}/recall`, body);
+  }
+
+  /**
+   * The count document and its three follow-ups.
+   *
+   * Four routes for one act of counting, and the ids in the paths are the reason the count
+   * has a device-minted id at all: a rep with no signal cannot address a line to a count
+   * the server has not named yet.
+   */
+  async postCount(body: CountBody): Promise<TransportResult> {
+    return this.request("POST", "/v1/samples/counts", body);
+  }
+
+  async postCountLine(countId: string, body: CountLineBody): Promise<TransportResult> {
+    return this.request("POST", `/v1/samples/counts/${encodeURIComponent(countId)}/lines`, body);
+  }
+
+  async postCountCommit(countId: string): Promise<TransportResult> {
+    // The route takes no body, and sending `{}` rather than nothing keeps the request a
+    // JSON POST like every other write here.
+    return this.request("POST", `/v1/samples/counts/${encodeURIComponent(countId)}/commit`, {});
+  }
+
+  async postCountCancel(countId: string): Promise<TransportResult> {
+    return this.request("POST", `/v1/samples/counts/${encodeURIComponent(countId)}/cancel`, {});
   }
 
   /**

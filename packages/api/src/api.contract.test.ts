@@ -106,9 +106,13 @@ describe("the API, end to end", () => {
         // "documented defaults" test below pass on a fresh database and fail on the
         // second run against the same one.
         await tx.query("DELETE FROM crm.notification_policy WHERE tenant_id = $1", [t]);
+        // ORDER MATTERS, children before parents: an adjustment written by a count
+        // references it (0056, ON DELETE RESTRICT), so the ledger goes first. The
+        // production erasure derives this order from the live FK graph; a fixture has to
+        // be told, and this one was the first thing the new key caught.
         await tx.query("DELETE FROM crm.sample_count_line WHERE tenant_id = $1", [t]);
-        await tx.query("DELETE FROM crm.sample_count WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_transaction WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.sample_count WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_holding WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.sample_lot WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [t]);
@@ -1517,6 +1521,87 @@ describe("the API, end to end", () => {
         const ledger = await call("GET", `/v1/team/samples/ledger?rep=${rep}`, { auth: mgr() });
         expect(ledger.body.data[0].kind).toBe("adjustment_out");
         expect(ledger.body.data[0].reason).toMatch(/cycle count/);
+      });
+
+      it("takes a count under an id the DEVICE minted, with the figure the device showed", async () => {
+        // The whole of 0056 in one request sequence: a rep counts their bag with no signal,
+        // so the id and the expected figure both come from the device, and the three calls
+        // arrive later in order.
+        let lotId = "";
+        await withTenantContext(admin, TENANT, async (tx) => {
+          const lot = await tx.query<{ id: string }>(
+            `INSERT INTO crm.sample_lot (tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+             VALUES ($1,'rec_i1','LOT-DEVICE-COUNT','2027-12-31','drug_sample') RETURNING id`,
+            [TENANT],
+          );
+          lotId = lot.rows[0]!.id;
+          await tx.query(
+            `INSERT INTO crm.sample_transaction
+               (id, tenant_id, lot_id, rep_profile_id, kind, quantity, erp_warehouse_id, occurred_at)
+             VALUES (gen_random_uuid(),$1,$2,$3,'receipt',20,'rec_wh1','2026-10-01T08:00:00Z')`,
+            [TENANT, lotId, rep],
+          );
+        });
+        const countId = randomUUID();
+        const opened = await call("POST", "/v1/samples/counts", {
+          body: { id: countId, countedAt: "2026-10-20T09:00:00.000Z", note: "counted in the car park" },
+        });
+        expect(opened.status).toBe(201);
+        expect(opened.body.id).toBe(countId);
+
+        // The same open again, as a retry after a lost reply: one count, not two.
+        const replayed = await call("POST", "/v1/samples/counts", {
+          body: { id: countId, countedAt: "2026-10-20T09:00:00.000Z" },
+        });
+        expect(replayed.status).toBe(201);
+        expect(replayed.body.id).toBe(countId);
+        expect(replayed.body.note).toBe("counted in the car park");
+
+        // The device was showing 18 when the rep counted 17; the server holds 20 by the
+        // time the line lands. All three numbers are kept.
+        const line = await call("POST", `/v1/samples/counts/${countId}/lines`, {
+          body: { lotId, countedQuantity: 17, deviceExpectedQuantity: 18 },
+        });
+        expect(line.status).toBe(201);
+        expect(line.body.expected_quantity).toBe("20.000");
+        expect(line.body.device_expected_quantity).toBe("18.000");
+
+        const detail = await call("GET", `/v1/samples/counts/${countId}`);
+        expect(detail.body.lines[0]).toMatchObject({
+          counted_quantity: "17.000",
+          expected_quantity: "20.000",
+          variance: "-3.000",
+          device_expected_quantity: "18.000",
+          device_variance: "-1.000",
+        });
+
+        const committed = await call("POST", `/v1/samples/counts/${countId}/commit`, { body: {} });
+        expect(committed.status).toBe(200);
+        expect(committed.body.adjustments).toBe(1);
+
+        // THE REPLAY THAT USED TO LIE. A reply lost after the commit committed came back as
+        // a 409, which the client classifies as permanent — so the rep was told their count
+        // was refused while the ledger held the adjustment it wrote.
+        const again = await call("POST", `/v1/samples/counts/${countId}/commit`, { body: {} });
+        expect(again.status).toBe(200);
+        expect(again.body.adjustments).toBe(1);
+
+        const holdings = (await call("GET", "/v1/samples/holdings")).body.data;
+        expect(holdings.find((h: { lot_id: string }) => h.lot_id === lotId).quantity_on_hand).toBe("17.000");
+      });
+
+      it("refuses a second open count for the same rep, under any id", async () => {
+        const first = await call("POST", "/v1/samples/counts", {
+          body: { id: randomUUID(), countedAt: "2026-10-20T09:00:00.000Z" },
+        });
+        expect(first.status).toBe(201);
+        const second = await call("POST", "/v1/samples/counts", {
+          body: { id: randomUUID(), countedAt: "2026-10-21T09:00:00.000Z" },
+        });
+        // A conflict, not a silent second document: the idempotency above is keyed on the
+        // id and must not widen into "any open count will do".
+        expect(second.status).toBeGreaterThanOrEqual(400);
+        expect((await call("POST", `/v1/samples/counts/${first.body.id as string}/cancel`, { body: {} })).status).toBe(204);
       });
 
       it("refuses to count a rep the caller does not supervise", async () => {

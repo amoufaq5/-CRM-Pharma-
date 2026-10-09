@@ -1138,6 +1138,100 @@ Concretely, and these specifics are the decision, not commentary on it:
     first 500 colleagues by name: the route takes a `?q=` filter and no screen uses it yet,
     so a rep in a tenant larger than that cannot reach everybody.
 
+28. **The count, taken where the stock is — and the three things that stopped it.**
+    A cycle count is the one custody document whose whole purpose is to happen away from a
+    desk: a rep empties their bag and counts it, in a car park, a clinic corridor, a hotel
+    room. 0017 and 0018 built it as an interactive document — open it, record a line per
+    lot, commit — and that shape is right. It simply could not be done offline, for three
+    reasons, each of which had to be fixed in the schema before a screen could exist.
+
+    **It had no device-minted id.** `POST /v1/samples/counts/:id/lines` needs the count's id
+    in its path, and `openCount` never accepted one, so the id existed only after a round
+    trip: a rep with no signal could not start a count at all. Everything else a device
+    records here has had a device-minted id since 0012 and 0017 — a visit, a disbursement, a
+    transfer, a recall — and the count was the lone exception. Nothing about it wanted to
+    be.
+
+    **Committing was not idempotent**, which an offline queue cannot live with.
+    `crm.commit_sample_count` raised `check_violation` on a count that was not `open`, so a
+    reply lost after the commit committed came back on retry as a 409 — classified as
+    permanent, correctly, which means the rep was told their count was REFUSED while the
+    ledger held the adjustments it had written. The worst shape of failure available: the
+    screen and the database disagree and the rep believes the screen. A committed count now
+    answers with the number of adjustments it wrote the first time; a CANCELLED one still
+    refuses, because that is a repeat of nothing.
+
+    **And an adjustment knew which count wrote it only in prose.** The reason string reads
+    `cycle count <uuid>: counted 9, held 10` — the link written as text because there was no
+    column for it. `count_id` makes it structural, which is both what lets a repeated commit
+    answer with the same number and what turns "which movements did this count produce?"
+    into a `WHERE` clause. The reason string is unchanged: it is what a person reads.
+
+    **The two-variance column, which is the part worth arguing about.** 0017 snapshots
+    `expected_quantity` when a line is written, and its comment says why: "so the variance a
+    reviewer sees is the one the counter saw". A count taken offline breaks that sentence
+    without touching it — the line arrives hours later, so the balance it snapshots is the
+    balance AT ARRIVAL. The device knows what it actually showed the rep, so it now sends
+    it, and it lands in its own column rather than over the server's. That direction is the
+    whole decision: a client able to overwrite `expected_quantity` could make any variance
+    disappear from review — send expected equal to counted, and the ledger still writes the
+    real adjustment while the reviewer sees a clean count. Two columns means a reviewer sees
+    all three numbers (shown, held, counted) and nobody can hide the gap between them.
+
+    **`dependsOn` became a list, because a commit waits for several things.** A signature
+    waits for its disbursement and a recall for its transfer — one parent each — and the
+    field doubled as the route's path parameter, which worked only because every dependent
+    had exactly one parent. A count's commit must wait for the count AND every line in it,
+    or it writes adjustments for the lots that happened to arrive and leaves the rest of the
+    bag unreconciled, with the late lines landing against a closed count where nothing will
+    ever reconcile them. Order alone cannot express that: a line that fails and backs off
+    leaves its kind's pass empty, and the commit would sail straight past it. So the
+    dependency is a list, the signature's path parameter became its own field
+    (`disbursementOf`), and a stored row from before the change is normalized once, by name,
+    where the store is read.
+
+    **A dead end, closed before it could exist.** A count whose LINE is refused permanently
+    stays OPEN, and `uq_sample_count_one_open` then refuses every count that rep tries
+    afterwards — with the commit unable to go and no screen able to settle it. So cancelling
+    is a queued kind too, it works from the car park where the problem is found, and
+    `cancelCount` is idempotent for an already-cancelled count for exactly the reason the
+    commit is. A COMMITTED count still refuses to cancel: that would claim to withdraw
+    findings that are already adjustments in the ledger.
+
+    **Every field on the count form starts empty**, and that is the most important decision
+    on the screen. The expected figure is shown beside each lot and never pre-filled: a form
+    that arrives holding the answer is a form a tired rep taps through, and what that
+    produces is a document saying somebody counted when nobody did. A blank field means "not
+    counted" and no line is sent for it — so a count of three lots out of eleven is a count
+    of three lots and says so, rather than writing off the eight nobody looked at.
+
+    **Verified against something moving while the count was in the bag.** That is the case
+    the second column exists for, so the gate arranges it: the rep counts 4 where the device
+    shows 5, a warehouse receipt of 2 lands from elsewhere while the count sits unsent, and
+    then the count syncs. The line records counted `4.000`, expected `7.000` (the server at
+    arrival) and device-expected `5.000`; the two variances are `-3.000` and `-1.000`, and
+    the 2 between them is the receipt. One adjustment of `3.000`, linked by `count_id`, and
+    the balance ends at `4.000` — exactly what was counted, because the commit reconciles
+    against what is HELD rather than against either snapshot. **148 browser checks, 0
+    failures.** The run also proves every balance still equals the sum of its own movements:
+    the count adjusted, it did not edit.
+
+    Three things the guards caught within the hour, each worth keeping:
+    `sample_transaction.count_id` was written single-column and the composite-key contract
+    refused it — a reference into a tenant-scoped table is stopped from naming another
+    tenant's row by RLS alone, and referential checks bypass RLS; the registry then demanded
+    a live probe proving the key refuses, which it now has. Two test fixtures deleted
+    `sample_count` before `sample_transaction` and the new key stopped them, which is the
+    ordering hazard made visible (the production erasure derives its order from the FK graph
+    and refuses a retained child of an erased parent, so it was never at risk). And the
+    strict test typecheck caught `entry.body.id` on a union where a count line's body has no
+    id at all — the same fact that made `rejectUnreconcilable` need to learn the difference.
+
+    **Still not built:** write-offs, returns, the disposal obligations with their regulatory
+    deadlines, and the expiry sweep. A count covers only the lots the device has cached, so
+    material a rep holds that the device has never heard of cannot be counted into
+    existence — which is the right conservative default and still a gap.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1552,7 +1646,7 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 117 checks across TWO browsers, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27). **What is NOT built is still most of the product**: the rest of custody (counts, write-offs, returns, disposal obligations, the expiry sweep), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 80 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
+| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 148 checks across TWO browsers, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28). **What is NOT built is still most of the product**: the rest of custody (write-offs, returns, disposal obligations, the expiry sweep), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 76 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 

@@ -1,3 +1,4 @@
+import { normalizeStoredOutbox } from "@crm/client";
 import type { CachedReference, ClientStore, OutboxEntry } from "@crm/client";
 
 /**
@@ -55,7 +56,11 @@ export function indexedDbStore(db: IDBDatabase): ClientStore {
     async readOutbox(): Promise<readonly OutboxEntry[]> {
       const tx = db.transaction(OUTBOX, "readonly");
       const all = await wrap(tx.objectStore(OUTBOX).getAll() as IDBRequest<OutboxEntry[]>);
-      return all;
+      // Normalized on the way out, in the one place rows come back from storage. A queue
+      // written before `dependsOn` became a list would otherwise look permanently undue,
+      // and a signature stored before the path parameter was its own field would be posted
+      // to `/disbursements/undefined/signature`.
+      return normalizeStoredOutbox(all);
     },
 
     async replaceOutbox(entries: readonly OutboxEntry[]): Promise<void> {

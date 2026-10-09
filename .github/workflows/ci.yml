@@ -258,7 +258,7 @@ jobs:
         run: ./scripts/verify-image-build.sh
 
       # The real thing. Builds the image and brings the stack up against a real Postgres:
-      # the 0001 ERP precondition refusing, all 55 migrations applying, a second run as a
+      # the 0001 ERP precondition refusing, all 56 migrations applying, a second run as a
       # no-op, the api healthy as crm_app, the JWKS fail-closed rule, 401 problem
       # documents, the scheduler refusing without a credential and running with one, and
       # the api publishing exactly the key the scheduler signs with.

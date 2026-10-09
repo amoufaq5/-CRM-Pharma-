@@ -2,6 +2,8 @@ import {
   SYNC_BATCH_MAX,
   SyncResponse,
   type AcceptBody,
+  type CountBody,
+  type CountLineBody,
   type DisbursementBody,
   type RecallBody,
   type SignatureBody,
@@ -58,6 +60,17 @@ export interface SyncTransport {
   postTransfer(body: TransferBody): Promise<TransportResult>;
   postAcceptance(transferId: string, body: AcceptBody): Promise<TransportResult>;
   postRecall(transferId: string, body: RecallBody): Promise<TransportResult>;
+  /**
+   * The count document, its lines and its commit — three routes for one act.
+   *
+   * The commit takes no body: which count to commit is in the path, and what it answers
+   * (how many adjustments it wrote) is the finding rather than an acknowledgement.
+   */
+  postCount(body: CountBody): Promise<TransportResult>;
+  postCountLine(countId: string, body: CountLineBody): Promise<TransportResult>;
+  postCountCommit(countId: string): Promise<TransportResult>;
+  /** Abandoning a count — a rep's only exit from one whose line was refused. 204. */
+  postCountCancel(countId: string): Promise<TransportResult>;
 }
 
 export interface SyncDeps {
@@ -190,7 +203,7 @@ export const SEND_PLANS: Readonly<Record<OutboxKind, KindPlan>> = {
     reply: "single",
     send: (batch, transport) => {
       const entry = only(batch, "signature");
-      return transport.putSignature(entry.dependsOn, entry.body);
+      return transport.putSignature(entry.disbursementOf, entry.body);
     },
   },
   transfer: {
@@ -214,6 +227,29 @@ export const SEND_PLANS: Readonly<Record<OutboxKind, KindPlan>> = {
       return transport.postRecall(entry.transferOf, entry.body);
     },
   },
+  count: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => transport.postCount(only(batch, "count").body),
+  },
+  count_line: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => {
+      const entry = only(batch, "count_line");
+      return transport.postCountLine(entry.countOf, entry.body);
+    },
+  },
+  count_commit: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => transport.postCountCommit(only(batch, "count_commit").countOf),
+  },
+  count_cancel: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => transport.postCountCancel(only(batch, "count_cancel").countOf),
+  },
 };
 
 /**
@@ -227,6 +263,16 @@ const SEND_ORDER: readonly OutboxKind[] = [
   "transfer",
   "acceptance",
   "recall",
+  // The count trio in document order. The dependencies are what actually enforce it —
+  // order alone would let a commit past a line that failed and backed off — but sending
+  // them in this order is what lands a whole count on one reconnection.
+  "count",
+  "count_line",
+  "count_commit",
+  // Last, and after the commit, so that a drain carrying both a finished count and an
+  // abandoned one settles each the way it was meant: nothing a cancel touches is still
+  // queued by the time it is sent, because queueing it discarded those rows.
+  "count_cancel",
 ];
 
 /**

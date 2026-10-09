@@ -243,6 +243,14 @@ const PlanProductsBody = z.object({
 });
 
 const CountBody = z.object({
+  /**
+   * Device-minted, and optional only for a caller that has a network (0056).
+   *
+   * A count is taken where the stock is, and the line route needs this id in its path — so
+   * a rep with no signal has to be able to mint it before there is anywhere to send it.
+   * Supplying one twice opens the count once: `openCount` reads the existing row back.
+   */
+  id: UUID.optional(),
   /** Omitted means a self-count. A manager passes a rep to record a supervised one. */
   repProfileId: UUID.nullish(),
   countedAt: z.string().datetime(),
@@ -252,6 +260,14 @@ const CountBody = z.object({
 const CountLineBody = z.object({
   lotId: UUID,
   countedQuantity: z.union([z.string().regex(/^\d{1,13}(\.\d{1,3})?$/), z.number().min(0)]),
+  /**
+   * What the device had on screen when the rep counted, which for an offline count is not
+   * the balance this line will snapshot on arrival. Recorded beside the server's own
+   * figure, never over it — see 0056 for why that direction is the only safe one.
+   */
+  deviceExpectedQuantity: z
+    .union([z.string().regex(/^\d{1,13}(\.\d{1,3})?$/), z.number().min(0)])
+    .nullish(),
 });
 
 const DisbursementBody = z.object({
@@ -1467,6 +1483,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       const count = await inTenant(deps, p, async (tx) => {
         await requireSupervision(tx, p, repProfileId);
         return openCount(tx, p.tenantId, {
+          ...(input.id !== undefined ? { id: input.id } : {}),
           repProfileId,
           countedBy: p.repProfileId,
           countedAt: new Date(input.countedAt),
@@ -1490,6 +1507,9 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           countId,
           lotId: input.lotId,
           countedQuantity: input.countedQuantity,
+          ...(input.deviceExpectedQuantity !== undefined && input.deviceExpectedQuantity !== null
+            ? { deviceExpectedQuantity: input.deviceExpectedQuantity }
+            : {}),
         });
       });
       return { status: 201, body: line };

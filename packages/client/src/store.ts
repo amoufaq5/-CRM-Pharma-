@@ -1,4 +1,13 @@
-import type { Account, Holding, IncomingTransfer, Me, RecallableTransfer, TransferPeer, Visit } from "./api.js";
+import type {
+  Account,
+  Count,
+  Holding,
+  IncomingTransfer,
+  Me,
+  RecallableTransfer,
+  TransferPeer,
+  Visit,
+} from "./api.js";
 import type { OutboxEntry } from "./outbox.js";
 
 /**
@@ -52,6 +61,11 @@ export interface CachedReference {
   readonly incoming?: readonly IncomingTransfer[];
   readonly recallable?: readonly RecallableTransfer[];
   readonly peers?: readonly TransferPeer[];
+  /**
+   * The rep's counts, cached for one reason: an OPEN count refuses every count afterwards,
+   * so a device that cannot see it would offer a button that always fails.
+   */
+  readonly counts?: readonly Count[];
   /** Epoch ms of the fetch, so the UI can say how stale it is instead of implying fresh. */
   readonly fetchedAt: number;
 }

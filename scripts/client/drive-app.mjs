@@ -104,6 +104,45 @@ function transferRows(kind = "transfer_out") {
   });
 }
 
+function countRows() {
+  const out = sql(
+    `SELECT id, status, COALESCE(note,''), counted_at FROM crm.sample_count
+      WHERE tenant_id = '${tenant}' ORDER BY created_at`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [id, status, note, countedAt] = line.split("|");
+    return { id, status, note, countedAt };
+  });
+}
+
+/** A count's lines with BOTH variances — the server's and the one the counter could see. */
+function countLineRows() {
+  const out = sql(
+    `SELECT cl.counted_quantity, cl.expected_quantity,
+            COALESCE(cl.device_expected_quantity::text,''),
+            (cl.counted_quantity - cl.expected_quantity)::text,
+            COALESCE((cl.counted_quantity - cl.device_expected_quantity)::text,'')
+       FROM crm.sample_count_line cl WHERE cl.tenant_id = '${tenant}' ORDER BY cl.created_at`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [counted, expected, deviceExpected, variance, deviceVariance] = line.split("|");
+    return { counted, expected, deviceExpected, variance, deviceVariance };
+  });
+}
+
+function adjustmentRows() {
+  const out = sql(
+    `SELECT kind, quantity, COALESCE(count_id::text,''), COALESCE(reason,'')
+       FROM crm.sample_transaction
+      WHERE tenant_id = '${tenant}' AND kind IN ('adjustment_in','adjustment_out')
+      ORDER BY recorded_at`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [kind, quantity, count_id, reason] = line.split("|");
+    return { kind, quantity, count_id, reason };
+  });
+}
+
 /** One rep's balance for the lot under test, as `on_hand|in_transit`, or "" if they hold no row. */
 function holding(subject) {
   return sql(
@@ -666,7 +705,118 @@ async function main() {
     is(holding("rep-grace"), "3.000|0.000", "with the receiver untouched — they never had it");
     await shot("18-recalled");
 
-    // ---- 15. the ERP deletes the tenant, and the queue STOPS ---------------
+    // ---- 15. counting the bag, where the bag is -----------------------------
+    // A count is the one custody document whose whole purpose is to happen away from a
+    // desk, and it is the first thing in this app that is a DOCUMENT rather than a
+    // movement: four routes, three of them addressed to an id the device had to mint
+    // before there was anywhere to send it.
+    await page.offline(true);
+    await page.click("#start-count");
+    await page.waitFor(`document.querySelector("#count-form") !== null`, { label: "the count form" });
+
+    // THE FIELD IS EMPTY. The expected figure is shown and never pre-filled: a form that
+    // arrives holding the answer is one a tired rep taps through, and what that produces is
+    // a document saying somebody counted when nobody did.
+    const field = await page.evaluate(
+      `const i = document.querySelector("#count-form input[name^='count:']"); return { value: i?.value ?? null, shown: i?.closest("li")?.querySelector(".meta")?.textContent?.trim() ?? null };`,
+    );
+    is(field.value, "", "every count field starts EMPTY, so nothing is confirmed by tapping through");
+    is(/device shows 5\.000/.test(String(field.shown)), true, `with the balance shown beside it instead (${String(field.shown).slice(0, 40)})`);
+    await shot("19-count-form");
+
+    // A number the ledger cannot hold is refused at the keyboard: inside a queue it is one
+    // line's `validation_failed` hours later, which refuses the commit and takes the whole
+    // count with it.
+    await page.fill(`#count-form input[name="count:${lotId}"]`, "4.00001");
+    await page.click("#save-count");
+    await page.waitFor(`/not numbers the ledger can hold/.test(document.body.textContent ?? "")`, { label: "the refusal" });
+    is(await page.evaluate(`${READ_OUTBOX} return rows.filter((r) => r.kind === "count").length;`), 0,
+      "a count with an impossible quantity is refused at the keyboard, and queues nothing");
+
+    // An empty count is not a count of zero.
+    await page.fill(`#count-form input[name="count:${lotId}"]`, "");
+    await page.click("#save-count");
+    await page.waitFor(`/Nothing was counted/.test(document.body.textContent ?? "")`, { label: "the empty-count refusal" });
+    is(await page.evaluate(`${READ_OUTBOX} return rows.filter((r) => r.kind === "count_line").length;`), 0,
+      "and a count with nothing filled in writes off nothing — a blank field is not a zero");
+
+    // The real count: the rep finds 4 where the device says 5.
+    await page.fill(`#count-form input[name="count:${lotId}"]`, "4");
+    await page.fill(`#count-form input[name="note"]`, "counted in the car park");
+    await page.click("#save-count");
+    await page.waitFor(`document.querySelector("button[data-discard-count]") !== null`, { label: "the queued count" });
+
+    const queuedCount = await page.evaluate(
+      `${READ_OUTBOX} return rows.filter((r) => r.kind.startsWith("count")).map((r) => ({ kind: r.kind, id: r.id, countOf: r.countOf ?? null, dependsOn: r.dependsOn ?? null, body: r.body }));`,
+    );
+    is(queuedCount.length, 3, "one count queues THREE rows: the document, a line, and the commit");
+    const doc = queuedCount.find((r) => r.kind === "count");
+    const line = queuedCount.find((r) => r.kind === "count_line");
+    const commit = queuedCount.find((r) => r.kind === "count_commit");
+    is(doc?.body?.note, "counted in the car park", "the document carries the note a reviewer reads");
+    is(line?.id, `${doc?.id}:${lotId}`, "the line is keyed by (count, lot), the way the server keys its row");
+    is(line?.body?.deviceExpectedQuantity, "5.000", "and carries what the DEVICE showed, not only what was counted");
+    is(line?.dependsOn, [doc?.id], "the line waits for the document, which the server has never heard of yet");
+    // THE DEPENDENCY THAT NEEDED A LIST. A commit that went early would write adjustments
+    // for the lots that happened to arrive and leave the rest of the bag unreconciled.
+    is(commit?.dependsOn, [doc?.id, line?.id], "and the COMMIT waits for the document AND every line");
+    is(countRows().length, 0, "nothing is in crm.sample_count while there is no signal");
+
+    const countedLocally = await page.textOf("li:has(button[data-disburse]) .meta");
+    is(/4\.000 on hand/.test(String(countedLocally)), true, `the screen shows what was counted, because that is what the ledger will say (${String(countedLocally).slice(0, 30)})`);
+    is(await page.evaluate(`return document.querySelector("#start-count")?.disabled === true;`), true,
+      "and a second count cannot be started while this one is unsent — one count is open at a time");
+
+    // SOMETHING MOVES WHILE THE COUNT IS IN THE BAG. A warehouse receipt is confirmed
+    // elsewhere — another device, a desk — so by the time the line arrives the server holds
+    // 7 where the rep was shown 5 and counted 4. This is the case 0056 exists for.
+    const receipt = await fetch(new URL("v1/samples/receipts", appUrl), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "x-tenant-id": tenant, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: crypto.randomUUID().replace(/-4(?=[0-9a-f]{3}-)/, "-7"),
+        lotId,
+        quantity: "2",
+        occurredAt: new Date().toISOString(),
+        erpWarehouseId: "wh-live-1",
+      }),
+    });
+    is(receipt.status, 201, "a receipt lands from somewhere else while the count sits unsent on the device");
+
+    await page.offline(false);
+    await page.waitFor(`document.querySelector("button[data-discard-count]") === null`, { timeoutMs: 25_000, label: "the count to land" });
+
+    const counts = countRows();
+    is(counts.length, 1, "one row in crm.sample_count");
+    is(counts[0]?.id, doc?.id, "under the id the DEVICE minted, which is what let the line be addressed at all");
+    is(counts[0]?.status, "committed", "committed, because the commit went last and after every line");
+    is(counts[0]?.note, "counted in the car park", "with the note the rep wrote");
+
+    const lines = countLineRows();
+    is(lines.length, 1, "one counted line");
+    is(lines[0]?.counted, "4.000", "holding what the rep counted");
+    is(lines[0]?.expected, "7.000", "the balance the SERVER held when the line arrived");
+    is(lines[0]?.deviceExpected, "5.000", "and the balance the DEVICE had shown them when they counted");
+    // The pair is the finding: the rep saw a variance of 1 and the ledger reconciled 3,
+    // and the 2 in between is the receipt that landed while the count was in a bag. One
+    // column could not have said that, and letting the device overwrite the server's figure
+    // would have hidden it.
+    is(lines[0]?.variance, "-3.000", "so the reviewer sees the variance against what was held");
+    is(lines[0]?.deviceVariance, "-1.000", "AND the variance the counter could actually see");
+
+    const adjustments = adjustmentRows();
+    is(adjustments.length, 1, "one adjustment in the ledger, not an edit to a balance");
+    is(adjustments[0]?.kind, "adjustment_out", "out, because the bag held less than the books");
+    is(adjustments[0]?.quantity, "3.000", "for the difference against what was HELD, so the balance ends at what was counted");
+    is(adjustments[0]?.count_id, doc?.id, "linked to the count that found it, structurally rather than in prose");
+    is(holding("rep-ada"), "4.000|0.000", "and the balance is exactly what the rep counted");
+    ok("the count reconciled a balance it had never seen, which is the whole point of counting offline");
+    await shot("20-counted");
+
+    is(await page.evaluate(`return document.querySelector("#start-count")?.disabled === true;`), false,
+      "and another count can be started now that this one is settled");
+
+    // ---- 16. the ERP deletes the tenant, and the queue STOPS ---------------
     // The whole chain, end to end, for the first time: the ERP signs a tombstone, 0050's
     // watcher marks the registry row, the API refuses every request for that tenant with
     // `tenant_deleted`, and the client — which is the only part of this that had never

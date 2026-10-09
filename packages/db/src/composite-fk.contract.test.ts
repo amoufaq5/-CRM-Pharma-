@@ -102,6 +102,10 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   sample_transaction_counterparty_rep_profile_id_fkey: { table: "sample_transaction", column: "counterparty_rep_profile_id", parent: "rep_profile", onDelete: "RESTRICT" },
   sample_transaction_visit_id_fkey: { table: "sample_transaction", column: "visit_id", parent: "visit", onDelete: "RESTRICT" },
   sample_transaction_transfer_of_fkey: { table: "sample_transaction", column: "transfer_of", parent: "sample_transaction", onDelete: "RESTRICT" },
+  // 0056: the cycle count that produced an adjustment. RESTRICT like everything else out of
+  // this ledger, and unreachable in practice — the append-only trigger refuses every DELETE
+  // on a transaction, so nothing can orphan one from this side either.
+  sample_transaction_count_id_fkey: { table: "sample_transaction", column: "count_id", parent: "sample_count", onDelete: "RESTRICT" },
   sample_holding_rep_profile_id_fkey: { table: "sample_holding", column: "rep_profile_id", parent: "rep_profile", onDelete: "RESTRICT" },
   sample_holding_lot_id_fkey: { table: "sample_holding", column: "lot_id", parent: "sample_lot", onDelete: "RESTRICT" },
   sample_count_rep_profile_id_fkey: { table: "sample_count", column: "rep_profile_id", parent: "rep_profile", onDelete: "RESTRICT" },
@@ -373,6 +377,13 @@ const PROBES: Readonly<Record<string, Probe>> = {
                                               counterparty_rep_profile_id, transfer_of, occurred_at)
           VALUES (gen_random_uuid(), $1, $2, $3, 'transfer_recall', 1, $4, $5, now())`,
     params: [TENANT_FK_B, B.lot, B.rep1, B.rep2, A.tx],
+  },
+  sample_transaction_count_id_fkey: {
+    what: "an adjustment claiming to come from another tenant's count",
+    sql: `INSERT INTO crm.sample_transaction (id, tenant_id, lot_id, rep_profile_id, kind, quantity,
+                                              reason, occurred_at, count_id)
+          VALUES (gen_random_uuid(), $1, $2, $3, 'adjustment_out', 1, 'probe', now(), $4)`,
+    params: [TENANT_FK_B, B.lot, B.rep1, A.cnt],
   },
   sample_holding_rep_profile_id_fkey: {
     what: "a derived balance held by another tenant's rep",
