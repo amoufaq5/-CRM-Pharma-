@@ -129,7 +129,10 @@ import {
   listWarehouses,
   requireActiveWarehouse,
   disposalHistory,
+  POLICY_HISTORY_LIMIT,
   disposalPolicy,
+  disposalPolicyDetail,
+  disposalPolicyHistory,
   setDisposalPolicy,
   getCount,
   listCounts,
@@ -1836,19 +1839,53 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
   /**
    * The tenant's disposal policy, read-only.
    *
-   * No write route, deliberately. The grace period and the promo auto-write-off flag are
-   * SOP parameters with a regulatory flavour, and every principal here is a rep profile —
-   * there is no compliance role to restrict a write to, and "supervises at least one rep"
-   * would let a first-line manager change a tenant-wide commitment. Until there is a role
-   * model, this is set by an administrator in SQL. Read is open because every rep is
-   * subject to it and ought to be able to see the deadline they are held to.
+   * Read is open because every rep is subject to it and ought to be able to see the deadline
+   * they are held to. The write is `PUT /v1/admin/samples/disposal-policy` and needs the
+   * `compliance` role — this comment used to say there was no write route and that the
+   * parameters were set "by an administrator in SQL", which was true until 0023 built the
+   * role model and stopped being true the day it landed.
+   *
+   * It answers the PROVENANCE as well as the values (0059): "30 days" is not an answer to
+   * "what am I held to" without who set it, when, and why. All four are null for a tenant
+   * that has never changed anything, which is a fact — the policy is the shipped default and
+   * nobody set it — rather than missing data.
    */
   router.add({
     method: "GET",
     pattern: "/v1/samples/disposal-policy",
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
-      const body = await inTenant(deps, ctx.principal, (tx) => disposalPolicy(tx, ctx.principal.tenantId));
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        disposalPolicyDetail(tx, ctx.principal.tenantId),
+      );
       return { status: 200, body };
+    },
+  });
+
+  /**
+   * How the policy got to where it is: every change, newest first.
+   *
+   * Open to every rep, for the same reason the policy is. The grace period is a commitment
+   * they are measured against, and "it was thirty days until last Tuesday" is part of
+   * knowing what you were held to in March — which is precisely the question an SOP
+   * parameter attracts and the one this history exists to answer.
+   *
+   * Nothing here is a secret within the tenant: the values are already readable, and who
+   * holds the `compliance` role is readable at `GET /v1/admin/roles` by an administrator and
+   * visible on every change here by anyone. That is the intended arrangement for a rule
+   * everybody is bound by, not an oversight.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/disposal-policy/history",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const limit = parse(
+        z.coerce.number().int().min(1).max(POLICY_HISTORY_LIMIT).optional(),
+        ctx.query.get("limit") ?? undefined,
+      );
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        disposalPolicyHistory(tx, ctx.principal.tenantId, { ...(limit !== undefined ? { limit } : {}) }),
+      );
+      return { status: 200, body: { data } };
     },
   });
 
@@ -2242,6 +2279,18 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
    * get before an obligation goes overdue, and whether promotional material may be
    * written off by a job at all. A changed grace period never rewrites a deadline that
    * has already been communicated: 0020 copies it onto each obligation at discovery.
+   *
+   * A REASON IS REQUIRED (0059). The role model answered who may change this; it left the
+   * record of WHAT HAPPENED exactly where 0023 found it — an `UPDATE … SET grace_days = 7`
+   * that moved `updated_at` and nothing else, so a policy loosened last Tuesday by somebody
+   * who has since lost the role looked identical to one that had stood for a year. The write
+   * is now an INSERT into an append-only log that the policy row is a projection of, and the
+   * author comes from the token rather than the body, like every other attributed write
+   * here.
+   *
+   * Not four-eyed, deliberately: a tenant with one compliance officer must be able to set
+   * its own grace period, and the alternative is the psql prompt this whole lineage exists
+   * to get away from. The reasoning is at length in 0059.
    */
   router.add({
     method: "PUT",
@@ -2252,6 +2301,10 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         z.object({
           graceDays: z.number().int().min(0).max(365).optional(),
           autoWriteoffPromo: z.boolean().optional(),
+          // Ten characters, matching the column's own CHECK — enough to stop `.` and not
+          // enough to pretend prose is guaranteed. Validated here as well as there so the
+          // refusal is a 422 naming the field rather than a translated constraint.
+          reason: z.string().min(10).max(1000),
         }),
         ctx.body,
       );
@@ -2262,6 +2315,8 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         setDisposalPolicy(tx, ctx.principal.tenantId, {
           ...(input.graceDays !== undefined ? { graceDays: input.graceDays } : {}),
           ...(input.autoWriteoffPromo !== undefined ? { autoWriteoffPromo: input.autoWriteoffPromo } : {}),
+          changedBy: ctx.principal.repProfileId,
+          reason: input.reason,
         }),
       );
       return { status: 200, body };

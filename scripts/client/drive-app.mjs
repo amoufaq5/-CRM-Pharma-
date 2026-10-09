@@ -194,6 +194,35 @@ function mirrorRows() {
   });
 }
 
+function policyRow() {
+  const out = sql(
+    `SELECT grace_days, auto_writeoff_promo FROM crm.disposal_policy WHERE tenant_id = '${tenant}'`,
+  );
+  if (out === "") return null;
+  const [grace, promo] = out.split("|");
+  return { grace, promo };
+}
+
+/**
+ * The append-only log the policy row is a projection of.
+ *
+ * Read from outside the app for the same reason every other table in this file is: what the
+ * screen said is one fact and what landed is another, and only the second is the record an
+ * inspector reads.
+ */
+function policyChangeRows() {
+  const out = sql(
+    `SELECT c.grace_days_from, c.grace_days_to, c.auto_writeoff_promo_from, c.auto_writeoff_promo_to,
+            r.display_name, c.reason
+       FROM crm.disposal_policy_change c JOIN crm.rep_profile r ON r.id = c.changed_by
+      WHERE c.tenant_id = '${tenant}' ORDER BY c.changed_at DESC, c.id DESC`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [from, to, promoFrom, promoTo, who, reason] = line.split("|");
+    return { from, to, promoFrom, promoTo, who, reason };
+  });
+}
+
 /** How many receipts the receiving rep has of her own. The premise of the return chapter. */
 function graceReceipts() {
   const out = sql(
@@ -1286,6 +1315,132 @@ async function main() {
       await graceReturns.screenshot(join(work, "app-25-returned-by-transfer.png"));
     } finally {
       await returnBrowser.close();
+    }
+
+    // ---- 20. the rule everyone is measured against, and who changed it -----
+    // THE FIRST ADMINISTRATIVE SCREEN IN THIS APP, and the first consumer of a route that
+    // has existed since 0023 with "so a client can decide which admin screens to show" in
+    // its own comment: `GET /v1/me/roles`. Ada holds the compliance grant (granted by
+    // Grace — nobody grants themselves one), so she is offered the form; Grace is not, and
+    // the server refuses her even if she asks.
+    await page.click("#refresh");
+    // Waited on the RULE, not on the heading. The section renders either way — with "this
+    // device has not been told the tenant's disposal policy yet" until the read answers —
+    // so a wait on the heading is true before the fetch that fills it, which is the shape
+    // of race this gate has now caught three times. It caught it here too, on Grace's
+    // screen below, where the heading was present and the policy was not.
+    await page.waitFor(`/day\\(s\\) to dispose of expired stock/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the policy itself" });
+
+    const policyBefore = await page.evaluate(`
+      const h = [...document.querySelectorAll("h2")].find((x) => /Disposal policy/.test(x.textContent ?? ""));
+      const sec = h?.parentElement;
+      return {
+        text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
+        canChange: sec?.querySelector("#edit-policy") !== null,
+        history: sec?.querySelector("details") !== null,
+      };`);
+    is(/30 day\(s\) to dispose of expired stock/.test(String(policyBefore.text)), true,
+      `the rep is shown the deadline they are held to (${String(policyBefore.text).slice(0, 70)})`);
+    is(/Nobody has changed this/.test(String(policyBefore.text)), true,
+      "and told nobody has changed it — printed as itself, not as a blank where a name would go");
+    is(policyBefore.history, false, "with no history section, because there is no history yet");
+    is(policyBefore.canChange, true, "and the compliance officer is offered the change — the roles route decides, not a guess");
+
+    // Changed with a reason, which is the whole increment. Before 0059 the write was an
+    // UPDATE that moved `updated_at` and nothing else.
+    await page.click("#edit-policy");
+    await page.waitFor(`document.querySelector("#policy-form") !== null`, { label: "the policy form" });
+    const prefilled = await page.evaluate(
+      `return { grace: document.querySelector('#policy-form input[name="graceDays"]')?.value ?? null,
+                promo: document.querySelector('#policy-form select[name="autoWriteoffPromo"]')?.value ?? null };`,
+    );
+    is(prefilled.grace, "30", "the form opens on what is in force rather than on empty boxes");
+    is(prefilled.promo, "no", "including the switch, so changing one knob cannot silently restate the other");
+
+    // A change with no reason is refused ON THE DEVICE, with the typed value still there.
+    await page.fill(`#policy-form input[name="graceDays"]`, "7");
+    await page.click("#save-policy");
+    let noReason = null;
+    for (let i = 0; i < 50; i += 1) {
+      noReason = await page.evaluate(`return document.querySelector("p.error")?.textContent?.trim() ?? null;`);
+      if (noReason !== null && /Say why/.test(String(noReason))) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    is(/Say why, in a sentence/.test(String(noReason)), true,
+      `a change with no reason is refused at the keyboard (${String(noReason).slice(0, 60)})`);
+    is(await page.evaluate(`return document.querySelector('#policy-form input[name="graceDays"]')?.value ?? null;`), "7",
+      "and the typed grace period is still in the box");
+    is(policyChangeRows().length, 0, "with nothing recorded, so a refused change leaves no trace to explain away");
+
+    await page.fill(`#policy-form input[name="reason"]`, "seven days from now on, after the Q3 inspection finding");
+    await page.click("#save-policy");
+    await page.waitFor(`/Recorded, with your name/.test(document.querySelector("p.good")?.textContent ?? "")`, { timeoutMs: 20_000, label: "the recorded change" });
+
+    const changes = policyChangeRows();
+    is(changes.length, 1, "one row in crm.disposal_policy_change");
+    is(changes[0]?.from, "30", "carrying what the grace period WAS — stamped by the database, not claimed by the client");
+    is(changes[0]?.to, "7", "and what it became");
+    is(changes[0]?.who, "Ada Lovelace", "attributed to the officer in the token, never to a name in the body");
+    is(/Q3 inspection/.test(String(changes[0]?.reason)), true, "with the reason she gave, which is the authority the deadline now rests on");
+    is(policyRow()?.grace, "7", "and crm.disposal_policy agrees, because it is a projection of that row");
+
+    // The direct UPDATE the old write used to be, refused by the database itself. This
+    // harness's psql runs as the SUPERUSER, which bypasses RLS — and the refusal still
+    // lands, because a trigger is not a permission. That is exactly the guarantee being
+    // measured: the policy cannot be changed without a change row by anybody, including
+    // whoever holds the application password, which is the hole 0023's header named.
+    let direct = "ACCEPTED";
+    try {
+      sql(`UPDATE crm.disposal_policy SET grace_days = 1 WHERE tenant_id = '${tenant}'`);
+    } catch (err) {
+      direct = String(err.stderr ?? err.message ?? "");
+    }
+    is(/cannot be updated directly/.test(direct), true,
+      `the UPDATE this write used to be is refused by the database (${direct.replace(/\s+/g, " ").slice(0, 80)})`);
+    is(policyRow()?.grace, "7", "so the policy still equals the last row of its log");
+
+    const policyAfter = await page.evaluate(`
+      const h = [...document.querySelectorAll("h2")].find((x) => /Disposal policy/.test(x.textContent ?? ""));
+      const sec = h?.parentElement;
+      return { text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null };`);
+    is(/7 day\(s\) to dispose/.test(String(policyAfter.text)), true, "the screen shows the new deadline");
+    is(/Set by Ada Lovelace/.test(String(policyAfter.text)), true, "and who set it");
+    is(/30 → 7 day\(s\)/.test(String(policyAfter.text)), true, "with the history reading as a change rather than as a value");
+    await shot("25-policy");
+
+    // AND THE REP WHO MAY NOT. Grace holds no grant: no form on her screen, and the server
+    // refuses her if she asks anyway — which is the half a screen can never enforce.
+    const policyBrowser = await launchBrowser();
+    const gracePolicy = await newPage(policyBrowser);
+    try {
+      await gracePolicy.goto(appUrl);
+      await gracePolicy.waitFor(`document.querySelector("#app")?.getAttribute("aria-busy") === "false"`, { label: "Grace's third device to boot" });
+      await gracePolicy.fill("#dev-token", token2);
+      await gracePolicy.fill("#dev-tenant", tenant);
+      await gracePolicy.click("#dev-login");
+      await gracePolicy.waitFor(`/day\\(s\\) to dispose of expired stock/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the policy on Grace's screen" });
+      const hers = await gracePolicy.evaluate(`
+        const h = [...document.querySelectorAll("h2")].find((x) => /Disposal policy/.test(x.textContent ?? ""));
+        const sec = h?.parentElement;
+        return { text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null, canChange: sec?.querySelector("#edit-policy") !== null };`);
+      is(/7 day\(s\) to dispose/.test(String(hers.text)), true, "a rep with no grant sees the same rule");
+      is(/Set by Ada Lovelace/.test(String(hers.text)), true, "and who set it, because it is the rule she is measured against");
+      is(hers.canChange, false, "but is offered no way to change it");
+      const refused = await gracePolicy.evaluate(`
+        const s = JSON.parse(localStorage.getItem("crm.field.session"));
+        const res = await fetch("/v1/admin/samples/disposal-policy", {
+          method: "PUT",
+          headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)}, "content-type": "application/json" },
+          body: JSON.stringify({ graceDays: 365, reason: "a rep with no grant trying it on" }),
+        });
+        return { status: res.status, body: await res.text() };`);
+      is(refused.status, 403, "and the server refuses her even when the screen is bypassed — the grant is the rule, not the button");
+      is(/compliance/.test(String(refused.body)), true, "naming the role she would need");
+      is(policyRow()?.grace, "7", "with the policy untouched");
+      is(policyChangeRows().length, 1, "and still exactly one change in the log");
+      await gracePolicy.screenshot(join(work, "app-26-policy-readonly.png"));
+    } finally {
+      await policyBrowser.close();
     }
 
     // ---- 20. the ERP deletes the tenant, and the queue STOPS ---------------

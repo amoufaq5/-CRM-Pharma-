@@ -262,6 +262,15 @@ export const TENANT_ERASE_BYSTANDER = "ef520000-0000-4000-8000-000000000022";
 export const TENANT_INCOMING = "f0550000-0000-4000-8000-000000000023";
 
 /**
+ * packages/sample — disposal-policy.contract (migration 0059).
+ *
+ * Its own tenant because this suite's whole subject is the tenant-wide SOP parameters: a
+ * suite sharing a tenant would have its grace period changed underneath it, and the
+ * sweep suites assert on deadlines computed from exactly that number.
+ */
+export const TENANT_DISPOSAL_POLICY = "f0590000-0000-4000-8000-000000000026";
+
+/**
  * packages/sample — warehouses.contract (migration 0058).
  *
  * Two, and the second is the subject of a test rather than a spare: `requireActiveWarehouse`

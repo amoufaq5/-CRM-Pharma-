@@ -1637,10 +1637,98 @@ ok: and every depot named by a movement in this run is one the ERP's own list ha
 
 ### What is still not built
 
-The disposal policy is read-only everywhere. The depot list is only as fresh as the
-snapshot — one opened five minutes ago is not yet addressable, one closed five minutes ago is
-still offered, and `crm.snapshot_freshness` carries the age with no screen showing it. A
-receipt still has no screen at all, so nobody picks a depot for one. A count covers only the
-lots the device has cached. The depot picker and the peer picker are both a plain select of
-the first 500 rows; both routes take a `?q=` filter and no screen uses it yet. Roughly 71 of
-the 106 routes have no screen.
+The depot list is only as fresh as the snapshot — one opened five minutes ago is not yet
+addressable, one closed five minutes ago is still offered, and `crm.snapshot_freshness`
+carries the age with no screen showing it. A receipt still has no screen at all, so nobody
+picks a depot for one. A count covers only the lots the device has cached. The depot picker
+and the peer picker are both a plain select of the first 500 rows; both routes take a `?q=`
+filter and no screen uses it yet. Roughly 71 of the 106 routes have no screen.
+
+## A policy change is a record
+
+*2026-10-09, same script. `pnpm client:verify` is 248 checks.*
+
+0023's header named the debt it was clearing in two clauses: `crm.disposal_policy` was
+"settable only by someone with a psql prompt — which in practice means settable by anyone
+with the application password, **with no record of who changed what**". It built the role
+model and answered the first. The write was still `UPDATE crm.disposal_policy SET grace_days
+= 7`, which moves a timestamp and records nothing — so a deadline loosened last Tuesday by
+somebody who has since lost the role read exactly like one that had stood for a year.
+
+0059 makes the policy row a projection of an append-only log, which is 0018's own arrangement
+between a holding and the custody ledger. The three properties that matter are all the
+database refusing something, and all three were measured against a real Postgres before any
+screen existed:
+
+```
+ok: refuses a direct UPDATE of the policy, which is what makes the log the record
+ok: refuses an upsert that smuggles the change into its DO UPDATE clause
+ok: is append-only: a change cannot be edited or deleted afterwards
+ok: stamps the previous value itself, so the log cannot be made to lie
+ok: creates the policy at the defaults and refuses a policy created at a value nobody set
+ok: still allows the policy row to be deleted, because a tenant erasure must
+```
+
+**In the browser**, the first administrative screen this app has had — and the first consumer
+of `GET /v1/me/roles`, which has carried "so a client can decide which admin screens to show"
+in its own comment since 0023 with nobody reading it:
+
+```
+ok: the rep is shown the deadline they are held to        (30 day(s) to dispose of expired stock)
+ok: and told nobody has changed it — printed as itself, not as a blank where a name would go
+ok: and the compliance officer is offered the change — the roles route decides, not a guess
+ok: the form opens on what is in force rather than on empty boxes
+ok: a change with no reason is refused at the keyboard
+ok: and the typed grace period is still in the box
+ok: with nothing recorded, so a refused change leaves no trace to explain away
+ok: carrying what the grace period WAS — stamped by the database, not claimed by the client
+ok: attributed to the officer in the token, never to a name in the body
+ok: the UPDATE this write used to be is refused by the database
+ok: with the history reading as a change rather than as a value   (30 → 7 day(s))
+```
+
+And the rep who may not:
+
+```
+ok: a rep with no grant sees the same rule
+ok: and who set it, because it is the rule she is measured against
+ok: but is offered no way to change it
+ok: and the server refuses her even when the screen is bypassed — the grant is the rule,
+    not the button                                                (403, naming `compliance`)
+```
+
+### What the guards and the gate caught
+
+- **A `FOR EACH ROW` trigger cannot refuse an UPDATE that matches nothing.** The first draft
+  of the direct-UPDATE test ran against a tenant whose policy row had been deleted by the
+  fixture, so the statement matched zero rows, no row trigger fired, and the test passed
+  while proving the opposite of its own name.
+- **A defect I introduced while fixing a smaller one.** The form is opened on the LIVE
+  values, because an officer deciding from a screen that says thirty days while a colleague
+  moved it to seven an hour ago is reasoning about a rule that is not in force. The first
+  version opened the form and refreshed behind it — and a refresh re-renders, so anybody who
+  started typing in the beat before it landed had their input discarded: the exact defect
+  `formDraft` was built to prevent, reintroduced by the thing meant to make the form
+  accurate. The read now happens strictly before the form exists.
+- **A fourth wait on something already true**, and the gate has now caught this shape three
+  times. The policy section renders either way — "this device has not been told the tenant's
+  disposal policy yet" until the read answers — so waiting on the heading was true before
+  the fetch that fills it. It passed on the officer's screen by luck and failed on the other
+  rep's, which is the honest outcome.
+- **0051's register demanded a decision for the new table** before anything else would pass,
+  and the honest answer is `undecided` with the question written out: the record that a named
+  employee changed a regulated deadline follows whatever is decided for `disposal_obligation`
+  and has to be decided *with* it, because retaining either alone leaves a record nobody can
+  read. Twenty undecided dispositions now, not nineteen.
+- **The composite-key guard refused the new reference** until it was `(tenant_id, changed_by)`
+  and had a live cross-tenant probe, as it has for every reference since 0035.
+
+### What is still not built
+
+The promo auto-write-off switch is the one setting here that lets a job take material off a
+balance, and nothing guards it beyond the role and the log — four eyes is the obvious
+candidate and is not built. The device shows the last five changes with no way to page
+further. And `crm.notification_endpoint` (0021) is the OTHER table 0023's header named: its
+writes are still an UPDATE with no record of who changed where a tenant's signals are pushed,
+which is the same defect somewhere more sensitive. Roughly 70 of the 106 routes have no
+screen.

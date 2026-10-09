@@ -128,6 +128,15 @@ VALUES ('$TENANT', 'rep-ada', 'E-1', 'emp-1', 'Ada Lovelace', 'active'),
        -- still accept her. The picker's one narrowing, visible in the run.
        ('$TENANT', 'rep-gone', 'E-3', NULL, 'Departed Rep', 'departed');
 
+-- THE COMPLIANCE GRANT, which is what makes the policy screen reachable at all. 0023's
+-- four-eyes rule means nobody grants themselves a role, so Grace grants Ada — the same
+-- bootstrap shape a real tenant has, where the first administrator is inserted by whoever
+-- runs the migrations and every grant after that names a different person as grantor.
+INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+SELECT '$TENANT', a.id, 'compliance', g.id, CURRENT_DATE - 1, 'the live gate needs somebody who may set the SOP parameters'
+  FROM crm.rep_profile a, crm.rep_profile g
+ WHERE a.subject = 'rep-ada' AND g.subject = 'rep-grace';
+
 INSERT INTO crm.territory (tenant_id, code, name)
 VALUES ('$TENANT', 'T-LIVE', 'Live territory');
 
@@ -163,6 +172,7 @@ COMMIT;
 SQL
 ok "rep-ada holds T-LIVE, which covers acc-live-1 and acc-live-2 — and acc-not-mine is covered by nobody"
 ok "rep-grace exists to hand material to, and rep-gone has departed"
+ok "rep-ada holds the compliance grant — granted by Grace, because 0023 lets nobody grant themselves one"
 ok "three ERP depots are mirrored into crm.warehouse_snapshot — DEPOT-1 and DEPOT-2 open, DEPOT-X closed"
 
 # A lot for the sample half of the run. The STOCK is not inserted: holdings are maintained

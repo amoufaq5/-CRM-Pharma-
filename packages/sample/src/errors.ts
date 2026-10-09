@@ -132,6 +132,22 @@ export class WarehouseListUnsyncedError extends Error {
   }
 }
 
+/**
+ * A change to the disposal SOP parameters that the database refuses (0059).
+ *
+ * Its own class rather than `SampleCountError`'s generality, because the two refusals it
+ * carries want the same HTTP answer for a reason worth stating: both are well-formed
+ * requests that the policy's current state refuses — a change to the value already in
+ * force, and a direct UPDATE of a row that is a projection of the change log. Neither is
+ * the caller mistyping something.
+ */
+export class DisposalPolicyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DisposalPolicyError";
+  }
+}
+
 export class SampleCountError extends Error {
   constructor(message: string) {
     super(message);
@@ -160,6 +176,14 @@ const CONSTRAINT_MESSAGES: Readonly<Record<string, string>> = {
   sample_lot_drug_needs_expiry:
     "a drug sample lot must have an expiry date — lot tracking exists to answer whether it was in date",
   sample_lot_status_reason: "a quarantined or withdrawn lot must say why",
+  // 0059. The route validates all three before the database sees them, so these are the
+  // backstop under a caller that is not the route — and the readable sentence matters most
+  // exactly there, at a psql prompt.
+  disposal_policy_change_reason_check:
+    "a change to the disposal policy must say why, in at least ten characters — it is the authority a regulated deadline is set under",
+  disposal_policy_change_is_a_change: "a disposal policy change must actually change something",
+  disposal_policy_change_grace_days_to_check: "a grace period must be between 0 and 365 days",
+  disposal_policy_change_grace_days_from_check: "a grace period must be between 0 and 365 days",
 };
 
 /** Recognises the database's refusals. Anything unrecognised passes through unchanged. */
@@ -226,6 +250,16 @@ export function translateSampleError(err: unknown): Error {
     return new LedgerImmutableError(message);
   }
   if (message.includes("sample count")) return new SampleCountError(message);
+  // 0059, and ABOVE nothing in particular — but below the `append-only` arm, deliberately:
+  // an attempt to edit the history is `LedgerImmutableError` like every other append-only
+  // refusal in this schema, and only the policy's own two refusals belong here.
+  if (
+    message.includes("disposal policy change changes nothing") ||
+    message.includes("crm.disposal_policy is derived from") ||
+    message.includes("a disposal policy is created at the defaults")
+  ) {
+    return new DisposalPolicyError(message);
+  }
 
   return err instanceof Error ? err : new Error(String(err));
 }

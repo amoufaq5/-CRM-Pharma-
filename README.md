@@ -115,7 +115,8 @@ authorisation on its own.
 | `POST /v1/samples/write-offs` | a destruction or an expiry write-off — **reason required**, and the two kinds stay apart |
 | `GET /v1/samples/warehouses` | the depots a return can be addressed to — active only, `?q=` matches code or name |
 | `POST /v1/samples/returns` | back to a depot off that list; mirrored to the ERP as a `receipt` |
-| `GET /v1/samples/disposal-policy` | the tenant's grace period, read-only |
+| `GET /v1/samples/disposal-policy` | the grace period and the promo switch, with who set them and why |
+| `GET /v1/samples/disposal-policy/history` | every change to those parameters, newest first — open to every rep, who is measured against them |
 | `GET /v1/team/samples/obligations` | the team's outstanding disposals — the chase list |
 | `GET /v1/notifications` | the inbox; `?unread=true` filters |
 | `GET /v1/notifications/unread-count` | a real count of a real column |
@@ -131,7 +132,7 @@ authorisation on its own.
 | `GET /v1/admin/roles/administrators` | who can configure this tenant — readable by every rep |
 | `POST /v1/admin/roles` | grant a role (**administrator**); never to oneself |
 | `POST /v1/admin/roles/:id/revoke` | end a grant (**administrator**); the grant stays, with an end date |
-| `PUT /v1/admin/samples/disposal-policy` | the grace period and the promo switch (**compliance**) |
+| `PUT /v1/admin/samples/disposal-policy` | the grace period and the promo switch (**compliance**); a **reason is required** and the change is an append-only record |
 | `GET\|POST /v1/admin/notification-endpoints` | where signals are pushed (**administrator**) |
 | `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; there is no DELETE |
 | `POST /v1/admin/notification-endpoints/:id/test` | ask the scheduler to probe it; `202`, because it is queued, not answered |
@@ -819,7 +820,7 @@ same bypass with extra steps.
 The trigger is the layer doing the work today. The key only pins a tenant that has been
 *erased*; the trigger pins one that has been *stopped*, which is every deleted tenant from the
 moment the watcher sees the tombstone until somebody runs the erasure — a window that stays
-open while the nineteen undecided dispositions stay undecided.
+open while the twenty undecided dispositions stay undecided.
 
 **It does not erase anything, and that is a decision rather than an omission.** Some of the
 CRM's copies may be records a jurisdiction requires us to keep; a deletion that destroys an
@@ -828,7 +829,7 @@ that is defensible today. The vocabulary for the other half is below.
 
 ## What happens to each table, and who decided
 
-**19 of this CRM's 39 tenant-scoped tables have no answer yet, and that is now a fact you can
+**20 of this CRM's 43 tenant-scoped tables have no answer yet, and that is now a fact you can
 read rather than a gap nobody mentioned.** Migration 0051 adds `crm.data_disposition`: one row
 per tenant-scoped table saying `erase`, `retain` with a lawful basis, or `undecided` with the
 question somebody has to answer.
@@ -1165,7 +1166,8 @@ pass vacuously. **83 files / 2,123 tests green on both transports.**
 `apps/field` is the client, and it is a slice rather than the product: **sign in, see my
 accounts, record a visit with no network, disburse samples with a signature on glass, hand
 material to a colleague and accept theirs, count the bag, write off what has expired, send
-stock back to a depot, watch all of it sync, read a refusal.** Roughly 71 of the 106
+stock back to a depot, read the SOP parameters you are measured against — and change them, if
+you hold the compliance grant — watch all of it sync, read a refusal.** Roughly 70 of the 106
 routes still have no screen — call plans, expenses, notifications, the manager's views, all
 of admin.
 
@@ -1173,8 +1175,8 @@ What it settles is the part that was a guess. Everything built for an offline de
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **221 checks in three
-real Chromium profiles — three devices, two reps — taken offline mid-session, against the
+and `pnpm client:verify` proves it the only way that means anything: **248 checks in four
+real Chromium profiles — four devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
 - a visit recorded with the network down lands in IndexedDB, pending, with a device-minted
@@ -1244,6 +1246,16 @@ real API binary, counting rows in Postgres.** The sequence it drives:
   `StockMovement` for the ERP, and when the gate plays the relay's verdict and kills one, the
   screen names it in the ERP's own words with a retry — because a return the ERP never hears
   about leaves a depot short in its own books while the CRM's record is perfectly correct;
+- **the rule everybody is measured against is on the screen, with who set it** — the first
+  administrative surface in this app and the first consumer of `GET /v1/me/roles`, a route
+  that has carried "so a client can decide which admin screens to show" in its own comment
+  since 0023 with nobody reading it. Every rep sees the grace period, the promo switch, and
+  the provenance; the holder of the `compliance` grant also gets a form, which cannot be
+  submitted without a reason and is **not queued** — a policy change is a decision about a
+  tenant-wide rule taken at a desk, not a record of something that happened in a car park,
+  and a queued one would take effect whenever a phone next found signal and overwrite a
+  colleague's. A rep with no grant is offered nothing and is refused 403 if the screen is
+  bypassed;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

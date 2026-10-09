@@ -5,7 +5,11 @@ import {
   Count,
   CountBody,
   CountList,
+  DisposalPolicy,
   FailedErpWriteList,
+  MyRoles,
+  PolicyBody,
+  PolicyChangeList,
   Obligation,
   ObligationList,
   ReturnBody,
@@ -48,6 +52,7 @@ import {
   type RecallableTransfer,
   type SyncReport,
   type WriteOffKind,
+  type PolicyChange,
   type TransferPeer,
   type Warehouse,
 } from "@crm/client";
@@ -101,6 +106,24 @@ interface State {
    * only exit is a write-off — material destroyed that a depot could have put back.
    */
   warehouses: readonly Warehouse[];
+  /**
+   * The SOP parameters the rep is measured against, and who set them.
+   *
+   * Null until a refresh has answered, which is not the same as "the default": a device
+   * that showed thirty days before it had asked would be stating a tenant-wide rule it had
+   * never been told.
+   */
+  policy: DisposalPolicy | null;
+  policyChanges: readonly PolicyChange[];
+  /**
+   * The administrative roles this rep holds, from `GET /v1/me/roles`.
+   *
+   * Empty is the right default for a device that has not asked: offering a form every write
+   * would refuse is worse than making a compliance officer press Refresh once.
+   */
+  roles: readonly string[];
+  /** True while the policy form is open. Only ever reachable with the `compliance` role. */
+  editingPolicy: boolean;
   cachedAt: number | null;
   outbox: readonly OutboxEntry[];
   online: boolean;
@@ -135,6 +158,10 @@ const state: State = {
   obligations: [],
   failedErpWrites: [],
   warehouses: [],
+  policy: null,
+  policyChanges: [],
+  roles: [],
+  editingPolicy: false,
   cachedAt: null,
   outbox: [],
   online: navigator.onLine,
@@ -377,6 +404,8 @@ function render(): void {
     parts.push(renderWriteOffForm(state.writingOff));
   } else if (state.returning !== null) {
     parts.push(renderReturnForm(state.returning, now));
+  } else if (state.editingPolicy) {
+    parts.push(renderPolicyForm());
   } else {
     parts.push(renderAccounts(now));
     // Before anything else a rep might do: a write the ERP never heard about is the one
@@ -387,6 +416,10 @@ function render(): void {
     parts.push(renderHoldings(now));
     parts.push(renderTransfers(now));
     parts.push(renderCounts(now));
+    // LAST, deliberately. It is the rule the rest of the screen is measured against rather
+    // than anything a rep does today, and a tenant-wide parameter above a rep's own work
+    // would be the wrong emphasis on a phone.
+    parts.push(renderPolicy(now));
   }
 
   root.innerHTML = parts.join("");
@@ -1011,6 +1044,144 @@ function renderReturnForm(holding: Holding, now: number): string {
 }
 
 /**
+ * The rule this rep is held to, and who decided it.
+ *
+ * READ-ONLY FOR ALMOST EVERYONE, and that is the point rather than a limitation. The grace
+ * period and the promo auto-write-off switch are the SOP parameters every rep in the tenant
+ * is measured against; `GET /v1/samples/disposal-policy` is open to all of them for exactly
+ * that reason, and the write needs the `compliance` grant. So this section shows the policy
+ * to anybody and the form to the two or three people who may change it.
+ *
+ * THE PROVENANCE IS NOT DECORATION. "Thirty days" is not an answer to "what am I held to"
+ * without who set it, when, and why — and before 0059 there was nothing to show, because the
+ * write was an `UPDATE … SET grace_days = 7` that moved a timestamp. "Nobody has changed
+ * this" is printed as itself rather than as a blank: a device that said "set by —" would
+ * imply somebody had.
+ */
+function renderPolicy(now: number): string {
+  const policy = state.policy;
+  if (policy === null) {
+    // Said rather than guessed. A device that printed the shipped default before it had
+    // asked would be stating a tenant-wide rule it has never been told.
+    return `<section>
+      <h2>Disposal policy</h2>
+      <p class="note">This device has not been told the tenant's disposal policy yet. Connect
+        once and it will say how long you have to dispose of expired stock.</p>
+    </section>`;
+  }
+  const mayChange = state.roles.includes("compliance");
+  const provenance =
+    policy.changed_by_name === null || policy.changed_by_name === undefined
+      ? `<p class="note">Nobody has changed this: it is the default this system ships with.</p>`
+      : `<p class="note">Set by <strong>${escapeHtml(policy.changed_by_name)}</strong> on
+           ${escapeHtml(String(policy.changed_at ?? "").slice(0, 10))}${
+             policy.reason === null || policy.reason === undefined
+               ? ""
+               : ` — “${escapeHtml(policy.reason)}”`
+           }</p>`;
+  return `<section>
+    <h2>Disposal policy</h2>
+    <ul class="list">
+      <li><span class="grow">
+        <span class="name">${policy.grace_days} day(s) to dispose of expired stock</span>
+        <span class="meta">from the day the nightly sweep finds it in your bag. A deadline you
+          have already been given never moves when this changes.</span>
+      </span></li>
+      <li><span class="grow">
+        <span class="name">Promotional material ${policy.auto_writeoff_promo ? "is" : "is not"} written off automatically</span>
+        <span class="meta">${policy.auto_writeoff_promo
+          ? "a leaflet past its campaign date is written off by the nightly job. Drug samples never are."
+          : "nothing leaves a balance without a person recording it."}</span>
+      </span></li>
+    </ul>
+    ${provenance}
+    <p class="note">Cached ${ago(state.cachedAt, now)}.</p>
+    ${renderPolicyHistory()}
+    ${mayChange
+      ? `<div class="actions"><button id="edit-policy" ${state.online ? "" : "disabled"}>Change it</button></div>
+         ${state.online
+           ? ""
+           : `<p class="note">Changing it needs a network: it is a decision about a
+                tenant-wide rule rather than a record of something that happened, so this
+                device does not queue it. A queued policy change would take effect whenever
+                a phone next found signal, and would overwrite a colleague's.</p>`}`
+      : ``}
+  </section>`;
+}
+
+/** The last few changes, which is how a rep knows what they were held to in March. */
+function renderPolicyHistory(): string {
+  if (state.policyChanges.length === 0) return "";
+  return `<details>
+    <summary>How it got here (${state.policyChanges.length})</summary>
+    <ul class="list">
+      ${state.policyChanges
+        .map((c) => {
+          const parts: string[] = [];
+          if (c.grace_days_from !== c.grace_days_to) {
+            parts.push(`${c.grace_days_from} → ${c.grace_days_to} day(s)`);
+          }
+          if (c.auto_writeoff_promo_from !== c.auto_writeoff_promo_to) {
+            parts.push(`promo auto-write-off ${c.auto_writeoff_promo_to ? "on" : "off"}`);
+          }
+          return `<li><span class="grow">
+            <span class="name">${escapeHtml(parts.join(", "))}</span>
+            <span class="meta">${escapeHtml(c.changed_by_name)} · ${escapeHtml(c.changed_at.slice(0, 10))} · ${escapeHtml(c.reason)}</span>
+          </span></li>`;
+        })
+        .join("")}
+    </ul>
+  </details>`;
+}
+
+/**
+ * Change the policy — which means stating why.
+ *
+ * THE REASON FIELD IS THE INCREMENT. The role model (0023) answered who may change these
+ * parameters and left the record of what happened where it found it: an UPDATE that moved
+ * `updated_at`. So the form cannot be submitted without a reason, the server refuses one
+ * shorter than ten characters, and the change lands as a row in an append-only log that the
+ * policy itself is a projection of.
+ *
+ * Both fields are pre-filled with what is in force, so a change to one knob does not silently
+ * restate the other — and the form shows the current values rather than empty boxes, because
+ * "what is it now" is the first thing somebody about to change it needs.
+ */
+function renderPolicyForm(): string {
+  const policy = state.policy;
+  if (policy === null) return "";
+  return `<section>
+    <h2>Change the disposal policy</h2>
+    <p class="note">These are the SOP parameters every rep in this tenant is measured
+      against. A deadline already communicated does not move: the grace period is copied
+      onto each obligation when the sweep finds the stock.</p>
+    <form id="policy-form">
+      <label>Days to dispose of expired stock
+        <input name="graceDays" type="text" inputmode="numeric" autocomplete="off"
+               value="${policy.grace_days}" />
+      </label>
+      <label>Write off expired promotional material automatically
+        <select name="autoWriteoffPromo">
+          <option value="no" ${policy.auto_writeoff_promo ? "" : "selected"}>No — a person records every write-off</option>
+          <option value="yes" ${policy.auto_writeoff_promo ? "selected" : ""}>Yes — the nightly job writes off expired leaflets</option>
+        </select>
+      </label>
+      <label>Why — required
+        <input name="reason" type="text" maxlength="1000" autocomplete="off"
+               placeholder="What changed, and on whose authority" />
+      </label>
+      <div class="actions">
+        <button id="save-policy" type="submit">Record the change</button>
+        <button id="cancel-policy" type="button" class="secondary">Cancel</button>
+      </div>
+      <p class="note">Your name and the values now in force are recorded with it, and the
+        record cannot be edited afterwards. Drug samples are never written off by a job
+        whatever this says — only promotional material.</p>
+    </form>
+  </section>`;
+}
+
+/**
  * Writes the ERP will never hear about unless somebody retries them.
  *
  * THE SECTION A RETURN MADE NECESSARY. Everything else a rep records is CRM-only, so a
@@ -1195,6 +1366,16 @@ function wireReady(): void {
   document.getElementById("return-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
     void saveReturn(event.target as HTMLFormElement);
+  });
+  on("edit-policy", "click", () => void openPolicyForm());
+  on("cancel-policy", "click", () => {
+    formDraft = null;
+    state.editingPolicy = false;
+    render();
+  });
+  document.getElementById("policy-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void savePolicy(event.target as HTMLFormElement);
   });
   for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-retry-erp]")) {
     button.addEventListener("click", () => {
@@ -2095,6 +2276,110 @@ async function saveReturn(form: HTMLFormElement): Promise<void> {
 }
 
 /**
+ * Open the policy form on the LIVE values, not on the cached ones.
+ *
+ * The read happens before the form exists, deliberately. Refreshing after it was open would
+ * re-render it, and `restoreFormDraft` would put the pre-filled stale values straight back
+ * over the fresh ones — the draft cannot tell a value the rep typed from one the renderer
+ * supplied. So the order is: read, then render the form, then let the rep type.
+ *
+ * It matters because the officer is deciding from what the screen says. A device showing
+ * thirty days while a colleague moved it to seven an hour ago would have them reason about a
+ * rule that is no longer in force. The record itself is safe either way — the server applies
+ * the value it is given and stamps the real previous one — but the decision would not be.
+ */
+async function openPolicyForm(): Promise<void> {
+  state.message = null;
+  // STRICTLY BEFORE the form exists. Opening it optimistically and refreshing behind it was
+  // the first version of this function and it is wrong in a way the rest of this app has a
+  // name for: the refresh re-renders, and an officer who started typing in the beat before
+  // it landed would have had their input discarded — the exact defect `formDraft` exists to
+  // prevent, reintroduced by the thing meant to make the form accurate. The cost is a beat
+  // where the button has been pressed and nothing has appeared; the button is only enabled
+  // with a network, so it is a beat and not a wait.
+  await refreshReference();
+  formDraft = null;
+  state.editingPolicy = true;
+  render();
+}
+
+/**
+ * Change the tenant's disposal SOP parameters.
+ *
+ * SENT, NOT QUEUED, and the reasoning is on `putDisposalPolicy`: this is a decision about a
+ * tenant-wide rule taken at a desk, not a record of something that happened in a car park. A
+ * queued one would take effect whenever a phone next found signal and would overwrite a
+ * colleague's in the meantime.
+ *
+ * THE DEVICE SENDS ONLY WHAT MOVED. Both inputs are pre-filled with what is in force, so
+ * submitting the form unchanged would otherwise restate both values — and the server, quite
+ * rightly, refuses a change that changes nothing. Comparing against the policy on screen
+ * means the rep gets "nothing has changed" from their own device instead of a 409.
+ */
+async function savePolicy(form: HTMLFormElement): Promise<void> {
+  const current = state.policy;
+  if (transport === null || store === null || current === null) return;
+
+  const data = new FormData(form);
+  const graceRaw = String(data.get("graceDays") ?? "").trim();
+  const promo = String(data.get("autoWriteoffPromo") ?? "") === "yes";
+  const reason = String(data.get("reason") ?? "").trim();
+
+  // Parsed here rather than left to the server, because `Number("")` is 0 and a blank box
+  // must not read as same-day disposal.
+  if (!/^\d{1,3}$/.test(graceRaw)) {
+    state.message = { kind: "error", text: "The grace period is a whole number of days, between 0 and 365." };
+    render();
+    return;
+  }
+  const graceDays = Number(graceRaw);
+
+  const body: Record<string, unknown> = { reason };
+  if (graceDays !== current.grace_days) body["graceDays"] = graceDays;
+  if (promo !== current.auto_writeoff_promo) body["autoWriteoffPromo"] = promo;
+  if (body["graceDays"] === undefined && body["autoWriteoffPromo"] === undefined) {
+    state.message = { kind: "warn", text: "Nothing has changed, so there is nothing to record." };
+    render();
+    return;
+  }
+
+  const parsed = PolicyBody.safeParse(body);
+  if (!parsed.success) {
+    state.message = {
+      kind: "error",
+      text:
+        reason.length < 10
+          ? "Say why, in a sentence: this is the authority a regulated deadline is set under, and the record cannot be edited afterwards."
+          : `This change cannot be saved: ${parsed.error.issues.map((i) => i.message).join("; ")}`,
+    };
+    render();
+    return;
+  }
+
+  const result = await transport.putDisposalPolicy(parsed.data);
+  if (result.kind !== "ok") {
+    state.message = {
+      kind: result.kind === "network" ? "warn" : "error",
+      text:
+        result.kind === "network"
+          ? "No network, so the change was not made. It is not saved on this device either — a policy that took effect whenever a phone found signal would be worse than one that waited."
+          : `The server said: ${result.detail ?? result.status}`,
+    };
+    render();
+    return;
+  }
+
+  state.editingPolicy = false;
+  formDraft = null;
+  state.message = { kind: "good", text: "Recorded, with your name and the reason. It applies to stock the sweep finds from now on." };
+  render();
+  // Re-read rather than patch the state from the reply: the provenance and the history come
+  // from the server, and a device that assembled them locally would be inventing the one
+  // thing this record exists to be.
+  await refreshReference();
+}
+
+/**
  * Ask the server to try a dead ERP write again.
  *
  * Direct rather than queued, which is the one deliberate inconsistency in this client and
@@ -2332,6 +2617,17 @@ async function refreshReference(): Promise<void> {
   // turn every return on this device back into a write-off.
   const warehousesResult = await transport.get("/v1/samples/warehouses");
   const warehouses = warehousesResult.kind === "ok" ? WarehouseList.safeParse(warehousesResult.body) : null;
+  // The rule every rep is measured against, its history, and whether this rep is one of the
+  // two people in the tenant who may change it. `GET /v1/me/roles` has existed since 0023
+  // with "so a client can decide which admin screens to show" in its own comment and no
+  // consumer; this is the consumer.
+  const policyResult = await transport.get("/v1/samples/disposal-policy");
+  const policy = policyResult.kind === "ok" ? DisposalPolicy.safeParse(policyResult.body) : null;
+  const policyChangesResult = await transport.get("/v1/samples/disposal-policy/history?limit=5");
+  const policyChanges =
+    policyChangesResult.kind === "ok" ? PolicyChangeList.safeParse(policyChangesResult.body) : null;
+  const rolesResult = await transport.get("/v1/me/roles");
+  const roles = rolesResult.kind === "ok" ? MyRoles.safeParse(rolesResult.body) : null;
 
   state.me = me.data;
   // Stamp the session with the rep it turned out to be, so a later cold start can tell
@@ -2349,6 +2645,12 @@ async function refreshReference(): Promise<void> {
   if (obligations !== null && obligations.success) state.obligations = obligations.data.data;
   if (failed !== null && failed.success) state.failedErpWrites = failed.data.data;
   if (warehouses !== null && warehouses.success) state.warehouses = warehouses.data.data;
+  if (policy !== null && policy.success) state.policy = policy.data;
+  if (policyChanges !== null && policyChanges.success) state.policyChanges = policyChanges.data.data;
+  // Assigned even when the list is EMPTY, unlike the reads above: an empty set of roles is a
+  // real answer and the one that must stick, or a rep who lost their grant this morning
+  // would keep a form the server now refuses.
+  if (roles !== null && roles.success) state.roles = roles.data.roles;
   state.cachedAt = Date.now();
   const cache: CachedReference = {
     me: me.data,
@@ -2362,6 +2664,9 @@ async function refreshReference(): Promise<void> {
     obligations: state.obligations,
     failedErpWrites: state.failedErpWrites,
     warehouses: state.warehouses,
+    ...(state.policy !== null ? { policy: state.policy } : {}),
+    policyChanges: state.policyChanges,
+    roles: state.roles,
     fetchedAt: state.cachedAt,
   };
   await store.writeCache(cache);
@@ -2383,6 +2688,14 @@ function adoptSession(session: Session): void {
     state.obligations = [];
     state.failedErpWrites = [];
     state.warehouses = [];
+    // The policy is the tenant's and would be the same for the next rep — the ROLES are not,
+    // and a form left on screen for somebody who does not hold the grant is the whole shape
+    // of mistake the shared-device work exists to stop. Both go, because a policy with no
+    // provenance on screen beside somebody else's name is no better.
+    state.policy = null;
+    state.policyChanges = [];
+    state.roles = [];
+    state.editingPolicy = false;
     state.cachedAt = null;
   }
   writeSession(session);
@@ -2450,6 +2763,9 @@ async function boot(): Promise<void> {
     state.obligations = cached.obligations ?? [];
     state.failedErpWrites = cached.failedErpWrites ?? [];
     state.warehouses = cached.warehouses ?? [];
+    state.policy = cached.policy ?? null;
+    state.policyChanges = cached.policyChanges ?? [];
+    state.roles = cached.roles ?? [];
     state.cachedAt = cached.fetchedAt;
   }
 

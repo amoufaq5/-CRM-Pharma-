@@ -242,6 +242,12 @@ export function toProblem(err: unknown): ApiError {
     // and the material's state refuses it.
     case "TransferAlreadySettledError":
     case "SampleCountError":
+    // The disposal SOP parameters (0059). A change to the value already in force, and a
+    // direct UPDATE of a row that is a projection of its own change log: both well-formed
+    // requests the policy's state refuses, which is a conflict and not a validation
+    // failure. The route rejects an empty body and a reason that is too short before the
+    // database is asked, so what reaches here is the state, not the shape.
+    case "DisposalPolicyError":
       return new ApiError("conflict", message);
     // Not a conflict: only the sender may take material back, because it is their
     // `quantity_in_transit` the recall draws down. 403 rather than the 404 the

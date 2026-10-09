@@ -1468,6 +1468,111 @@ Concretely, and these specifics are the decision, not commentary on it:
     stronger model and still unbuilt). And the picker is the first 500 open depots with no
     search box, exactly as the peer picker is: the route's `?q=` has no screen.
 
+32. **A policy change is a record — the half of 0023 that was never built.**
+    0023's header names the debt it was written to clear, and names it exactly:
+    `crm.disposal_policy` was "settable only by someone with a psql prompt — which in
+    practice means settable by anyone with the application password, WITH NO RECORD OF WHO
+    CHANGED WHAT". It built the role model and answered the first clause.
+    `PUT /v1/admin/samples/disposal-policy` has required the `compliance` grant since, and a
+    district manager with a full team is refused. The second clause was never touched. The
+    write was still
+
+        UPDATE crm.disposal_policy SET grace_days = 7, updated_at = now()
+
+    which leaves a timestamp and nothing else: not who, not what it was before, not why.
+
+    **And the shape of it made the absence invisible.** `updated_at` moves, so the row looks
+    maintained — a policy loosened last Tuesday by somebody who has since lost the role read
+    exactly like one that had stood untouched for a year. These are the SOP parameters every
+    rep in the tenant is measured against, and the question an inspector asks about an SOP
+    parameter is never "what is it now".
+
+    **THE RULE WAS ALREADY IN THE SCHEMA, one table over.** 0018 refuses a direct write to
+    `crm.sample_holding` because "the balance is a projection of the ledger. Allowing a bare
+    UPDATE would reopen exactly the gap this file closes — a number that disagrees with the
+    movements behind it and no way to tell which is wrong." A policy knob is a balance and a
+    policy change is a movement, so 0059 applies the same arrangement: an append-only
+    `crm.disposal_policy_change`, an INSERT on it as the ONLY way to change the policy, and
+    `pg_trigger_depth() > 1` — 0018's own test — refusing anything else.
+
+    **The `from` values are the database's, never the caller's.** A log where the previous
+    value is whatever the writer claimed is not evidence of anything: a client could record
+    "30 → 7" over a row that was already 7, or "7 → 7" to make a real loosening read as a
+    no-op. The trigger reads the live row `FOR UPDATE` and overwrites whatever arrived, so
+    the caller supplies only what the policy should BECOME, and the reason.
+
+    **A reason is required, not required-when-it-tightens.** Conditional evidence is the kind
+    that is missing in the one case somebody wanted it missing — and the direction a change
+    "tightens" in is not even obvious: a shorter grace period is stricter on reps and better
+    for compliance, while turning promo auto-write-off ON is the one setting that lets a
+    scheduled job take material off a balance with no person involved, which is what 0020's
+    entire header argues against for drug samples.
+
+    **Not four-eyed, and that is operational rather than principled.** 0023 accepted that a
+    tenant needs two administrators to stay administrable, because a role grant is rare. An
+    SOP parameter is rarer still, and requiring a second compliance officer for every change
+    would mean a tenant with one officer cannot set its own grace period — the only
+    workaround being the psql prompt this whole lineage exists to get away from. Attribution
+    plus an append-only history is the level that fits; four eyes is a rule to add over a log
+    that now exists, rather than a reason not to build the log.
+
+    **Two things the guard deliberately still allows**, both argued at length in 0059. A bare
+    INSERT of the DEFAULT row, because it is created lazily on first read (0020: "a policy
+    row for a tenant that has no samples is noise") — but an INSERT that NAMES a value is
+    refused, since a tenant whose policy was created at seven days by a psql prompt would be
+    a policy nobody set, the same defect in a new costume. And DELETE, because
+    `crm.data_disposition` says `erase` for this table and `executeTenantErasure` removes it
+    with a plain statement at trigger depth 1: a guard that refused would break a tenant
+    erasure, which is far worse than what it would prevent, and the deletion happens under a
+    signed tombstone attesting the row count anyway.
+
+    **THE FIRST ADMINISTRATIVE SCREEN IN THE APP**, and the first consumer of a route built
+    for exactly this. `GET /v1/me/roles` has carried the comment "so a client can decide
+    which admin screens to show" since 0023 and had nobody reading it. Now the device reads
+    it, shows the policy and its provenance to every rep — the rule they are measured against
+    is not a secret from them — and shows the form to the holders of the grant. Nothing is
+    pre-selected that was not already in force, the form cannot be submitted without a
+    reason, and the change is NOT queued: everything the outbox holds is a record of
+    something that happened in the field and must survive a dead battery, while this is a
+    decision about a tenant-wide rule taken at a desk. A queued one would take effect
+    whenever a phone next found signal and would overwrite a colleague's in the meantime.
+
+    **One defect introduced and caught in the same session, worth recording because the fix
+    was the cause.** The form opens on the LIVE values rather than the cached ones, since an
+    officer deciding from a screen showing thirty days while a colleague moved it to seven an
+    hour ago is reasoning about a rule that is not in force. The first version opened the form
+    and refreshed behind it — and a refresh re-renders, so an officer who started typing in
+    the beat before it landed had their input discarded: precisely the defect `formDraft`
+    exists to prevent, reintroduced by the thing meant to make the form accurate. The read is
+    now strictly before the form exists, which costs a beat where the button has been pressed
+    and nothing has appeared, and the button is only enabled with a network.
+
+    **One stale comment fixed, which was worse than a missing one.** `GET
+    /v1/samples/disposal-policy` said "No write route, deliberately… Until there is a role
+    model, this is set by an administrator in SQL." True when written, false from the day
+    0023 landed, and left describing the opposite of the code for nine migrations.
+
+    **Verified live.** Thirteen contract assertions against a real Postgres, and the three
+    that cannot be faked are all the database refusing something: a direct UPDATE, an upsert
+    smuggling the change into its `DO UPDATE` clause, and an edit of the history. One of them
+    caught a defect in its own first draft — a `FOR EACH ROW` trigger cannot refuse an UPDATE
+    that matches nothing, so the test passed against a tenant with no policy row while
+    proving the opposite. In the browser: the compliance officer is shown the rule, shown
+    that nobody has changed it, refused at the keyboard when she saves without a reason (with
+    her typed value still in the box), and her change lands as one row carrying `30 → 7`, her
+    name, and her sentence — while the same `UPDATE` the write used to be is refused by the
+    database with the harness's own superuser connection, because a trigger is not a
+    permission. The rep with no grant sees the same rule and the same author, is offered no
+    form, and is refused 403 when the screen is bypassed. **248 browser checks, 0 failures**
+    (221 before).
+
+    **Still open.** The promo auto-write-off switch is the one setting here that lets a job
+    remove material from a balance, and it is guarded by nothing beyond the role and the log —
+    four eyes is the obvious candidate and is not built. The history is capped at five on the
+    device with no way to page further. And `crm.notification_endpoint` (0021) is the OTHER
+    table 0023's header named: its writes are still an UPDATE with no record of who changed
+    where a tenant's signals are pushed, which is the same defect in a more sensitive place.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1812,7 +1917,7 @@ commit.
 | Nothing picks up `ALTER ROLE crm_app BYPASSRLS` on a running system. The privilege verdict is cached per role NAME for the life of the process, because asking the catalog costs ~82 µs and asking it on every transaction is the wrong trade. A restart notices; so does `/healthz` in a new process. Altering the role is a superuser action on a role the deployment creates `NOSUPERUSER NOBYPASSRLS`, so the exposure is an operator deliberately widening their own application role. | Platform | _set a date_ |
 | **Deleting a notification took its `crm.notification_delivery` rows with it until 0046 dropped the foreign key.** By the `ON DELETE CASCADE` migration 0021 wrote, the retention period for a notification was also the retention period for the record of where that signal was pushed — coherent (the policy says the tenant no longer keeps this) but it meant delivery history could not be retained longer than the notification it described. The answer this row asked for was the one 0046 took: "separating them needs the delivery rows to stop depending on the notification row", so the key was dropped, the row copies what it needs, and the trigger that makes the copies is the tenant guard the key used to be. | Platform | **closed 2026-10-06** |
 | **The SMTP sender has now spoken to one third-party server and no production relay.** `scripts/crosscheck-smtp.sh` drives it against **aiosmtpd**, which rules out a mistake the client and our own sink share — deliberately a cross-check a reviewer runs rather than a CI gate, because making the suite depend on an undeclared Python package would trade a real verification for a brittle one. Beyond that it is verified end to end against a sink written alongside it — reply classification at every stage, dot-stuffing, RFC 2047 subjects, STARTTLS with certificate verification, AUTH PLAIN and LOGIN — and the sink is faithful to RFC 5321/3207/4616 as far as it goes, but neither it nor aiosmtpd is Postfix, Exchange or SES. Untested in the wild: PIPELINING, a relay that enforces SIZE rather than advertising it, reply codes outside the ranges covered, and whether a given provider accepts `8bit`. It also does no DKIM signing, which is not claimed anywhere. | Platform | _set a date_ |
-| Roles now cover six administrative surfaces — the disposal policy, notification endpoints and their probe limits, notification retention, the delivery log, dead ERP writes, and the expense account map (`crm.expense_account_map` left this list when its routes landed, which is the sequence this row asks for: the route first, then the role that honours it). `crm.cycle`, `crm.territory`, `crm.territory_assignment` and `crm.sample_lot` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |
+| Roles now cover six administrative surfaces — the disposal policy (whose changes are, since 0059, an attributed append-only record rather than an UPDATE; `crm.notification_endpoint` is the other table 0023's header named and has not had the same treatment), notification endpoints and their probe limits, notification retention, the delivery log, dead ERP writes, and the expense account map (`crm.expense_account_map` left this list when its routes landed, which is the sequence this row asks for: the route first, then the role that honours it). `crm.cycle`, `crm.territory`, `crm.territory_assignment` and `crm.sample_lot` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |
 | **The disposal deadline is carried per (rep, lot), so a FIRST hand-off between two cooperating reps can still move the material's effective deadline.** Closed as of 0030 for the unilateral recall path and for any pair that has each held the lot once: the sweep now asks `crm.disposal_carry_forward` and inserts a CONTINUATION obligation inheriting `discovered_on` and `due_by` verbatim, naming the row it continues. What is left open is deliberate and pinned by a test — a genuine hand-over to a rep who has never held the lot starts that rep's own grace period, because holding someone to a deadline they were never given is the mirror image of the bug. Closing it means deciding that an obligation attaches to the MATERIAL rather than to a person, which changes what the table means. | Compliance | _set a date_ |
 | **`created_at` is the transaction clock, and when this was written only the outbox had a `seq` to fall back on. Five tables have one now.** 0027 added the first after proving the tie, and `crm.disposal_obligation` had nothing equivalent, so two obligations written in one transaction — which a catch-up sweep does — could not be ordered at all. 0036 gave it one and pointed `open_disposal_obligations` at it; `crm.attachment_access` (0033), `crm.notification_endpoint_probe` (0034), `crm.outbox_dead_letter` (0041) and `crm.notification_delivery` (0046) were each written with one from the start. The lesson is kept because it is the one every new append-only table has to be told: `disposal_obligation_chain` sidesteps it by walking `continues_obligation_id` recursively from the root rather than ordering by time, bounded at 10,000 so a hand-edited cycle fails short instead of hanging. `crm.open_disposal_obligations` would have the same problem if it ever needed a stable order. | Platform | **closed 2026-10-06** |
 | **The prune guard's floor is capped at 1,000 rows (0032), which is a judgement and not a derivation.** The floor short-circuits the share ceiling, so an uncapped one is a permanent unattributed bypass — it shipped capped at a million. 1,000 is ten times the default and bounds what a misconfigured floor can cost to a number an operator can read and recover from, and a pass the floor lets through is now reported as `FLOOR-WAIVED` rather than reading like an ordinary pass. What nobody has decided is whether the right number for a two-million-row inbox is the same as for an eight-hundred-row one; the honest answer may be that the floor should be a share too. | Product | _set a date_ |
@@ -1882,7 +1987,7 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 221 checks across THREE browser profiles, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28), then write-offs and the date a disposal was recorded on (item 29), then the return to a warehouse and the first write the ERP must hear about (item 30), then the warehouse list that made a return possible for stock a colleague handed over (item 31). **What is NOT built is still most of the product**: the disposal policy, call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 71 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
+| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 248 checks across FOUR browser profiles, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28), then write-offs and the date a disposal was recorded on (item 29), then the return to a warehouse and the first write the ERP must hear about (item 30), then the warehouse list that made a return possible for stock a colleague handed over (item 31), and then the disposal policy — the first administrative screen, and the record of who changed it that 0023 left unbuilt (item 32). **What is NOT built is still most of the product**: call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface but this one — roughly 70 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 

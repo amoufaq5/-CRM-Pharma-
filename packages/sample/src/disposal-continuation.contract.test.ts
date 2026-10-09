@@ -267,18 +267,21 @@ describe("a disposal deadline across a round trip", () => {
      */
     it("is neither lengthened by a longer policy nor shortened by a shorter one", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { graceDays: 30 });
+        // No opening `setDisposalPolicy(30)`: thirty days IS the shipped default
+        // (`DEFAULT_GRACE_DAYS`), and since 0059 a change that changes nothing is refused
+        // rather than recorded — so writing the starting value would be a no-op the
+        // database turns down, which is the rule working.
         const lot = await heldStock(tx, { expiry: "2026-03-31", quantity: 10 });
         await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
 
-        await setDisposalPolicy(tx, TENANT, { graceDays: 365 });
+        await setDisposalPolicy(tx, TENANT, { graceDays: 365, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         await sendSweepRecall(tx, lot, {
           quantity: 10, sentOn: "2026-04-12", sweptOn: "2026-04-13", recalledOn: "2026-04-14",
         });
         await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-15") });
         expect((await openObligations(tx, REP, { asOf: "2026-04-15" }))[0]!.due_by).toBe("2026-05-10");
 
-        await setDisposalPolicy(tx, TENANT, { graceDays: 0 });
+        await setDisposalPolicy(tx, TENANT, { graceDays: 0, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         await sendSweepRecall(tx, lot, {
           quantity: 10, sentOn: "2026-04-17", sweptOn: "2026-04-18", recalledOn: "2026-04-19",
         });

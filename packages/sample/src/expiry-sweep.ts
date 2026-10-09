@@ -99,22 +99,141 @@ export async function disposalPolicy(tx: PoolClient, tenantId: string): Promise<
   return rows[0] ?? { grace_days: DEFAULT_GRACE_DAYS, auto_writeoff_promo: false };
 }
 
+/**
+ * The policy as a screen needs it: the two knobs, plus who last changed them and why.
+ *
+ * Separate from `disposalPolicy` above, which the sweep uses: the engine needs two numbers
+ * and the provenance would be dead weight on every nightly run. A reader needs the
+ * opposite — "30 days" is not an answer to "what am I held to" without "set by whom, when,
+ * and on what grounds", which is the question an SOP parameter always attracts.
+ *
+ * The provenance is NULL for a tenant that has never changed anything, and that is a fact
+ * rather than missing data: the policy is the shipped default and nobody set it. A screen
+ * that said "set by —" would imply somebody had.
+ */
+export interface DisposalPolicyDetail extends DisposalPolicy {
+  readonly changed_at: Date | null;
+  readonly changed_by: string | null;
+  readonly changed_by_name: string | null;
+  readonly reason: string | null;
+}
+
+export async function disposalPolicyDetail(
+  tx: PoolClient,
+  tenantId: string,
+): Promise<DisposalPolicyDetail> {
+  await disposalPolicy(tx, tenantId);
+  const { rows } = await tx.query<DisposalPolicyDetail>(
+    `SELECT p.grace_days, p.auto_writeoff_promo,
+            c.changed_at, c.changed_by::text AS changed_by, r.display_name AS changed_by_name, c.reason
+       FROM crm.disposal_policy p
+       -- The latest change, by the wall clock and then by id: two changes in one
+       -- transaction would otherwise tie, which is what clock_timestamp() on the column is
+       -- for and this ordering makes deterministic even so.
+       LEFT JOIN LATERAL (
+         SELECT changed_at, changed_by, reason
+           FROM crm.disposal_policy_change
+          WHERE tenant_id = p.tenant_id
+          ORDER BY changed_at DESC, id DESC
+          LIMIT 1
+       ) c ON true
+       LEFT JOIN crm.rep_profile r ON r.id = c.changed_by
+      WHERE p.tenant_id = $1`,
+    [tenantId],
+  );
+  return rows[0] ?? {
+    grace_days: DEFAULT_GRACE_DAYS,
+    auto_writeoff_promo: false,
+    changed_at: null,
+    changed_by: null,
+    changed_by_name: null,
+    reason: null,
+  };
+}
+
+/** One entry in the policy's history. */
+export interface DisposalPolicyChange {
+  readonly id: string;
+  readonly changed_at: Date;
+  readonly changed_by: string;
+  readonly changed_by_name: string;
+  readonly reason: string;
+  readonly grace_days_from: number;
+  readonly grace_days_to: number;
+  readonly auto_writeoff_promo_from: boolean;
+  readonly auto_writeoff_promo_to: boolean;
+}
+
+export const POLICY_HISTORY_LIMIT = 200;
+
+/**
+ * Every change to the SOP parameters, newest first.
+ *
+ * Readable by every rep, for the reason the policy itself is: they are measured against it,
+ * and "it changed last Tuesday" is part of knowing what you are held to. The author's name
+ * is joined in because a rep profile id is not an answer to "who".
+ */
+export async function disposalPolicyHistory(
+  tx: PoolClient,
+  tenantId: string,
+  opts: { readonly limit?: number } = {},
+): Promise<readonly DisposalPolicyChange[]> {
+  const limit = Math.max(1, Math.min(POLICY_HISTORY_LIMIT, opts.limit ?? 50));
+  const { rows } = await tx.query<DisposalPolicyChange>(
+    `SELECT c.id::text AS id, c.changed_at, c.changed_by::text AS changed_by,
+            r.display_name AS changed_by_name, c.reason,
+            c.grace_days_from, c.grace_days_to,
+            c.auto_writeoff_promo_from, c.auto_writeoff_promo_to
+       FROM crm.disposal_policy_change c
+       -- An INNER join, which would normally be the wrong shape for an audit read: a row
+       -- that vanishes because a join missed is evidence quietly withheld. It cannot miss
+       -- here, and the reason is structural rather than hopeful — the composite foreign key
+       -- is ON DELETE RESTRICT, so a rep profile named by a change cannot be deleted while
+       -- the change exists, and RLS shows the caller every profile in their own tenant.
+       JOIN crm.rep_profile r ON r.id = c.changed_by
+      WHERE c.tenant_id = $1
+      ORDER BY c.changed_at DESC, c.id DESC
+      LIMIT $2`,
+    [tenantId, limit],
+  );
+  return rows;
+}
+
+/**
+ * Changes the policy — by writing the change, which is the only way there is.
+ *
+ * 0059 made `crm.disposal_policy` a projection of `crm.disposal_policy_change`, so this
+ * INSERTs and reads the result back rather than UPDATEing: the trigger stamps what the
+ * values were BEFORE (never trusting the caller about that), refuses a change that changes
+ * nothing, and applies the new values. A direct UPDATE is refused by the database.
+ *
+ * `changedBy` and `reason` are REQUIRED, which is the point of the increment. Before it, the
+ * write was `UPDATE … SET grace_days = 7` and the record of who shortened a regulated
+ * deadline, from what, and why, did not exist — only `updated_at` moved, which made the
+ * absence look like maintenance.
+ */
 export async function setDisposalPolicy(
   tx: PoolClient,
   tenantId: string,
-  input: { graceDays?: number; autoWriteoffPromo?: boolean },
+  input: {
+    graceDays?: number;
+    autoWriteoffPromo?: boolean;
+    readonly changedBy: string;
+    readonly reason: string;
+  },
 ): Promise<DisposalPolicy> {
-  await disposalPolicy(tx, tenantId);
-  const { rows } = await tx.query<DisposalPolicy>(
-    `UPDATE crm.disposal_policy
-        SET grace_days = COALESCE($2, grace_days),
-            auto_writeoff_promo = COALESCE($3, auto_writeoff_promo),
-            updated_at = now()
-      WHERE tenant_id = $1
-      RETURNING grace_days, auto_writeoff_promo`,
-    [tenantId, input.graceDays ?? null, input.autoWriteoffPromo ?? null],
-  );
-  return rows[0]!;
+  try {
+    const { rows } = await tx.query<DisposalPolicy>(
+      `INSERT INTO crm.disposal_policy_change
+         (tenant_id, changed_by, reason, grace_days_to, auto_writeoff_promo_to)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING grace_days_to AS grace_days, auto_writeoff_promo_to AS auto_writeoff_promo`,
+      [tenantId, input.changedBy, input.reason, input.graceDays ?? null, input.autoWriteoffPromo ?? null],
+    );
+    return rows[0]!;
+  } catch (err) {
+    throw translateSampleError(err);
+  }
 }
 
 export async function sweepExpiredStock(

@@ -101,6 +101,15 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [t]);
+        // Before the policy row, and with the log's own append-only trigger turned off: 0059
+        // refuses a DELETE on the history, which is the point of it, so a fixture that needs
+        // to undo one says so explicitly rather than finding a statement that happens to work.
+        await tx.query("ALTER TABLE crm.disposal_policy_change DISABLE TRIGGER USER");
+        try {
+          await tx.query("DELETE FROM crm.disposal_policy_change WHERE tenant_id = $1", [t]);
+        } finally {
+          await tx.query("ALTER TABLE crm.disposal_policy_change ENABLE TRIGGER USER");
+        }
         await tx.query("DELETE FROM crm.disposal_policy WHERE tenant_id = $1", [t]);
         // Per-tenant policy rows are STATE, not fixtures: leaving one behind made the
         // "documented defaults" test below pass on a fresh database and fail on the
@@ -3174,7 +3183,9 @@ describe("the API, end to end", () => {
       });
 
       it("refuses a write from a rep with no role — 403, not 404", async () => {
-        const res = await call("PUT", "/v1/admin/samples/disposal-policy", { body: { graceDays: 7 } });
+        const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { graceDays: 7, reason: "tightening after the inspection" },
+        });
         expect(res.status).toBe(403);
         expect(res.body.detail).toContain("compliance");
         // 403 and not the 404 the supervision routes return: the resource is the
@@ -3193,36 +3204,128 @@ describe("the API, end to end", () => {
         const roster = await call("GET", "/v1/team", { auth: mgrToken });
         expect(roster.body.data.length).toBeGreaterThan(0);
         const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
-          body: { graceDays: 7 },
+          body: { graceDays: 7, reason: "tightening after the inspection" },
           auth: mgrToken,
         });
         expect(res.status).toBe(403);
       });
 
-      it("accepts a write from the compliance officer", async () => {
+      it("accepts a write from the compliance officer, and says who made it and why", async () => {
         await grant(() => rep, "compliance", () => manager);
         const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
-          body: { graceDays: 14, autoWriteoffPromo: true },
+          body: {
+            graceDays: 14,
+            autoWriteoffPromo: true,
+            reason: "a fortnight from now on, and leaflets go back centrally",
+          },
           auth: repToken,
         });
         expect(res.status).toBe(200);
         expect(res.body).toEqual({ grace_days: 14, auto_writeoff_promo: true });
-        expect((await call("GET", "/v1/samples/disposal-policy")).body.grace_days).toBe(14);
+
+        // THE PROVENANCE, which is the whole increment. Before 0059 the write was an
+        // `UPDATE … SET grace_days = 14` and this read answered two numbers: a deadline
+        // loosened last Tuesday by somebody who has since lost the role was indistinguishable
+        // from one that had stood for a year.
+        const read = await call("GET", "/v1/samples/disposal-policy");
+        expect(read.body.grace_days).toBe(14);
+        expect(read.body.changed_by).toBe(rep);
+        expect(read.body.changed_by_name).toBe("Rep One");
+        expect(read.body.reason).toContain("fortnight");
+        expect(typeof read.body.changed_at).toBe("string");
+
+        // And the history, which every rep may read for the same reason the policy itself is
+        // open: they are measured against it.
+        const history = await call("GET", "/v1/samples/disposal-policy/history", {
+          auth: token({ sub: "idp|rep2" }),
+        });
+        expect(history.status).toBe(200);
+        expect(history.body.data).toHaveLength(1);
+        expect(history.body.data[0]).toMatchObject({
+          grace_days_from: 30,
+          grace_days_to: 14,
+          auto_writeoff_promo_from: false,
+          auto_writeoff_promo_to: true,
+          changed_by_name: "Rep One",
+        });
+      });
+
+      it("says nobody set it when nobody has", async () => {
+        // NULL rather than a placeholder: the policy is the shipped default, and a screen
+        // saying "set by —" would imply somebody had set it.
+        const res = await call("GET", "/v1/samples/disposal-policy");
+        expect(res.body).toMatchObject({
+          grace_days: 30,
+          auto_writeoff_promo: false,
+          changed_at: null,
+          changed_by: null,
+          changed_by_name: null,
+          reason: null,
+        });
+        expect((await call("GET", "/v1/samples/disposal-policy/history")).body.data).toEqual([]);
+      });
+
+      it("refuses a change with no reason, which is the record it exists to keep", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        const none = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { graceDays: 7 },
+          auth: repToken,
+        });
+        expect(none.status).toBe(422);
+        const thin = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { graceDays: 7, reason: "." },
+          auth: repToken,
+        });
+        expect(thin.status).toBe(422);
+        // Nothing was recorded and nothing changed, so a refused change leaves no trace to
+        // explain away.
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.grace_days).toBe(30);
+        expect((await call("GET", "/v1/samples/disposal-policy/history")).body.data).toEqual([]);
+      });
+
+      it("refuses a change to the value already in force as a conflict", async () => {
+        // A well-formed request the policy's own state refuses, which is a 409 and not a
+        // 422 — and it keeps the history free of rows that record nothing.
+        await grant(() => rep, "compliance", () => manager);
+        const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { graceDays: 30, reason: "writing down the value that is already in force" },
+          auth: repToken,
+        });
+        expect(res.status).toBe(409);
+        expect(res.body.detail).toContain("changes nothing");
       });
 
       it("refuses a grace period outside the range the SOP allows", async () => {
         await grant(() => rep, "compliance", () => manager);
-        expect((await call("PUT", "/v1/admin/samples/disposal-policy", { body: { graceDays: 400 } })).status).toBe(422);
+        expect(
+          (
+            await call("PUT", "/v1/admin/samples/disposal-policy", {
+              body: { graceDays: 400, reason: "a grace period longer than the SOP allows" },
+            })
+          ).status,
+        ).toBe(422);
       });
 
       it("refuses an empty change rather than reporting a no-op as success", async () => {
         await grant(() => rep, "compliance", () => manager);
-        expect((await call("PUT", "/v1/admin/samples/disposal-policy", { body: {} })).status).toBe(422);
+        expect(
+          (
+            await call("PUT", "/v1/admin/samples/disposal-policy", {
+              body: { reason: "a reason attached to no change at all" },
+            })
+          ).status,
+        ).toBe(422);
       });
 
       it("does not accept the administrator role in place of compliance", async () => {
         await grant(() => rep, "administrator", () => manager);
-        expect((await call("PUT", "/v1/admin/samples/disposal-policy", { body: { graceDays: 7 } })).status).toBe(403);
+        expect(
+          (
+            await call("PUT", "/v1/admin/samples/disposal-policy", {
+              body: { graceDays: 7, reason: "an administrator reaching for a compliance knob" },
+            })
+          ).status,
+        ).toBe(403);
       });
     });
 

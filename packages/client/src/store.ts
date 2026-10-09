@@ -1,9 +1,11 @@
 import type {
   Account,
   Count,
+  DisposalPolicy,
   FailedErpWrite,
   Obligation,
   Holding,
+  PolicyChange,
   IncomingTransfer,
   Me,
   RecallableTransfer,
@@ -97,6 +99,18 @@ export interface CachedReference {
    * accepted.
    */
   readonly warehouses?: readonly Warehouse[];
+  /**
+   * The disposal SOP parameters, and the roles the signed-in rep holds.
+   *
+   * The policy is cached because the deadline is the point and it does not change while a
+   * rep is offline — the same reasoning as the obligations themselves. The ROLES are cached
+   * for a narrower reason: without them a device cannot tell whether to offer an
+   * administrative form at all, and a cold start with no signal would otherwise show a
+   * compliance officer nothing and a plain rep a form every write would refuse.
+   */
+  readonly policy?: DisposalPolicy;
+  readonly policyChanges?: readonly PolicyChange[];
+  readonly roles?: readonly string[];
   /** Epoch ms of the fetch, so the UI can say how stale it is instead of implying fresh. */
   readonly fetchedAt: number;
 }

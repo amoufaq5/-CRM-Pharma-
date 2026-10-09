@@ -6,6 +6,7 @@ import {
   type CountBody,
   type CountLineBody,
   type DisbursementBody,
+  type PolicyBody,
   type RecallBody,
   type ReturnBody,
   type SignatureBody,
@@ -161,6 +162,20 @@ export class ApiTransport implements SyncTransport {
   /** Material back to a warehouse, which is also a write the ERP has to be told about. */
   async postReturn(body: ReturnBody): Promise<TransportResult> {
     return this.request("POST", "/v1/samples/returns", body);
+  }
+
+  /**
+   * Change the tenant's disposal SOP parameters.
+   *
+   * NOT a queued outbox kind, for the same reason the retry below is not — and the reason is
+   * sharper here. Everything the queue holds is a record of something that HAPPENED in the
+   * field and must survive a dead battery. This is a decision about a tenant-wide rule, made
+   * at a desk by one of the two people in the tenant who may make it. A queued policy change
+   * would be a rule that takes effect whenever a phone next finds signal, and a second
+   * officer's change landing in between would be silently overwritten by a stale one.
+   */
+  async putDisposalPolicy(body: PolicyBody): Promise<TransportResult> {
+    return this.request("PUT", "/v1/admin/samples/disposal-policy", body);
   }
 
   /**

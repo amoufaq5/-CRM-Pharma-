@@ -1,4 +1,5 @@
 export {
+  DisposalPolicyError,
   IncompleteRecordError,
   InsufficientHoldingError,
   LedgerImmutableError,
@@ -58,12 +59,17 @@ export {
 } from "./store.js";
 export {
   DEFAULT_GRACE_DAYS,
+  POLICY_HISTORY_LIMIT,
   disposalHistory,
   disposalPolicy,
+  disposalPolicyDetail,
+  disposalPolicyHistory,
   setDisposalPolicy,
   sweepExpiredStock,
   type DisposalObligationHistoryEntry,
   type DisposalPolicy,
+  type DisposalPolicyChange,
+  type DisposalPolicyDetail,
   type ExpirySweepOptions,
   type ExpirySweepResult,
 } from "./expiry-sweep.js";

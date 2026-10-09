@@ -339,14 +339,14 @@ describe("the expiry sweep", () => {
 
     it("uses the tenant's grace period, and the one in force when it was discovered", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { graceDays: 7 });
+        await setDisposalPolicy(tx, TENANT, { graceDays: 7, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         await heldStock(tx, { expiry: "2026-03-31" });
         const result = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
         expect(result.policy.grace_days).toBe(7);
         expect((await openObligations(tx, REP, { asOf: "2026-04-10" }))[0]!.due_by).toBe("2026-04-17");
 
         // Lengthening the policy must not move a deadline already communicated.
-        await setDisposalPolicy(tx, TENANT, { graceDays: 90 });
+        await setDisposalPolicy(tx, TENANT, { graceDays: 90, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-11") });
         expect((await openObligations(tx, REP, { asOf: "2026-04-11" }))[0]!.due_by).toBe("2026-04-17");
       });
@@ -400,7 +400,7 @@ describe("the expiry sweep", () => {
         // period, stock destroyed on day three, and a sweep that does not run until day
         // nine — a weekend, a paused scheduler, a device that synced late. Recorded as the
         // sweep's date it reads two days overdue; it was four days early.
-        await setDisposalPolicy(tx, TENANT, { graceDays: 7 });
+        await setDisposalPolicy(tx, TENANT, { graceDays: 7, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         const lot = await heldStock(tx, { expiry: "2026-03-31", quantity: 4 });
         await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
         const { rows: due } = await tx.query<{ due_by: string }>(
@@ -565,7 +565,7 @@ describe("the expiry sweep", () => {
 
     it("writes off promotional material once the tenant opts in, and closes the obligation", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true });
+        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         const lot = await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 50 });
 
         const result = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
@@ -590,7 +590,7 @@ describe("the expiry sweep", () => {
     /** Opting in must not reach a drug sample. The flag is named for what it covers. */
     it("never writes off a drug sample, even with the flag on", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true });
+        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         const drug = await heldStock(tx, { expiry: "2026-03-31", kind: "drug_sample", quantity: 10 });
         const promo = await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 20 });
 
@@ -607,7 +607,7 @@ describe("the expiry sweep", () => {
 
     it("is idempotent with the flag on", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true });
+        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 20 });
         expect((await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") })).autoWrittenOff).toBe(1);
         expect((await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-11") })).autoWrittenOff).toBe(0);
@@ -685,7 +685,7 @@ describe("the expiry sweep", () => {
 
     it("tells nobody about an automatic promo write-off, which is not news", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true });
+        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
         await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 20 });
         const result = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
         expect(result.autoWrittenOff).toBe(1);
@@ -712,7 +712,7 @@ describe("the expiry sweep", () => {
 
     it("refuses an implausible grace period", async () => {
       await inTenant(async (tx) => {
-        await expect(setDisposalPolicy(tx, TENANT, { graceDays: 400 })).rejects.toThrow(/grace_days/);
+        await expect(setDisposalPolicy(tx, TENANT, { graceDays: 400, changedBy: REP, reason: "a fixture setting the SOP parameter under test" })).rejects.toThrow(/grace_days/);
       });
     });
   });

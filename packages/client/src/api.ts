@@ -479,6 +479,76 @@ export type Obligation = z.infer<typeof Obligation>;
 export const ObligationList = z.object({ data: z.array(Obligation) });
 
 /**
+ * `GET /v1/me/roles`: the administrative roles the caller holds, so a device can decide
+ * which screens to show.
+ *
+ * The route has existed since 0023 with that sentence in its own comment and no consumer.
+ * `.catch([])` rather than a required field: a server older than the route answers 404 and
+ * the reader keeps an empty set, which is the right default for an administrative screen —
+ * a device that guessed yes would offer a form every write would refuse.
+ */
+export const MyRoles = z.object({ roles: z.array(z.string()).catch([]) });
+export type MyRoles = z.infer<typeof MyRoles>;
+
+/**
+ * `GET /v1/samples/disposal-policy`: the deadline a rep is held to, and who set it.
+ *
+ * The provenance is as load-bearing as the numbers. "Thirty days" is not an answer to "what
+ * am I held to" without who decided, when, and on what grounds — and all four are null for a
+ * tenant that has never changed anything, which is a fact rather than missing data: the
+ * policy is the shipped default and nobody set it.
+ */
+export const DisposalPolicy = z
+  .object({
+    grace_days: z.number().int(),
+    auto_writeoff_promo: z.boolean(),
+    changed_at: z.string().nullish(),
+    changed_by: Uuid.nullish(),
+    changed_by_name: z.string().nullish(),
+    reason: z.string().nullish(),
+  })
+  .passthrough();
+export type DisposalPolicy = z.infer<typeof DisposalPolicy>;
+
+/** A row of `GET /v1/samples/disposal-policy/history`: one change, with both halves. */
+export const PolicyChange = z
+  .object({
+    id: Uuid,
+    changed_at: z.string(),
+    changed_by: Uuid,
+    changed_by_name: z.string(),
+    reason: z.string(),
+    grace_days_from: z.number().int(),
+    grace_days_to: z.number().int(),
+    auto_writeoff_promo_from: z.boolean(),
+    auto_writeoff_promo_to: z.boolean(),
+  })
+  .passthrough();
+export type PolicyChange = z.infer<typeof PolicyChange>;
+
+export const PolicyChangeList = z.object({ data: z.array(PolicyChange) });
+
+/**
+ * What `PUT /v1/admin/samples/disposal-policy` accepts.
+ *
+ * THE REASON IS NOT OPTIONAL, and the ten-character floor is the column's own CHECK rather
+ * than a UI preference: this is the authority a regulated deadline is set under, and 0023's
+ * header named "no record of who changed what" as the debt it was clearing. The author is
+ * NOT in the body — the server takes it from the token, like every other attributed write —
+ * so a device cannot file one officer's decision under another's name.
+ */
+export const PolicyBody = z
+  .object({
+    graceDays: z.number().int().min(0).max(365).optional(),
+    autoWriteoffPromo: z.boolean().optional(),
+    reason: z.string().min(10).max(1000),
+  })
+  .refine((v) => v.graceDays !== undefined || v.autoWriteoffPromo !== undefined, {
+    message: "supply a grace period, the promo switch, or both",
+  });
+export type PolicyBody = z.infer<typeof PolicyBody>;
+
+/**
  * A row of `GET /v1/samples/warehouses`: a depot a return can be addressed to.
  *
  * The list that makes a return possible for material this rep never received from a depot

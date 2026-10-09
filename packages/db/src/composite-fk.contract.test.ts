@@ -17,8 +17,9 @@ import { withTenantContext } from "./tenant-context.js";
  * dropped two of the 46, BOTH of `crm.notification_delivery`'s, on retention grounds: a
  * delivery record has to outlive the notification it describes and the endpoint it was
  * addressed to, or the evidence of a push to a third party disappears when somebody tidies
- * up either parent. 44 remain and the rule is unchanged — a reference that EXISTS is
- * composite — and both dropped guards moved into `crm.notification_delivery_context`, which
+ * up either parent. 44 remained, and every reference added since arrives composite — 0056's
+ * `sample_transaction.count_id` and 0059's `disposal_policy_change.changed_by` — because the
+ * rule is unchanged: a reference that EXISTS is composite, and both dropped guards moved into `crm.notification_delivery_context`, which
  * is tighter than the keys were: a referential check runs with row security disabled and
  * would have found another tenant's parent, where resolving it under the caller's own policy
  * makes it read as absent.
@@ -52,7 +53,8 @@ import { withTenantContext } from "./tenant-context.js";
 
 /**
  * The 44 references migrations 0035 (38) and 0037 (the last 8) made tenant-scoped and 0046
- * and 0048 left standing, and what each one must still be.
+ * and 0048 left standing, plus the ones added composite since, and what each one must still
+ * be.
  */
 interface Hardened {
   /** The referencing table, unqualified. */
@@ -110,6 +112,9 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   sample_holding_lot_id_fkey: { table: "sample_holding", column: "lot_id", parent: "sample_lot", onDelete: "RESTRICT" },
   sample_count_rep_profile_id_fkey: { table: "sample_count", column: "rep_profile_id", parent: "rep_profile", onDelete: "RESTRICT" },
   sample_count_counted_by_fkey: { table: "sample_count", column: "counted_by", parent: "rep_profile", onDelete: "RESTRICT" },
+  // 0059. The record that a named employee changed a regulated SOP parameter; RESTRICT
+  // because the log is the audit trail and outlives nothing.
+  disposal_policy_change_changed_by_fkey: { table: "disposal_policy_change", column: "changed_by", parent: "rep_profile", onDelete: "RESTRICT" },
   sample_count_line_count_id_fkey: { table: "sample_count_line", column: "count_id", parent: "sample_count", onDelete: "CASCADE" },
   sample_count_line_lot_id_fkey: { table: "sample_count_line", column: "lot_id", parent: "sample_lot", onDelete: "RESTRICT" },
 
@@ -377,6 +382,18 @@ const PROBES: Readonly<Record<string, Probe>> = {
                                               counterparty_rep_profile_id, transfer_of, occurred_at)
           VALUES (gen_random_uuid(), $1, $2, $3, 'transfer_recall', 1, $4, $5, now())`,
     params: [TENANT_FK_B, B.lot, B.rep1, B.rep2, A.tx],
+  },
+  disposal_policy_change_changed_by_fkey: {
+    what: "a policy change attributed to another tenant's rep",
+    // Every from/to column is supplied, unlike the route, which supplies only what the
+    // policy should BECOME. 0059's trigger fills the rest — and this probe runs with the
+    // table's user triggers off, as the whole file does, so the NOT NULLs would answer
+    // first and the foreign key would never be reached.
+    sql: `INSERT INTO crm.disposal_policy_change
+            (tenant_id, changed_by, reason, grace_days_from, grace_days_to,
+             auto_writeoff_promo_from, auto_writeoff_promo_to)
+          VALUES ($1, $2, 'probing the composite key', 30, 7, false, false)`,
+    params: [TENANT_FK_B, A.rep1],
   },
   sample_transaction_count_id_fkey: {
     what: "an adjustment claiming to come from another tenant's count",
