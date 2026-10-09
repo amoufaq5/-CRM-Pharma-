@@ -156,8 +156,12 @@ export async function sweepExpiredStock(
     let resolved = 0;
     let unattributed = 0;
     for (const row of live) {
-      const { rows: movement } = await tx.query<{ transaction_id: string; resolution: string }>(
-        `SELECT transaction_id, resolution
+      const { rows: movement } = await tx.query<{
+        transaction_id: string;
+        resolution: string;
+        occurred_on: string;
+      }>(
+        `SELECT transaction_id, resolution, occurred_on::text AS occurred_on
            FROM crm.disposal_resolving_movement($1, $2, $3::date)`,
         [row.rep_profile_id, row.lot_id, row.discovered_on],
       );
@@ -170,12 +174,21 @@ export async function sweepExpiredStock(
         unattributed += 1;
         continue;
       }
+      // WHEN THE MATERIAL LEFT, not when this sweep noticed (0057). The movement is right
+      // here and carries the date; `today` would record a disposal done on day three of a
+      // grace period as having happened on day nine, which is the difference between early
+      // and overdue in the one field an audit of lateness reads.
+      //
+      // Bounded by the sweep's own date because a device clock running fast must not
+      // produce a disposal recorded in the future. No lower bound is needed: the function
+      // only returns movements at or after `discovered_on`.
+      const resolvedOn = found.occurred_on < today ? found.occurred_on : today;
       await tx.query(
         `UPDATE crm.disposal_obligation
             SET status = 'resolved', resolved_on = $2::date, resolution = $3,
                 resolving_transaction_id = $4, updated_at = now()
           WHERE id = $1`,
-        [row.id, today, found.resolution, found.transaction_id],
+        [row.id, resolvedOn, found.resolution, found.transaction_id],
       );
       resolved += 1;
     }

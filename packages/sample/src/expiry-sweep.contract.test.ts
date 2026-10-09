@@ -373,14 +373,111 @@ describe("the expiry sweep", () => {
         expect(result.resolved).toBe(1);
         expect(await openObligations(tx, REP, { asOf: "2026-04-16" })).toHaveLength(0);
 
-        const { rows } = await tx.query<{ status: string; resolution: string; resolving_transaction_id: string }>(
-          "SELECT status, resolution, resolving_transaction_id FROM crm.disposal_obligation WHERE tenant_id = $1",
+        const { rows } = await tx.query<{
+          status: string;
+          resolution: string;
+          resolving_transaction_id: string;
+          resolved_on: string;
+        }>(
+          `SELECT status, resolution, resolving_transaction_id, resolved_on::text AS resolved_on
+             FROM crm.disposal_obligation WHERE tenant_id = $1`,
           [TENANT],
         );
         expect(rows[0]!.status).toBe("resolved");
         expect(rows[0]!.resolution).toBe("destroyed");
         // Attributed from the ledger rather than declared, so the answer is the ledger's.
         expect(rows[0]!.resolving_transaction_id).toBe(destroyed.id);
+        // AND THE DATE IS THE LEDGER'S TOO (0057). It was destroyed on the 15th and swept
+        // on the 16th; `resolved_on` used to be the sweep's date, which is the one field an
+        // audit of lateness reads.
+        expect(rows[0]!.resolved_on).toBe("2026-04-15");
+      });
+    });
+
+    it("records the disposal's OWN date, however long the sweep took to notice", async () => {
+      await inTenant(async (tx) => {
+        // The defect 0057 fixed, at the scale that makes it matter: a seven-day grace
+        // period, stock destroyed on day three, and a sweep that does not run until day
+        // nine — a weekend, a paused scheduler, a device that synced late. Recorded as the
+        // sweep's date it reads two days overdue; it was four days early.
+        await setDisposalPolicy(tx, TENANT, { graceDays: 7 });
+        const lot = await heldStock(tx, { expiry: "2026-03-31", quantity: 4 });
+        await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
+        const { rows: due } = await tx.query<{ due_by: string }>(
+          "SELECT due_by::text AS due_by FROM crm.disposal_obligation WHERE tenant_id = $1",
+          [TENANT],
+        );
+        expect(due[0]!.due_by).toBe("2026-04-17");
+
+        await writeOff(tx, TENANT, {
+          id: randomUUID(),
+          lotId: lot.id,
+          repProfileId: REP,
+          quantity: 4,
+          occurredAt: day("2026-04-13"),
+          kind: "expiry_writeoff",
+          reason: "written off in the field, binned per SOP-14",
+        });
+
+        await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-19") });
+        const { rows } = await tx.query<{ resolved_on: string; resolution: string }>(
+          `SELECT resolved_on::text AS resolved_on, resolution
+             FROM crm.disposal_obligation WHERE tenant_id = $1`,
+          [TENANT],
+        );
+        expect(rows[0]!.resolution).toBe("written_off");
+        expect(rows[0]!.resolved_on).toBe("2026-04-13");
+        // Four days inside the deadline, which is the fact. The sweep's own date would have
+        // said the 19th, and nothing in the record would have contradicted it.
+        expect(rows[0]!.resolved_on < due[0]!.due_by).toBe(true);
+      });
+    });
+
+    it("will not record a disposal in the future, however wrong a device's clock is", async () => {
+      await inTenant(async (tx) => {
+        // The movement keeps whatever date it was given — the ledger is append-only and not
+        // the sweep's business — but an obligation claiming it was resolved next week is
+        // worse than one that is a few hours coarse.
+        const lot = await heldStock(tx, { expiry: "2026-03-31", quantity: 2 });
+        await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
+        await writeOff(tx, TENANT, {
+          id: randomUUID(),
+          lotId: lot.id,
+          repProfileId: REP,
+          quantity: 2,
+          occurredAt: day("2026-05-30"),
+          kind: "destruction",
+          reason: "destroyed; this device's clock is a month fast",
+        });
+        await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-14") });
+        const { rows } = await tx.query<{ resolved_on: string }>(
+          `SELECT resolved_on::text AS resolved_on FROM crm.disposal_obligation WHERE tenant_id = $1`,
+          [TENANT],
+        );
+        expect(rows[0]!.resolved_on).toBe("2026-04-14");
+      });
+    });
+
+    it("cannot record a resolution before the obligation was discovered", async () => {
+      await inTenant(async (tx) => {
+        // The lower bound needs no clamp, and this is why: the attribution query only looks
+        // at movements at or after `discovered_on`, so a disposal that predates the
+        // discovery is not a candidate for resolving it at all.
+        const lot = await heldStock(tx, { expiry: "2026-03-31", quantity: 10 });
+        // Half of it goes before anybody notices it has expired.
+        await writeOff(tx, TENANT, {
+          id: randomUUID(),
+          lotId: lot.id,
+          repProfileId: REP,
+          quantity: 10,
+          occurredAt: day("2026-04-05"),
+          kind: "destruction",
+          reason: "destroyed before the sweep ran",
+        });
+        const result = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
+        // Nothing to raise (the holding is already zero) and so nothing to resolve.
+        expect(result.opened).toBe(0);
+        expect(await openObligations(tx, REP, { asOf: "2026-04-10" })).toHaveLength(0);
       });
     });
 

@@ -2,6 +2,7 @@ import type {
   AcceptBody,
   CountBody,
   CountLineBody,
+  WriteOffBody,
   DisbursementBody,
   RecallBody,
   SignatureBody,
@@ -54,6 +55,7 @@ export const OUTBOX_KINDS = [
   "count_line",
   "count_commit",
   "count_cancel",
+  "write_off",
 ] as const;
 export type OutboxKind = (typeof OUTBOX_KINDS)[number];
 
@@ -214,6 +216,19 @@ export interface CountCancelEntry extends OutboxEntryBase {
   readonly countOf: string;
 }
 
+/**
+ * Material leaving custody for good: destroyed, or written off because it expired.
+ *
+ * No dependency and no second half. It is the simplest kind in this queue and the most
+ * consequential: a row that says regulated material no longer exists, carrying the only
+ * record of why. The server's `reason` is required for that reason, and the form refuses an
+ * empty one at the keyboard rather than queueing something the server must reject.
+ */
+export interface WriteOffEntry extends OutboxEntryBase {
+  readonly kind: "write_off";
+  readonly body: WriteOffBody;
+}
+
 export type OutboxEntry =
   | VisitEntry
   | DisbursementEntry
@@ -224,7 +239,8 @@ export type OutboxEntry =
   | CountEntry
   | CountLineEntry
   | CountCommitEntry
-  | CountCancelEntry;
+  | CountCancelEntry
+  | WriteOffEntry;
 
 export interface BackoffPolicy {
   /** First delay, doubled per attempt. */
@@ -285,7 +301,8 @@ export type NewOutboxEntry =
   | Omit<CountEntry, keyof OutboxEntryStatus>
   | Omit<CountLineEntry, keyof OutboxEntryStatus>
   | Omit<CountCommitEntry, keyof OutboxEntryStatus>
-  | Omit<CountCancelEntry, keyof OutboxEntryStatus>;
+  | Omit<CountCancelEntry, keyof OutboxEntryStatus>
+  | Omit<WriteOffEntry, keyof OutboxEntryStatus>;
 
 /**
  * Every helper takes the rep, and takes it as a REQUIRED option rather than an optional
@@ -467,6 +484,16 @@ export function enqueueCountCommit(
     },
     now,
   );
+}
+
+/** Material out of custody. Keyed by its own id, like every other movement. */
+export function enqueueWriteOff(
+  entries: readonly OutboxEntry[],
+  body: WriteOffBody,
+  now: number,
+  opts: Attribution,
+): readonly OutboxEntry[] {
+  return enqueue(entries, { id: body.id, kind: "write_off", body, createdBy: opts.createdBy }, now);
 }
 
 /**

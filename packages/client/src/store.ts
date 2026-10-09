@@ -1,6 +1,7 @@
 import type {
   Account,
   Count,
+  Obligation,
   Holding,
   IncomingTransfer,
   Me,
@@ -66,6 +67,14 @@ export interface CachedReference {
    * so a device that cannot see it would offer a button that always fails.
    */
   readonly counts?: readonly Count[];
+  /**
+   * What this rep must dispose of, and by when.
+   *
+   * Cached because the deadline is the point: a rep standing in front of expired stock
+   * with no signal needs to know it is overdue, and that fact does not change while they
+   * are offline — the only thing that changes is how overdue.
+   */
+  readonly obligations?: readonly Obligation[];
   /** Epoch ms of the fetch, so the UI can say how stale it is instead of implying fresh. */
   readonly fetchedAt: number;
 }

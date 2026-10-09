@@ -406,3 +406,66 @@ export const CountList = z.object({ data: z.array(Count) });
 
 /** What `POST /v1/samples/counts/:id/commit` answers: the finding, as a number. */
 export const CommitResult = z.object({ adjustments: z.number().int() });
+
+// ---- getting material out of custody --------------------------------------
+
+export const WRITE_OFF_KINDS = ["destruction", "expiry_writeoff"] as const;
+export type WriteOffKind = (typeof WRITE_OFF_KINDS)[number];
+
+/**
+ * What `POST /v1/samples/write-offs` accepts: material leaving custody for good.
+ *
+ * TWO KINDS, KEPT APART ON PURPOSE, as the route's own comment says: `destruction` says it
+ * was destroyed, `expiry_writeoff` says it stopped being counted. A reader who needs to
+ * tell those apart can, and nothing in this client collapses them into one word.
+ *
+ * `reason` is REQUIRED by the server (`length BETWEEN 1 AND 500`), and this is the one
+ * write in the whole client where that is true of a free-text field. It is the only record
+ * of why regulated material no longer exists, so a device that let it through empty would
+ * be queueing a row the server must refuse — hours later, from inside a queue.
+ *
+ * `occurredAt` is when the material actually went, which for a write-off recorded in a car
+ * park is not when it syncs. It is also the date the expiry sweep now records the
+ * obligation as resolved on (0057), so it is the difference between a disposal logged as
+ * early and the same disposal logged as overdue.
+ */
+export const WriteOffBody = z.object({
+  id: Uuid,
+  lotId: Uuid,
+  quantity: DecimalQuantity,
+  occurredAt: z.string().datetime(),
+  kind: z.enum(WRITE_OFF_KINDS),
+  reason: z.string().min(1).max(500),
+});
+export type WriteOffBody = z.infer<typeof WriteOffBody>;
+
+/**
+ * A row of `GET /v1/samples/obligations`: material this rep must get rid of, and by when.
+ *
+ * `days_overdue` is positive once past the deadline and negative while there is still time,
+ * so one number sorts and reads for both — and `status` is the server's own word for it.
+ *
+ * `quantity_on_hand` comes from the holding rather than from the obligation, which makes a
+ * zero here meaningful: the material is gone and the obligation is simply waiting for the
+ * nightly sweep to confirm it. The screen says that rather than showing a deadline for
+ * something already dealt with.
+ */
+export const Obligation = z
+  .object({
+    id: Uuid,
+    rep_profile_id: Uuid,
+    lot_id: Uuid,
+    erp_item_id: z.string(),
+    lot_number: z.string(),
+    material_kind: z.string(),
+    expired_on: z.string(),
+    discovered_on: z.string(),
+    due_by: z.string(),
+    days_overdue: z.number().int(),
+    status: z.enum(["open", "overdue"]),
+    quantity_on_hand: z.string(),
+  })
+  .passthrough();
+export type Obligation = z.infer<typeof Obligation>;
+
+export const ObligationList = z.object({ data: z.array(Obligation) });

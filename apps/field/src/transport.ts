@@ -10,6 +10,7 @@ import {
   type SignatureBody,
   type TransferBody,
   type VisitBody,
+  type WriteOffBody,
 } from "@crm/client";
 import type { SyncTransport, TransportResult } from "@crm/client";
 
@@ -149,6 +150,11 @@ export class ApiTransport implements SyncTransport {
 
   async postCountCancel(countId: string): Promise<TransportResult> {
     return this.request("POST", `/v1/samples/counts/${encodeURIComponent(countId)}/cancel`, {});
+  }
+
+  /** Material out of custody. One route, one row, always with a reason. */
+  async postWriteOff(body: WriteOffBody): Promise<TransportResult> {
+    return this.request("POST", "/v1/samples/write-offs", body);
   }
 
   /**

@@ -9,6 +9,7 @@ import type {
   SignatureBody,
   TransferBody,
   VisitBody,
+  WriteOffBody,
 } from "./api.js";
 import {
   DEFAULT_BACKOFF,
@@ -19,6 +20,7 @@ import {
   enqueueCountCancel,
   enqueueCountCommit,
   enqueueCountLine,
+  enqueueWriteOff,
   enqueueDisbursement,
   enqueueRecall,
   enqueueSignature,
@@ -61,6 +63,7 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
   countLines: { countId: string; body: CountLineBody }[];
   commits: string[];
   cancels: string[];
+  writeOffs: WriteOffBody[];
 } {
   const batches: VisitBody[][] = [];
   const disbursementBatches: DisbursementBody[][] = [];
@@ -72,6 +75,7 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
   const countLines: { countId: string; body: CountLineBody }[] = [];
   const commits: string[] = [];
   const cancels: string[] = [];
+  const writeOffs: WriteOffBody[] = [];
   const calls: string[] = [];
   let i = 0;
   const next = (): TransportResult => {
@@ -90,6 +94,7 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
     countLines,
     commits,
     cancels,
+    writeOffs,
     calls,
     postVisits: async (visits) => {
       batches.push([...visits]);
@@ -139,6 +144,11 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
     postCountCancel: async (countId) => {
       cancels.push(countId);
       calls.push(`cancel:${countId}`);
+      return next();
+    },
+    postWriteOff: async (body) => {
+      writeOffs.push(body);
+      calls.push(`write-off:${body.id}`);
       return next();
     },
   };
@@ -838,5 +848,90 @@ describe("abandoning a count", () => {
     const transport = recordingTransport([{ kind: "ok", status: 204, body: null }]);
     const report = await sync({ store, transport, now });
     expect(report.accepted).toEqual(["cancel-1"]);
+  });
+});
+
+describe("syncOnce with a write-off", () => {
+  const now = (): number => 10_000;
+  const created = { kind: "ok", status: 201, body: {} } as const satisfies TransportResult;
+  const LOT = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c01";
+  const writeOffBody = (id: string, kind: "destruction" | "expiry_writeoff" = "expiry_writeoff"): WriteOffBody => ({
+    id,
+    lotId: LOT,
+    quantity: "3",
+    occurredAt: "2026-10-09T09:00:00.000Z",
+    kind,
+    reason: "expired, destroyed at the depot per SOP-14",
+  });
+
+  it("posts it to its own route, carrying the reason", async () => {
+    const store = memoryStore(enqueueWriteOff([], writeOffBody("w1"), 1000, MINE));
+    const transport = recordingTransport([created]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.writeOffs).toEqual([writeOffBody("w1")]);
+    expect(report.accepted).toEqual(["w1"]);
+    expect(store.entries).toEqual([]);
+  });
+
+  it("keeps the two kinds apart on the wire", async () => {
+    // `destruction` says it was destroyed and `expiry_writeoff` says it stopped being
+    // counted. A client that collapsed them would make the ledger unable to answer which
+    // happened, which is the question an inspector asks first.
+    const store = memoryStore(enqueueWriteOff([], writeOffBody("w1", "destruction"), 1000, MINE));
+    const transport = recordingTransport([created]);
+    await sync({ store, transport, now });
+    expect(transport.writeOffs[0]?.kind).toBe("destruction");
+  });
+
+  it("goes after a count, so the balance is reconciled before material leaves it", async () => {
+    let q = enqueueCount([], { id: "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0cff", countedAt: "2026-10-09T08:00:00.000Z", note: null }, 1000, MINE);
+    q = enqueueCountCommit(q, 1001, {
+      ...MINE,
+      id: "commit-1",
+      countOf: "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0cff",
+      lineIds: [],
+    });
+    q = enqueueWriteOff(q, writeOffBody("w1"), 1002, MINE);
+    const store = memoryStore(q);
+    const transport = recordingTransport([created, { kind: "ok", status: 200, body: { adjustments: 0 } }, created]);
+    await sync({ store, transport, now });
+    expect(transport.calls).toEqual([
+      "count:01995b2a-9c40-7c3a-b7e1-2f4d6a8b0cff",
+      "commit:01995b2a-9c40-7c3a-b7e1-2f4d6a8b0cff",
+      "write-off:w1",
+    ]);
+  });
+
+  it("treats a refusal for insufficient stock as permanent, not as something to retry", async () => {
+    // The rep wrote off more than they hold. Retrying cannot make it true, and the row has
+    // to be visible: material somebody believes they disposed of is not a silent failure.
+    const store = memoryStore(enqueueWriteOff([], writeOffBody("w1"), 1000, MINE));
+    const transport = recordingTransport([
+      { kind: "status", status: 409, problemKind: "insufficient_stock", detail: "rep holds 1.000 of lot LOT-1" },
+    ]);
+    const report = await sync({ store, transport, now });
+    expect(report.rejected).toEqual([{ id: "w1", reason: "rep holds 1.000 of lot LOT-1" }]);
+    expect(store.entries[0]?.state).toBe("rejected");
+  });
+
+  it("keeps it queued when the network is gone", async () => {
+    const store = memoryStore(enqueueWriteOff([], writeOffBody("w1"), 1000, MINE));
+    const transport = recordingTransport([{ kind: "network" }]);
+    const report = await sync({ store, transport, now, random: () => 0.5 });
+    expect(report.retrying).toEqual(["w1"]);
+    expect(store.entries[0]?.state).toBe("pending");
+  });
+
+  it("is idempotent across a replay, because the id was minted on the device", async () => {
+    // The server upserts on the id (`ON CONFLICT DO NOTHING`, then reads the row back), so
+    // a write-off re-sent after a lost reply does not take the material twice.
+    const store = memoryStore(enqueueWriteOff([], writeOffBody("w1"), 1000, MINE));
+    const transport = recordingTransport([created]);
+    await sync({ store, transport, now });
+    const again = memoryStore(enqueueWriteOff([], writeOffBody("w1"), 2000, MINE));
+    await sync({ store: again, transport: recordingTransport([created]), now });
+    expect(transport.writeOffs[0]?.id).toBe("w1");
+    expect(again.entries).toEqual([]);
   });
 });

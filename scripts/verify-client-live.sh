@@ -164,6 +164,22 @@ COMMIT;
 SQL
 ok "lot LOT-FIELD-1 of itm-live-1 exists, expiring in a year"
 
+# A SECOND lot, already expired. There is no honest way to put expired stock into a rep's
+# hands through the API — 0020 refuses a receipt of it, deliberately, because a warehouse
+# that ships expired material takes it back — so this is how expired stock really arises: it
+# was received while in date and went stale in the bag. The receipt below is dated before
+# the expiry, which is the only thing that makes it acceptable.
+EXPIRED_LOT="$(psql -At -c "SELECT gen_random_uuid()")"
+psql -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL || fail "could not seed the expired lot"
+BEGIN;
+SET ROLE crm_app;
+SELECT set_config('app.current_tenant_id', '$TENANT', true);
+INSERT INTO crm.sample_lot (id, tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
+VALUES ('$EXPIRED_LOT', '$TENANT', 'itm-live-2', 'LOT-STALE-1', CURRENT_DATE - 5, 'drug_sample');
+COMMIT;
+SQL
+ok "lot LOT-STALE-1 expired five days ago, which is what a rep finds in a bag"
+
 # ---------------------------------------------------------------------------
 echo "--- 5. the CRM's own API binary ---"
 export LIVE_IDP_PEM="$WORK/idp.pem"
@@ -215,6 +231,10 @@ ON_HAND="$(psql -At -c "SELECT quantity_on_hand FROM crm.sample_holding WHERE te
 [ "$ON_HAND" = "10.000" ] || fail "the rep holds '$ON_HAND' of LOT-FIELD-1, expected 10.000"
 ok "a receipt through the API gives rep-ada 10 units, and the holding trigger agrees"
 
+# The stale lot's stock is NOT given here. It arrives inside the browser run, immediately
+# before the disposal chapter, for one reason: a second holding from the start would be a
+# second row in every list the earlier chapters assert on, and they are about one lot.
+
 # ---------------------------------------------------------------------------
 echo "--- 7. drive the app in a real browser ---"
 export CRM_FIELD_TOKEN
@@ -226,6 +246,11 @@ CRM_FIELD_TOKEN_2="$(node "$ROOT/scripts/live-erp/human-token.mjs" rep-grace)" |
 export CRM_FIELD_TOKEN_2
 export CRM_FIELD_TENANT="$TENANT"
 export CRM_FIELD_LOT_ID="$LOT_ID"
+export CRM_FIELD_EXPIRED_LOT="$EXPIRED_LOT"
+# The APPLICATION role, for the sweep the driver runs: `withTenantContext` refuses a
+# connection whose role bypasses RLS, which is the point of it.
+export CRM_APP_PGUSER="$API_PGUSER"
+export CRM_APP_PGPASSWORD="$API_PGPASSWORD"
 export CRM_PGDATABASE="$CLIENT_DB"
 node "$ROOT/scripts/client/drive-app.mjs" "$APP_URL" "$WORK" | tee "$WORK/drive.log" \
   || fail "the browser run reported failures (see the ok:/FAIL: lines above)"

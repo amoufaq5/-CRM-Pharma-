@@ -9,6 +9,7 @@ import {
   type SignatureBody,
   type TransferBody,
   type VisitBody,
+  type WriteOffBody,
 } from "./api.js";
 import {
   applyBatchFailure,
@@ -71,6 +72,8 @@ export interface SyncTransport {
   postCountCommit(countId: string): Promise<TransportResult>;
   /** Abandoning a count — a rep's only exit from one whose line was refused. 204. */
   postCountCancel(countId: string): Promise<TransportResult>;
+  /** Material out of custody: destroyed, or written off for expiry. Always with a reason. */
+  postWriteOff(body: WriteOffBody): Promise<TransportResult>;
 }
 
 export interface SyncDeps {
@@ -250,6 +253,11 @@ export const SEND_PLANS: Readonly<Record<OutboxKind, KindPlan>> = {
     reply: "single",
     send: (batch, transport) => transport.postCountCancel(only(batch, "count_cancel").countOf),
   },
+  write_off: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => transport.postWriteOff(only(batch, "write_off").body),
+  },
 };
 
 /**
@@ -273,6 +281,11 @@ const SEND_ORDER: readonly OutboxKind[] = [
   // abandoned one settles each the way it was meant: nothing a cancel touches is still
   // queued by the time it is sent, because queueing it discarded those rows.
   "count_cancel",
+  // Last and independent: nothing waits for a write-off and it waits for nothing. It is
+  // after the count on purpose, so a count and a write-off recorded in the same session
+  // reconcile the balance before material is taken out of it — which is the order they
+  // happened in, and the order that leaves the ledger readable.
+  "write_off",
 ];
 
 /**

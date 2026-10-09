@@ -1232,6 +1232,77 @@ Concretely, and these specifics are the decision, not commentary on it:
     material a rep holds that the device has never heard of cannot be counted into
     existence — which is the right conservative default and still a gap.
 
+29. **Getting expired stock out of custody, and the date the record got wrong.**
+    Expired stock in a rep's bag is the most common sample-audit finding there is, and the
+    write-off is the only thing that ends it. The routes for it have existed since 0017 and
+    0020 — `POST /v1/samples/write-offs` already takes a device-minted id and already
+    demands a reason — so this increment is mostly a screen. What it found on the way is
+    not.
+
+    **A disposal was recorded as happening on the day the SWEEP noticed.**
+    `sweepExpiredStock` closes an obligation whose holding has reached zero and attributes
+    the resolution from the ledger rather than from a claim — `disposal_resolving_movement`
+    returns the last decreasing movement, which is 0020's rule and a good one. It then wrote
+    `resolved_on = today`: the cron job's clock. The movement is right there, carrying the
+    date it happened, and the one field recording WHEN a regulated disposal took place was
+    filled in from when a sweep next ran. A rep with a seven-day grace period who destroys
+    expired stock on day three, swept on day nine — a weekend, a paused scheduler, a device
+    that synced late — has it recorded as two days overdue. It was four days early, and
+    nothing in the record contradicts the wrong version: the ledger says the third and the
+    obligation says the ninth. 0057 returns the movement's own date and the sweep uses it,
+    bounded by the sweep's date so a device clock running fast cannot date a disposal next
+    week. No lower bound is needed — the attribution query only considers movements at or
+    after the obligation was discovered. **This increment is what made it worth fixing
+    now**: a write-off recorded with no signal carries the moment the rep did it and may not
+    reach the server for days, so "when the sweep noticed" and "when it happened" stop being
+    nearly the same date.
+
+    **A refusal silently wiped everything the rep had typed.** Found by the browser run, and
+    it is the signature defect from item 26 in the part of the form nobody had checked.
+    `render()` replaces the DOM from every state change — including the one that reports a
+    refusal — so "you are carrying 6, so 99 cannot be written off" arrived with the reason
+    field blank. For a write-off that reason is the only record of why regulated material no
+    longer exists, and what a retyped one says is shorter every time. On a COUNT form it is
+    worse: a number per lot plus a note, all of it lost to one mistyped digit, which is the
+    difference between fixing a character and counting the bag again. Both earlier gates had
+    hidden it by re-filling each field after every refusal. The open form's values are now
+    snapshotted before the DOM goes and restored after, keyed by the form's id, and cleared
+    wherever a form is opened or closed — because "a fresh form starts blank" is a rule two
+    earlier increments wrote down and this would otherwise have broken.
+
+    **Three states per obligation, and naming them is the screen's whole value**: a deadline
+    still ahead or already past (the server's own `status` and `days_overdue`); a write-off
+    QUEUED here, so the rep does not do it twice — the second would be refused for
+    insufficient stock, or worse, succeed against a different carton; and the material GONE
+    with the obligation still open, because only the sweep closes one. That lag is real and
+    the screen says so instead of showing a deadline for something already dealt with. The
+    RECORD is not late even when the sweep is, which is what 0057 bought.
+
+    **The two kinds stay apart.** `destruction` says it was destroyed; `expiry_writeoff`
+    says it stopped being counted. A single "dispose" button would have made the ledger
+    unable to answer which happened, which is the question an inspector asks first. The form
+    defaults by where it was opened from — expired, from an obligation; destroyed, from the
+    stock list — and offers both either way.
+
+    **Verified against stock that really went stale.** There is no honest way to put expired
+    material into a rep's hands through the API: 0020 refuses a receipt of it outright,
+    because a warehouse that ships expired stock takes it back. So the gate does what
+    reality does — receives it twenty days ago, fifteen days before the lot expired, through
+    the real route, and asserts that receiving it TODAY is refused with a 409. The REAL
+    nightly sweep then raises the obligation; one the gate wrote itself would prove nothing
+    about the one a rep sees. The rep disposes of it offline with a reason, it syncs, and the
+    sweep runs **three days late** — at which point the obligation is resolved,
+    `written_off`, attributed from the ledger, and dated **the day the material actually
+    left**, inside the deadline it was given. **178 browser checks, 0 failures.**
+
+    **Still not built:** the return to a warehouse — the other resolution path, and the
+    better one for stock a warehouse can dispose of centrally. That route exists, mirrors to
+    the ERP as a receipt, and has no screen, so this device currently offers only the
+    destructive exit from an obligation. The form says so in as many words rather than
+    leaving a rep to assume there is nothing else. Also unbuilt: the disposal policy is
+    read-only everywhere (no screen sets a grace period), and the expiry sweep itself has no
+    surface — it is a scheduler job whose findings a rep only ever sees as obligations.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1646,7 +1717,7 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 148 checks across TWO browsers, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28). **What is NOT built is still most of the product**: the rest of custody (write-offs, returns, disposal obligations, the expiry sweep), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 76 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
+| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 178 checks across TWO browsers, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28), then write-offs and the date a disposal was recorded on (item 29). **What is NOT built is still most of the product**: the rest of custody (returns to a warehouse, and the disposal policy), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 74 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 

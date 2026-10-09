@@ -112,7 +112,7 @@ authorisation on its own.
 | `GET /v1/team/visits` | one rep's activity |
 | `GET /v1/samples/obligations` | what the caller must dispose of, with the deadline |
 | `GET /v1/samples/obligations/:lotId/history` | the whole continuation chain for one lot, with each link's resolution and the ledger movement that discharged it |
-| `POST /v1/samples/write-offs` | a destruction or an expiry write-off, with a reason |
+| `POST /v1/samples/write-offs` | a destruction or an expiry write-off — **reason required**, and the two kinds stay apart |
 | `POST /v1/samples/returns` | back to a warehouse; mirrored to the ERP as a `receipt` |
 | `GET /v1/samples/disposal-policy` | the tenant's grace period, read-only |
 | `GET /v1/team/samples/obligations` | the team's outstanding disposals — the chase list |
@@ -1160,15 +1160,16 @@ pass vacuously. **83 files / 2,123 tests green on both transports.**
 
 `apps/field` is the client, and it is a slice rather than the product: **sign in, see my
 accounts, record a visit with no network, disburse samples with a signature on glass, hand
-material to a colleague and accept theirs, count the bag, watch all of it sync, read a
-refusal.** Roughly 76 of the 106 routes still have no screen — the rest of sample custody,
-call plans, expenses, notifications, the manager's views, all of admin.
+material to a colleague and accept theirs, count the bag, write off what has expired, watch
+all of it sync, read a refusal.** Roughly 74 of the 106 routes still have no screen — the
+return-to-warehouse path, call plans, expenses, notifications, the manager's views, all of
+admin.
 
 What it settles is the part that was a guess. Everything built for an offline device —
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **148 checks in two
+and `pnpm client:verify` proves it the only way that means anything: **178 checks in two
 real Chromium profiles — two devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
@@ -1214,6 +1215,17 @@ real API binary, counting rows in Postgres.** The sequence it drives:
   (`-3.000`) and the one the counter could actually see (`-1.000`). One adjustment of
   `3.000`, linked to the count by a column rather than by prose, and the balance ends at
   exactly what was counted;
+- **expired stock leaves custody** with a reason attached. The gate holds expired material
+  the only honest way there is — received twenty days ago, fifteen days before the lot
+  expired, since a receipt of expired stock is refused with a 409 — lets the **real** nightly
+  sweep raise the disposal obligation, disposes of it offline, and then runs the sweep
+  **three days late**: the obligation closes as `written_off`, attributed from the ledger,
+  and dated **the day the material actually left**. It used to be dated the day the sweep
+  noticed, which is the difference between four days early and two days overdue in the one
+  field an audit of lateness reads;
+- and **a refusal no longer wipes what the rep typed**. Every refusal goes through a render
+  that replaces the DOM, so "you are carrying 6, so 99 cannot be written off" used to arrive
+  with the reason field blank — on a count form, a number per lot and the note with it;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

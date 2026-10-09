@@ -26,6 +26,7 @@ const token2 = process.env["CRM_FIELD_TOKEN_2"];
 const tenant = process.env["CRM_FIELD_TENANT"];
 const database = process.env["CRM_PGDATABASE"];
 const lotId = process.env["CRM_FIELD_LOT_ID"];
+const expiredLot = process.env["CRM_FIELD_EXPIRED_LOT"];
 
 let checks = 0;
 let failures = 0;
@@ -143,12 +144,53 @@ function adjustmentRows() {
   });
 }
 
-/** One rep's balance for the lot under test, as `on_hand|in_transit`, or "" if they hold no row. */
-function holding(subject) {
+function writeOffRows() {
+  const out = sql(
+    `SELECT kind, quantity, COALESCE(reason,''), occurred_at::date
+       FROM crm.sample_transaction
+      WHERE tenant_id = '${tenant}' AND kind IN ('destruction','expiry_writeoff')
+      ORDER BY recorded_at`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [kind, quantity, reason, occurredOn] = line.split("|");
+    return { kind, quantity, reason, occurredOn };
+  });
+}
+
+function obligationRows() {
+  const out = sql(
+    `SELECT status, COALESCE(resolution,''), COALESCE(resolved_on::text,''), due_by::text
+       FROM crm.disposal_obligation WHERE tenant_id = '${tenant}' ORDER BY created_at`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [status, resolution, resolved_on, due_by] = line.split("|");
+    return { status, resolution, resolved_on, due_by };
+  });
+}
+
+/** The REAL sweep, at a date of the gate's choosing — which is how the date fix is provable. */
+function sweepAsOf(asOf) {
+  return execFileSync("node", [join(import.meta.dirname, "sweep.mjs"), tenant, asOf], {
+    encoding: "utf8",
+    // As the APPLICATION role, not as the admin this file's `psql` helper uses:
+    // `withTenantContext` refuses a connection whose role bypasses RLS, and the sweep is
+    // the scheduler's work rather than an inspection of it.
+    env: {
+      ...process.env,
+      PGDATABASE: database,
+      PGUSER: process.env["CRM_APP_PGUSER"] ?? process.env["PGUSER"] ?? "crm_app",
+      ...(process.env["CRM_APP_PGPASSWORD"] !== undefined ? { PGPASSWORD: process.env["CRM_APP_PGPASSWORD"] } : {}),
+    },
+    cwd: join(import.meta.dirname, "..", ".."),
+  }).trim();
+}
+
+/** One rep's balance for a lot, as `on_hand|in_transit`, or "" if they hold no row. */
+function holding(subject, lot = lotId) {
   return sql(
     `SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
        FROM crm.sample_holding h JOIN crm.rep_profile r ON r.id = h.rep_profile_id
-      WHERE h.tenant_id = '${tenant}' AND h.lot_id = '${lotId}' AND r.subject = '${subject}'`,
+      WHERE h.tenant_id = '${tenant}' AND h.lot_id = '${lot}' AND r.subject = '${subject}'`,
   );
 }
 
@@ -166,6 +208,9 @@ function signatureRows() {
 async function main() {
   if (token === undefined || tenant === undefined || database === undefined || appUrl === undefined) {
     throw new Error("drive-app.mjs needs <app-url>, CRM_FIELD_TOKEN, CRM_FIELD_TENANT and CRM_PGDATABASE");
+  }
+  if (expiredLot === undefined) {
+    throw new Error("drive-app.mjs needs CRM_FIELD_EXPIRED_LOT — the write-off chapter needs stock that has gone stale");
   }
   if (token2 === undefined) {
     throw new Error("drive-app.mjs needs CRM_FIELD_TOKEN_2 — the transfer chapter needs a second rep");
@@ -727,11 +772,18 @@ async function main() {
     // A number the ledger cannot hold is refused at the keyboard: inside a queue it is one
     // line's `validation_failed` hours later, which refuses the commit and takes the whole
     // count with it.
+    await page.fill(`#count-form input[name="note"]`, "counted in the car park, two cartons, one short");
     await page.fill(`#count-form input[name="count:${lotId}"]`, "4.00001");
     await page.click("#save-count");
     await page.waitFor(`/not numbers the ledger can hold/.test(document.body.textContent ?? "")`, { label: "the refusal" });
     is(await page.evaluate(`${READ_OUTBOX} return rows.filter((r) => r.kind === "count").length;`), 0,
       "a count with an impossible quantity is refused at the keyboard, and queues nothing");
+    // THE WORST CASE OF THE SAME DEFECT. A count form can hold a number per lot plus a
+    // note; losing all of it to one mistyped digit is the difference between fixing a
+    // character and counting the bag again.
+    is(await page.evaluate(`return document.querySelector("#count-form input[name=note]")?.value ?? null;`),
+      "counted in the car park, two cartons, one short",
+      "and a refusal keeps every other field, which on a count form is the whole document");
 
     // An empty count is not a count of zero.
     await page.fill(`#count-form input[name="count:${lotId}"]`, "");
@@ -816,7 +868,164 @@ async function main() {
     is(await page.evaluate(`return document.querySelector("#start-count")?.disabled === true;`), false,
       "and another count can be started now that this one is settled");
 
-    // ---- 16. the ERP deletes the tenant, and the queue STOPS ---------------
+    // ---- 16. expired stock, and getting it out of custody ------------------
+    // Expired stock in a rep's bag is the most common sample-audit finding there is, and
+    // the write-off is the only thing that ends it. The obligation this clears was raised
+    // by the REAL nightly sweep in §6b, not by a fixture — an obligation the gate wrote
+    // itself would prove nothing about the one a rep actually sees.
+    // The stale stock arrives now rather than at the start of the run, so that every chapter
+    // before this one is about one lot. Received TWENTY DAYS AGO, fifteen days before the
+    // lot expired — which is the only honest way to hold expired stock: 0020 refuses a
+    // receipt of it outright, because a warehouse that ships expired material takes it back.
+    const staleReceipt = await fetch(new URL("v1/samples/receipts", appUrl), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "x-tenant-id": tenant, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: crypto.randomUUID().replace(/-4(?=[0-9a-f]{3}-)/, "-7"),
+        lotId: expiredLot,
+        quantity: "6",
+        occurredAt: new Date(Date.now() - 20 * 86_400_000).toISOString(),
+        erpWarehouseId: "wh-live-1",
+      }),
+    });
+    is(staleReceipt.status, 201, "stock received while it was still in date goes stale in the bag");
+
+    const refusedToday = await fetch(new URL("v1/samples/receipts", appUrl), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "x-tenant-id": tenant, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: crypto.randomUUID().replace(/-4(?=[0-9a-f]{3}-)/, "-7"),
+        lotId: expiredLot,
+        quantity: "1",
+        occurredAt: new Date().toISOString(),
+        erpWarehouseId: "wh-live-1",
+      }),
+    });
+    is(refusedToday.status, 409, "while receiving it TODAY is refused — that is what makes the back-dated one honest");
+
+    // The REAL nightly sweep raises the obligation. One written by this gate would prove
+    // nothing about the one a rep actually sees.
+    const firstSweep = sweepAsOf(new Date().toISOString());
+    is(/"opened":1/.test(firstSweep), true, `the sweep raises one disposal obligation (${firstSweep.slice(0, 50)})`);
+
+    await page.click("#refresh");
+    // Waiting for the SECTION, not for a write-off button: the stock list already has one
+    // for the other lot, so that condition was true before the refresh had happened and the
+    // assertions below ran against the previous render.
+    await page.waitFor(`/To dispose of/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the disposal list" });
+
+    // Scoped to the disposal SECTION. The stale lot is also a holding now, so a document-wide
+    // text search would answer with whichever row came first and the assertion would be
+    // about the stock list instead of the deadline.
+    const obligation = await page.evaluate(`
+      const heading = [...document.querySelectorAll("h2")].find((h) => /To dispose of/.test(h.textContent ?? ""));
+      const li = [...(heading?.parentElement?.querySelectorAll("li") ?? [])].find((n) => /LOT-STALE-1/.test(n.textContent ?? ""));
+      return { name: li?.querySelector(".name")?.textContent?.trim() ?? null, meta: li?.querySelector(".meta")?.textContent?.trim() ?? null };`);
+    is(/LOT-STALE-1/.test(String(obligation.name)), true, `the rep is shown what they must dispose of (${String(obligation.name)})`);
+    is(/6\.000 on hand/.test(String(obligation.meta)), true, "with how much of it they are carrying");
+    is(/expired/.test(String(obligation.meta)) && /day\(s\) left|OVERDUE/.test(String(obligation.meta)), true,
+      `and the deadline, in days rather than a date to work out (${String(obligation.meta).slice(0, 70)})`);
+    await shot("21-obligations");
+
+    // OFFLINE, which is where a rep stands when they find it.
+    await page.offline(true);
+    await page.click(`button[data-write-off="${expiredLot}"]`);
+    await page.waitFor(`document.querySelector("#write-off-form") !== null`, { label: "the write-off form" });
+    is(await page.evaluate(`return document.querySelector("#write-off-form select[name=kind]")?.value ?? null;`),
+      "expiry_writeoff",
+      "the form opened from a disposal obligation defaults to EXPIRED, not destroyed — the two are kept apart");
+    is(await page.evaluate(`return document.querySelector("#write-off-form input[name=quantity]")?.value ?? null;`), "",
+      "and the quantity starts empty: this is the screen that records material no longer existing");
+
+    // A reason is the only record of WHY regulated material is gone, so an empty one is
+    // refused here rather than hours later as a 422 from inside a queue.
+    await page.fill(`#write-off-form input[name="quantity"]`, "6");
+    await page.click("#save-write-off");
+    await page.waitFor(`/reason is required/.test(document.body.textContent ?? "")`, { label: "the missing-reason refusal" });
+    is(await page.evaluate(`${READ_OUTBOX} return rows.filter((r) => r.kind === "write_off").length;`), 0,
+      "a write-off with no reason is refused at the keyboard, and queues nothing");
+
+    // More than the rep holds is refused too: the database would refuse it anyway, and by
+    // then the box is already in a bin.
+    const REASON = "expired, binned at the depot per SOP-14, witnessed by QA";
+    await page.fill(`#write-off-form input[name="quantity"]`, "99");
+    await page.fill(`#write-off-form input[name="reason"]`, REASON);
+    await page.click("#save-write-off");
+    await page.waitFor(`/cannot be written off/.test(document.body.textContent ?? "")`, { label: "the over-balance refusal" });
+
+    // AND THE TYPED REASON IS STILL THERE. Found by this very step: every refusal goes
+    // through `render()`, which replaces the DOM, so the rep was told to fix one field and
+    // silently lost the other — the same defect the signature had, in the part of the form
+    // nobody had checked. What a retyped reason says is shorter every time, and for a
+    // write-off the reason is the only record of why the material is gone.
+    const kept = await page.evaluate(`
+      const f = document.querySelector("#write-off-form");
+      return { reason: f?.querySelector("[name=reason]")?.value ?? null, quantity: f?.querySelector("[name=quantity]")?.value ?? null, kind: f?.querySelector("[name=kind]")?.value ?? null };`);
+    is(kept.reason, REASON, "a refusal does not wipe what the rep already typed");
+    is(kept.quantity, "99", "including the field it is complaining about, so they can see what they entered");
+    is(kept.kind, "expiry_writeoff", "and the choice they made stays chosen");
+
+    await page.fill(`#write-off-form input[name="quantity"]`, "6");
+    await page.click("#save-write-off");
+    // Scoped to the message, not the body: "written off" is also the name of an option in
+    // this very form, so a document-wide match was true before anything had been saved.
+    await page.waitFor(`/Saved on this device/.test(document.querySelector("p.good")?.textContent ?? "")`, { label: "the queued write-off" });
+
+    const queuedWriteOff = await page.evaluate(
+      `${READ_OUTBOX} const w = rows.find((r) => r.kind === "write_off"); return w === undefined ? null : { kind: w.body.kind, quantity: w.body.quantity, reason: w.body.reason, occurredAt: w.body.occurredAt };`,
+    );
+    is(queuedWriteOff?.kind, "expiry_writeoff", "the queued row says which of the two things happened");
+    is(queuedWriteOff?.quantity, "6", "for the quantity the rep entered");
+    is(/SOP-14/.test(String(queuedWriteOff?.reason)), true, "carrying the reason an inspector will read");
+    is(writeOffRows().length, 0, "and nothing is in the ledger while there is no signal");
+
+    // The obligation is still listed — only the sweep can close it — but it no longer shows
+    // a deadline, because the rep has dealt with it and a screen that kept counting days
+    // would be chasing them for work they have done.
+    const afterQueue = await page.evaluate(`
+      const heading = [...document.querySelectorAll("h2")].find((h) => /To dispose of/.test(h.textContent ?? ""));
+      const li = [...(heading?.parentElement?.querySelectorAll("li") ?? [])].find((n) => /LOT-STALE-1/.test(n.textContent ?? ""));
+      return { meta: li?.querySelector(".meta")?.textContent?.trim() ?? null, button: li?.querySelector("button[data-write-off]") !== null };`);
+    is(/waiting to send|dealt with/.test(String(afterQueue.meta)), true,
+      `the obligation says it has been dealt with rather than showing a deadline (${String(afterQueue.meta).slice(0, 70)})`);
+    is(afterQueue.meta !== null && afterQueue.button === false, true,
+      "and offers no second disposal, which would be refused or hit a different carton");
+
+    await page.offline(false);
+    await page.waitFor(`(async () => { ${READ_OUTBOX} return rows.every((r) => r.kind !== "write_off"); })()`, { timeoutMs: 25_000, label: "the write-off to land" });
+
+    const written = writeOffRows();
+    is(written.length, 1, "one write-off in crm.sample_transaction");
+    is(written[0]?.kind, "expiry_writeoff", "of the kind the rep chose");
+    is(written[0]?.quantity, "6.000", "for the whole of what they held");
+    is(/SOP-14/.test(String(written[0]?.reason)), true, "with the reason stored against the movement");
+    is(holding("rep-ada", expiredLot), "0.000|0.000", "and the stock is out of custody");
+
+    // STILL OPEN, and that is correct rather than a bug: the nightly sweep is what closes
+    // an obligation, and it attributes the resolution from the ledger rather than trusting
+    // whoever says they dealt with it.
+    is(obligationRows()[0]?.status === "open" || obligationRows()[0]?.status === "overdue", true,
+      "the obligation is still open until the sweep confirms it from the ledger");
+    await shot("22-written-off");
+
+    // THE SWEEP, RUN THREE DAYS LATE — a weekend, a paused scheduler, a device that synced
+    // slowly. This is the case 0057 exists for.
+    const late = new Date(Date.now() + 3 * 86_400_000).toISOString();
+    const sweep = sweepAsOf(late);
+    is(/"resolved":1/.test(sweep), true, `the late sweep closes the obligation (${sweep.slice(0, 60)})`);
+    const settled = obligationRows()[0];
+    is(settled?.status, "resolved", "resolved");
+    is(settled?.resolution, "written_off", "attributed from the LEDGER — written off, not guessed");
+    // The date is the one that matters. Before 0057 this was the sweep's own date, so a
+    // disposal done today and swept on Friday was recorded as having happened on Friday —
+    // the difference between inside a deadline and past it, in the one field an audit of
+    // lateness reads.
+    is(settled?.resolved_on, new Date().toISOString().slice(0, 10),
+      "and dated the day the material actually left, not the day the sweep noticed");
+    is(settled.resolved_on <= String(settled.due_by), true,
+      `which is inside the deadline it was given (${settled?.resolved_on} <= ${settled?.due_by})`);
+
+    // ---- 17. the ERP deletes the tenant, and the queue STOPS ---------------
     // The whole chain, end to end, for the first time: the ERP signs a tombstone, 0050's
     // watcher marks the registry row, the API refuses every request for that tenant with
     // `tenant_deleted`, and the client — which is the only part of this that had never

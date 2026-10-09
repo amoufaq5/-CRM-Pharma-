@@ -5,6 +5,9 @@ import {
   Count,
   CountBody,
   CountList,
+  Obligation,
+  ObligationList,
+  WriteOffBody,
   DisbursementBody,
   Holding,
   HoldingList,
@@ -23,6 +26,7 @@ import {
   enqueueCountCommit,
   enqueueCountLine,
   enqueueDisbursement,
+  enqueueWriteOff,
   enqueueRecall,
   enqueueSignature,
   enqueueTransfer,
@@ -38,6 +42,7 @@ import {
   type OutboxEntry,
   type RecallableTransfer,
   type SyncReport,
+  type WriteOffKind,
   type TransferPeer,
 } from "@crm/client";
 
@@ -78,6 +83,8 @@ interface State {
   peers: readonly TransferPeer[];
   /** Counts the server knows about, which is how an OPEN one becomes visible here. */
   counts: readonly Count[];
+  /** What this rep must dispose of, soonest deadline first. */
+  obligations: readonly Obligation[];
   cachedAt: number | null;
   outbox: readonly OutboxEntry[];
   online: boolean;
@@ -89,6 +96,8 @@ interface State {
   transferring: Holding | null;
   /** True while the count form is open. A count is the whole bag, not one lot. */
   counting: boolean;
+  /** The lot being taken out of custody, and why this screen was opened. */
+  writingOff: { holding: Holding; because: "expired" | "chosen" } | null;
   message: { kind: "good" | "warn" | "error"; text: string } | null;
   blocked: string | null;
   syncing: boolean;
@@ -105,6 +114,7 @@ const state: State = {
   recallable: [],
   peers: [],
   counts: [],
+  obligations: [],
   cachedAt: null,
   outbox: [],
   online: navigator.onLine,
@@ -112,6 +122,7 @@ const state: State = {
   disbursing: null,
   transferring: null,
   counting: false,
+  writingOff: null,
   message: null,
   blocked: null,
   syncing: false,
@@ -130,6 +141,53 @@ let pad: SignaturePad | null = null;
  * restoring in `wireReady` is what stops their signature disappearing without a word.
  */
 let signatureInProgress: ImageData | null = null;
+/**
+ * What the rep has typed into the open form, carried across a re-render.
+ *
+ * THE SAME DEFECT THE SIGNATURE HAD, in the part of the form nobody thought to check.
+ * `render()` replaces the DOM from every state change — including the one that reports a
+ * refusal — so a rep who typed a reason, a quantity or eleven counted lots and then hit
+ * "you are carrying 6, so 99 cannot be written off" lost all of it along with the message
+ * telling them to fix one field. For a write-off the reason is the only record of why
+ * regulated material no longer exists, and what a retyped one says is shorter every time.
+ *
+ * Keyed by the form's id so a draft cannot leak between screens, and cleared whenever a
+ * form is opened or closed — a fresh form starts blank, which is a rule two earlier
+ * increments wrote down and this would otherwise break.
+ */
+let formDraft: { readonly formId: string; readonly values: Readonly<Record<string, string>> } | null = null;
+
+/** Read the open form, if there is one. Synchronous, immediately before the DOM goes. */
+function captureFormDraft(): void {
+  const form = document.querySelector("form[id]");
+  if (!(form instanceof HTMLFormElement)) return;
+  const values: Record<string, string> = {};
+  for (const el of form.querySelectorAll("input[name], select[name], textarea[name]")) {
+    if (el instanceof HTMLInputElement) {
+      values[el.name] = el.type === "checkbox" ? (el.checked ? "1" : "") : el.value;
+    } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+      values[el.name] = el.value;
+    }
+  }
+  formDraft = { formId: form.id, values };
+}
+
+/** Put it back, into the same form. A different form on screen means the draft is not its. */
+function restoreFormDraft(): void {
+  const draft = formDraft;
+  if (draft === null) return;
+  const form = document.getElementById(draft.formId);
+  if (!(form instanceof HTMLFormElement)) return;
+  for (const [name, value] of Object.entries(draft.values)) {
+    const el = form.querySelector(`[name="${CSS.escape(name)}"]`);
+    if (el instanceof HTMLInputElement) {
+      if (el.type === "checkbox") el.checked = value === "1";
+      else el.value = value;
+    } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+      el.value = value;
+    }
+  }
+}
 
 const app = (): HTMLElement => {
   const el = document.getElementById("app");
@@ -175,6 +233,8 @@ function describeEntry(entry: OutboxEntry): string {
       return `Committing the count — one adjustment per difference`;
     case "count_cancel":
       return `Abandoning the count of ${entry.countOf.slice(0, 8)}`;
+    case "write_off":
+      return `${entry.body.kind === "destruction" ? "Destroyed" : "Written off"} ${entry.body.quantity} of ${nameOfLot(entry.body.lotId)}`;
   }
 }
 
@@ -226,6 +286,7 @@ function render(): void {
   // BEFORE the DOM goes. Synchronous, because anything async would resolve after the
   // canvas it was reading had been replaced.
   if (pad !== null) signatureInProgress = pad.snapshot() ?? signatureInProgress;
+  captureFormDraft();
   const root = app();
   root.setAttribute("aria-busy", state.phase === "booting" ? "true" : "false");
 
@@ -278,8 +339,12 @@ function render(): void {
     parts.push(renderTransferForm(state.transferring));
   } else if (state.counting) {
     parts.push(renderCountForm(now));
+  } else if (state.writingOff !== null) {
+    parts.push(renderWriteOffForm(state.writingOff));
   } else {
     parts.push(renderAccounts(now));
+    // Before the stock itself: a deadline is the thing on this screen with a clock running.
+    parts.push(renderObligations(now));
     parts.push(renderHoldings(now));
     parts.push(renderTransfers(now));
     parts.push(renderCounts(now));
@@ -287,6 +352,8 @@ function render(): void {
 
   root.innerHTML = parts.join("");
   wireReady();
+  // After the DOM is back and before the rep can type into it.
+  restoreFormDraft();
 }
 
 function renderLogin(): string {
@@ -417,7 +484,8 @@ function renderHoldings(now: number): string {
             <span class="meta${expired ? " error" : ""}">${escapeHtml(h.quantity_on_hand)} on hand${h.expiry_date !== null ? ` · expires ${escapeHtml(h.expiry_date)}${expired ? " — EXPIRED" : ""}` : ""}${Number(h.quantity_in_transit) > 0 ? ` · ${escapeHtml(h.quantity_in_transit)} in transit` : ""}</span>
           </span>
           <button data-disburse="${escapeHtml(h.lot_id)}" ${expired || Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Disburse</button>
-          <button class="secondary" data-transfer="${escapeHtml(h.lot_id)}" ${Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Transfer</button></li>`;
+          <button class="secondary" data-transfer="${escapeHtml(h.lot_id)}" ${Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Transfer</button>
+          <button class="secondary" data-write-off="${escapeHtml(h.lot_id)}" ${Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Write off</button></li>`;
         })
         .join("")}
     </ul>
@@ -704,6 +772,105 @@ function renderCounts(now: number): string {
   return sections.join("");
 }
 
+/**
+ * Take material out of custody.
+ *
+ * TWO KINDS, AND THE DIFFERENCE IS THE RECORD. `destruction` says the material was
+ * destroyed; `expiry_writeoff` says it stopped being counted. The route keeps them apart
+ * deliberately and so does this form — a single "dispose" button would have made the ledger
+ * unable to answer which happened, which is the question an inspector asks first.
+ *
+ * The quantity starts EMPTY for the same reason the count form's fields do: this is the one
+ * screen in the app that records regulated material no longer existing, and a form that
+ * arrives holding "all of it" is one a tired rep confirms without reading. The reason is
+ * required by the server and refused here, because an empty one is a row the server must
+ * reject hours later from inside a queue.
+ */
+function renderWriteOffForm(target: { holding: Holding; because: "expired" | "chosen" }): string {
+  const { holding, because } = target;
+  const obligation = state.obligations.find((o) => o.lot_id === holding.lot_id);
+  return `<section>
+    <h2>Out of custody — ${escapeHtml(holding.lot_number)}</h2>
+    ${obligation !== undefined
+      ? `<p class="${obligation.status === "overdue" ? "error" : "warn"}">This lot expired
+           ${escapeHtml(obligation.expired_on)} and must be disposed of by
+           ${escapeHtml(obligation.due_by)}${obligation.days_overdue > 0 ? ` — ${obligation.days_overdue} day(s) OVERDUE` : ""}.</p>`
+      : ""}
+    <form id="write-off-form">
+      <div class="row">
+        <label>What happened
+          <select name="kind">
+            <option value="destruction" ${because === "chosen" ? "selected" : ""}>Destroyed</option>
+            <option value="expiry_writeoff" ${because === "expired" ? "selected" : ""}>Expired — written off</option>
+          </select>
+        </label>
+        <label>Quantity (of ${escapeHtml(holding.quantity_on_hand)})
+          <input name="quantity" type="text" inputmode="decimal" autocomplete="off" placeholder="how much" />
+        </label>
+      </div>
+      <label>Reason — required
+        <input name="reason" type="text" maxlength="500" autocomplete="off"
+               placeholder="Where, how, and who witnessed it" />
+      </label>
+      <div class="actions">
+        <button id="save-write-off" type="submit">Record it</button>
+        <button id="cancel-write-off" type="button" class="secondary">Cancel</button>
+      </div>
+      <p class="note">This is the only record of why this material no longer exists, so the
+        reason is what an inspector reads. Destroyed and written off are kept apart on
+        purpose. Returning stock to a warehouse instead is not yet on this device — that
+        route exists and has no screen.</p>
+    </form>
+  </section>`;
+}
+
+/**
+ * What this rep must get rid of, and by when.
+ *
+ * Three states per row, and naming them is the whole value of the section:
+ *
+ *   - a deadline still ahead, or already past (the server's own `status` and `days_overdue`);
+ *   - a write-off QUEUED on this device, so the rep does not do it twice — the second would
+ *     be refused for insufficient stock, or worse, succeed against a different carton;
+ *   - the material GONE but the obligation still open, because the nightly sweep is what
+ *     closes it. That lag is real and the screen says so rather than showing a deadline for
+ *     something already dealt with. The record itself is not late: 0057 made the sweep
+ *     record the date the material actually left.
+ */
+function renderObligations(now: number): string {
+  if (state.obligations.length === 0) return "";
+  const queued = new Set(
+    state.outbox.filter((e) => e.kind === "write_off").map((e) => (e.kind === "write_off" ? e.body.lotId : "")),
+  );
+  return `<section>
+    <h2>To dispose of (${state.obligations.length})</h2>
+    <p class="note">Expired stock in a bag is the most common sample-audit finding there is.
+      Cached ${ago(state.cachedAt, now)}.</p>
+    <ul class="list">
+      ${state.obligations
+        .map((o) => {
+          const gone = Number(o.quantity_on_hand) <= 0;
+          const pending = queued.has(o.lot_id);
+          const state_ = gone
+            ? "dealt with — the nightly sweep will close this"
+            : pending
+              ? "recorded on this device, waiting to send"
+              : o.days_overdue > 0
+                ? `${o.days_overdue} day(s) OVERDUE`
+                : `due ${o.due_by} (${Math.abs(o.days_overdue)} day(s) left)`;
+          return `<li><span class="grow">
+            <span class="name">${escapeHtml(o.lot_number)} · ${escapeHtml(o.erp_item_id)}</span>
+            <span class="meta${o.days_overdue > 0 && !gone && !pending ? " error" : ""}">${escapeHtml(o.quantity_on_hand)} on hand · expired ${escapeHtml(o.expired_on)} · ${escapeHtml(state_)}</span>
+          </span>
+          ${gone || pending
+            ? ""
+            : `<button data-write-off="${escapeHtml(o.lot_id)}">Dispose of it</button>`}</li>`;
+        })
+        .join("")}
+    </ul>
+  </section>`;
+}
+
 function renderVisitForm(account: Account): string {
   return `<section>
     <h2>Visit — ${escapeHtml(text(account.name, account.erp_account_id))}</h2>
@@ -803,6 +970,7 @@ function wireReady(): void {
   on("refresh", "click", () => void refreshReference());
   on("cancel-visit", "click", () => {
     state.recording = null;
+    formDraft = null;
     render();
   });
 
@@ -810,6 +978,7 @@ function wireReady(): void {
     button.addEventListener("click", () => {
       const id = button.dataset["visit"];
       state.recording = state.accounts.find((a) => a.erp_account_id === id) ?? null;
+      formDraft = null;
       state.message = null;
       render();
     });
@@ -828,13 +997,49 @@ function wireReady(): void {
     });
   }
 
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-write-off]")) {
+    button.addEventListener("click", () => {
+      const lotId = button.dataset["writeOff"];
+      const holding = state.holdings.find((h) => h.lot_id === lotId) ?? null;
+      if (holding === null) {
+        // An obligation for a lot this device has no holding for. It can happen: the
+        // obligation list and the holdings are two reads, and a write-off needs the
+        // quantity, so this says so rather than opening a form with no balance in it.
+        state.message = { kind: "warn", text: "This device has no balance cached for that lot. Refresh while there is a network." };
+        render();
+        return;
+      }
+      formDraft = null;
+      state.writingOff = {
+        holding,
+        // Which button was pressed decides the default KIND, because the two entry points
+        // mean different things: from a disposal obligation it is expired stock, and from
+        // the stock list it is usually something damaged.
+        because: state.obligations.some((o) => o.lot_id === lotId) ? "expired" : "chosen",
+      };
+      state.message = null;
+      render();
+    });
+  }
+  on("cancel-write-off", "click", () => {
+    state.writingOff = null;
+    formDraft = null;
+    render();
+  });
+  document.getElementById("write-off-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveWriteOff(event.target as HTMLFormElement);
+  });
+
   on("start-count", "click", () => {
     state.counting = true;
+    formDraft = null;
     state.message = null;
     render();
   });
   on("cancel-count", "click", () => {
     state.counting = false;
+    formDraft = null;
     render();
   });
   document.getElementById("count-form")?.addEventListener("submit", (event) => {
@@ -858,12 +1063,14 @@ function wireReady(): void {
     button.addEventListener("click", () => {
       const lotId = button.dataset["transfer"];
       state.transferring = state.holdings.find((h) => h.lot_id === lotId) ?? null;
+      formDraft = null;
       state.message = null;
       render();
     });
   }
   on("cancel-transfer", "click", () => {
     state.transferring = null;
+    formDraft = null;
     render();
   });
   document.getElementById("transfer-form")?.addEventListener("submit", (event) => {
@@ -891,6 +1098,7 @@ function wireReady(): void {
 
   on("cancel-disbursement", "click", () => {
     state.disbursing = null;
+    formDraft = null;
     signatureInProgress = null;
     pad?.detach();
     pad = null;
@@ -982,6 +1190,7 @@ async function saveVisit(form: HTMLFormElement): Promise<void> {
   state.outbox = enqueueVisit(state.outbox, parsed.data, Date.now(), { createdBy: author });
   await store.replaceOutbox(state.outbox);
   state.recording = null;
+  formDraft = null;
   state.message = { kind: "good", text: "Saved on this device. It will sync when there is a network." };
   render();
   void drain({ manual: false });
@@ -1079,6 +1288,7 @@ async function saveDisbursement(form: HTMLFormElement): Promise<void> {
   pad.detach();
   pad = null;
   signatureInProgress = null;
+  formDraft = null;
   state.disbursing = null;
   state.message = {
     kind: "good",
@@ -1164,6 +1374,7 @@ async function saveTransfer(form: HTMLFormElement): Promise<void> {
   );
 
   state.transferring = null;
+  formDraft = null;
   state.message = {
     kind: "good",
     text: `Saved on this device: ${quantity} of ${holding.lot_number} to ${nameOfPeer(toRepProfileId)}. It syncs when there is a network.`,
@@ -1428,6 +1639,7 @@ async function saveCount(form: HTMLFormElement): Promise<void> {
   });
 
   state.counting = false;
+  formDraft = null;
   state.message = {
     kind: "good",
     text: `Saved on this device: a count of ${counted.length} lot(s). It syncs as one document — the count, each line, then the commit.`,
@@ -1471,6 +1683,101 @@ async function abandonOpenCount(countId: string): Promise<void> {
   });
   await store.replaceOutbox(state.outbox);
   state.message = { kind: "good", text: "Saved on this device: that count will be abandoned, and no adjustments written." };
+  render();
+  void drain({ manual: false });
+}
+
+/**
+ * Record material leaving custody.
+ *
+ * The simplest write in this app and the one with the least margin: there is no second half
+ * to wait for, nothing depends on it, and what it records is that regulated material no
+ * longer exists. So everything that can be refused is refused here — an empty reason, a
+ * quantity that is not a number the ledger can hold, more than the rep is carrying — rather
+ * than hours later from inside a queue, where the rep has already put the box in a bin.
+ */
+async function saveWriteOff(form: HTMLFormElement): Promise<void> {
+  const target = state.writingOff;
+  const author = authorId();
+  if (target === null || store === null) return;
+  if (author === null) {
+    state.message = { kind: "error", text: "This device does not know who is signed in yet, so it cannot record who disposed of this. Connect once and try again." };
+    render();
+    return;
+  }
+
+  const data = new FormData(form);
+  const quantity = String(data.get("quantity") ?? "").trim();
+  const reason = String(data.get("reason") ?? "").trim();
+  const kind = String(data.get("kind") ?? "") as WriteOffKind;
+
+  if (reason === "") {
+    state.message = {
+      kind: "error",
+      text: "A reason is required: it is the only record of why this material no longer exists.",
+    };
+    render();
+    return;
+  }
+
+  // The live holding, not the snapshot the form was opened with — a drain that settled
+  // another movement refreshes the balances underneath an open form.
+  const live = state.holdings.find((h) => h.lot_id === target.holding.lot_id) ?? target.holding;
+  const parsed = WriteOffBody.safeParse({
+    id: mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) }),
+    lotId: live.lot_id,
+    quantity,
+    occurredAt: new Date().toISOString(),
+    kind,
+    reason,
+  });
+  if (!parsed.success) {
+    state.message = {
+      kind: "error",
+      text: `This cannot be recorded: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`,
+    };
+    render();
+    return;
+  }
+  if (Number(quantity) <= 0) {
+    state.message = { kind: "error", text: "Nothing was disposed of, so there is nothing to record." };
+    render();
+    return;
+  }
+  if (Number(quantity) > Number(live.quantity_on_hand)) {
+    state.message = {
+      kind: "error",
+      text: `You are carrying ${live.quantity_on_hand} of ${live.lot_number}, so ${quantity} cannot be written off.`,
+    };
+    render();
+    return;
+  }
+
+  state.outbox = enqueueWriteOff(state.outbox, parsed.data, Date.now(), { createdBy: author });
+  await store.replaceOutbox(state.outbox);
+
+  const remaining = Number(live.quantity_on_hand) - Number(quantity);
+  state.holdings = state.holdings.map((h) =>
+    h.lot_id === live.lot_id
+      ? { ...h, quantity_on_hand: Number.isFinite(remaining) ? Math.max(0, remaining).toFixed(3) : h.quantity_on_hand }
+      : h,
+  );
+  // The obligation's own `quantity_on_hand` comes from the holding, so the screen moves it
+  // to "dealt with" the moment the row is queued — and the obligation stays listed, because
+  // only the sweep can close it and saying otherwise would be a claim this device cannot
+  // make.
+  state.obligations = state.obligations.map((o) =>
+    o.lot_id === live.lot_id
+      ? { ...o, quantity_on_hand: Number.isFinite(remaining) ? Math.max(0, remaining).toFixed(3) : o.quantity_on_hand }
+      : o,
+  );
+
+  state.writingOff = null;
+  formDraft = null;
+  state.message = {
+    kind: "good",
+    text: `Saved on this device: ${quantity} of ${live.lot_number} ${kind === "destruction" ? "destroyed" : "written off"}. It syncs when there is a network.`,
+  };
   render();
   void drain({ manual: false });
 }
@@ -1530,6 +1837,9 @@ async function drain(opts: { manual: boolean; revive?: boolean }): Promise<void>
     // wrote on this screen are a claim that abandoning it withdraws.
     "count_commit",
     "count_cancel",
+    // A write-off changes a balance AND may be what clears a disposal obligation, so the
+    // refresh re-reads both lists.
+    "write_off",
   ]);
   const custodyIdsBefore = state.outbox.filter((e) => CUSTODY_KINDS.has(e.kind)).map((e) => e.id);
 
@@ -1648,6 +1958,8 @@ async function refreshReference(): Promise<void> {
   // rather than meet it as a conflict.
   const countsResult = await transport.get("/v1/samples/counts");
   const counts = countsResult.kind === "ok" ? CountList.safeParse(countsResult.body) : null;
+  const obligationsResult = await transport.get("/v1/samples/obligations");
+  const obligations = obligationsResult.kind === "ok" ? ObligationList.safeParse(obligationsResult.body) : null;
 
   state.me = me.data;
   // Stamp the session with the rep it turned out to be, so a later cold start can tell
@@ -1662,6 +1974,7 @@ async function refreshReference(): Promise<void> {
   if (recallable !== null && recallable.success) state.recallable = recallable.data.data;
   if (peers !== null && peers.success) state.peers = peers.data.data;
   if (counts !== null && counts.success) state.counts = counts.data.data;
+  if (obligations !== null && obligations.success) state.obligations = obligations.data.data;
   state.cachedAt = Date.now();
   const cache: CachedReference = {
     me: me.data,
@@ -1672,6 +1985,7 @@ async function refreshReference(): Promise<void> {
     recallable: state.recallable,
     peers: state.peers,
     counts: state.counts,
+    obligations: state.obligations,
     fetchedAt: state.cachedAt,
   };
   await store.writeCache(cache);
@@ -1690,6 +2004,7 @@ function adoptSession(session: Session): void {
     state.recallable = [];
     state.peers = [];
     state.counts = [];
+    state.obligations = [];
     state.cachedAt = null;
   }
   writeSession(session);
@@ -1754,6 +2069,7 @@ async function boot(): Promise<void> {
     state.recallable = cached.recallable ?? [];
     state.peers = cached.peers ?? [];
     state.counts = cached.counts ?? [];
+    state.obligations = cached.obligations ?? [];
     state.cachedAt = cached.fetchedAt;
   }
 

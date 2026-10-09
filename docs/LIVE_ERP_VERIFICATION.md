@@ -1218,7 +1218,7 @@ typechecks green while `event.respondWith` does not exist.
 - **A real identity provider.** The token is minted by the same harness stand-in §10 uses.
   The PKCE implementation is tested against RFC 7636's own vector, and no live issuer has
   ever answered it.
-- **Most of the product.** Roughly 76 of the 106 routes have no screen.
+- **Most of the product.** Roughly 74 of the 106 routes have no screen.
 - **Any browser but Chromium**, and iOS Safari is the one that matters most for a field
   app. No Capacitor wrapper, no device under memory pressure, no push.
 - **A real ERP behind the outbox.** `ERP_BASE_URL` points nowhere in this run; §1–§7 cover
@@ -1442,11 +1442,69 @@ ok: and every balance still equals the sum of its movements — the count adjust
   has no id at all, which is the same fact that made `rejectUnreconcilable` need to learn
   the difference between a body that carries an id and one that cannot.
 
+## Expired stock, and the date a disposal was recorded on
+
+*2026-10-09, same script. `pnpm client:verify` is 178 checks.*
+
+Expired stock in a rep's bag is the most common sample-audit finding there is, and the
+write-off is the only thing that ends it. Two things make this chapter worth reading.
+
+**There is no honest way to hold expired stock through the API**, so the gate does what
+reality does. 0020 refuses a receipt of expired material outright — a warehouse that ships
+it takes it back — so the run receives the lot TWENTY DAYS AGO, fifteen days before it
+expired, through the same route with the same refusals in force, and then proves the rule it
+is relying on:
+
+```
+ok: stock received while it was still in date goes stale in the bag
+ok: while receiving it TODAY is refused — that is what makes the back-dated one honest
+ok: the sweep raises one disposal obligation ({"expiredHoldings":1,"opened":1,...)
+```
+
+The obligation is raised by the **real** `sweepExpiredStock`, the function the scheduler
+calls nightly. One the gate wrote itself would prove nothing about the one a rep sees.
+
+**Then the sweep runs three days late**, which is the case migration 0057 exists for:
+
+```
+ok: the rep is shown what they must dispose of (LOT-STALE-1 · itm-live-2)
+ok: with how much of it they are carrying
+ok: and the deadline, in days rather than a date to work out
+ok: the form opened from a disposal obligation defaults to EXPIRED, not destroyed
+ok: and the quantity starts empty: this is the screen that records material no longer existing
+ok: a write-off with no reason is refused at the keyboard, and queues nothing
+ok: a refusal does not wipe what the rep already typed
+ok: the obligation says it has been dealt with rather than showing a deadline
+ok: one write-off in crm.sample_transaction
+ok: and the stock is out of custody
+ok: the obligation is still open until the sweep confirms it from the ledger
+ok: the late sweep closes the obligation ({"resolved":1,...)
+ok: attributed from the LEDGER — written off, not guessed
+ok: and dated the day the material actually left, not the day the sweep noticed
+ok: which is inside the deadline it was given
+```
+
+### The two defects this chapter found
+
+- **A disposal was recorded on the day the sweep noticed.** `resolved_on` was the cron job's
+  clock while the resolving movement — right there, already read for attribution — carried
+  the date it happened. Seven-day grace, destroyed on day three, swept on day nine: recorded
+  as two days overdue when it was four days early, with the ledger saying one thing and the
+  obligation another. 0057 takes the movement's own date, bounded by the sweep's so a fast
+  device clock cannot date a disposal next week.
+- **A refusal wiped what the rep had typed.** Every refusal renders, and a render replaces
+  the DOM: "you are carrying 6, so 99 cannot be written off" arrived with the reason field
+  blank, and the reason is the only record of why regulated material no longer exists. On a
+  count form it is a number per lot plus the note, all of it gone to one mistyped digit.
+  Both earlier gates had hidden it by re-filling every field after every refusal. The form's
+  values now survive a render, and the run asserts it in both places.
+
 ### What is still not built
 
-Write-offs, returns, the disposal obligations with their regulatory deadlines, and the
-expiry sweep — the rest of custody. A count covers only the lots the device has cached, so
-material a rep holds that the device has never heard of cannot be counted into existence:
-the right conservative default, and still a gap. The peer picker is a plain select of the
-first 500 colleagues; the route takes a `?q=` filter and no screen uses it yet. Roughly 76
-of the 106 routes have no screen.
+The return to a warehouse — the other resolution path, and the better one for stock a
+warehouse can dispose of centrally. That route exists, mirrors to the ERP as a receipt, and
+has no screen, so the device currently offers only the destructive exit from an obligation;
+the form says so rather than leaving a rep to assume there is nothing else. The disposal
+policy is read-only everywhere. A count covers only the lots the device has cached. The peer
+picker is a plain select of the first 500 colleagues; the route takes a `?q=` filter and no
+screen uses it yet. Roughly 74 of the 106 routes have no screen.
