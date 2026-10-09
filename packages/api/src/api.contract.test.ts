@@ -150,6 +150,7 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.account_snapshot WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.product_snapshot WHERE tenant_id = $1", [t]);
+        await tx.query("DELETE FROM crm.warehouse_snapshot WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [t]);
       });
     }
@@ -192,6 +193,17 @@ describe("the API, end to end", () => {
          VALUES ($1,'rec_i1','SKU-1','Amoxil 500mg',999,'AED','active'),
                 ($1,'rec_i2','SKU-2','Panadol 1g',1000,'AED','active'),
                 ($1,'rec_i3','SKU-3','Ventolin',20,'AED','active')`,
+        [TENANT],
+      );
+      // The depots. A receipt and a return both name one, and since 0058 the route checks
+      // the id against this list rather than accepting any string of the right shape — so
+      // a fixture that seeds no warehouse cannot record a receipt at all, which is the
+      // point of the check.
+      await tx.query(
+        `INSERT INTO crm.warehouse_snapshot (tenant_id, erp_warehouse_id, code, name, warehouse_type, city, status)
+         VALUES ($1,'rec_wh1','DEPOT-1','Central Depot','distribution','Dubai','active'),
+                ($1,'rec_wh2','DEPOT-2','Second Depot','distribution','Abu Dhabi','active'),
+                ($1,'rec_whx','DEPOT-X','Shut Depot','transit','Sharjah','closed')`,
         [TENANT],
       );
     });
@@ -854,6 +866,72 @@ describe("the API, end to end", () => {
       expect(filtered.body.data.map((p: { rep_profile_id: string }) => p.rep_profile_id)).toEqual([otherRep]);
     });
 
+    it("offers the depots a return can be addressed to, and only the open ones", async () => {
+      const res = await call("GET", "/v1/samples/warehouses");
+      expect(res.status).toBe(200);
+      const codes = res.body.data.map((w: { code: string }) => w.code);
+      expect(codes).toEqual(["DEPOT-1", "DEPOT-2"]);
+      // A closed depot is a lorry sent to a locked gate, and the write refuses it too — so
+      // the picker must not offer it. The row stays in the snapshot: a movement already
+      // posted against it has to remain nameable.
+      expect(codes).not.toContain("DEPOT-X");
+      expect(res.body.data[0]).toMatchObject({
+        erp_warehouse_id: "rec_wh1",
+        name: "Central Depot",
+        city: "Dubai",
+        status: "active",
+      });
+
+      const filtered = await call("GET", "/v1/samples/warehouses?q=second");
+      expect(filtered.body.data.map((w: { code: string }) => w.code)).toEqual(["DEPOT-2"]);
+    });
+
+    it("refuses a receipt from a depot that does not exist, at the point of entry", async () => {
+      // Before the warehouse list, any id matching `^[A-Za-z0-9_-]{1,200}$` was accepted
+      // here, the movement was written, and the ERP refused the mirrored StockMovement
+      // hours later from inside the relay queue — where nobody is standing. 422 now.
+      const lotId = await aLot();
+      const res = await call("POST", "/v1/samples/receipts", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 5,
+          occurredAt: "2026-10-01T08:00:00.000Z",
+          erpWarehouseId: "rec_invented",
+        },
+      });
+      expect(res.status).toBe(422);
+      expect(res.body.detail).toContain("rec_invented");
+
+      // AND NOTHING WAS WRITTEN. The check is before the insert, so a refused receipt
+      // leaves neither a movement nor an outbox row to mirror it.
+      await withTenantContext(admin, TENANT, async (tx) => {
+        const { rows } = await tx.query<{ n: string }>(
+          "SELECT count(*) AS n FROM crm.sample_transaction WHERE lot_id = $1",
+          [lotId],
+        );
+        expect(rows[0]!.n).toBe("0");
+      });
+    });
+
+    it("refuses a receipt from a closed depot as a conflict, not as a bad request", async () => {
+      // A well-formed request the depot's own state refuses, which is the same reading
+      // `lot_expired` and `insufficient_stock` get. A client shows it differently: pick
+      // another depot, rather than check what you typed.
+      const lotId = await aLot();
+      const res = await call("POST", "/v1/samples/receipts", {
+        body: {
+          id: randomUUID(),
+          lotId,
+          quantity: 5,
+          occurredAt: "2026-10-01T08:00:00.000Z",
+          erpWarehouseId: "rec_whx",
+        },
+      });
+      expect(res.status).toBe(409);
+      expect(res.body.detail).toContain("closed");
+    });
+
     /**
      * The offline flush. One bad row must not reject the rest of a rep's day.
      */
@@ -1036,6 +1114,88 @@ describe("the API, end to end", () => {
           // the other direction from a rep receipt.
           expect(rows[0]!.payload["movement_type"]).toBe("receipt");
         });
+      });
+
+      it("returns transferred stock to a depot that never sent it, which is why the list exists", async () => {
+        // THE GAP THE WAREHOUSE LIST CLOSES. A lot handed over by a colleague has no
+        // receipt of its own, so `last_received_from` is null and the device had no
+        // destination it could name without inventing one — the only exit was a write-off
+        // of material a depot could have put back on a shelf. With a list, the rep picks a
+        // depot, and the server checks the pick against the same list.
+        const lotId = await expiredInBag(otherRep, 6);
+        const transferId = randomUUID();
+        expect(
+          (
+            await call("POST", "/v1/samples/transfers", {
+              auth: token({ sub: "idp|rep2", tenant: TENANT }),
+              body: {
+                id: transferId,
+                lotId,
+                quantity: 6,
+                occurredAt: "2026-09-01T09:00:00.000Z",
+                toRepProfileId: rep,
+              },
+            })
+          ).status,
+        ).toBe(201);
+        expect(
+          (
+            await call("POST", `/v1/samples/transfers/${transferId}/accept`, {
+              body: { id: randomUUID(), lotId, quantity: 6, occurredAt: "2026-09-02T09:00:00.000Z" },
+            })
+          ).status,
+        ).toBe(201);
+
+        // No receipt of this rep's own, so nothing in the ledger names a depot for it.
+        const holdings = await call("GET", "/v1/samples/holdings");
+        const held = holdings.body.data.find((h: { lot_id: string }) => h.lot_id === lotId);
+        expect(held.last_received_from).toBeNull();
+
+        const returned = await call("POST", "/v1/samples/returns", {
+          body: {
+            id: randomUUID(),
+            lotId,
+            quantity: 6,
+            occurredAt: "2026-10-15T09:00:00.000Z",
+            // A depot of the rep's choosing, from the list — not the one that sent this lot
+            // to their colleague, which never sent it here.
+            erpWarehouseId: "rec_wh2",
+            reason: "handed over at a congress, going back to my own depot",
+          },
+        });
+        expect(returned.status).toBe(201);
+        expect(returned.body.erpMirrorEnqueued).toBe(true);
+      });
+
+      it("refuses a return to a depot that does not exist, or to one that has closed", async () => {
+        const lotId = await expiredInBag(rep, 4);
+        const unknown = await call("POST", "/v1/samples/returns", {
+          body: {
+            id: randomUUID(),
+            lotId,
+            quantity: 2,
+            occurredAt: "2026-10-15T09:00:00.000Z",
+            erpWarehouseId: "rec_nowhere",
+          },
+        });
+        expect(unknown.status).toBe(422);
+        const shut = await call("POST", "/v1/samples/returns", {
+          body: {
+            id: randomUUID(),
+            lotId,
+            quantity: 2,
+            occurredAt: "2026-10-15T09:00:00.000Z",
+            erpWarehouseId: "rec_whx",
+          },
+        });
+        expect(shut.status).toBe(409);
+
+        // Neither refusal left a movement behind, so the rep still holds all four and the
+        // ERP was told nothing. A check that refused AFTER writing would be worse than no
+        // check: the ledger would hold a return to a depot that cannot receive it.
+        const holdings = await call("GET", "/v1/samples/holdings");
+        const held = holdings.body.data.find((h: { lot_id: string }) => h.lot_id === lotId);
+        expect(held.quantity_on_hand).toBe("4.000");
       });
 
       it("shows a manager the team's outstanding disposals and a peer nothing", async () => {

@@ -343,6 +343,16 @@ export CRM_PGDATABASE="$CRM_DB"
 node "$ROOT/scripts/live-erp/seed.mjs" || fail "seeding the ERP fixtures failed"
 ok "fixtures present"
 
+# The CRM learns the ERP's depots, through the shipped refresher, before any rep can record
+# receiving stock from one: since 0058 a receipt naming a warehouse the snapshot does not
+# have is refused — and with an EMPTY snapshot it is refused as an integration failure (503)
+# rather than a bad id, because nothing could be validated. That ordering is production's
+# too; §11 proves the scheduler is what maintains it.
+WH_SYNC="$(CRM_PGUSER="${CRM_PGUSER:-crm_app}" CRM_PGPASSWORD="${CRM_PGPASSWORD:-crm_app}" \
+  node "$ROOT/scripts/live-erp/sync-warehouses.mjs")" \
+  || fail "the CRM could not sync its warehouse list from the live ERP"
+ok "$WH_SYNC"
+
 # ---------------------------------------------------------------------------
 echo "--- 8. the schema the CRM's committed baseline claims to be a capture of ---"
 # packages/acl/schema/baseline.json is the file CI diffs against, and three of the

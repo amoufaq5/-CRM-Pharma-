@@ -9,6 +9,7 @@ import type {
   RecallableTransfer,
   TransferPeer,
   Visit,
+  Warehouse,
 } from "./api.js";
 import type { OutboxEntry } from "./outbox.js";
 
@@ -84,6 +85,18 @@ export interface CachedReference {
    * lives on the server.
    */
   readonly failedErpWrites?: readonly FailedErpWrite[];
+  /**
+   * The depots a return can be addressed to.
+   *
+   * Cached because this is the one reference list whose absence CHANGES WHAT A REP CAN DO
+   * rather than only what they can see: with no list on the device, a return has no
+   * destination to offer and the only exit left for expired stock is a write-off — which
+   * destroys material a depot could have taken back. A stale list is a far smaller problem
+   * than no list, and the server re-checks the chosen depot when the return drains, so a
+   * depot that closed meanwhile is refused with its own sentence rather than silently
+   * accepted.
+   */
+  readonly warehouses?: readonly Warehouse[];
   /** Epoch ms of the fetch, so the UI can say how stale it is instead of implying fresh. */
   readonly fetchedAt: number;
 }

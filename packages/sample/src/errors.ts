@@ -93,6 +93,45 @@ export class LedgerImmutableError extends Error {
   }
 }
 
+/**
+ * A receipt or a return naming a warehouse the CRM's list does not have.
+ *
+ * The caller's mistake, and answerable: the list is at `GET /v1/samples/warehouses`. Before
+ * 0058 there was no list, so any id of the right SHAPE was accepted and the ERP refused the
+ * mirrored movement hours later from inside the relay queue — or accepted it against a real
+ * warehouse belonging to another site, which is worse because nothing refuses it at all.
+ */
+export class UnknownWarehouseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnknownWarehouseError";
+  }
+}
+
+/** A known depot that is not open. Well-formed request, refused by the warehouse's state. */
+export class WarehouseInactiveError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WarehouseInactiveError";
+  }
+}
+
+/**
+ * The warehouse list has never synced for this tenant, so nothing can be validated against it.
+ *
+ * An INTEGRATION state rather than the caller's error, and kept separate for that reason:
+ * answering 422 here would tell a rep their warehouse id is wrong when the truth is that
+ * the CRM has not fetched the list yet, and they would go looking for a typo that is not
+ * there. Fails closed deliberately — the alternative, accepting any id while the list is
+ * empty, is validation that stops validating exactly when the integration is unhealthy.
+ */
+export class WarehouseListUnsyncedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WarehouseListUnsyncedError";
+  }
+}
+
 export class SampleCountError extends Error {
   constructor(message: string) {
     super(message);

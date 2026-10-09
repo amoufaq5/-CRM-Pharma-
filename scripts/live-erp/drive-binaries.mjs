@@ -340,6 +340,58 @@ if (PHASE === "api-write") {
     `movement_type=${queued?.payload?.movement_type} quantity=${queued?.payload?.quantity}`,
   );
 
+  // 10h-bis. THE DEPOT HAS TO BE A DEPOT. The receipt above names `wh-1`, which §7 of this
+  // gate created at the ERP and the CRM then mirrored into `crm.warehouse_snapshot` with
+  // the shipped refresher. Before 0058 any string matching `^[A-Za-z0-9_-]{1,200}$` was
+  // accepted here, the movement was written, and the ERP refused the mirrored
+  // `StockMovement` hours later from inside the relay queue — a dead letter, with the rep
+  // who recorded it long gone. Measured in both directions, because an id that is simply
+  // never checked would pass the positive half on its own.
+  const invented = await api("/v1/samples/receipts", {
+    method: "POST",
+    token,
+    body: {
+      id: randomUUID(),
+      lotId: loadState().lotId,
+      quantity: "1.000",
+      occurredAt: new Date().toISOString(),
+      erpWarehouseId: "wh-invented",
+    },
+  });
+  expect(
+    invented.status === 422,
+    "a receipt from a depot the ERP does not have is refused at the point of entry, not by a dead letter",
+    `${invented.status} ${String(invented.body?.detail ?? "").slice(0, 90)}`,
+  );
+  const shut = await api("/v1/samples/receipts", {
+    method: "POST",
+    token,
+    body: {
+      id: randomUUID(),
+      lotId: loadState().lotId,
+      quantity: "1.000",
+      occurredAt: new Date().toISOString(),
+      erpWarehouseId: "wh-shut",
+    },
+  });
+  expect(
+    shut.status === 409,
+    "and one the ERP says is closed is a conflict — a well-formed request the depot's own state refuses",
+    `${shut.status} ${String(shut.body?.detail ?? "").slice(0, 90)}`,
+  );
+  const refusedWrote = await inCrm(async (tx) => {
+    const { rows } = await tx.query(
+      `SELECT count(*)::text AS n FROM crm.outbox WHERE tenant_id = $1 AND payload->>'warehouse_id' IN ('wh-invented','wh-shut')`,
+      [TENANT],
+    );
+    return rows[0]?.n;
+  });
+  expect(
+    refusedWrote === "0",
+    "and neither refusal left a movement or a mirror behind — the check runs before the insert",
+    `outbox rows for the refused depots=${refusedWrote}`,
+  );
+
   // 10i. THE FINDING, MADE INTO A CHECK. Nothing in the API reaches the ERP: it
   // constructs no `ErpClient`, opens no socket to it, and every read it serves
   // comes from a `crm.*` snapshot. So the boundary is crossed asynchronously, by
@@ -495,6 +547,23 @@ if (PHASE === "drain") {
     snaps.length > 0 && products.length === 4,
     "the same process filled crm.product_snapshot from the live ERP in the same tick",
     `snapshot_full ticks=${snaps.length} rows=${products.length} prices=${products.map((p) => p.list_price).join(",")}`,
+  );
+  // The fourth snapshot, through the job that drives all of them. `refreshAll` used to
+  // enumerate the snapshot names a second time, so a snapshot could be declared, migrated
+  // and tested and still never be refreshed in production — it is now derived from the
+  // projection registry, and this is the line that proves the scheduler maintains the list
+  // the receipt check above depends on.
+  const depots = await inCrm(async (tx) => {
+    const { rows } = await tx.query(
+      `SELECT code, status FROM crm.warehouse_snapshot WHERE tenant_id = $1 ORDER BY code`,
+      [TENANT],
+    );
+    return rows;
+  });
+  expect(
+    depots.length === 3 && depots.filter((d) => d.status === "active").length === 2,
+    "and crm.warehouse_snapshot too — the scheduler is what keeps a return's destinations current",
+    depots.map((d) => `${d.code}=${d.status}`).join(" "),
   );
   expect(
     /UNBOUNDED/.test(snaps.map((s) => s.detail).join(" ")),

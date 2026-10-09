@@ -87,7 +87,7 @@ authorisation on its own.
 | `GET /v1/call-plans/:id/adherence` | planned vs actual, per target and in summary |
 | `GET /v1/samples/holdings` | what they are carrying, by lot |
 | `GET /v1/samples/expiring` | what is about to go out of date in their bag |
-| `POST /v1/samples/receipts` | confirm stock from a warehouse — the one route that mirrors to the ERP |
+| `POST /v1/samples/receipts` | confirm stock from a depot — the one route that mirrors to the ERP; the depot must be one the ERP has |
 | `POST /v1/samples/disbursements` | a hand-over, with recipient and signature hash |
 | `GET\|POST /v1/samples/transfers` | outstanding transfers, either side / send to another rep |
 | `GET /v1/samples/transfers/incoming` | material on its way TO the caller — the list an accept acts on |
@@ -113,7 +113,8 @@ authorisation on its own.
 | `GET /v1/samples/obligations` | what the caller must dispose of, with the deadline |
 | `GET /v1/samples/obligations/:lotId/history` | the whole continuation chain for one lot, with each link's resolution and the ledger movement that discharged it |
 | `POST /v1/samples/write-offs` | a destruction or an expiry write-off — **reason required**, and the two kinds stay apart |
-| `POST /v1/samples/returns` | back to a warehouse; mirrored to the ERP as a `receipt` |
+| `GET /v1/samples/warehouses` | the depots a return can be addressed to — active only, `?q=` matches code or name |
+| `POST /v1/samples/returns` | back to a depot off that list; mirrored to the ERP as a `receipt` |
 | `GET /v1/samples/disposal-policy` | the tenant's grace period, read-only |
 | `GET /v1/team/samples/obligations` | the team's outstanding disposals — the chase list |
 | `GET /v1/notifications` | the inbox; `?unread=true` filters |
@@ -752,7 +753,7 @@ issue a signed `TombstoneRecord` while "every row of the tenant's actual busines
 survived", so the tombstone "was not incomplete. It was false, and it was cryptographically
 signed."
 
-The CRM holds that tenant's product, rep and account snapshots, its queued ERP writes, its
+The CRM holds that tenant's product, rep, account and warehouse snapshots, its queued ERP writes, its
 expense claims with their ledger account codes, its notifications and its attachments.
 Nothing listened. So the ERP's proof became true about the ERP and false about a system
 holding copies of the same personal data — the same defect, one system over, and not one the
@@ -990,9 +991,12 @@ PGUSER=… PGHOST=… ./scripts/verify-live-erp.sh
 ```
 
 Boots a real `operate-server` over a real Postgres, points it at the CRM's own JWKS, and
-runs **125 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
-`@crm/relay` as a library, and 35 through the CRM's own `api` and `scheduler` **binaries**,
-started as processes exactly as `deploy/docker-compose.yml` starts them. The CRM's own
+runs **129 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
+`@crm/relay` as a library, and 39 through the CRM's own `api` and `scheduler` **binaries**,
+started as processes exactly as `deploy/docker-compose.yml` starts them. It also syncs the
+ERP's warehouses into `crm.warehouse_snapshot` with the shipped `SnapshotRefresher` before
+any rep records a receipt — because since 0058 a receipt naming a depot the ERP does not
+have is refused at the point of entry, which the gate measures in both directions. The CRM's own
 database is dropped and rebuilt from empty each run — it used to
 be required to exist already, which made the gate's schema whatever was lying around, and
 that is how a check came to fail with `column "seq" does not exist` against a database three
@@ -1161,7 +1165,7 @@ pass vacuously. **83 files / 2,123 tests green on both transports.**
 `apps/field` is the client, and it is a slice rather than the product: **sign in, see my
 accounts, record a visit with no network, disburse samples with a signature on glass, hand
 material to a colleague and accept theirs, count the bag, write off what has expired, send
-stock back to the warehouse, watch all of it sync, read a refusal.** Roughly 71 of the 106
+stock back to a depot, watch all of it sync, read a refusal.** Roughly 71 of the 106
 routes still have no screen — call plans, expenses, notifications, the manager's views, all
 of admin.
 
@@ -1169,8 +1173,8 @@ What it settles is the part that was a guess. Everything built for an offline de
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **201 checks in two
-real Chromium profiles — two devices, two reps — taken offline mid-session, against the
+and `pnpm client:verify` proves it the only way that means anything: **221 checks in three
+real Chromium profiles — three devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
 - a visit recorded with the network down lands in IndexedDB, pending, with a device-minted
@@ -1226,14 +1230,20 @@ real API binary, counting rows in Postgres.** The sequence it drives:
 - and **a refusal no longer wipes what the rep typed**. Every refusal goes through a render
   that replaces the DOM, so "you are carrying 6, so 99 cannot be written off" used to arrive
   with the reason field blank — on a count form, a number per lot and the note with it;
-- **stock goes back to the warehouse it came from** — the one write here the ERP has to be
-  told about, since the material re-enters its books. The warehouse is **shown, not
-  offered**: the CRM models no warehouses, so the only destination a device can name without
-  inventing one is where the lot was received from, and material that arrived by transfer
-  has none and says so. The return leaves exactly one `StockMovement` for the ERP, and when
-  the gate plays the relay's verdict and kills it, the screen names it in the ERP's own
-  words with a retry — because a return the ERP never hears about leaves a warehouse short
-  in its own books while the CRM's record is perfectly correct;
+- **stock goes back to a depot off the ERP's own list** — the one write here the ERP has to
+  be told about, since the material re-enters its books. The destination used to be **shown,
+  not offered**: with no warehouse list, the only id a device could name without inventing
+  one was the depot the lot was received from, so material that arrived by TRANSFER had no
+  destination at all and the device offered only a write-off — destroying stock a depot could
+  have put back on a shelf. `crm.warehouse_snapshot` (0058) closed that: the open depots are
+  offered, the lot's own origin is pre-selected where it has one, nothing is pre-selected
+  where it does not, and the server checks the pick against the same list — so a depot that
+  does not exist is refused at the keyboard rather than by a dead letter days later. The gate
+  proves the case that was impossible: the rep who received her stock from a colleague, with
+  no receipt of her own, sends it back to a depot she picked. Each return leaves one
+  `StockMovement` for the ERP, and when the gate plays the relay's verdict and kills one, the
+  screen names it in the ERP's own words with a retry — because a return the ERP never hears
+  about leaves a depot short in its own books while the CRM's record is perfectly correct;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

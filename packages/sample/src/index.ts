@@ -10,6 +10,9 @@ export {
   TransferAlreadySettledError,
   TransferMismatchError,
   TransferNotSenderError,
+  UnknownWarehouseError,
+  WarehouseInactiveError,
+  WarehouseListUnsyncedError,
   translateSampleError,
 } from "./errors.js";
 export {
@@ -73,6 +76,13 @@ export {
   type RecallableTransfer,
   type TransferRecall,
 } from "./recall.js";
+export {
+  ACTIVE_WAREHOUSE_STATUS,
+  WAREHOUSE_LIMIT,
+  listWarehouses,
+  requireActiveWarehouse,
+  type Warehouse,
+} from "./warehouses.js";
 export {
   TRANSFER_PEER_LIMIT,
   incomingTransfers,

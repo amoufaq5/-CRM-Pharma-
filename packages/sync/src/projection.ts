@@ -9,7 +9,7 @@ import {
   coerceTimestamp,
 } from "./coerce.js";
 
-export type SnapshotName = "product" | "rep" | "account";
+export type SnapshotName = "product" | "rep" | "account" | "warehouse";
 
 /**
  * One snapshot's contract: which ERP entity feeds it, which table it fills, and
@@ -142,10 +142,62 @@ export const ACCOUNT_PROJECTION: SnapshotProjection = {
   },
 };
 
+/**
+ * The ERP's warehouses.
+ *
+ * The one snapshot that is not read to SHOW a number but to VALIDATE one: a receipt and a
+ * return both name a warehouse, and until this table existed any id matching
+ * `crm.erp_record_id`'s shape was accepted and failed hours later from inside the relay
+ * queue (0058). It is also what makes material received from a colleague returnable at
+ * all — before it, the device could only name the depot a lot was received from, and a lot
+ * that arrived by transfer has no such receipt.
+ *
+ * `status` is projected rather than filtered here on purpose: the snapshot mirrors what the
+ * ERP says, and WHICH statuses may receive a return is the writer's rule, not the
+ * mirror's. A sweep that dropped the inactive rows would also make a movement's historical
+ * destination unnameable.
+ */
+export const WAREHOUSE_PROJECTION: SnapshotProjection = {
+  name: "warehouse",
+  entity: "Warehouse",
+  table: "crm.warehouse_snapshot",
+  idColumn: "erp_warehouse_id",
+  columns: [
+    "erp_warehouse_id",
+    "code",
+    "name",
+    "warehouse_type",
+    "address_line1",
+    "city",
+    "country",
+    "status",
+    "erp_updated_at",
+  ],
+  project(r) {
+    return {
+      erp_warehouse_id: coerceRequiredRecordId("id", r["id"]),
+      // Both required at the ERP, and both load-bearing on a picker: a rep knows a depot
+      // by its code. Required here too, so a rename that empties either is a rejected
+      // record rather than a blank row in a list of destinations.
+      code: coerceRequiredText("code", r["code"]),
+      name: coerceRequiredText("name", r["name"]),
+      warehouse_type: coerceText("warehouse_type", r["warehouse_type"]),
+      // Enough to tell two depots in the same city apart on a phone, and nothing more:
+      // the ERP's address is not the CRM's business and a field not copied cannot drift.
+      address_line1: coerceText("address_line1", r["address_line1"]),
+      city: coerceText("city", r["city"]),
+      country: coerceCountry("country", r["country"]),
+      status: coerceText("status", r["status"]),
+      erp_updated_at: coerceTimestamp("updated_at", r["updated_at"]),
+    };
+  },
+};
+
 export const PROJECTIONS: readonly SnapshotProjection[] = [
   PRODUCT_PROJECTION,
   REP_PROJECTION,
   ACCOUNT_PROJECTION,
+  WAREHOUSE_PROJECTION,
 ];
 
 export function projectionFor(name: SnapshotName): SnapshotProjection {

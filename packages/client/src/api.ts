@@ -479,6 +479,34 @@ export type Obligation = z.infer<typeof Obligation>;
 export const ObligationList = z.object({ data: z.array(Obligation) });
 
 /**
+ * A row of `GET /v1/samples/warehouses`: a depot a return can be addressed to.
+ *
+ * The list that makes a return possible for material this rep never received from a depot
+ * — stock handed over by a colleague, which before this had no destination a device could
+ * name and could only be written off. `erp_warehouse_id` is the opaque ERP id the movement
+ * is posted against; `code` is what a rep recognises and what the picker shows.
+ *
+ * `status` is carried although the route returns only active depots: the list and the write
+ * enforce the same rule, and a client that showed a status it had not been told would be
+ * inventing one. Passthrough, like every other read schema here, so a server that adds a
+ * column does not break a device.
+ */
+export const Warehouse = z
+  .object({
+    erp_warehouse_id: ErpRecordId,
+    code: z.string(),
+    name: z.string(),
+    warehouse_type: z.string().nullish(),
+    city: z.string().nullish(),
+    country: z.string().nullish(),
+    status: z.string().nullish(),
+  })
+  .passthrough();
+export type Warehouse = z.infer<typeof Warehouse>;
+
+export const WarehouseList = z.object({ data: z.array(Warehouse) });
+
+/**
  * What `POST /v1/samples/returns` accepts: material going back into ERP stock.
  *
  * THE FIRST WRITE IN THIS CLIENT THAT THE ERP MUST HEAR ABOUT. Everything else a rep
@@ -493,10 +521,17 @@ export const ObligationList = z.object({ data: z.array(Obligation) });
  * ERP never hears about leaves a warehouse short in its own books, with nothing on this
  * device saying so.
  *
- * `erpWarehouseId` is NOT a free choice. The CRM models no warehouses — it is an opaque
- * ERP id, not a reference — so the device sends the warehouse the material came FROM, off
- * the holding's `last_received_from`. A lot that arrived by transfer has none, and such
- * material cannot be returned from this device at all.
+ * `erpWarehouseId` IS NOW A CHOICE, and a checked one. It used to be the warehouse the
+ * material came from and nothing else — off the holding's `last_received_from` — because
+ * the CRM modelled no warehouses, so the only id a device could name without inventing one
+ * was a depot that had demonstrably sent this lot here. The consequence was that stock
+ * received from a COLLEAGUE could not be returned at all: no receipt, no destination, and
+ * the only exit was a write-off of material a depot could have put back on a shelf.
+ *
+ * `GET /v1/samples/warehouses` closes that (0058). The device offers the list, defaults to
+ * `last_received_from` when the lot has one, and the server checks the id against the same
+ * list — so a depot that does not exist is refused at the point of entry rather than by the
+ * ERP hours later from inside the relay queue.
  */
 export const ReturnBody = z.object({
   id: Uuid,

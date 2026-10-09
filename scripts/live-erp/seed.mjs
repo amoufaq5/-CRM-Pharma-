@@ -100,6 +100,27 @@ for (const price of [9, 20, 100, 1000]) {
   });
 }
 
+// The depots. Since 0058 the CRM refuses a receipt or a return naming a warehouse its
+// snapshot does not have, so `wh-1` — which the API write check below posts a receipt
+// against — has to be a warehouse the ERP really serves, not a string of the right shape.
+// Three of them, and the third is closed on purpose: the CRM accepts only an ACTIVE depot,
+// and a list with nothing inactive in it cannot show that the filter does anything.
+for (const [id, code, name, status] of [
+  ["wh-1", "DEPOT-1", "Central Depot", "active"],
+  ["wh-2", "DEPOT-2", "Second Depot", "active"],
+  ["wh-shut", "DEPOT-X", "Decommissioned Shed", "closed"],
+]) {
+  await put("warehouses", {
+    id,
+    code,
+    name,
+    warehouse_type: "distribution",
+    city: "Dubai",
+    country: "AE",
+    status,
+  });
+}
+
 // Leave requests straddling 2026-02-01, so the ISO-date check has a non-empty
 // result on BOTH sides of the boundary. A one-sided check passes against a
 // filter that drops everything.

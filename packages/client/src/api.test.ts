@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { Account, Me, Problem, SYNC_BATCH_MAX, SyncResponse, VisitBody, problemKind } from "./api.js";
+import {
+  Account,
+  Me,
+  Problem,
+  ReturnBody,
+  SYNC_BATCH_MAX,
+  SyncResponse,
+  VisitBody,
+  Warehouse,
+  WarehouseList,
+  problemKind,
+} from "./api.js";
 
 /**
  * The client's copy of the wire contract, held to the server's own rules.
@@ -94,6 +105,39 @@ describe("responses", () => {
   it("rejects a reply missing the per-row results, which is the shape a portal returns", () => {
     expect(SyncResponse.safeParse({ accepted: 0, rejected: 0 }).success).toBe(false);
     expect(SyncResponse.safeParse("<html>captive portal</html>").success).toBe(false);
+  });
+
+  it("accepts a depot with only the fields a picker needs", () => {
+    // `name` and `code` are NOT NULL at the ERP and in the snapshot; the rest is optional
+    // because a depot with no city is a depot, and refusing it would empty a rep's list of
+    // destinations over a blank column.
+    expect(
+      Warehouse.safeParse({ erp_warehouse_id: "wh-1", code: "DEPOT-1", name: "Central" }).success,
+    ).toBe(true);
+    expect(
+      Warehouse.safeParse({ erp_warehouse_id: "wh-1", code: "DEPOT-1", name: "Central", city: null, status: null })
+        .success,
+    ).toBe(true);
+  });
+
+  it("refuses a depot whose id could not be an ERP record id", () => {
+    // The movement is posted against this id. A value the server's own domain would refuse
+    // must not reach a queue that drains hours later.
+    expect(Warehouse.safeParse({ erp_warehouse_id: "wh 1!", code: "D", name: "N" }).success).toBe(false);
+    expect(WarehouseList.safeParse({ data: [] }).success).toBe(true);
+    expect(WarehouseList.safeParse({ data: [{ code: "D", name: "N" }] }).success).toBe(false);
+  });
+
+  it("still requires a return to name a depot, so a blank pick cannot be queued", () => {
+    const base = {
+      id: "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c1e",
+      lotId: "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c1f",
+      quantity: "3.000",
+      occurredAt: "2026-10-15T09:00:00.000Z",
+    };
+    expect(ReturnBody.safeParse({ ...base, erpWarehouseId: "wh-1" }).success).toBe(true);
+    expect(ReturnBody.safeParse({ ...base, erpWarehouseId: "" }).success).toBe(false);
+    expect(ReturnBody.safeParse(base).success).toBe(false);
   });
 
   it("parses an RFC 9457 problem with and without a detail", () => {

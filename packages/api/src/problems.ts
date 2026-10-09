@@ -253,6 +253,16 @@ export function toProblem(err: unknown): ApiError {
     case "SampleLotNotFoundError":
     case "CallPlanNotFoundError":
       return new ApiError("not_found", message);
+    // The warehouse list (0058). Three refusals rather than one, because a client does
+    // three different things with them: pick again from the list, pick a different depot,
+    // or wait for the list to sync. A 422 for the third would send a rep hunting a typo
+    // in an id that was never checked against anything.
+    case "UnknownWarehouseError":
+      return new ApiError("validation_failed", message);
+    case "WarehouseInactiveError":
+      return new ApiError("conflict", message);
+    case "WarehouseListUnsyncedError":
+      return new ApiError("upstream_unavailable", message);
 
     // Call plans (0015/0016).
     case "TargetOutsideTerritoryError":

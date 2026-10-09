@@ -194,6 +194,16 @@ function mirrorRows() {
   });
 }
 
+/** How many receipts the receiving rep has of her own. The premise of the return chapter. */
+function graceReceipts() {
+  const out = sql(
+    `SELECT count(*) FROM crm.sample_transaction t
+       JOIN crm.rep_profile r ON r.id = t.rep_profile_id
+      WHERE t.tenant_id = '${tenant}' AND r.subject = 'rep-grace' AND t.kind = 'receipt'`,
+  );
+  return Number(out.trim());
+}
+
 function obligationRows() {
   const out = sql(
     `SELECT status, COALESCE(resolution,''), COALESCE(resolved_on::text,''), due_by::text
@@ -1080,18 +1090,34 @@ async function main() {
     await page.click(`button[data-return="${lotId}"]`);
     await page.waitFor(`document.querySelector("#return-form") !== null`, { label: "the return form" });
 
-    // THE WAREHOUSE IS SHOWN, NOT OFFERED. The CRM models no warehouses — an
-    // `erp_warehouse_id` is an opaque text id — so the only destination a device can name
-    // without inventing one is where the material came from.
+    // THE DEPOT IS CHOSEN FROM A LIST AND NEVER TYPED. It used not to be a choice at all:
+    // with no warehouse list, the only destination a device could name without inventing
+    // one was `last_received_from`, so this form showed it and offered nothing. The list
+    // (0058) makes it a choice, and the three properties that matter are all on this screen
+    // — the open depots are offered, the closed one is not, and the lot's own origin is
+    // pre-selected so the common case is still one tap.
     const form = await page.evaluate(`
       const f = document.querySelector("#return-form");
+      const sel = f?.querySelector('select[name="warehouse"]');
       return {
         text: f?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
         fields: [...(f?.querySelectorAll("input[name], select[name]") ?? [])].map((e) => e.name),
+        options: [...(sel?.options ?? [])].map((o) => o.value),
+        labels: [...(sel?.options ?? [])].map((o) => o.textContent?.replace(/\\s+/g, " ").trim()),
+        selected: sel?.value ?? null,
       };`);
-    is(/wh-live-1/.test(String(form.text)), true, "the return names the warehouse the material came from");
+    is(form.fields.includes("warehouse"), true,
+      `the return offers a depot to pick (${JSON.stringify(form.fields)})`);
+    is(form.options, ["", "wh-live-1", "wh-live-2"],
+      "the open depots the ERP told us about, and no third option");
+    is(form.options.includes("wh-live-x"), false,
+      "the closed depot is not on offer — the write refuses it, so the screen must not suggest it");
+    is(form.selected, "wh-live-1",
+      "and the depot this lot came from is pre-selected, so the common case is unchanged");
+    is(/where this lot came from/.test(String(form.labels.join(" "))), true,
+      `with that option saying why it is the default (${JSON.stringify(form.labels[1])})`);
     is(form.fields.includes("erpWarehouseId"), false,
-      `and there is no field for it: a typed ERP id is a return addressed to a depot that may not exist (${JSON.stringify(form.fields)})`);
+      "and still no free-text field for an ERP id: the picked value is checked against the list, here and again by the server");
 
     await page.fill(`#return-form input[name="quantity"]`, "99");
     await page.click("#save-return");
@@ -1116,7 +1142,7 @@ async function main() {
       `${READ_OUTBOX} const r = rows.find((x) => x.kind === "return_to_warehouse"); return r === undefined ? null : { quantity: r.body.quantity, warehouse: r.body.erpWarehouseId, reason: r.body.reason };`,
     );
     is(queuedReturn?.quantity, "1", "the queued return carries the quantity");
-    is(queuedReturn?.warehouse, "wh-live-1", "and the warehouse, taken off the holding rather than from a form");
+    is(queuedReturn?.warehouse, "wh-live-1", "and the depot, which the form had pre-selected from the lot's own origin");
     is(returnRows().length, 0, "with nothing in the ledger while there is no signal");
 
     await page.offline(false);
@@ -1125,7 +1151,7 @@ async function main() {
     const returned = returnRows();
     is(returned.length, 1, "one return_to_warehouse in crm.sample_transaction");
     is(returned[0]?.quantity, "1.000", "for the quantity the rep sent back");
-    is(returned[0]?.warehouse, "wh-live-1", "addressed to the warehouse it came from");
+    is(returned[0]?.warehouse, "wh-live-1", "addressed to the depot it came from");
     is(/surplus/.test(String(returned[0]?.reason)), true, "with the reason, which whoever receives it reads");
     is(holding("rep-ada"), "3.000|0.000", "and the stock has left the rep's balance");
 
@@ -1169,7 +1195,100 @@ async function main() {
     is(revived[0]?.revive_count, "1", "and counts that somebody has already asked once");
     ok("the retry re-sends rather than edits, which is what helps when the ERP side has changed and nothing else");
 
-    // ---- 19. the ERP deletes the tenant, and the queue STOPS ---------------
+    // ---- 19. stock that came from a colleague goes back to a depot ----------
+    // THE GAP THE WAREHOUSE LIST CLOSED, measured on the device that had it. Grace holds
+    // 3 of LOT-FIELD-1 and every unit of it arrived by TRANSFER — she has no receipt of her
+    // own, so `last_received_from` is null for her and there was no destination this app
+    // could name. ADR-0001 recorded the consequence: the device offered only the write-off,
+    // and said so on screen. A write-off destroys material a depot could have put back on a
+    // shelf, so the honest exit was the wasteful one.
+    //
+    // A third browser, with its own profile — her own IndexedDB and her own localStorage.
+    // The earlier one was closed at the end of §13, and reusing this browser's profile
+    // would be the shared-device case, which §13 already covers.
+    const returnBrowser = await launchBrowser();
+    const graceReturns = await newPage(returnBrowser);
+    try {
+      await graceReturns.goto(appUrl);
+      await graceReturns.waitFor(`document.querySelector("#app")?.getAttribute("aria-busy") === "false"`, { label: "Grace's second device to boot" });
+      await graceReturns.fill("#dev-token", token2);
+      await graceReturns.fill("#dev-tenant", tenant);
+      await graceReturns.click("#dev-login");
+      await graceReturns.waitFor(`document.querySelector("button[data-return]") !== null`, { timeoutMs: 20_000, label: "Grace's stock" });
+
+      // The premise, checked rather than assumed: nothing in the ledger names a depot for
+      // this rep's stock, because no depot ever sent it to her.
+      is(graceReceipts(), 0, "the receiving rep has no receipt of her own — every unit she holds arrived by transfer");
+      is(holding("rep-grace"), "3.000|0.000", "and she holds the three she accepted");
+
+      await graceReturns.click("button[data-return]");
+      await graceReturns.waitFor(`document.querySelector("#return-form") !== null`, { label: "Grace's return form" });
+      const graceForm = await graceReturns.evaluate(`
+        const f = document.querySelector("#return-form");
+        const sel = f?.querySelector('select[name="warehouse"]');
+        return {
+          text: f?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
+          options: [...(sel?.options ?? [])].map((o) => o.value),
+          selected: sel?.value ?? null,
+        };`);
+      is(graceForm.options, ["", "wh-live-1", "wh-live-2"], "the same two open depots are offered to her");
+      is(graceForm.selected, "", "with NOTHING pre-selected, because no depot has a claim to be the default");
+      is(/reached you from a colleague/.test(String(graceForm.text)), true,
+        `and the screen says why she has to pick (${String(graceForm.text).slice(0, 80)})`);
+
+      // Refused without a pick, which is the whole reason nothing is pre-selected: a
+      // default depot would be a guess with a lorry attached.
+      await graceReturns.fill(`#return-form input[name="quantity"]`, "1");
+      await graceReturns.click("#save-return");
+      let unpicked = null;
+      for (let i = 0; i < 50; i += 1) {
+        unpicked = await graceReturns.evaluate(`return document.querySelector("p.error")?.textContent?.trim() ?? null;`);
+        if (unpicked !== null && /Pick the depot/.test(String(unpicked))) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      is(/Pick the depot this material is going back to/.test(String(unpicked)), true,
+        `a return with no depot chosen is refused at the keyboard (${String(unpicked)})`);
+      // AND THE TYPED QUANTITY SURVIVED the refusal, which is the defect this run found in
+      // the write-off form and the reason `formDraft` exists.
+      is(await graceReturns.evaluate(`return document.querySelector('#return-form input[name="quantity"]')?.value ?? null;`), "1",
+        "and the quantity she typed is still in the box");
+
+      // Offline, like every other decision in this app.
+      await graceReturns.offline(true);
+      await graceReturns.fill(`#return-form select[name="warehouse"]`, "wh-live-2");
+      await graceReturns.fill(`#return-form input[name="reason"]`, "handed over at a congress, going back to my own depot");
+      await graceReturns.click("#save-return");
+      await graceReturns.waitFor(`/Saved on this device/.test(document.querySelector("p.good")?.textContent ?? "")`, { label: "Grace's queued return" });
+      const queuedHers = await graceReturns.evaluate(
+        `${READ_OUTBOX} const r = rows.find((x) => x.kind === "return_to_warehouse"); return r === undefined ? null : { quantity: r.body.quantity, warehouse: r.body.erpWarehouseId, by: r.createdBy ?? null };`,
+      );
+      is(queuedHers?.warehouse, "wh-live-2", "the queued return carries the depot SHE picked, not the one the lot's history names");
+      is(/DEPOT-2/.test(String(await graceReturns.evaluate(`return document.querySelector("p.good")?.textContent ?? "";`))), true,
+        "and the confirmation names it by its code, which is what she recognises");
+
+      await graceReturns.offline(false);
+      await graceReturns.waitFor(`(async () => { ${READ_OUTBOX} return rows.every((r) => r.kind !== "return_to_warehouse"); })()`, { timeoutMs: 25_000, label: "Grace's return to land" });
+
+      const bothReturns = returnRows();
+      is(bothReturns.length, 2, "two returns in the ledger for this run");
+      is(bothReturns[1]?.warehouse, "wh-live-2",
+        "and the second is addressed to a depot that never sent this material anywhere — which was impossible before the list existed");
+      is(holding("rep-grace"), "2.000|0.000", "her balance is down by what she sent back");
+      // Still no receipt of her own: a RETURN is not a receipt, so the premise this chapter
+      // started from is still true after it. The list, not the ledger, is what made the
+      // return addressable.
+      is(graceReceipts(), 0, "and she still has no receipt of her own — the depot list is what made the return possible, not a backdated history");
+
+      const mirrors = mirrorRows();
+      is(mirrors.length, 2, "the ERP has a second StockMovement waiting, because this stock re-enters its books too");
+      is(mirrors[1]?.payload_warehouse, "wh-live-2", "posted against the depot she chose");
+      is(mirrors[1]?.state, "pending", "and queued, like the first");
+      await graceReturns.screenshot(join(work, "app-25-returned-by-transfer.png"));
+    } finally {
+      await returnBrowser.close();
+    }
+
+    // ---- 20. the ERP deletes the tenant, and the queue STOPS ---------------
     // The whole chain, end to end, for the first time: the ERP signs a tombstone, 0050's
     // watcher marks the registry row, the API refuses every request for that tenant with
     // `tenant_deleted`, and the client — which is the only part of this that had never

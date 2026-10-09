@@ -1508,13 +1508,14 @@ warehouse, so the ERP's balance was already right. A return puts it back, which 
 route mirrors it as a `StockMovement` — and why "accepted" stops meaning "finished".
 
 ```
-ok: the return names the warehouse the material came from
-ok: and there is no field for it: a typed ERP id is a return addressed to a depot that may not exist
+ok: the return offers a depot to pick
+ok: the open depots the ERP told us about, and no third option
+ok: and the depot this lot came from is pre-selected, so the common case is unchanged
 ok: a return of more than the rep holds is refused at the keyboard
 ok: the queued return carries the quantity
-ok: and the warehouse, taken off the holding rather than from a form
+ok: and the depot, which the form had pre-selected from the lot's own origin
 ok: one return_to_warehouse in crm.sample_transaction
-ok: addressed to the warehouse it came from
+ok: addressed to the depot it came from
 ok: and the stock has left the rep's balance
 ok: one ERP write was enqueued for it — a StockMovement the warehouse needs
 ok: waiting for the relay, which this harness does not run
@@ -1535,8 +1536,8 @@ ok: and counts that somebody has already asked once           (revive_count 1)
 And from outside the app:
 
 ```
-ok: the return left one StockMovement for the ERP, queued again after its death and counted as retried once
-ok: and the rep who got her stock by transfer has no warehouse of her own — so no return is offered for it
+ok: both returns left a StockMovement for the ERP — the first queued again after its death and counted as retried once
+ok: the rep who got her stock by transfer still has no depot in her own history, and sent it back to one she picked from the list
 ```
 
 ### Two findings, one of them in the app's own error message
@@ -1559,11 +1560,87 @@ that reflects it; and a `waitFor` on a button that already existed for another l
 before the refresh it was meant to wait for. Neither was a product defect, and both made one
 look intermittent — which is worse than a hard failure.
 
+## A warehouse is a place
+
+*2026-10-09, same script, plus `./scripts/verify-live-erp.sh`. `pnpm client:verify` is 221
+checks; the live-ERP gate is 129.*
+
+The chapter above left two things open and they were the same thing. Material a colleague
+handed over has no receipt of its own, so `last_received_from` is null and the device had no
+destination it could name — the only exit was a write-off of stock a depot could have put
+back on a shelf. And `POST /v1/samples/receipts` accepted any `erp_warehouse_id` of the right
+SHAPE, because the CRM modelled no warehouses, so an invented id was written here and refused
+by the ERP days later from inside the relay queue. `crm.warehouse_snapshot` (0058) answers
+both.
+
+**This one is proven against a real `operate-server`, not a fixture.** The ERP is seeded with
+three warehouses through its own HTTP API, and the CRM pulls them in with the shipped
+`SnapshotRefresher` — the same class the scheduler's `snapshot_full` job calls:
+
+```
+ok: synced 3 warehouse(s) from the live ERP: DEPOT-1=active DEPOT-2=active DEPOT-X=closed
+```
+
+Then, at the live server, through the API binary:
+
+```
+ok: a receipt from a depot the ERP does not have is refused at the point of entry, not by a
+    dead letter                        (422 no ERP warehouse wh-invented in this tenant's list)
+ok: and one the ERP says is closed is a conflict — a well-formed request the depot's own
+    state refuses                      (409 warehouse DEPOT-X is closed, not active)
+ok: and neither refusal left a movement or a mirror behind — the check runs before the insert
+```
+
+And through the scheduler binary, which is what keeps the list current in production:
+
+```
+ok: and crm.warehouse_snapshot too — the scheduler is what keeps a return's destinations
+    current                            (DEPOT-1=active DEPOT-2=active DEPOT-X=closed)
+```
+
+**The case that was impossible, in a third browser profile.** A rep who received every unit
+she holds by transfer, with no receipt of her own, returns it:
+
+```
+ok: the receiving rep has no receipt of her own — every unit she holds arrived by transfer
+ok: the same two open depots are offered to her
+ok: with NOTHING pre-selected, because no depot has a claim to be the default
+ok: and the screen says why she has to pick
+ok: a return with no depot chosen is refused at the keyboard
+ok: and the quantity she typed is still in the box
+ok: the queued return carries the depot SHE picked, not the one the lot's history names
+ok: two returns in the ledger for this run
+ok: and the second is addressed to a depot that never sent this material anywhere —
+    which was impossible before the list existed
+ok: and she still has no receipt of her own — the depot list is what made the return
+    possible, not a backdated history
+ok: and every depot named by a movement in this run is one the ERP's own list has
+```
+
+### What the existing guards caught
+
+- **`refreshAll` was enumerating the snapshot names a second time** — `["product", "rep",
+  "account"]`, hard-coded beside the projection registry. A fourth snapshot could be
+  declared, projected, migrated and tested and still never be refreshed, because the only
+  job that drives all of them had its own list. Now derived from `PROJECTIONS`, with a test
+  pinning the order. The one real defect in existing code this increment found, and writing
+  the fourth snapshot is what found it.
+- **0051's retention register went red within the minute.** Five of its assertions fail when
+  a tenant-scoped table has no disposition, because silence is not `none` — so the new table
+  arrived with its decision (`erase`, for the reason the other three snapshots carry: a copy
+  of ERP master data we were only ever a cache for).
+- **Not a foreign key, and the sweep is why.** A composite FK from the ledger into the
+  snapshot was the first thing to reach for; it would break `deleteStale` the moment a depot
+  closed and vanished upstream — `RESTRICT` pins the row and the refresh fails, `CASCADE`
+  deletes custody history, `SET NULL` violates `sample_tx_warehouse_fields`. The rule is a
+  check at the moment of the write, so a movement keeps its destination for ever.
+
 ### What is still not built
 
-The disposal policy is read-only everywhere. A **warehouse list** synced from the ERP is
-what would let material received by transfer be returned at all — the CRM has no concept for
-one, so the device offers only the write-off for such stock and says so. A count covers only
-the lots the device has cached. The peer picker is a plain select of the first 500
-colleagues; the route takes a `?q=` filter and no screen uses it yet. Roughly 71 of the 106
-routes have no screen.
+The disposal policy is read-only everywhere. The depot list is only as fresh as the
+snapshot — one opened five minutes ago is not yet addressable, one closed five minutes ago is
+still offered, and `crm.snapshot_freshness` carries the age with no screen showing it. A
+receipt still has no screen at all, so nobody picks a depot for one. A count covers only the
+lots the device has cached. The depot picker and the peer picker are both a plain select of
+the first 500 rows; both routes take a `?q=` filter and no screen uses it yet. Roughly 71 of
+the 106 routes have no screen.

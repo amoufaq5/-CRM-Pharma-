@@ -20,6 +20,7 @@ import {
   TransferBody,
   TransferPeerList,
   VisitBody,
+  WarehouseList,
   countLineKey,
   discardCount,
   enqueueAcceptance,
@@ -48,6 +49,7 @@ import {
   type SyncReport,
   type WriteOffKind,
   type TransferPeer,
+  type Warehouse,
 } from "@crm/client";
 
 import { capture, createSignaturePad, type SignaturePad } from "./signature.js";
@@ -91,6 +93,14 @@ interface State {
   obligations: readonly Obligation[];
   /** What this rep recorded that the ERP will never hear about unless it is retried. */
   failedErpWrites: readonly FailedErpWrite[];
+  /**
+   * The depots a return can be addressed to.
+   *
+   * The one reference list whose absence changes what a rep can DO rather than only what
+   * they can see: with no list, a return has no destination to offer and expired stock's
+   * only exit is a write-off — material destroyed that a depot could have put back.
+   */
+  warehouses: readonly Warehouse[];
   cachedAt: number | null;
   outbox: readonly OutboxEntry[];
   online: boolean;
@@ -124,6 +134,7 @@ const state: State = {
   counts: [],
   obligations: [],
   failedErpWrites: [],
+  warehouses: [],
   cachedAt: null,
   outbox: [],
   online: navigator.onLine,
@@ -246,13 +257,24 @@ function describeEntry(entry: OutboxEntry): string {
     case "write_off":
       return `${entry.body.kind === "destruction" ? "Destroyed" : "Written off"} ${entry.body.quantity} of ${nameOfLot(entry.body.lotId)}`;
     case "return_to_warehouse":
-      return `Returned ${entry.body.quantity} of ${nameOfLot(entry.body.lotId)} to ${entry.body.erpWarehouseId}`;
+      return `Returned ${entry.body.quantity} of ${nameOfLot(entry.body.lotId)} to ${nameOfWarehouse(entry.body.erpWarehouseId)}`;
   }
 }
 
 /** A lot id as a lot number, where the device still has the holding that names it. */
 function nameOfLot(lotId: string): string {
   return state.holdings.find((h) => h.lot_id === lotId)?.lot_number ?? lotId.slice(0, 8);
+}
+
+/**
+ * A warehouse id as the code a rep would recognise, where the device knows one.
+ *
+ * Falls back to the id for the same reason `nameOfPeer` does: a queued return addressed to
+ * a depot that has since left the list still has to be describable, and the id is what the
+ * ERP will be told either way.
+ */
+function nameOfWarehouse(erpWarehouseId: string): string {
+  return state.warehouses.find((w) => w.erp_warehouse_id === erpWarehouseId)?.code ?? erpWarehouseId;
 }
 
 /**
@@ -354,7 +376,7 @@ function render(): void {
   } else if (state.writingOff !== null) {
     parts.push(renderWriteOffForm(state.writingOff));
   } else if (state.returning !== null) {
-    parts.push(renderReturnForm(state.returning));
+    parts.push(renderReturnForm(state.returning, now));
   } else {
     parts.push(renderAccounts(now));
     // Before anything else a rep might do: a write the ERP never heard about is the one
@@ -836,8 +858,8 @@ function renderWriteOffForm(target: { holding: Holding; because: "expired" | "ch
       </div>
       <p class="note">This is the only record of why this material no longer exists, so the
         reason is what an inspector reads. Destroyed and written off are kept apart on
-        purpose. Returning stock to a warehouse instead is not yet on this device — that
-        route exists and has no screen.</p>
+        purpose. If a depot would take this material back, send it back instead — a
+        write-off destroys stock somebody could still use.</p>
     </form>
   </section>`;
 }
@@ -891,46 +913,99 @@ function renderObligations(now: number): string {
 }
 
 /**
- * Send material back to the warehouse it came from.
+ * Send material back to a depot.
  *
- * THE WAREHOUSE IS NOT A CHOICE, and that is the whole design of this screen. The CRM
- * models no warehouses — an `erp_warehouse_id` is an opaque text id, not a reference, and
- * no route lists them — so the only answer a device can give that is not invented is where
- * the material came from, which is also where it goes back to in practice. It is shown, not
- * offered; a select with one option would pretend there was a decision.
+ * THE WAREHOUSE USED NOT TO BE A CHOICE, and the reason it now is one is the whole point of
+ * this screen. The CRM modelled no warehouses, so the only destination a device could name
+ * without inventing it was `last_received_from` — the depot that had demonstrably sent this
+ * lot to this rep. Material handed over by a COLLEAGUE has no such receipt, so this form
+ * used to say it did not know where the stock came from and offer the write-off instead:
+ * destroying material a depot could have put back on a shelf, because the device could not
+ * name the shelf.
  *
- * A lot that arrived by TRANSFER has no such warehouse, and this form says so rather than
- * guessing: the depot that sent it to a colleague never sent it here. Writing it off is
- * still available, which is the honest pair of exits a device can offer today.
+ * `GET /v1/samples/warehouses` (0058) removed that. The device offers the depots the ERP
+ * says are open, with the lot's own origin pre-selected when it has one and is still open,
+ * and the server checks the choice against the same list.
+ *
+ * NOTHING IS PRE-SELECTED OTHERWISE. A default depot would be a guess with a lorry attached,
+ * and the one thing worse than making a rep choose is choosing wrong for them.
+ *
+ * With an EMPTY list — a device whose cache predates the list, or one that has never been
+ * online since it appeared — the old behaviour stands exactly as it was: the origin depot
+ * is shown rather than offered, and a transfer-received lot still cannot be returned. That
+ * is a worse screen than the list gives, and it is never a worse screen than before.
  */
-function renderReturnForm(holding: Holding): string {
-  const warehouse = holding.last_received_from ?? null;
-  return `<section>
-    <h2>Back to the warehouse — ${escapeHtml(holding.lot_number)}</h2>
-    ${warehouse === null
-      ? `<p class="warn">This device does not know which warehouse this material came from —
-           it reached you from a colleague rather than from a depot, so there is no
-           warehouse to send it back to. Writing it off is the other way out.</p>
-         <div class="actions"><button id="cancel-return" type="button" class="secondary">Back</button></div>`
-      : `<form id="return-form">
-          <p class="note">Going back to <strong>${escapeHtml(warehouse)}</strong> — the
-            warehouse this lot came from. That is the only destination this device can name,
-            and it is where returned stock goes.</p>
-          <label>Quantity (of ${escapeHtml(holding.quantity_on_hand)})
+function renderReturnForm(holding: Holding, now: number): string {
+  const from = holding.last_received_from ?? null;
+  const depots = state.warehouses;
+  const fromIsOpen = from !== null && depots.some((w) => w.erp_warehouse_id === from);
+
+  const noList = `<p class="warn">This device has no list of depots yet${
+    from === null
+      ? ` — and this material reached you from a colleague rather than from a depot, so
+         there is no warehouse to send it back to. Connect once to fetch the list, or write
+         it off.`
+      : `, so the only destination it can name is where this lot came from.`
+  }</p>`;
+
+  const options = [
+    `<option value="" ${fromIsOpen ? "" : "selected"}>Choose a depot…</option>`,
+    ...depots.map(
+      (w) =>
+        `<option value="${escapeHtml(w.erp_warehouse_id)}" ${w.erp_warehouse_id === from ? "selected" : ""}>${escapeHtml(w.code)} — ${escapeHtml(w.name)}${w.city === null || w.city === undefined || w.city === "" ? "" : ` (${escapeHtml(w.city)})`}${w.erp_warehouse_id === from ? " · where this lot came from" : ""}</option>`,
+    ),
+  ].join("");
+
+  const quantityAndReason = `<label>Quantity (of ${escapeHtml(holding.quantity_on_hand)})
             <input name="quantity" type="text" inputmode="decimal" autocomplete="off" placeholder="how much" />
           </label>
           <label>Reason
             <input name="reason" type="text" maxlength="500" autocomplete="off"
                    placeholder="Why it is going back — optional, and read by whoever receives it" />
-          </label>
+          </label>`;
+
+  const mirrorNote = `<p class="note">This is the one thing you record that the ERP has to be told about:
+            the stock re-enters the depot's own books. If that message fails, it shows up
+            below as something the ERP has not been told — the return itself is still
+            recorded here either way.</p>`;
+
+  return `<section>
+    <h2>Back to a depot — ${escapeHtml(holding.lot_number)}</h2>
+    ${depots.length === 0
+      ? from === null
+        ? `${noList}
+         <div class="actions"><button id="cancel-return" type="button" class="secondary">Back</button></div>`
+        : `<form id="return-form">
+          ${noList}
+          <p class="note">Going back to <strong>${escapeHtml(from)}</strong> — the depot this
+            lot came from.</p>
+          ${quantityAndReason}
           <div class="actions">
             <button id="save-return" type="submit">Record the return</button>
             <button id="cancel-return" type="button" class="secondary">Cancel</button>
           </div>
-          <p class="note">This is the one thing you record that the ERP has to be told about:
-            the stock re-enters the warehouse's own books. If that message fails, it shows up
-            below as something the ERP has not been told — the return itself is still
-            recorded here either way.</p>
+          ${mirrorNote}
+        </form>`
+      : `<form id="return-form">
+          <label>Depot
+            <select name="warehouse">${options}</select>
+          </label>
+          ${from !== null && !fromIsOpen
+            ? `<p class="warn">This lot came from ${escapeHtml(from)}, which is not in the list
+                 of open depots — it may have closed, or the list may be older than it is.
+                 Pick where the stock is actually going.</p>`
+            : from === null
+              ? `<p class="note">This material reached you from a colleague, so there is no
+                   depot it came from. Pick the one taking it back.</p>`
+              : ""}
+          ${quantityAndReason}
+          <div class="actions">
+            <button id="save-return" type="submit">Record the return</button>
+            <button id="cancel-return" type="button" class="secondary">Cancel</button>
+          </div>
+          <p class="note">${depots.length} depot(s), as the ERP had them ${escapeHtml(ago(state.cachedAt, now))}.
+            A depot that has closed since is refused when this sends, with the reason attached.</p>
+          ${mirrorNote}
         </form>`}
   </section>`;
 }
@@ -1914,13 +1989,18 @@ async function saveWriteOff(form: HTMLFormElement): Promise<void> {
 }
 
 /**
- * Record material going back to a warehouse.
+ * Record material going back to a depot.
  *
- * The warehouse comes off the holding, never off the form: there is no field for it,
- * because a device that let a rep type an ERP record id would be inviting a return
- * addressed to a depot that does not exist — and the server's `erp_record_id` domain would
- * refuse it hours later from inside a queue, or worse, accept a real id belonging to the
- * wrong site.
+ * THE DESTINATION IS CHOSEN FROM A LIST AND NEVER TYPED. A free text field here would
+ * invite a return addressed to a depot that does not exist: the server's `erp_record_id`
+ * domain only checks the SHAPE of an id, so before the warehouse list the mistake surfaced
+ * hours later as a dead letter in the relay queue — or not at all, if the id happened to
+ * belong to a real depot at another site, which the ERP accepts and posts against.
+ *
+ * The chosen id is checked against the cached list here and again by the server against
+ * the live snapshot. Both, deliberately: this one catches a tampered option before the
+ * movement is queued, and the server's catches a depot that closed while the return sat in
+ * the queue — which this device cannot know about and must not pretend to.
  */
 async function saveReturn(form: HTMLFormElement): Promise<void> {
   const target = state.returning;
@@ -1933,19 +2013,36 @@ async function saveReturn(form: HTMLFormElement): Promise<void> {
   }
 
   const live = state.holdings.find((h) => h.lot_id === target.lot_id) ?? target;
-  const warehouse = live.last_received_from ?? null;
+  const data = new FormData(form);
+  const quantity = String(data.get("quantity") ?? "").trim();
+  const reason = String(data.get("reason") ?? "").trim();
+
+  // The picked depot, or — on a device with no list — the one this lot came from, which is
+  // the only destination such a device can name without inventing one.
+  const picked = String(data.get("warehouse") ?? "").trim();
+  const warehouse = picked !== "" ? picked : (state.warehouses.length === 0 ? live.last_received_from ?? null : null);
   if (warehouse === null) {
     state.message = {
       kind: "error",
-      text: "This device does not know which warehouse this material came from, so it cannot address a return.",
+      text:
+        state.warehouses.length === 0
+          ? "This device does not know which depot this material came from, so it cannot address a return."
+          : "Pick the depot this material is going back to.",
     };
     render();
     return;
   }
-
-  const data = new FormData(form);
-  const quantity = String(data.get("quantity") ?? "").trim();
-  const reason = String(data.get("reason") ?? "").trim();
+  // A depot the list does not have would be refused by the server anyway; refusing it here
+  // means the rep finds out while they are still looking at the form, and it is the one
+  // check that catches an option that did not come from the list.
+  if (state.warehouses.length > 0 && !state.warehouses.some((w) => w.erp_warehouse_id === warehouse)) {
+    state.message = {
+      kind: "error",
+      text: `${warehouse} is not one of the depots this device knows about, so a return cannot be addressed to it.`,
+    };
+    render();
+    return;
+  }
 
   const parsed = ReturnBody.safeParse({
     id: mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) }),
@@ -1991,7 +2088,7 @@ async function saveReturn(form: HTMLFormElement): Promise<void> {
   formDraft = null;
   state.message = {
     kind: "good",
-    text: `Saved on this device: ${quantity} of ${live.lot_number} going back to ${warehouse}. The ERP is told when this syncs.`,
+    text: `Saved on this device: ${quantity} of ${live.lot_number} going back to ${nameOfWarehouse(warehouse)}. The ERP is told when this syncs.`,
   };
   render();
   void drain({ manual: false });
@@ -2230,6 +2327,11 @@ async function refreshReference(): Promise<void> {
   // up on its own schedule, neither of which this device knows about.
   const failedResult = await transport.get("/v1/erp-writes/failed");
   const failed = failedResult.kind === "ok" ? FailedErpWriteList.safeParse(failedResult.body) : null;
+  // The depots. Fetched every refresh and kept on failure like the rest — an empty list is
+  // the claim "there is nowhere to send stock back to", and losing the list would quietly
+  // turn every return on this device back into a write-off.
+  const warehousesResult = await transport.get("/v1/samples/warehouses");
+  const warehouses = warehousesResult.kind === "ok" ? WarehouseList.safeParse(warehousesResult.body) : null;
 
   state.me = me.data;
   // Stamp the session with the rep it turned out to be, so a later cold start can tell
@@ -2246,6 +2348,7 @@ async function refreshReference(): Promise<void> {
   if (counts !== null && counts.success) state.counts = counts.data.data;
   if (obligations !== null && obligations.success) state.obligations = obligations.data.data;
   if (failed !== null && failed.success) state.failedErpWrites = failed.data.data;
+  if (warehouses !== null && warehouses.success) state.warehouses = warehouses.data.data;
   state.cachedAt = Date.now();
   const cache: CachedReference = {
     me: me.data,
@@ -2258,6 +2361,7 @@ async function refreshReference(): Promise<void> {
     counts: state.counts,
     obligations: state.obligations,
     failedErpWrites: state.failedErpWrites,
+    warehouses: state.warehouses,
     fetchedAt: state.cachedAt,
   };
   await store.writeCache(cache);
@@ -2278,6 +2382,7 @@ function adoptSession(session: Session): void {
     state.counts = [];
     state.obligations = [];
     state.failedErpWrites = [];
+    state.warehouses = [];
     state.cachedAt = null;
   }
   writeSession(session);
@@ -2344,6 +2449,7 @@ async function boot(): Promise<void> {
     state.counts = cached.counts ?? [];
     state.obligations = cached.obligations ?? [];
     state.failedErpWrites = cached.failedErpWrites ?? [];
+    state.warehouses = cached.warehouses ?? [];
     state.cachedAt = cached.fetchedAt;
   }
 

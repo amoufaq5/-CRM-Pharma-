@@ -144,10 +144,26 @@ SELECT '$TENANT', a.id, t.id, CURRENT_DATE - 1
 INSERT INTO crm.account_snapshot (tenant_id, erp_account_id, name, status, country, erp_updated_at, synced_at)
 VALUES ('$TENANT', 'acc-live-1', 'St Mary''s Hospital', 'active', 'GB', now(), now()),
        ('$TENANT', 'acc-live-2', 'Riverside Clinic', 'active', 'GB', now(), now());
+
+-- THE DEPOTS, and this one is a stand-in that says so. Everything else in this file is
+-- seeded because a rep cannot create it; this is a MIRROR of the ERP's `Warehouse` entity
+-- that `SnapshotRefresher` fills in production, and there is no ERP in this gate — the
+-- fixture is the three rows a refresh would have written. The refresh itself, against a
+-- real operate-server serving pack-erp-core, is §7 of `verify-client-live.sh`'s sibling
+-- `verify-live-erp.sh`, which now syncs these from the live server and asserts on them.
+--
+-- The closed one is not decoration: since 0058 only an ACTIVE depot is offered or accepted,
+-- and a list with nothing closed in it cannot show that the filter does anything.
+INSERT INTO crm.warehouse_snapshot
+  (tenant_id, erp_warehouse_id, code, name, warehouse_type, city, country, status, erp_updated_at, synced_at)
+VALUES ('$TENANT', 'wh-live-1', 'DEPOT-1', 'Central Depot',    'distribution', 'London',   'GB', 'active', now(), now()),
+       ('$TENANT', 'wh-live-2', 'DEPOT-2', 'Northern Depot',   'distribution', 'Leeds',    'GB', 'active', now(), now()),
+       ('$TENANT', 'wh-live-x', 'DEPOT-X', 'Decommissioned',   'transit',      'Bristol',  'GB', 'closed', now(), now());
 COMMIT;
 SQL
 ok "rep-ada holds T-LIVE, which covers acc-live-1 and acc-live-2 — and acc-not-mine is covered by nobody"
 ok "rep-grace exists to hand material to, and rep-gone has departed"
+ok "three ERP depots are mirrored into crm.warehouse_snapshot — DEPOT-1 and DEPOT-2 open, DEPOT-X closed"
 
 # A lot for the sample half of the run. The STOCK is not inserted: holdings are maintained
 # by the ledger's triggers (0018), so the rep is given material the way a rep is given
@@ -289,7 +305,9 @@ ok "the stored signature hashes to exactly what the ledger committed to before i
 # cancelled it before it was ever sent, transferred 3 to Grace and had it accepted,
 # transferred 1 more and recalled it, received 2 more while a count sat unsent on the
 # device, COUNTED 4 — which the commit made true, and is the only step here that sets a
-# balance rather than moving it — and finally sent 1 back to the warehouse.
+# balance rather than moving it — and finally sent 1 back to a depot. The receiving rep then
+# sent 1 of HER transfer-received stock back to a depot she picked from the ERP's list, which
+# is the movement that was impossible before there was a list.
 REMAINING="$(psql -At -c "
   SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
     FROM crm.sample_holding h JOIN crm.rep_profile r ON r.id = h.rep_profile_id
@@ -301,8 +319,8 @@ GRACE="$(psql -At -c "
   SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
     FROM crm.sample_holding h JOIN crm.rep_profile r ON r.id = h.rep_profile_id
    WHERE h.tenant_id = '$TENANT' AND h.lot_id = '$LOT_ID' AND r.subject = 'rep-grace'")"
-[ "$GRACE" = "3.000|0.000" ] || fail "rep-grace holds '$GRACE', expected 3.000|0.000"
-ok "and the receiver holds exactly what she accepted, on her own balance"
+[ "$GRACE" = "2.000|0.000" ] || fail "rep-grace holds '$GRACE', expected 2.000|0.000"
+ok "and the receiver holds 2: she accepted 3 and sent 1 back to a depot that never shipped it to her"
 
 # The total across both reps is the one invariant a custody chain must never break: every
 # movement in this run moved material between columns, and none of it created or destroyed
@@ -310,8 +328,8 @@ ok "and the receiver holds exactly what she accepted, on her own balance"
 TOTAL="$(psql -At -c "
   SELECT COALESCE(SUM(quantity_on_hand + quantity_in_transit), 0)
     FROM crm.sample_holding WHERE tenant_id = '$TENANT' AND lot_id = '$LOT_ID'")"
-[ "$TOTAL" = "6.000" ] || fail "the two reps hold '$TOTAL' between them, expected 6.000"
-ok "and the two balances sum to 6: 8 after the disbursement, 2 received, 3 off by the count, 1 returned"
+[ "$TOTAL" = "5.000" ] || fail "the two reps hold '$TOTAL' between them, expected 5.000"
+ok "and the two balances sum to 5: 8 after the disbursement, 2 received, 3 off by the count, 2 returned"
 
 # Every balance in this run is still the sum of its own movements. The count did not edit a
 # number; it posted an adjustment, which is the property that makes the ledger the record.
@@ -351,21 +369,42 @@ ok "and its adjustment is linked to the count structurally, not parsed out of a 
 # for. The relay is not running here, so the row is what matters: the right warehouse, the
 # right quantity as a NUMBER, and a retry recorded against it.
 MIRROR="$(psql -At -c "
-  SELECT state || '|' || revive_count || '|' || (payload->>'warehouse_id') || '|' || (payload->>'quantity')
+  SELECT string_agg(state || '|' || revive_count || '|' || (payload->>'warehouse_id') || '|' || (payload->>'quantity'), ' ' ORDER BY seq)
     FROM crm.outbox
    WHERE tenant_id = '$TENANT' AND entity = 'StockMovement' AND payload->>'movement_type' = 'receipt'")"
-[ "$MIRROR" = "pending|1|wh-live-1|1" ] || fail "the return's ERP mirror reads '$MIRROR', expected pending|1|wh-live-1|1"
-ok "the return left one StockMovement for the ERP, queued again after its death and counted as retried once"
+[ "$MIRROR" = "pending|1|wh-live-1|1 pending|0|wh-live-2|1" ] \
+  || fail "the returns' ERP mirrors read '$MIRROR', expected 'pending|1|wh-live-1|1 pending|0|wh-live-2|1'"
+ok "both returns left a StockMovement for the ERP — the first queued again after its death and counted as retried once"
 
-# The gap this increment leaves, asserted rather than described: material that arrived by
-# TRANSFER has no warehouse to go back to, so the device cannot offer a return for it.
+# THE GAP THIS INCREMENT CLOSED, asserted rather than described. Material that arrived by
+# TRANSFER has no receipt of its own, so nothing in the ledger names a depot for it — and
+# until the warehouse list existed the device could offer no return for such stock at all,
+# only a write-off of material a depot could have put back on a shelf. Both halves are
+# measured: she still has no receipt, and her return is addressed to a depot anyway.
 GRACE_FROM="$(psql -At -c "
   SELECT COALESCE((SELECT t.erp_warehouse_id::text FROM crm.sample_transaction t
                     JOIN crm.rep_profile r ON r.id = t.rep_profile_id
                    WHERE t.tenant_id = '$TENANT' AND r.subject = 'rep-grace' AND t.kind = 'receipt'
                    LIMIT 1), 'none')")"
 [ "$GRACE_FROM" = "none" ] || fail "rep-grace has a receipt of her own ('$GRACE_FROM'), which this assertion assumes she does not"
-ok "and the rep who got her stock by transfer has no warehouse of her own — so no return is offered for it"
+GRACE_RETURN="$(psql -At -c "
+  SELECT COALESCE(t.erp_warehouse_id::text, 'none') FROM crm.sample_transaction t
+    JOIN crm.rep_profile r ON r.id = t.rep_profile_id
+   WHERE t.tenant_id = '$TENANT' AND r.subject = 'rep-grace' AND t.kind = 'return_to_warehouse'")"
+[ "$GRACE_RETURN" = "wh-live-2" ] \
+  || fail "rep-grace's return is addressed to '$GRACE_RETURN', expected wh-live-2 — the depot she picked from the list"
+ok "the rep who got her stock by transfer still has no depot in her own history, and sent it back to one she picked from the list"
+
+# And the destination was checked, not taken on trust: every warehouse any movement in this
+# run names is a row in the snapshot the ERP fills. A movement citing a depot that does not
+# exist is what the pre-0058 route accepted and the relay found out about days later.
+UNKNOWN_DEPOT="$(psql -At -c "
+  SELECT count(*) FROM crm.sample_transaction t
+   WHERE t.tenant_id = '$TENANT' AND t.erp_warehouse_id IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM crm.warehouse_snapshot w
+                      WHERE w.tenant_id = t.tenant_id AND w.erp_warehouse_id = t.erp_warehouse_id)")"
+[ "$UNKNOWN_DEPOT" = "0" ] || fail "$UNKNOWN_DEPOT movement(s) name a depot the CRM has no record of"
+ok "and every depot named by a movement in this run is one the ERP's own list has"
 
 OUTSTANDING="$(psql -At -c "
   SELECT count(*) FROM crm.sample_transaction t

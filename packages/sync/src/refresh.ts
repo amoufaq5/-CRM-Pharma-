@@ -5,7 +5,7 @@ import { withTenantContext } from "@crm/db";
 import type { Pool, PoolClient } from "pg";
 
 import { CoercionError } from "./coerce.js";
-import { projectionFor, type SnapshotName, type SnapshotProjection } from "./projection.js";
+import { PROJECTIONS, projectionFor, type SnapshotName, type SnapshotProjection } from "./projection.js";
 import {
   deleteStale,
   readFreshness,
@@ -183,7 +183,12 @@ export class SnapshotRefresher {
     mode: "incremental" | "full" = "incremental",
   ): Promise<readonly (RefreshResult | { snapshot: SnapshotName; error: string })[]> {
     const out: (RefreshResult | { snapshot: SnapshotName; error: string })[] = [];
-    for (const name of ["product", "rep", "account"] as const) {
+    // DERIVED FROM `PROJECTIONS`, not a second list. This was a hard-coded triple, which
+    // meant a new snapshot was declared, tested, migrated — and then never refreshed by
+    // the scheduler, because the only job that drives all of them enumerated the names
+    // again. `projectionFor` already refuses a name with no projection; this makes the
+    // reverse impossible too.
+    for (const { name } of PROJECTIONS) {
       try {
         out.push(await this.refresh(tenantId, name, mode));
       } catch (err) {

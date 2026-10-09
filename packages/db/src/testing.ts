@@ -262,6 +262,18 @@ export const TENANT_ERASE_BYSTANDER = "ef520000-0000-4000-8000-000000000022";
 export const TENANT_INCOMING = "f0550000-0000-4000-8000-000000000023";
 
 /**
+ * packages/sample — warehouses.contract (migration 0058).
+ *
+ * Two, and the second is the subject of a test rather than a spare: `requireActiveWarehouse`
+ * answers differently when a tenant's warehouse list is EMPTY (the snapshot has never
+ * synced, so nothing can be validated and the refusal is a 503) from when the list exists
+ * and the id is simply not in it (422). Proving that needs a tenant whose snapshot stays
+ * empty for the whole run, which no suite seeding warehouses can also be.
+ */
+export const TENANT_WAREHOUSE = "f0580000-0000-4000-8000-000000000024";
+export const TENANT_WAREHOUSE_UNSYNCED = "f1580000-0000-4000-8000-000000000025";
+
+/**
  * Runs `fn` with `crm.tenant`'s protective triggers off, for test cleanup only.
  *
  * Migration 0053 made a stopped tenant's registry row undeletable, because deleting it

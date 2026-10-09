@@ -15,6 +15,7 @@ export {
   PRODUCT_PROJECTION,
   PROJECTIONS,
   REP_PROJECTION,
+  WAREHOUSE_PROJECTION,
   projectionFor,
   type SnapshotName,
   type SnapshotProjection,

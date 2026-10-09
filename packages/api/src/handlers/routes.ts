@@ -126,6 +126,8 @@ import {
   holdingsFor,
   incomingTransfers,
   ledgerFor,
+  listWarehouses,
+  requireActiveWarehouse,
   disposalHistory,
   disposalPolicy,
   setDisposalPolicy,
@@ -1073,6 +1075,28 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
    * once. The principal supplies the rep; the database refuses an impostor rather than
    * this route deciding, so the sender-only rule has exactly one home.
    */
+  /**
+   * The depots a return may be addressed to.
+   *
+   * Mirrored from the ERP (`crm.warehouse_snapshot`, 0058) rather than proxied: a return is
+   * recorded on a device that may be offline for hours, so a synchronous read of the ERP
+   * inside that write would make the write depend on the ERP being up at drain time — the
+   * one thing the outbox exists to avoid. The list is therefore as fresh as the snapshot,
+   * which the scheduler refreshes every five minutes.
+   *
+   * Active only, because that is also what the write accepts. `?q=` matches the code or the
+   * name; the cap is a screen limit, as on `/transfer-peers`.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/samples/warehouses",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const q = ctx.query.get("q");
+      const data = await inTenant(deps, ctx.principal, (tx) => listWarehouses(tx, { query: q }));
+      return { status: 200, body: { data } };
+    },
+  });
+
   router.add({
     method: "POST",
     pattern: "/v1/samples/transfers/:id/recall",
@@ -1178,6 +1202,13 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       const body = await inTenant(deps, ctx.principal, async (tx) => {
         const lot = await getLot(tx, input.lotId);
         if (lot === null) throw notFound(`no sample lot ${input.lotId}`);
+        // THE WAREHOUSE HAS TO EXIST. Until 0058 any id of the right shape was accepted
+        // here, the movement was written, and the ERP refused the mirrored `StockMovement`
+        // hours later from inside the relay queue — by which time the rep who named it is
+        // long gone and the only remedy is a dead letter somebody must notice. The worse
+        // case is an id that IS real and belongs to another site: the ERP accepts it and
+        // posts against the wrong depot's balance, and nothing anywhere refuses it.
+        await requireActiveWarehouse(tx, input.erpWarehouseId);
         const row = await receiveSamples(tx, ctx.principal.tenantId, {
           id: input.id,
           lotId: input.lotId,
@@ -1759,6 +1790,12 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       const body = await inTenant(deps, p, async (tx) => {
         const lot = await getLot(tx, input.lotId);
         if (lot === null) throw notFound(`no sample lot ${input.lotId}`);
+        // Same check as the receipt, and the reason it is here rather than in a CHECK
+        // constraint or a foreign key is 0058's: the snapshot is a mirror whose rows a full
+        // sweep can retract, and the append-only ledger must not depend referentially on a
+        // table another system can empty. A movement keeps its destination for ever; this
+        // answers only whether it may be written now.
+        await requireActiveWarehouse(tx, input.erpWarehouseId);
         const row = await returnToWarehouse(tx, p.tenantId, {
           id: input.id,
           lotId: input.lotId,

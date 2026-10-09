@@ -30,6 +30,8 @@ export {
   TransferBody,
   TransferPeer,
   TransferPeerList,
+  Warehouse,
+  WarehouseList,
   MAX_ATTACHMENT_BASE64_CHARS,
   MAX_ATTACHMENT_BYTES,
   SignatureBody,

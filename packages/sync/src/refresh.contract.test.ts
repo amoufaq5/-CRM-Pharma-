@@ -4,6 +4,7 @@ import { ErpClient, type FetchLike, type TenantCredential, type UiSchema } from 
 import { ERP_SCHEMA_FIXTURE } from "@crm/acl/fixtures";
 import { withTenantContext } from "@crm/db";
 
+import { PROJECTIONS } from "./projection.js";
 import { SnapshotRefresher } from "./refresh.js";
 import { evaluateStaleness, readFreshness } from "./snapshot-store.js";
 
@@ -395,8 +396,16 @@ describe("snapshot refresh against a real database", () => {
       fetch: fetchImpl,
     });
     const results = await new SnapshotRefresher({ pool: p, client }).refreshAll(TENANT, "incremental");
-    expect(results).toHaveLength(3);
-    expect(results[0]).toHaveProperty("error");
+    // EVERY declared snapshot is attempted, named from the registry rather than counted:
+    // `refreshAll` used to enumerate the names a second time, so a snapshot could be
+    // declared and migrated and never refreshed by the one job that drives all of them.
+    expect(results.map((r) => r.snapshot)).toEqual(PROJECTIONS.map((proj) => proj.name));
+    // The product feed's own failure is reported rather than thrown, and the sweep carried
+    // on to the rest. The narrow fixture serves only three entities, so the others fail too
+    // — with `UnknownEntityError`, which is a different failure and exactly the point: each
+    // snapshot gets its own verdict instead of the first one ending the run.
+    expect(results[0]).toMatchObject({ snapshot: "product", error: expect.stringContaining("500") });
+    for (const r of results.slice(1)) expect(r).toHaveProperty("error");
   });
 
   it("stops a runaway sweep rather than looping forever", async () => {
