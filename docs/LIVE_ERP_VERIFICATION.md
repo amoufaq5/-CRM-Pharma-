@@ -1218,7 +1218,7 @@ typechecks green while `event.respondWith` does not exist.
 - **A real identity provider.** The token is minted by the same harness stand-in §10 uses.
   The PKCE implementation is tested against RFC 7636's own vector, and no live issuer has
   ever answered it.
-- **Most of the product.** Roughly 74 of the 106 routes have no screen.
+- **Most of the product.** Roughly 71 of the 106 routes have no screen.
 - **Any browser but Chromium**, and iOS Safari is the one that matters most for a field
   app. No Capacitor wrapper, no device under memory pressure, no push.
 - **A real ERP behind the outbox.** `ERP_BASE_URL` points nowhere in this run; §1–§7 cover
@@ -1499,12 +1499,71 @@ ok: which is inside the deadline it was given
   Both earlier gates had hidden it by re-filling every field after every refusal. The form's
   values now survive a render, and the run asserts it in both places.
 
+## Back to the warehouse, and the first write the ERP must hear about
+
+*2026-10-09, same script. `pnpm client:verify` is 201 checks.*
+
+Every other movement this client records is CRM-only: the material had already left the
+warehouse, so the ERP's balance was already right. A return puts it back, which is why the
+route mirrors it as a `StockMovement` — and why "accepted" stops meaning "finished".
+
+```
+ok: the return names the warehouse the material came from
+ok: and there is no field for it: a typed ERP id is a return addressed to a depot that may not exist
+ok: a return of more than the rep holds is refused at the keyboard
+ok: the queued return carries the quantity
+ok: and the warehouse, taken off the holding rather than from a form
+ok: one return_to_warehouse in crm.sample_transaction
+ok: addressed to the warehouse it came from
+ok: and the stock has left the rep's balance
+ok: one ERP write was enqueued for it — a StockMovement the warehouse needs
+ok: waiting for the relay, which this harness does not run
+ok: and the quantity as a NUMBER, not the text Postgres hands over
+```
+
+Then the gate plays the relay's verdict — marking that row dead, labelled as the fixture it
+is, since this harness runs no relay — and the screen has to account for it:
+
+```
+ok: the rep is told WHAT the ERP never heard about            (StockMovement create)
+ok: in the ERP's own words rather than as an error code       (…warehouse wh-live-1 is closed for receipts)
+ok: with something they can do about it
+ok: pressing it puts the write back in the queue, with the same payload
+ok: and counts that somebody has already asked once           (revive_count 1)
+```
+
+And from outside the app:
+
+```
+ok: the return left one StockMovement for the ERP, queued again after its death and counted as retried once
+ok: and the rep who got her stock by transfer has no warehouse of her own — so no return is offered for it
+```
+
+### Two findings, one of them in the app's own error message
+
+- **"The server's reply did not match the contract this app was built against"** was what a
+  rep saw when the network dropped between two of the three reference reads. That sentence
+  sends somebody hunting a version mismatch which does not exist. A request that failed is
+  not a contract mismatch, and the two are now separate messages. Found because the wrong
+  one kept overwriting a gate assertion at random.
+- **The ERP's vocabulary is the inverse of the CRM's.** A return mirrors as
+  `movement_type: receipt` — stock arriving at a warehouse — while a CRM *receipt* mirrors
+  as `issue`. An assertion written against every `StockMovement` found four rows and the
+  wrong quantity, which is the sort of thing a scoped assertion catches and a loose one
+  silently averages over.
+
+### Two gate races, both passing by luck until now
+
+A loop that waited for IndexedDB to be empty and then read the DOM was racing the repaint
+that reflects it; and a `waitFor` on a button that already existed for another lot was true
+before the refresh it was meant to wait for. Neither was a product defect, and both made one
+look intermittent — which is worse than a hard failure.
+
 ### What is still not built
 
-The return to a warehouse — the other resolution path, and the better one for stock a
-warehouse can dispose of centrally. That route exists, mirrors to the ERP as a receipt, and
-has no screen, so the device currently offers only the destructive exit from an obligation;
-the form says so rather than leaving a rep to assume there is nothing else. The disposal
-policy is read-only everywhere. A count covers only the lots the device has cached. The peer
-picker is a plain select of the first 500 colleagues; the route takes a `?q=` filter and no
-screen uses it yet. Roughly 74 of the 106 routes have no screen.
+The disposal policy is read-only everywhere. A **warehouse list** synced from the ERP is
+what would let material received by transfer be returned at all — the CRM has no concept for
+one, so the device offers only the write-off for such stock and says so. A count covers only
+the lots the device has cached. The peer picker is a plain select of the first 500
+colleagues; the route takes a `?q=` filter and no screen uses it yet. Roughly 71 of the 106
+routes have no screen.

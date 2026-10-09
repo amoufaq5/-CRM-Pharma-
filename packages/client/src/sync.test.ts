@@ -7,6 +7,7 @@ import type {
   DisbursementBody,
   RecallBody,
   SignatureBody,
+  ReturnBody,
   TransferBody,
   VisitBody,
   WriteOffBody,
@@ -20,6 +21,7 @@ import {
   enqueueCountCancel,
   enqueueCountCommit,
   enqueueCountLine,
+  enqueueReturn,
   enqueueWriteOff,
   enqueueDisbursement,
   enqueueRecall,
@@ -64,6 +66,7 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
   commits: string[];
   cancels: string[];
   writeOffs: WriteOffBody[];
+  returns: ReturnBody[];
 } {
   const batches: VisitBody[][] = [];
   const disbursementBatches: DisbursementBody[][] = [];
@@ -76,6 +79,7 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
   const commits: string[] = [];
   const cancels: string[] = [];
   const writeOffs: WriteOffBody[] = [];
+  const returns: ReturnBody[] = [];
   const calls: string[] = [];
   let i = 0;
   const next = (): TransportResult => {
@@ -95,6 +99,7 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
     commits,
     cancels,
     writeOffs,
+    returns,
     calls,
     postVisits: async (visits) => {
       batches.push([...visits]);
@@ -149,6 +154,11 @@ function recordingTransport(answers: readonly TransportResult[]): SyncTransport 
     postWriteOff: async (body) => {
       writeOffs.push(body);
       calls.push(`write-off:${body.id}`);
+      return next();
+    },
+    postReturn: async (body) => {
+      returns.push(body);
+      calls.push(`return:${body.id}`);
       return next();
     },
   };
@@ -933,5 +943,90 @@ describe("syncOnce with a write-off", () => {
     await sync({ store: again, transport: recordingTransport([created]), now });
     expect(transport.writeOffs[0]?.id).toBe("w1");
     expect(again.entries).toEqual([]);
+  });
+});
+
+describe("syncOnce with a return", () => {
+  const now = (): number => 10_000;
+  const LOT = "01995b2a-9c40-7c3a-b7e1-2f4d6a8b0c01";
+  const returnBody = (id: string): ReturnBody => ({
+    id,
+    lotId: LOT,
+    quantity: "4",
+    occurredAt: "2026-10-09T09:00:00.000Z",
+    erpWarehouseId: "wh-1",
+    reason: "expired, going back for central disposal",
+  });
+
+  /** What the route really answers: the movement, and whether the ERP was told. */
+  const landed = (enqueued: boolean): TransportResult => ({
+    kind: "ok",
+    status: 201,
+    body: { id: "server-row", erpMirrorEnqueued: enqueued, erpMirror: { enqueued, reason: enqueued ? null : "collapsed onto a dead outbox row" } },
+  });
+
+  it("posts it to the returns route, carrying the warehouse it came from", async () => {
+    const store = memoryStore(enqueueReturn([], returnBody("r1"), 1000, MINE));
+    const transport = recordingTransport([landed(true)]);
+    const report = await sync({ store, transport, now });
+
+    expect(transport.returns).toEqual([returnBody("r1")]);
+    expect(report.accepted).toEqual(["r1"]);
+    expect(store.entries).toEqual([]);
+  });
+
+  it("ACCEPTS the row even when the ERP mirror did not enqueue", async () => {
+    // The route's own decision, and the engine must not second-guess it: the CRM ledger IS
+    // correct, so the queued row has landed and keeping it would re-send a movement the
+    // server already has. Whether the ERP was told is a different fact, read from
+    // `GET /v1/erp-writes/failed` — conflating the two would either lose the return or
+    // report a recorded movement as failed.
+    const store = memoryStore(enqueueReturn([], returnBody("r1"), 1000, MINE));
+    const transport = recordingTransport([landed(false)]);
+    const report = await sync({ store, transport, now });
+
+    expect(report.accepted).toEqual(["r1"]);
+    expect(report.rejected).toEqual([]);
+    expect(store.entries).toEqual([]);
+  });
+
+  it("goes after the write-off, so the two exits from an obligation keep their order", async () => {
+    let q = enqueueWriteOff(
+      [],
+      {
+        id: "w1",
+        lotId: LOT,
+        quantity: "1",
+        occurredAt: "2026-10-09T09:00:00.000Z",
+        kind: "destruction",
+        reason: "damaged in the car",
+      },
+      1000,
+      MINE,
+    );
+    q = enqueueReturn(q, returnBody("r1"), 1001, MINE);
+    const store = memoryStore(q);
+    const transport = recordingTransport([{ kind: "ok", status: 201, body: {} }, landed(true)]);
+    await sync({ store, transport, now });
+    expect(transport.calls).toEqual(["write-off:w1", "return:r1"]);
+  });
+
+  it("treats a lot the server cannot find as permanent, not as something to retry", async () => {
+    // The route 404s when the lot is gone — it reads the lot to build the ERP mirror. A
+    // retry cannot make it exist.
+    const store = memoryStore(enqueueReturn([], returnBody("r1"), 1000, MINE));
+    const transport = recordingTransport([
+      { kind: "status", status: 404, problemKind: "not_found", detail: "no sample lot" },
+    ]);
+    const report = await sync({ store, transport, now });
+    expect(report.rejected).toEqual([{ id: "r1", reason: "no sample lot" }]);
+  });
+
+  it("keeps it queued when the network is gone", async () => {
+    const store = memoryStore(enqueueReturn([], returnBody("r1"), 1000, MINE));
+    const transport = recordingTransport([{ kind: "network" }]);
+    const report = await sync({ store, transport, now, random: () => 0.5 });
+    expect(report.retrying).toEqual(["r1"]);
+    expect(store.entries[0]?.state).toBe("pending");
   });
 });

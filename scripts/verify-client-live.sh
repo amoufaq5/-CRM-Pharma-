@@ -288,14 +288,14 @@ ok "the stored signature hashes to exactly what the ledger committed to before i
 # sum of what the browser did: received 10, disbursed 2, queued a transfer of 2 and
 # cancelled it before it was ever sent, transferred 3 to Grace and had it accepted,
 # transferred 1 more and recalled it, received 2 more while a count sat unsent on the
-# device — and then COUNTED 4, which the commit made true. The count is the only step here
-# that sets a balance rather than moving it, and it is why this is 4 and not 7.
+# device, COUNTED 4 — which the commit made true, and is the only step here that sets a
+# balance rather than moving it — and finally sent 1 back to the warehouse.
 REMAINING="$(psql -At -c "
   SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
     FROM crm.sample_holding h JOIN crm.rep_profile r ON r.id = h.rep_profile_id
    WHERE h.tenant_id = '$TENANT' AND h.lot_id = '$LOT_ID' AND r.subject = 'rep-ada'")"
-[ "$REMAINING" = "4.000|0.000" ] || fail "rep-ada holds '$REMAINING' (on hand|in transit) at the end of the run, expected 4.000|0.000"
-ok "the sender's balance ends at what the COUNT said: 10 received, 2 disbursed, 3 transferred, 2 received again, counted 4"
+[ "$REMAINING" = "3.000|0.000" ] || fail "rep-ada holds '$REMAINING' (on hand|in transit) at the end of the run, expected 3.000|0.000"
+ok "the rep's balance ends at 3: counted to 4, then 1 sent back to the warehouse"
 
 GRACE="$(psql -At -c "
   SELECT h.quantity_on_hand || '|' || h.quantity_in_transit
@@ -310,8 +310,8 @@ ok "and the receiver holds exactly what she accepted, on her own balance"
 TOTAL="$(psql -At -c "
   SELECT COALESCE(SUM(quantity_on_hand + quantity_in_transit), 0)
     FROM crm.sample_holding WHERE tenant_id = '$TENANT' AND lot_id = '$LOT_ID'")"
-[ "$TOTAL" = "7.000" ] || fail "the two reps hold '$TOTAL' between them, expected 7.000"
-ok "and the two balances sum to 7: 8 left after the disbursement, 2 received, 3 written off by the count"
+[ "$TOTAL" = "6.000" ] || fail "the two reps hold '$TOTAL' between them, expected 6.000"
+ok "and the two balances sum to 6: 8 after the disbursement, 2 received, 3 off by the count, 1 returned"
 
 # Every balance in this run is still the sum of its own movements. The count did not edit a
 # number; it posted an adjustment, which is the property that makes the ledger the record.
@@ -346,6 +346,26 @@ LINKED="$(psql -At -c "
    WHERE t.tenant_id = '$TENANT' AND t.kind = 'adjustment_out' AND t.quantity = 3.000")"
 [ "$LINKED" = "1" ] || fail "$LINKED adjustments are linked to a count, expected 1"
 ok "and its adjustment is linked to the count structurally, not parsed out of a reason string"
+
+# The return, and the one message in this whole run that somebody outside the CRM is waiting
+# for. The relay is not running here, so the row is what matters: the right warehouse, the
+# right quantity as a NUMBER, and a retry recorded against it.
+MIRROR="$(psql -At -c "
+  SELECT state || '|' || revive_count || '|' || (payload->>'warehouse_id') || '|' || (payload->>'quantity')
+    FROM crm.outbox
+   WHERE tenant_id = '$TENANT' AND entity = 'StockMovement' AND payload->>'movement_type' = 'receipt'")"
+[ "$MIRROR" = "pending|1|wh-live-1|1" ] || fail "the return's ERP mirror reads '$MIRROR', expected pending|1|wh-live-1|1"
+ok "the return left one StockMovement for the ERP, queued again after its death and counted as retried once"
+
+# The gap this increment leaves, asserted rather than described: material that arrived by
+# TRANSFER has no warehouse to go back to, so the device cannot offer a return for it.
+GRACE_FROM="$(psql -At -c "
+  SELECT COALESCE((SELECT t.erp_warehouse_id::text FROM crm.sample_transaction t
+                    JOIN crm.rep_profile r ON r.id = t.rep_profile_id
+                   WHERE t.tenant_id = '$TENANT' AND r.subject = 'rep-grace' AND t.kind = 'receipt'
+                   LIMIT 1), 'none')")"
+[ "$GRACE_FROM" = "none" ] || fail "rep-grace has a receipt of her own ('$GRACE_FROM'), which this assertion assumes she does not"
+ok "and the rep who got her stock by transfer has no warehouse of her own — so no return is offered for it"
 
 OUTSTANDING="$(psql -At -c "
   SELECT count(*) FROM crm.sample_transaction t

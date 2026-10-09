@@ -1081,6 +1081,69 @@ describe("sample custody", () => {
       });
     });
 
+    it("carries the warehouse the material came FROM, which is the only place it can go back to", async () => {
+      await inTenant(async (tx) => {
+        // A return needs a warehouse and the CRM models none: `erp_warehouse_id` is an
+        // opaque text id, not a reference, and no route lists them. Where it came from is
+        // the only answer a device can give that is not invented.
+        const lot = await aLot(tx);
+        await stock(tx, lot, 10);
+        const [holding] = await holdingsFor(tx, REP);
+        expect(holding?.last_received_from).toBe("SM-WH-1");
+      });
+    });
+
+    it("carries the LAST warehouse when a lot was topped up from a second one", async () => {
+      await inTenant(async (tx) => {
+        const lot = await aLot(tx);
+        await receiveSamples(tx, TENANT, {
+          id: randomUUID(),
+          lotId: lot.id,
+          repProfileId: REP,
+          quantity: 4,
+          occurredAt: DAY("2026-10-01"),
+          erpWarehouseId: "SM-WH-OLD",
+        });
+        await receiveSamples(tx, TENANT, {
+          id: randomUUID(),
+          lotId: lot.id,
+          repProfileId: REP,
+          quantity: 4,
+          occurredAt: DAY("2026-10-05"),
+          erpWarehouseId: "SM-WH-NEW",
+        });
+        const [holding] = await holdingsFor(tx, REP);
+        expect(holding?.last_received_from).toBe("SM-WH-NEW");
+      });
+    });
+
+    it("carries NULL for material that arrived by transfer, which has no warehouse to go back to", async () => {
+      await inTenant(async (tx) => {
+        // The honest gap. The depot that sent this to a colleague never sent it here, and
+        // naming it anyway would attribute a return to a warehouse that never had it. Such
+        // material can still be written off.
+        const lot = await aLot(tx);
+        await stock(tx, lot, 5);
+        const sent = await transferOut(tx, TENANT, {
+          id: randomUUID(),
+          lotId: lot.id,
+          repProfileId: REP,
+          quantity: 5,
+          occurredAt: DAY("2026-10-06"),
+          toRepProfileId: OTHER_REP,
+        });
+        await acceptTransfer(tx, TENANT, {
+          id: randomUUID(),
+          transferOf: sent.id,
+          repProfileId: OTHER_REP,
+          occurredAt: DAY("2026-10-07"),
+        });
+        const [theirs] = await holdingsFor(tx, OTHER_REP);
+        expect(theirs?.quantity_on_hand).toBe("5.000");
+        expect(theirs?.last_received_from).toBeNull();
+      });
+    });
+
     it("returns to zero holdings cleanly for a rep who has nothing", async () => {
       await inTenant(async (tx) => {
         expect(await holdingsFor(tx, THIRD_REP)).toHaveLength(0);

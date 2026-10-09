@@ -243,6 +243,14 @@ export const Holding = z.object({
   // into a float to show it would reintroduce exactly the error the column type avoids.
   quantity_on_hand: z.string(),
   quantity_in_transit: z.string(),
+  /**
+   * The ERP warehouse this rep last received this lot from, or null.
+   *
+   * Optional on the way in, because a cache written by an earlier build has none and a
+   * device that threw on an older record would lose a rep's queue on an upgrade. Null and
+   * absent mean the same thing here — there is nowhere to return this material to.
+   */
+  last_received_from: z.string().nullish(),
 });
 export type Holding = z.infer<typeof Holding>;
 
@@ -469,3 +477,60 @@ export const Obligation = z
 export type Obligation = z.infer<typeof Obligation>;
 
 export const ObligationList = z.object({ data: z.array(Obligation) });
+
+/**
+ * What `POST /v1/samples/returns` accepts: material going back into ERP stock.
+ *
+ * THE FIRST WRITE IN THIS CLIENT THAT THE ERP MUST HEAR ABOUT. Everything else a rep
+ * records is CRM-only — a visit, a disbursement, a transfer between reps, a count, a
+ * write-off — because the material had already left the warehouse and the ERP's balance was
+ * already right. A return puts it back, so the route mirrors it as a `receipt` on the ERP
+ * side, and the mirror can fail independently of the movement being recorded: the route
+ * answers 201 either way, deliberately, because the CRM ledger IS correct and a 4xx would
+ * tell the rep their return was not written when it was.
+ *
+ * Which is why this client reads `GET /v1/erp-writes/failed` after a drain. A return the
+ * ERP never hears about leaves a warehouse short in its own books, with nothing on this
+ * device saying so.
+ *
+ * `erpWarehouseId` is NOT a free choice. The CRM models no warehouses — it is an opaque
+ * ERP id, not a reference — so the device sends the warehouse the material came FROM, off
+ * the holding's `last_received_from`. A lot that arrived by transfer has none, and such
+ * material cannot be returned from this device at all.
+ */
+export const ReturnBody = z.object({
+  id: Uuid,
+  lotId: Uuid,
+  quantity: DecimalQuantity,
+  occurredAt: z.string().datetime(),
+  erpWarehouseId: ErpRecordId,
+  reason: z.string().max(500).nullish(),
+});
+export type ReturnBody = z.infer<typeof ReturnBody>;
+
+/**
+ * A row of `GET /v1/erp-writes/failed`: something this rep recorded that the ERP will never
+ * hear about unless somebody retries it.
+ *
+ * Named for what it means rather than for the table behind it, which is the route's own
+ * choice: a rep does not know what an outbox is, they know they recorded something and it
+ * did not arrive.
+ */
+export const FailedErpWrite = z
+  .object({
+    id: Uuid,
+    entity: z.string(),
+    operation: z.string(),
+    source_table: z.string(),
+    attempts: z.number().int(),
+    revive_count: z.number().int(),
+    dead_at: z.string().nullable(),
+    dead_reason: z.string().nullable(),
+  })
+  .passthrough();
+export type FailedErpWrite = z.infer<typeof FailedErpWrite>;
+
+export const FailedErpWriteList = z.object({ data: z.array(FailedErpWrite) });
+
+/** What a retry answers: queued, and how many times it has been asked for. */
+export const RetryResult = z.object({ id: Uuid, queued: z.boolean(), reviveCount: z.number().int() });

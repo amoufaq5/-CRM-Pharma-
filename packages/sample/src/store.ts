@@ -62,6 +62,22 @@ export interface SampleHolding {
   readonly quantity_in_transit: string;
   readonly last_movement_at: Date | null;
   readonly last_counted_at: Date | null;
+  /**
+   * The ERP warehouse this rep last received THIS lot from, or null.
+   *
+   * Here because a return has to go somewhere and the CRM models no warehouses — an
+   * `erp_warehouse_id` is an opaque CHECKed text id, not a reference (ADR-0001 Q1), and
+   * there is no route that lists them. The only non-fabricated answer available to a
+   * device is where the material came from, which is also the overwhelmingly common
+   * destination: stock goes back to the depot that sent it.
+   *
+   * NULL for a lot that reached this rep by TRANSFER rather than by receipt. That is a
+   * real gap and the honest one: the warehouse that sent it to a colleague never sent it
+   * here, and naming it anyway would attribute a return to a depot that never had it.
+   * Material like that can still be written off; returning it needs a warehouse list the
+   * CRM does not have.
+   */
+  readonly last_received_from: string | null;
 }
 
 export interface SampleTransaction {
@@ -411,7 +427,19 @@ export async function holdingsFor(
             l.expiry_date::text AS expiry_date, l.material_kind,
             h.quantity_on_hand::text AS quantity_on_hand,
             h.quantity_in_transit::text AS quantity_in_transit,
-            h.last_movement_at, h.last_counted_at
+            h.last_movement_at, h.last_counted_at,
+            -- Where it came from, read off the ledger rather than stored on the balance:
+            -- the receipt is the fact, and a column here would be a second copy of it that
+            -- could disagree. The LAST receipt, because a lot can be topped up from a
+            -- different depot and the most recent one is the live relationship.
+            (SELECT t.erp_warehouse_id::text
+               FROM crm.sample_transaction t
+              WHERE t.rep_profile_id = h.rep_profile_id
+                AND t.lot_id = h.lot_id
+                AND t.kind = 'receipt'
+                AND t.erp_warehouse_id IS NOT NULL
+              ORDER BY t.occurred_at DESC, t.recorded_at DESC
+              LIMIT 1) AS last_received_from
        FROM crm.sample_holding h
        JOIN crm.sample_lot l ON l.id = h.lot_id
       WHERE h.rep_profile_id = $1

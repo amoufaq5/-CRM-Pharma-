@@ -2,6 +2,7 @@ import type {
   AcceptBody,
   CountBody,
   CountLineBody,
+  ReturnBody,
   WriteOffBody,
   DisbursementBody,
   RecallBody,
@@ -56,6 +57,7 @@ export const OUTBOX_KINDS = [
   "count_commit",
   "count_cancel",
   "write_off",
+  "return_to_warehouse",
 ] as const;
 export type OutboxKind = (typeof OUTBOX_KINDS)[number];
 
@@ -229,6 +231,20 @@ export interface WriteOffEntry extends OutboxEntryBase {
   readonly body: WriteOffBody;
 }
 
+/**
+ * Material going back to the warehouse it came from.
+ *
+ * The one kind in this queue whose landing is not the end of the story: the route records
+ * the movement AND enqueues a mirror to the ERP, and the mirror can die on its own. A 201
+ * here means the CRM ledger is right, not that the warehouse has been told — which is why
+ * the app reads the failed-writes list after a drain rather than treating acceptance as
+ * completion.
+ */
+export interface ReturnEntry extends OutboxEntryBase {
+  readonly kind: "return_to_warehouse";
+  readonly body: ReturnBody;
+}
+
 export type OutboxEntry =
   | VisitEntry
   | DisbursementEntry
@@ -240,7 +256,8 @@ export type OutboxEntry =
   | CountLineEntry
   | CountCommitEntry
   | CountCancelEntry
-  | WriteOffEntry;
+  | WriteOffEntry
+  | ReturnEntry;
 
 export interface BackoffPolicy {
   /** First delay, doubled per attempt. */
@@ -302,7 +319,8 @@ export type NewOutboxEntry =
   | Omit<CountLineEntry, keyof OutboxEntryStatus>
   | Omit<CountCommitEntry, keyof OutboxEntryStatus>
   | Omit<CountCancelEntry, keyof OutboxEntryStatus>
-  | Omit<WriteOffEntry, keyof OutboxEntryStatus>;
+  | Omit<WriteOffEntry, keyof OutboxEntryStatus>
+  | Omit<ReturnEntry, keyof OutboxEntryStatus>;
 
 /**
  * Every helper takes the rep, and takes it as a REQUIRED option rather than an optional
@@ -484,6 +502,16 @@ export function enqueueCountCommit(
     },
     now,
   );
+}
+
+/** Material back to the warehouse it came from. */
+export function enqueueReturn(
+  entries: readonly OutboxEntry[],
+  body: ReturnBody,
+  now: number,
+  opts: Attribution,
+): readonly OutboxEntry[] {
+  return enqueue(entries, { id: body.id, kind: "return_to_warehouse", body, createdBy: opts.createdBy }, now);
 }
 
 /** Material out of custody. Keyed by its own id, like every other movement. */

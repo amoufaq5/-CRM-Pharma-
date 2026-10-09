@@ -6,6 +6,7 @@ import {
   type CountLineBody,
   type DisbursementBody,
   type RecallBody,
+  type ReturnBody,
   type SignatureBody,
   type TransferBody,
   type VisitBody,
@@ -74,6 +75,14 @@ export interface SyncTransport {
   postCountCancel(countId: string): Promise<TransportResult>;
   /** Material out of custody: destroyed, or written off for expiry. Always with a reason. */
   postWriteOff(body: WriteOffBody): Promise<TransportResult>;
+  /**
+   * Material back to a warehouse — the only write here the ERP must hear about.
+   *
+   * A 201 says the CRM ledger is right. Whether the ERP was told is a separate fact, in
+   * the response's `erpMirror` and in `GET /v1/erp-writes/failed`, and this engine does
+   * not conflate them: the row is accepted because the movement landed.
+   */
+  postReturn(body: ReturnBody): Promise<TransportResult>;
 }
 
 export interface SyncDeps {
@@ -258,6 +267,11 @@ export const SEND_PLANS: Readonly<Record<OutboxKind, KindPlan>> = {
     reply: "single",
     send: (batch, transport) => transport.postWriteOff(only(batch, "write_off").body),
   },
+  return_to_warehouse: {
+    batchMax: 1,
+    reply: "single",
+    send: (batch, transport) => transport.postReturn(only(batch, "return_to_warehouse").body),
+  },
 };
 
 /**
@@ -286,6 +300,7 @@ const SEND_ORDER: readonly OutboxKind[] = [
   // reconcile the balance before material is taken out of it — which is the order they
   // happened in, and the order that leaves the ledger readable.
   "write_off",
+  "return_to_warehouse",
 ];
 
 /**

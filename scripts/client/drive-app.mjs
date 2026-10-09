@@ -157,6 +157,43 @@ function writeOffRows() {
   });
 }
 
+function returnRows() {
+  const out = sql(
+    `SELECT quantity, COALESCE(erp_warehouse_id::text,''), COALESCE(reason,'')
+       FROM crm.sample_transaction
+      WHERE tenant_id = '${tenant}' AND kind = 'return_to_warehouse' ORDER BY recorded_at`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [quantity, warehouse, reason] = line.split("|");
+    return { quantity, warehouse, reason };
+  });
+}
+
+/**
+ * The ERP-facing side of a RETURN: what the relay will send, and what it says when it
+ * gives up.
+ *
+ * Scoped to `movement_type = 'receipt'`, which is the ERP's word for stock arriving at a
+ * warehouse — a CRM return. The three receipts earlier in this run mirror too, as
+ * `'issue'`: material leaving the warehouse. Asserting on every StockMovement found four
+ * rows and the wrong quantity, which is the ERP's vocabulary being the inverse of the
+ * CRM's and worth being caught by.
+ */
+function mirrorRows() {
+  const out = sql(
+    `SELECT entity, operation, state, COALESCE(dead_reason,''), revive_count,
+            payload->>'warehouse_id', payload->>'quantity'
+       FROM crm.outbox
+      WHERE tenant_id = '${tenant}' AND entity = 'StockMovement'
+        AND payload->>'movement_type' = 'receipt'
+      ORDER BY seq`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [entity, operation, state, dead_reason, revive_count, payload_warehouse, payload_quantity] = line.split("|");
+    return { entity, operation, state, dead_reason, revive_count, payload_warehouse, payload_quantity };
+  });
+}
+
 function obligationRows() {
   const out = sql(
     `SELECT status, COALESCE(resolution,''), COALESCE(resolved_on::text,''), due_by::text
@@ -706,8 +743,13 @@ async function main() {
     // is: the refused out-of-territory visit from §8 is deliberately still there, kept for
     // a person to look at. An assertion written as "the queue is empty" failed on exactly
     // that, which is the gate telling the truth about a rule the gate had forgotten.
+    // Polled on the SCREEN, not on the store. The queue is written before the render that
+    // reflects it, so a loop that waits for IndexedDB to be empty and then reads the DOM
+    // is racing a repaint — which it lost, once, after passing by luck for two increments.
     for (let i = 0; i < 100; i += 1) {
-      const gone = await page.evaluate(`${READ_OUTBOX} return rows.every((r) => r.kind !== "transfer");`);
+      const gone = await page.evaluate(
+        `${READ_OUTBOX} return rows.every((r) => r.kind !== "transfer") && document.querySelector("button[data-unsend]") === null;`,
+      );
       if (gone === true) break;
       await new Promise((r) => setTimeout(r, 200));
     }
@@ -1025,7 +1067,109 @@ async function main() {
     is(settled.resolved_on <= String(settled.due_by), true,
       `which is inside the deadline it was given (${settled?.resolved_on} <= ${settled?.due_by})`);
 
-    // ---- 17. the ERP deletes the tenant, and the queue STOPS ---------------
+    // ---- 17. back to the warehouse, and the one write the ERP must hear -----
+    // Every other thing a rep records here is CRM-only: the material had already left the
+    // warehouse, so the ERP's balance was already right. A return puts it back, which the
+    // ERP has to be told about — and that message can fail on its own while the return
+    // itself is perfectly recorded. This chapter is really about that gap.
+    // No refresh first, deliberately: the previous chapter's refresh already loaded the
+    // holdings with `last_received_from`, and clicking Refresh here and then immediately
+    // going offline left a read in flight whose failure message overwrote the assertion
+    // below — which is how the misleading contract-mismatch message was found.
+    await page.offline(true);
+    await page.click(`button[data-return="${lotId}"]`);
+    await page.waitFor(`document.querySelector("#return-form") !== null`, { label: "the return form" });
+
+    // THE WAREHOUSE IS SHOWN, NOT OFFERED. The CRM models no warehouses — an
+    // `erp_warehouse_id` is an opaque text id — so the only destination a device can name
+    // without inventing one is where the material came from.
+    const form = await page.evaluate(`
+      const f = document.querySelector("#return-form");
+      return {
+        text: f?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
+        fields: [...(f?.querySelectorAll("input[name], select[name]") ?? [])].map((e) => e.name),
+      };`);
+    is(/wh-live-1/.test(String(form.text)), true, "the return names the warehouse the material came from");
+    is(form.fields.includes("erpWarehouseId"), false,
+      `and there is no field for it: a typed ERP id is a return addressed to a depot that may not exist (${JSON.stringify(form.fields)})`);
+
+    await page.fill(`#return-form input[name="quantity"]`, "99");
+    await page.click("#save-return");
+    // Polled and then ASSERTED with what it actually saw, rather than waited for: a
+    // `waitFor` on this failed once and told me only that its last value was `false`, which
+    // is the shape of failure the deploy-smoke gate taught me not to leave lying around.
+    let refusal = null;
+    for (let i = 0; i < 50; i += 1) {
+      refusal = await page.evaluate(`return document.querySelector("p.error")?.textContent?.trim() ?? null;`);
+      if (refusal !== null && /cannot be sent back/.test(String(refusal))) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    is(/You are carrying 4\.000 of LOT-FIELD-1, so 99 cannot be sent back/.test(String(refusal)), true,
+      `a return of more than the rep holds is refused at the keyboard (${String(refusal)})`);
+
+    await page.fill(`#return-form input[name="quantity"]`, "1");
+    await page.fill(`#return-form input[name="reason"]`, "surplus, going back to the depot");
+    await page.click("#save-return");
+    await page.waitFor(`/Saved on this device/.test(document.querySelector("p.good")?.textContent ?? "")`, { label: "the queued return" });
+
+    const queuedReturn = await page.evaluate(
+      `${READ_OUTBOX} const r = rows.find((x) => x.kind === "return_to_warehouse"); return r === undefined ? null : { quantity: r.body.quantity, warehouse: r.body.erpWarehouseId, reason: r.body.reason };`,
+    );
+    is(queuedReturn?.quantity, "1", "the queued return carries the quantity");
+    is(queuedReturn?.warehouse, "wh-live-1", "and the warehouse, taken off the holding rather than from a form");
+    is(returnRows().length, 0, "with nothing in the ledger while there is no signal");
+
+    await page.offline(false);
+    await page.waitFor(`(async () => { ${READ_OUTBOX} return rows.every((r) => r.kind !== "return_to_warehouse"); })()`, { timeoutMs: 25_000, label: "the return to land" });
+
+    const returned = returnRows();
+    is(returned.length, 1, "one return_to_warehouse in crm.sample_transaction");
+    is(returned[0]?.quantity, "1.000", "for the quantity the rep sent back");
+    is(returned[0]?.warehouse, "wh-live-1", "addressed to the warehouse it came from");
+    is(/surplus/.test(String(returned[0]?.reason)), true, "with the reason, which whoever receives it reads");
+    is(holding("rep-ada"), "3.000|0.000", "and the stock has left the rep's balance");
+
+    // THE MIRROR. This is the only movement in the whole run that produces one, and the
+    // ERP's own stock figures are wrong until it is delivered.
+    const mirror = mirrorRows();
+    is(mirror.length, 1, "one ERP write was enqueued for it — a StockMovement the warehouse needs");
+    is(mirror[0]?.entity, "StockMovement", "of the entity the ERP knows");
+    is(mirror[0]?.state, "pending", "waiting for the relay, which this harness does not run");
+    is(mirror[0]?.payload_warehouse, "wh-live-1", "carrying the same warehouse");
+    is(mirror[0]?.payload_quantity, "1", "and the quantity as a NUMBER, not the text Postgres hands over");
+    await shot("23-returned");
+
+    // ---- 18. when the ERP never hears about it -----------------------------
+    // The relay is not running here, so the gate plays its verdict: this is the row marked
+    // DEAD after the ERP refused it enough times. A fixture, labelled as one — what is
+    // under test is the client's handling, and the relay's own giving-up is covered by its
+    // own suites.
+    sql(`UPDATE crm.outbox SET state = 'dead', dead_at = now(),
+            dead_reason = 'ERP rejected the StockMovement: warehouse wh-live-1 is closed for receipts'
+          WHERE tenant_id = '${tenant}' AND entity = 'StockMovement'
+            AND payload->>'movement_type' = 'receipt'`);
+
+    await page.click("#refresh");
+    await page.waitFor(`/The ERP has not been told/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the failed-write notice" });
+    const failed = await page.evaluate(`
+      const heading = [...document.querySelectorAll("h2")].find((h) => /The ERP has not been told/.test(h.textContent ?? ""));
+      const li = heading?.parentElement?.querySelector("li");
+      return { name: li?.querySelector(".name")?.textContent?.trim() ?? null, meta: li?.querySelector(".meta")?.textContent?.trim() ?? null, retry: li?.querySelector("button[data-retry-erp]") !== null };`);
+    is(failed.name, "StockMovement create", "the rep is told WHAT the ERP never heard about");
+    is(/closed for receipts/.test(String(failed.meta)), true,
+      `in the ERP's own words rather than as an error code (${String(failed.meta).slice(0, 60)})`);
+    is(failed.retry, true, "with something they can do about it");
+    ok("a return that is recorded here but never reaches the ERP is VISIBLE, which is the whole point of the section");
+    await shot("24-erp-not-told");
+
+    await page.click("button[data-retry-erp]");
+    await page.waitFor(`document.querySelector("button[data-retry-erp]") === null`, { timeoutMs: 20_000, label: "the retry" });
+    const revived = mirrorRows();
+    is(revived[0]?.state, "pending", "pressing it puts the write back in the queue, with the same payload");
+    is(revived[0]?.revive_count, "1", "and counts that somebody has already asked once");
+    ok("the retry re-sends rather than edits, which is what helps when the ERP side has changed and nothing else");
+
+    // ---- 19. the ERP deletes the tenant, and the queue STOPS ---------------
     // The whole chain, end to end, for the first time: the ERP signs a tombstone, 0050's
     // watcher marks the registry row, the API refuses every request for that tenant with
     // `tenant_deleted`, and the client — which is the only part of this that had never

@@ -5,8 +5,10 @@ import {
   Count,
   CountBody,
   CountList,
+  FailedErpWriteList,
   Obligation,
   ObligationList,
+  ReturnBody,
   WriteOffBody,
   DisbursementBody,
   Holding,
@@ -26,6 +28,7 @@ import {
   enqueueCountCommit,
   enqueueCountLine,
   enqueueDisbursement,
+  enqueueReturn,
   enqueueWriteOff,
   enqueueRecall,
   enqueueSignature,
@@ -40,6 +43,7 @@ import {
   type ClientStore,
   type IncomingTransfer,
   type OutboxEntry,
+  type FailedErpWrite,
   type RecallableTransfer,
   type SyncReport,
   type WriteOffKind,
@@ -85,6 +89,8 @@ interface State {
   counts: readonly Count[];
   /** What this rep must dispose of, soonest deadline first. */
   obligations: readonly Obligation[];
+  /** What this rep recorded that the ERP will never hear about unless it is retried. */
+  failedErpWrites: readonly FailedErpWrite[];
   cachedAt: number | null;
   outbox: readonly OutboxEntry[];
   online: boolean;
@@ -98,6 +104,8 @@ interface State {
   counting: boolean;
   /** The lot being taken out of custody, and why this screen was opened. */
   writingOff: { holding: Holding; because: "expired" | "chosen" } | null;
+  /** The lot going back to a warehouse, if that form is open. */
+  returning: Holding | null;
   message: { kind: "good" | "warn" | "error"; text: string } | null;
   blocked: string | null;
   syncing: boolean;
@@ -115,6 +123,7 @@ const state: State = {
   peers: [],
   counts: [],
   obligations: [],
+  failedErpWrites: [],
   cachedAt: null,
   outbox: [],
   online: navigator.onLine,
@@ -123,6 +132,7 @@ const state: State = {
   transferring: null,
   counting: false,
   writingOff: null,
+  returning: null,
   message: null,
   blocked: null,
   syncing: false,
@@ -235,6 +245,8 @@ function describeEntry(entry: OutboxEntry): string {
       return `Abandoning the count of ${entry.countOf.slice(0, 8)}`;
     case "write_off":
       return `${entry.body.kind === "destruction" ? "Destroyed" : "Written off"} ${entry.body.quantity} of ${nameOfLot(entry.body.lotId)}`;
+    case "return_to_warehouse":
+      return `Returned ${entry.body.quantity} of ${nameOfLot(entry.body.lotId)} to ${entry.body.erpWarehouseId}`;
   }
 }
 
@@ -341,8 +353,13 @@ function render(): void {
     parts.push(renderCountForm(now));
   } else if (state.writingOff !== null) {
     parts.push(renderWriteOffForm(state.writingOff));
+  } else if (state.returning !== null) {
+    parts.push(renderReturnForm(state.returning));
   } else {
     parts.push(renderAccounts(now));
+    // Before anything else a rep might do: a write the ERP never heard about is the one
+    // thing on this screen that somebody outside the CRM is waiting for.
+    parts.push(renderFailedErpWrites(now));
     // Before the stock itself: a deadline is the thing on this screen with a clock running.
     parts.push(renderObligations(now));
     parts.push(renderHoldings(now));
@@ -485,7 +502,8 @@ function renderHoldings(now: number): string {
           </span>
           <button data-disburse="${escapeHtml(h.lot_id)}" ${expired || Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Disburse</button>
           <button class="secondary" data-transfer="${escapeHtml(h.lot_id)}" ${Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Transfer</button>
-          <button class="secondary" data-write-off="${escapeHtml(h.lot_id)}" ${Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Write off</button></li>`;
+          <button class="secondary" data-write-off="${escapeHtml(h.lot_id)}" ${Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Write off</button>
+          <button class="secondary" data-return="${escapeHtml(h.lot_id)}" ${Number(h.quantity_on_hand) <= 0 ? "disabled" : ""}>Send back</button></li>`;
         })
         .join("")}
     </ul>
@@ -864,10 +882,92 @@ function renderObligations(now: number): string {
           </span>
           ${gone || pending
             ? ""
-            : `<button data-write-off="${escapeHtml(o.lot_id)}">Dispose of it</button>`}</li>`;
+            : `<button data-write-off="${escapeHtml(o.lot_id)}">Dispose of it</button>
+               <button class="secondary" data-return="${escapeHtml(o.lot_id)}">Send back</button>`}</li>`;
         })
         .join("")}
     </ul>
+  </section>`;
+}
+
+/**
+ * Send material back to the warehouse it came from.
+ *
+ * THE WAREHOUSE IS NOT A CHOICE, and that is the whole design of this screen. The CRM
+ * models no warehouses — an `erp_warehouse_id` is an opaque text id, not a reference, and
+ * no route lists them — so the only answer a device can give that is not invented is where
+ * the material came from, which is also where it goes back to in practice. It is shown, not
+ * offered; a select with one option would pretend there was a decision.
+ *
+ * A lot that arrived by TRANSFER has no such warehouse, and this form says so rather than
+ * guessing: the depot that sent it to a colleague never sent it here. Writing it off is
+ * still available, which is the honest pair of exits a device can offer today.
+ */
+function renderReturnForm(holding: Holding): string {
+  const warehouse = holding.last_received_from ?? null;
+  return `<section>
+    <h2>Back to the warehouse — ${escapeHtml(holding.lot_number)}</h2>
+    ${warehouse === null
+      ? `<p class="warn">This device does not know which warehouse this material came from —
+           it reached you from a colleague rather than from a depot, so there is no
+           warehouse to send it back to. Writing it off is the other way out.</p>
+         <div class="actions"><button id="cancel-return" type="button" class="secondary">Back</button></div>`
+      : `<form id="return-form">
+          <p class="note">Going back to <strong>${escapeHtml(warehouse)}</strong> — the
+            warehouse this lot came from. That is the only destination this device can name,
+            and it is where returned stock goes.</p>
+          <label>Quantity (of ${escapeHtml(holding.quantity_on_hand)})
+            <input name="quantity" type="text" inputmode="decimal" autocomplete="off" placeholder="how much" />
+          </label>
+          <label>Reason
+            <input name="reason" type="text" maxlength="500" autocomplete="off"
+                   placeholder="Why it is going back — optional, and read by whoever receives it" />
+          </label>
+          <div class="actions">
+            <button id="save-return" type="submit">Record the return</button>
+            <button id="cancel-return" type="button" class="secondary">Cancel</button>
+          </div>
+          <p class="note">This is the one thing you record that the ERP has to be told about:
+            the stock re-enters the warehouse's own books. If that message fails, it shows up
+            below as something the ERP has not been told — the return itself is still
+            recorded here either way.</p>
+        </form>`}
+  </section>`;
+}
+
+/**
+ * Writes the ERP will never hear about unless somebody retries them.
+ *
+ * THE SECTION A RETURN MADE NECESSARY. Everything else a rep records is CRM-only, so a
+ * landed row meant the job was done. A return puts stock back into a warehouse's books, and
+ * the route answers 201 whether or not the mirror to the ERP enqueued — deliberately,
+ * because the CRM ledger IS correct and a 4xx would tell the rep their return was not
+ * written when it was. The consequence is that "accepted" stops meaning "finished", and the
+ * only honest thing a device can do is show the difference.
+ *
+ * The retry needs a network, unlike every other action here: it is a request to a queue
+ * that lives on the server, where nothing happens offline anyway.
+ */
+function renderFailedErpWrites(now: number): string {
+  if (state.failedErpWrites.length === 0) return "";
+  return `<section>
+    <h2>The ERP has not been told (${state.failedErpWrites.length})</h2>
+    <p class="warn">These were recorded here and the ERP never accepted them. The records are
+      safe; the ERP's own stock figures are not up to date until these go through.</p>
+    <ul class="list">
+      ${state.failedErpWrites
+        .map(
+          (w) => `<li><span class="grow">
+            <span class="name">${escapeHtml(w.entity)} ${escapeHtml(w.operation)}</span>
+            <span class="meta error">${escapeHtml(w.dead_reason ?? "no reason recorded")} · ${w.attempts} attempt(s)${w.revive_count > 0 ? ` · retried ${w.revive_count}×` : ""}</span>
+          </span>
+          <button class="secondary" data-retry-erp="${escapeHtml(w.id)}" ${state.online ? "" : "disabled"}>Try again</button></li>`,
+        )
+        .join("")}
+    </ul>
+    <p class="note">Cached ${ago(state.cachedAt, now)}. Trying again re-sends the same
+      message, which helps when the ERP side has changed and not when the message itself is
+      wrong — it is not an edit.${state.online ? "" : " Needs a network."}</p>
   </section>`;
 }
 
@@ -994,6 +1094,37 @@ function wireReady(): void {
       // rather than resting on every path out of it staying correct.
       signatureInProgress = null;
       render();
+    });
+  }
+
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-return]")) {
+    button.addEventListener("click", () => {
+      const lotId = button.dataset["return"];
+      const holding = state.holdings.find((h) => h.lot_id === lotId) ?? null;
+      if (holding === null) {
+        state.message = { kind: "warn", text: "This device has no balance cached for that lot. Refresh while there is a network." };
+        render();
+        return;
+      }
+      formDraft = null;
+      state.returning = holding;
+      state.message = null;
+      render();
+    });
+  }
+  on("cancel-return", "click", () => {
+    formDraft = null;
+    state.returning = null;
+    render();
+  });
+  document.getElementById("return-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveReturn(event.target as HTMLFormElement);
+  });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-retry-erp]")) {
+    button.addEventListener("click", () => {
+      const id = button.dataset["retryErp"];
+      if (id !== undefined) void retryErpWrite(id);
     });
   }
 
@@ -1782,6 +1913,118 @@ async function saveWriteOff(form: HTMLFormElement): Promise<void> {
   void drain({ manual: false });
 }
 
+/**
+ * Record material going back to a warehouse.
+ *
+ * The warehouse comes off the holding, never off the form: there is no field for it,
+ * because a device that let a rep type an ERP record id would be inviting a return
+ * addressed to a depot that does not exist — and the server's `erp_record_id` domain would
+ * refuse it hours later from inside a queue, or worse, accept a real id belonging to the
+ * wrong site.
+ */
+async function saveReturn(form: HTMLFormElement): Promise<void> {
+  const target = state.returning;
+  const author = authorId();
+  if (target === null || store === null) return;
+  if (author === null) {
+    state.message = { kind: "error", text: "This device does not know who is signed in yet, so it cannot record who returned this. Connect once and try again." };
+    render();
+    return;
+  }
+
+  const live = state.holdings.find((h) => h.lot_id === target.lot_id) ?? target;
+  const warehouse = live.last_received_from ?? null;
+  if (warehouse === null) {
+    state.message = {
+      kind: "error",
+      text: "This device does not know which warehouse this material came from, so it cannot address a return.",
+    };
+    render();
+    return;
+  }
+
+  const data = new FormData(form);
+  const quantity = String(data.get("quantity") ?? "").trim();
+  const reason = String(data.get("reason") ?? "").trim();
+
+  const parsed = ReturnBody.safeParse({
+    id: mintUuidV7({ now: () => Date.now(), randomBytes: (b) => crypto.getRandomValues(b) }),
+    lotId: live.lot_id,
+    quantity,
+    occurredAt: new Date().toISOString(),
+    erpWarehouseId: warehouse,
+    ...(reason !== "" ? { reason } : {}),
+  });
+  if (!parsed.success) {
+    state.message = {
+      kind: "error",
+      text: `This return cannot be saved: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`,
+    };
+    render();
+    return;
+  }
+  if (Number(quantity) <= 0) {
+    state.message = { kind: "error", text: "Nothing was sent back, so there is nothing to record." };
+    render();
+    return;
+  }
+  if (Number(quantity) > Number(live.quantity_on_hand)) {
+    state.message = {
+      kind: "error",
+      text: `You are carrying ${live.quantity_on_hand} of ${live.lot_number}, so ${quantity} cannot be sent back.`,
+    };
+    render();
+    return;
+  }
+
+  state.outbox = enqueueReturn(state.outbox, parsed.data, Date.now(), { createdBy: author });
+  await store.replaceOutbox(state.outbox);
+
+  const remaining = Number(live.quantity_on_hand) - Number(quantity);
+  const left = Number.isFinite(remaining) ? Math.max(0, remaining).toFixed(3) : live.quantity_on_hand;
+  state.holdings = state.holdings.map((h) => (h.lot_id === live.lot_id ? { ...h, quantity_on_hand: left } : h));
+  state.obligations = state.obligations.map((o) =>
+    o.lot_id === live.lot_id ? { ...o, quantity_on_hand: left } : o,
+  );
+
+  state.returning = null;
+  formDraft = null;
+  state.message = {
+    kind: "good",
+    text: `Saved on this device: ${quantity} of ${live.lot_number} going back to ${warehouse}. The ERP is told when this syncs.`,
+  };
+  render();
+  void drain({ manual: false });
+}
+
+/**
+ * Ask the server to try a dead ERP write again.
+ *
+ * Direct rather than queued, which is the one deliberate inconsistency in this client and
+ * is argued where the transport method lives: this is an operator action on a queue that
+ * lives on the server, not a record of something that happened in the field.
+ */
+async function retryErpWrite(id: string): Promise<void> {
+  if (transport === null) return;
+  const result = await transport.retryErpWrite(id);
+  if (result.kind === "ok") {
+    // Dropped from the list immediately: it is queued now, and the next refresh is what
+    // confirms whether it got through. Leaving it listed as failed would invite a second
+    // press that answers "no longer dead".
+    state.failedErpWrites = state.failedErpWrites.filter((w) => w.id !== id);
+    state.message = { kind: "good", text: "Queued again. If it fails once more it comes back to this list with the reason." };
+  } else {
+    state.message = {
+      kind: result.kind === "network" ? "warn" : "error",
+      text:
+        result.kind === "network"
+          ? "No network, so the server could not be asked. Try again when there is one."
+          : `The server said: ${result.detail ?? result.status}`,
+    };
+  }
+  render();
+}
+
 async function currentPosition(): Promise<{ latitude: number; longitude: number; accuracyM?: number } | null> {
   if (!("geolocation" in navigator)) return null;
   return new Promise((resolve) => {
@@ -1840,6 +2083,9 @@ async function drain(opts: { manual: boolean; revive?: boolean }): Promise<void>
     // A write-off changes a balance AND may be what clears a disposal obligation, so the
     // refresh re-reads both lists.
     "write_off",
+    // A return does both of those AND is the only one whose landing leaves something for
+    // the ERP to accept, which the same refresh reads.
+    "return_to_warehouse",
   ]);
   const custodyIdsBefore = state.outbox.filter((e) => CUSTODY_KINDS.has(e.kind)).map((e) => e.id);
 
@@ -1932,10 +2178,29 @@ async function refreshReference(): Promise<void> {
 
   const me = Me.safeParse(meResult.body);
   const accountsResult = await transport.get("/v1/accounts");
-  const accounts = accountsResult.kind === "ok" ? AccountList.safeParse(accountsResult.body) : null;
   const holdingsResult = await transport.get("/v1/samples/holdings");
+
+  // A REQUEST THAT FAILED IS NOT A CONTRACT MISMATCH, and conflating them was a real
+  // defect: these are three requests, so a rep who loses signal between the first and the
+  // second was told "the server's reply did not match the contract this app was built
+  // against" — which sends somebody hunting a version mismatch that does not exist, when
+  // the truth is that the network went away mid-refresh. Found by a gate assertion that
+  // kept being overwritten by this message at random.
+  const unreachable = [accountsResult, holdingsResult].find((r) => r.kind !== "ok");
+  if (unreachable !== undefined) {
+    state.message =
+      unreachable.kind === "network"
+        ? { kind: "warn", text: "The network went away part-way through — showing what this device has." }
+        : { kind: "error", text: `The server said: ${unreachable.detail ?? String(unreachable.status)}` };
+    render();
+    return;
+  }
+
+  const accounts = accountsResult.kind === "ok" ? AccountList.safeParse(accountsResult.body) : null;
   const holdings = holdingsResult.kind === "ok" ? HoldingList.safeParse(holdingsResult.body) : null;
   if (!me.success || accounts === null || !accounts.success || holdings === null || !holdings.success) {
+    // Now this message means what it says: the server answered, and what it answered is
+    // not the shape this build was written against.
     state.message = { kind: "error", text: "The server's reply did not match the contract this app was built against." };
     render();
     return;
@@ -1960,6 +2225,11 @@ async function refreshReference(): Promise<void> {
   const counts = countsResult.kind === "ok" ? CountList.safeParse(countsResult.body) : null;
   const obligationsResult = await transport.get("/v1/samples/obligations");
   const obligations = obligationsResult.kind === "ok" ? ObligationList.safeParse(obligationsResult.body) : null;
+  // What the ERP never heard about. Read on every refresh rather than only after a return,
+  // because a mirror can die days later — the relay retries on its own schedule and gives
+  // up on its own schedule, neither of which this device knows about.
+  const failedResult = await transport.get("/v1/erp-writes/failed");
+  const failed = failedResult.kind === "ok" ? FailedErpWriteList.safeParse(failedResult.body) : null;
 
   state.me = me.data;
   // Stamp the session with the rep it turned out to be, so a later cold start can tell
@@ -1975,6 +2245,7 @@ async function refreshReference(): Promise<void> {
   if (peers !== null && peers.success) state.peers = peers.data.data;
   if (counts !== null && counts.success) state.counts = counts.data.data;
   if (obligations !== null && obligations.success) state.obligations = obligations.data.data;
+  if (failed !== null && failed.success) state.failedErpWrites = failed.data.data;
   state.cachedAt = Date.now();
   const cache: CachedReference = {
     me: me.data,
@@ -1986,6 +2257,7 @@ async function refreshReference(): Promise<void> {
     peers: state.peers,
     counts: state.counts,
     obligations: state.obligations,
+    failedErpWrites: state.failedErpWrites,
     fetchedAt: state.cachedAt,
   };
   await store.writeCache(cache);
@@ -2005,6 +2277,7 @@ function adoptSession(session: Session): void {
     state.peers = [];
     state.counts = [];
     state.obligations = [];
+    state.failedErpWrites = [];
     state.cachedAt = null;
   }
   writeSession(session);
@@ -2070,6 +2343,7 @@ async function boot(): Promise<void> {
     state.peers = cached.peers ?? [];
     state.counts = cached.counts ?? [];
     state.obligations = cached.obligations ?? [];
+    state.failedErpWrites = cached.failedErpWrites ?? [];
     state.cachedAt = cached.fetchedAt;
   }
 

@@ -7,6 +7,7 @@ import {
   type CountLineBody,
   type DisbursementBody,
   type RecallBody,
+  type ReturnBody,
   type SignatureBody,
   type TransferBody,
   type VisitBody,
@@ -155,6 +156,24 @@ export class ApiTransport implements SyncTransport {
   /** Material out of custody. One route, one row, always with a reason. */
   async postWriteOff(body: WriteOffBody): Promise<TransportResult> {
     return this.request("POST", "/v1/samples/write-offs", body);
+  }
+
+  /** Material back to a warehouse, which is also a write the ERP has to be told about. */
+  async postReturn(body: ReturnBody): Promise<TransportResult> {
+    return this.request("POST", "/v1/samples/returns", body);
+  }
+
+  /**
+   * Ask the server to try a dead ERP write again.
+   *
+   * NOT a queued outbox kind, and that is the one deliberate inconsistency in this client.
+   * Everything the queue holds is a record of something that happened in the field, which
+   * must survive a dead battery; this is an operator action on a queue that lives on the
+   * server, where nothing happens until there is a network anyway. Queuing it would also
+   * mean classifying "that write is no longer dead" — which is good news — as a refusal.
+   */
+  async retryErpWrite(id: string): Promise<TransportResult> {
+    return this.request("POST", `/v1/erp-writes/${encodeURIComponent(id)}/retry`, {});
   }
 
   /**

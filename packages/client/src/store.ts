@@ -1,6 +1,7 @@
 import type {
   Account,
   Count,
+  FailedErpWrite,
   Obligation,
   Holding,
   IncomingTransfer,
@@ -75,6 +76,14 @@ export interface CachedReference {
    * are offline — the only thing that changes is how overdue.
    */
   readonly obligations?: readonly Obligation[];
+  /**
+   * Writes the ERP will never hear about unless somebody retries them.
+   *
+   * Cached like the rest so the fact survives going offline — but it is the one cached
+   * list whose ACTION needs a network, because retrying is a request to a queue that
+   * lives on the server.
+   */
+  readonly failedErpWrites?: readonly FailedErpWrite[];
   /** Epoch ms of the fetch, so the UI can say how stale it is instead of implying fresh. */
   readonly fetchedAt: number;
 }

@@ -1160,16 +1160,16 @@ pass vacuously. **83 files / 2,123 tests green on both transports.**
 
 `apps/field` is the client, and it is a slice rather than the product: **sign in, see my
 accounts, record a visit with no network, disburse samples with a signature on glass, hand
-material to a colleague and accept theirs, count the bag, write off what has expired, watch
-all of it sync, read a refusal.** Roughly 74 of the 106 routes still have no screen — the
-return-to-warehouse path, call plans, expenses, notifications, the manager's views, all of
-admin.
+material to a colleague and accept theirs, count the bag, write off what has expired, send
+stock back to the warehouse, watch all of it sync, read a refusal.** Roughly 71 of the 106
+routes still have no screen — call plans, expenses, notifications, the manager's views, all
+of admin.
 
 What it settles is the part that was a guess. Everything built for an offline device —
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **178 checks in two
+and `pnpm client:verify` proves it the only way that means anything: **201 checks in two
 real Chromium profiles — two devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
@@ -1226,6 +1226,14 @@ real API binary, counting rows in Postgres.** The sequence it drives:
 - and **a refusal no longer wipes what the rep typed**. Every refusal goes through a render
   that replaces the DOM, so "you are carrying 6, so 99 cannot be written off" used to arrive
   with the reason field blank — on a count form, a number per lot and the note with it;
+- **stock goes back to the warehouse it came from** — the one write here the ERP has to be
+  told about, since the material re-enters its books. The warehouse is **shown, not
+  offered**: the CRM models no warehouses, so the only destination a device can name without
+  inventing one is where the lot was received from, and material that arrived by transfer
+  has none and says so. The return leaves exactly one `StockMovement` for the ERP, and when
+  the gate plays the relay's verdict and kills it, the screen names it in the ERP's own
+  words with a retry — because a return the ERP never hears about leaves a warehouse short
+  in its own books while the CRM's record is perfectly correct;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

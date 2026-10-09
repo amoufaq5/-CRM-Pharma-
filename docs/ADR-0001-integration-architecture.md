@@ -1303,6 +1303,70 @@ Concretely, and these specifics are the decision, not commentary on it:
     read-only everywhere (no screen sets a grace period), and the expiry sweep itself has no
     surface — it is a scheduler job whose findings a rep only ever sees as obligations.
 
+30. **Back to the warehouse — and the first write the ERP has to be told about.**
+    The other exit from a disposal obligation, and the better one for stock a warehouse can
+    dispose of centrally. `POST /v1/samples/returns` has existed since 0017; what makes it
+    different from everything else this client records is the last four words of its own
+    comment: it **mirrors to the ERP as a `receipt`**. Every other movement a rep records is
+    CRM-only, because the material had already left the warehouse and the ERP's balance was
+    already right. A return puts it back.
+
+    **So "accepted" stops meaning "finished".** The route answers 201 whether or not the
+    mirror enqueued — deliberately, and the comment says why: the CRM ledger IS correct, and
+    a 4xx would tell the rep their return was not written when it was. The engine therefore
+    accepts the queued row (keeping it would re-send a movement the server already has), and
+    the app reads `GET /v1/erp-writes/failed` on every refresh instead. A return the ERP
+    never hears about leaves a warehouse short in its own books with nothing on the device
+    saying so, and that list — named for what it means to a rep rather than for the table
+    behind it — is the only honest answer available.
+
+    **The warehouse is shown, not offered.** The CRM models no warehouses: an
+    `erp_warehouse_id` is an opaque CHECKed text id, not a reference (Q1), and no route
+    lists them. A device that let a rep type one would be inviting a return addressed to a
+    depot that does not exist — or worse, to a real id belonging to the wrong site. The only
+    non-fabricated answer is where the material came from, which is also where returned
+    stock actually goes, so `holdingsFor` now carries `last_received_from`: the warehouse of
+    this rep's most recent receipt of that lot, read off the ledger rather than stored on
+    the balance, because the receipt is the fact and a column would be a second copy that
+    could disagree.
+
+    **And it is NULL for material that arrived by transfer**, which is the honest gap rather
+    than a convenient default: the depot that sent it to a colleague never sent it here, and
+    naming it anyway would attribute a return to a warehouse that never had it. The form
+    says so and offers the write-off instead. A warehouse list synced from the ERP is what
+    would close it, and the CRM has no concept for one.
+
+    **The retry is the one action in this client that is not queued.** Everything the outbox
+    holds is a record of something that happened in the field and must survive a dead
+    battery; this is an operator action on a queue that lives on the server, where nothing
+    happens offline anyway. Queuing it would also mean classifying "that write is no longer
+    dead" — which is good news — as a refusal. The button is disabled with no network and
+    says why.
+
+    **A misleading error, found by a gate assertion that kept being overwritten.** The
+    reference refresh is three requests; if the first succeeded and a later one failed, the
+    app said *"the server's reply did not match the contract this app was built against"* —
+    which sends somebody hunting a version mismatch that does not exist, when the truth is
+    that the network went away mid-refresh. A request that failed is not a contract
+    mismatch, and the two are now separate: a dropped network says so in those words, a
+    server error quotes the server, and the contract message is reserved for a reply that
+    arrived and did not parse.
+
+    **Verified end to end.** The return goes up with the warehouse off the holding, lands as
+    `return_to_warehouse`, and leaves exactly one `StockMovement` in the outbox with
+    `movement_type: receipt` — the ERP's word for stock arriving, which is the inverse of
+    the CRM's and caught an assertion that matched every StockMovement and found the three
+    receipts' mirrors too. The gate then plays the relay's verdict (marking that row dead,
+    labelled as the fixture it is, since this harness runs no relay), and the screen names
+    it in the ERP's own words with something the rep can do about it; pressing it re-queues
+    the same payload with `revive_count` at 1. **201 browser checks, 0 failures**, run twice.
+
+    Two gate races worth recording, because both had been passing by luck: a loop that
+    waited for IndexedDB to be empty and then read the DOM was racing the repaint that
+    reflects it, and a `waitFor` on a button that already existed for another lot was true
+    before the refresh it was meant to wait for. Neither was a product defect; both made one
+    look intermittent, which is worse.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1717,7 +1781,7 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 178 checks across TWO browsers, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28), then write-offs and the date a disposal was recorded on (item 29). **What is NOT built is still most of the product**: the rest of custody (returns to a warehouse, and the disposal policy), call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 74 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
+| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 201 checks across TWO browsers, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28), then write-offs and the date a disposal was recorded on (item 29), then the return to a warehouse and the first write the ERP must hear about (item 30). **What is NOT built is still most of the product**: the disposal policy, and a warehouse list the CRM has no concept for, call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface — roughly 71 of the 106 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 
