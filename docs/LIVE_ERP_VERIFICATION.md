@@ -1806,3 +1806,148 @@ to and belongs in an admin console that does not exist. `crm.notification_policy
 `crm.notification_prune_guard` and `crm.expense_account_map` are the same shape of
 configuration with the same gap — and three bespoke logs is the point at which this should
 become one mechanism rather than a fourth copy.
+
+## A configuration change is a record
+
+*2026-10-10, `pnpm client:verify` (272 checks) and `npx vitest run` (97 files / 2,473
+tests). The live-ERP gate is unchanged at 133 — nothing here touches the ERP.*
+
+The chapter above ended by naming the condition for building this: "three bespoke logs is the
+point at which this should become one mechanism rather than a fourth copy." The third instance
+turned out to be two tables — `crm.notification_policy` and `crm.expense_account_map` — so
+0061 is the mechanism. One append-only `crm.config_change`, attached with one statement, and
+the thing worth verifying live is not the table but the **trigger**: the refusal is a `RAISE`
+from a function reading a transaction-local setting, the exemption is a lookup in `pg_attrdef`
+with the default cast to the column's own type, and `changed_columns` is computed by comparing
+two `jsonb` images of a row. Not one of those can be observed against a fake connection.
+
+It also works the opposite way round from the two logs before it. 0059 and 0060 use
+**projection** — the log is the only write path, a direct `UPDATE` is refused outright. This
+uses **observation** — the row is written normally and an `AFTER` trigger records what moved,
+refusing the write when nobody has said who is making it. Same guarantee, one trigger per
+table instead of one apparatus per table, and no store function's signature changes.
+
+### In the browser, through the API, because there is no form
+
+The notification horizons are among the ~70 routes with no screen, so the gate drives the
+mechanism rather than a form. The sequence matters and is the whole of what is asserted:
+
+```
+ok: reading the probe limits provisions the tenant's policy row              (200)
+ok: the row is there                                                           (1)
+ok: and nothing was recorded, because a row holding only what a migration declared
+    is not a decision anybody made                                             (0)
+ok: an UPDATE nobody has signed is refused by the database
+    (ERROR: config-change-unattributed: a change to crm.notification_policy must…)
+ok: with nothing recorded, so a refused change leaves no trace to explain away (0)
+ok: the administrator's signed change is accepted                            (200)
+ok: two records for one request — the honest unit is the action, not the statement
+ok: both under the one sentence the request carried
+ok: attributed to the administrator in the TOKEN — the body never named her
+ok: carrying what the cooldown WAS, read from the row rather than claimed
+    ({"probe_cooldown_seconds": 120, …})
+ok: a request that changes nothing is accepted                               (200)
+ok: and recorded nowhere, so the log a reader relies on to be short stays short (2)
+ok: both records are on screen                                                 (2)
+ok: rendered as the change it was, column name and all
+    (probe_cooldown_seconds: 120 → 600 · probe_budget_max_probes: 120 → 40 …)
+ok: a rep with no administrator grant gets no configuration-history section at all
+ok: and the server refuses her even when the screen is bypassed               (403)
+```
+
+Three of those are the ones that cannot be faked. The unsigned `UPDATE` goes through psql as
+the **superuser** — bypassing row-level security, owning everything — and the refusal still
+lands, because a trigger is not a permission. The `120` in the `before` is the column default
+the row was provisioned at and no part of the request mentioned it, so the log's previous
+value is the database's rather than the writer's claim. And **one request lands two records**,
+because `PUT /v1/admin/notifications/probe-limits` calls two store functions over one row —
+which is why attribution is scoped to a block rather than consumed by the first write.
+
+### One assertion sequenced rather than assumed, the same defect two migrations apart
+
+The unsigned-`UPDATE` check passed on its first run having updated nothing. A `FOR EACH ROW`
+trigger cannot refuse an `UPDATE` that matches zero rows, and `crm.notification_policy` is
+provisioned lazily, so the tenant had no policy row yet. The gate now reads the probe limits
+first — which both provisions the row and asserts the exemption background code depends on —
+and only then tries the write.
+
+This is exactly the defect the disposal-policy chapter recorded about its own suite. It was
+written down, and it happened again anyway, in a different harness. The honest lesson is that
+a refusal test needs a row to refuse, and the only way to know there is one is to put it there
+in the same breath and count it.
+
+### What the database taught, against a test written expecting the other answer
+
+A `now()` default **is** exempt from attribution; a `gen_random_uuid()` one is not. The rule
+compares the stored value against the declared default evaluated now, and `now()` is the
+transaction clock — so inside the inserting transaction it re-derives to exactly the value the
+column holds, which is precisely what the exemption asks. The scratch-table test was written
+expecting a refusal and the database was right. `gen_random_uuid()` never re-derives, so it
+reads as chosen and demands an author; a `clock_timestamp()` default would behave the same
+way. The failure mode is always a refusal asking who, never a silent exemption.
+
+```
+ok: finds nothing chosen in a row holding every declared default
+ok: finds the column that differs from its declared default
+ok: counts a column with no default as chosen only while it holds a value
+ok: whose default cannot be re-derived is never exempt — the rule fails closed
+ok: with a transaction-clock default is exempt, because the default re-derives
+ok: refuses to attach to a table with no primary key
+ok: is idempotent, so a table re-attached is still recorded once per write
+```
+
+Those run against **scratch tables**, and that is a deliberate choice rather than convenience:
+the two production tables cannot pose any of those questions. Neither has a column with a
+volatile default, neither lacks a primary key, and `crm.notification_policy` keys on
+`tenant_id` alone — so a suite using only them would be asserting each generic rule against
+the one case it happens to meet today. The scratch tables carry `crm.data_disposition` rows
+and force row-level security while they exist, because two suites derive their claim from the
+live catalog and relying on `fileParallelism: false` is the "it happens to be set" reasoning
+this repository has been bitten by before.
+
+### What this cost, and what it caught
+
+- **The guard found two writers no reading of the routes had turned up.**
+  `setProbeCooldownSeconds` and `setProbeBudget` also write `crm.notification_policy`. They
+  surfaced as a refusal the moment the trigger was attached — the mechanism paying for itself
+  before it shipped, because a bespoke fourth log would have covered the writers somebody
+  remembered.
+- **The no-op refusal was wrong, and a fixture said so.** The first design refused a write
+  that moved nothing, copying 0059 and 0060. The expense sweeper's fixture re-upserts
+  identical mappings and broke immediately — and it was right to: `PUT
+  /v1/admin/expense-accounts/:category` is an upsert, and refusing "make sure this maps to
+  6200" because it already does makes an idempotent route non-idempotent. A no-op is now not
+  recorded and not refused; the universal half is kept, the opinionated half belongs to the
+  route.
+- **Eleven suites write configuration, and each now signs.** Where the subject is something
+  else, the suite's own tenant helper is wrapped once rather than thirty call sites being
+  edited — the signature there is a precondition for writing configuration, not the thing
+  under test. Where the subject IS the table, the suite signs with its own named rep and
+  asserts on the log. `wipeConfigChanges` joins `wipeEndpoints` as a shared teardown helper,
+  because the log names its author `ON DELETE RESTRICT` and five suites delete their reps.
+- **The composite-key registry demanded a live cross-tenant probe**, as it has for every key
+  since 0035, and the probe is the one case no production path can reach: the log is written
+  by a trigger that reads its author from a setting, so nothing ever inserts into it directly.
+  The constraint still has to be composite — a referential check runs with row security off,
+  so a single-column key would let one tenant's record name a rep in another.
+- **0051's register refused the table until it carried a decision**, taking the undecided
+  count to 22 of 45 tenant-scoped tables.
+
+### What is still not built
+
+- **Two arrangements now live in the schema.** 0059 and 0060 keep their typed logs on purpose
+  — a history a screen renders wants columns, and both of their shapes are already served over
+  HTTP — but the rule for choosing between them lives in 0061's header rather than anywhere a
+  reader looks first.
+- **`crm.config_change`'s own retention disposition is `undecided`**, and the question is real
+  rather than paperwork: the log records which ledger account a category posted to, and
+  `crm.expense_claim` is retained for seven years under `financial_transactions_7y` with its
+  account snapshot. A retained claim whose mapping history was erased is a posting nobody can
+  explain.
+- **The screen shows five and cannot page**, and takes neither the `table` nor a column
+  filter although the route takes the first. For a tenant that changes its settings twice a
+  year that is the right size; for one that tunes a prune guard weekly it is not.
+- **Nothing is four-eyed.** Item 32's open note still stands for the promo auto-write-off
+  switch, and it stands here too: an administrator can re-point an expense category to any
+  ledger account alone, and the only thing stopping a quiet redirection of a tenant's spend is
+  that the log will say who did it.

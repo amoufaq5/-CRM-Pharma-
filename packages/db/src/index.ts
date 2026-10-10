@@ -1,3 +1,12 @@
+export { CONFIG_LOG_LIMIT, configChanges, type ConfigChange } from "./config-log.js";
+export {
+  ACTOR_SETTING,
+  REASON_SETTING,
+  UnattributedChangeError,
+  translateAttributionError,
+  withAttribution,
+  type ChangeAttribution,
+} from "./attribution.js";
 export {
   PrivilegedConnectionError,
   ROLE_PRIVILEGE_SQL,

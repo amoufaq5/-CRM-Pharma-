@@ -137,6 +137,16 @@ SELECT '$TENANT', a.id, 'compliance', g.id, CURRENT_DATE - 1, 'the live gate nee
   FROM crm.rep_profile a, crm.rep_profile g
  WHERE a.subject = 'rep-ada' AND g.subject = 'rep-grace';
 
+-- AND THE ADMINISTRATOR GRANT, which is a DIFFERENT grant on purpose. 0061's configuration
+-- log is administrator-only and the disposal policy is compliance-only, and the split is the
+-- point: one is a statement about the system's own settings, the other is an SOP parameter
+-- reps are measured against. Ada holds both here so one browser can drive both screens; Grace
+-- holds neither, which is what makes her screens below evidence rather than scenery.
+INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+SELECT '$TENANT', a.id, 'administrator', g.id, CURRENT_DATE - 1, 'the live gate needs somebody who may read the configuration history'
+  FROM crm.rep_profile a, crm.rep_profile g
+ WHERE a.subject = 'rep-ada' AND g.subject = 'rep-grace';
+
 INSERT INTO crm.territory (tenant_id, code, name)
 VALUES ('$TENANT', 'T-LIVE', 'Live territory');
 

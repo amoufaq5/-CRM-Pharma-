@@ -8,6 +8,7 @@ import {
   DisposalPolicy,
   FailedErpWriteList,
   MyRoles,
+  ConfigChangeList,
   PolicyBody,
   PolicyChangeList,
   Obligation,
@@ -52,6 +53,7 @@ import {
   type RecallableTransfer,
   type SyncReport,
   type WriteOffKind,
+  type ConfigChange,
   type PolicyChange,
   type TransferPeer,
   type Warehouse,
@@ -115,6 +117,8 @@ interface State {
    */
   policy: DisposalPolicy | null;
   policyChanges: readonly PolicyChange[];
+  /** The tenant's configuration history. Only ever non-empty for an `administrator`. */
+  configChanges: readonly ConfigChange[];
   /**
    * The administrative roles this rep holds, from `GET /v1/me/roles`.
    *
@@ -160,6 +164,7 @@ const state: State = {
   warehouses: [],
   policy: null,
   policyChanges: [],
+  configChanges: [],
   roles: [],
   editingPolicy: false,
   cachedAt: null,
@@ -420,6 +425,11 @@ function render(): void {
     // than anything a rep does today, and a tenant-wide parameter above a rep's own work
     // would be the wrong emphasis on a phone.
     parts.push(renderPolicy(now));
+    // After the policy, because it is the same kind of thing one layer out: the policy is
+    // one tenant-wide rule with a screen of its own, this is every OTHER tenant-wide
+    // setting's history. Empty for everybody but an administrator, and empty sections
+    // render as nothing.
+    parts.push(renderConfigHistory());
   }
 
   root.innerHTML = parts.join("");
@@ -1132,6 +1142,84 @@ function renderPolicyHistory(): string {
         .join("")}
     </ul>
   </details>`;
+}
+
+/**
+ * Who changed this tenant's settings, and why (0061).
+ *
+ * ADMINISTRATOR ONLY, and absent rather than empty for everyone else: a section headed
+ * "configuration history" with nothing under it reads as "nobody has ever changed anything",
+ * which is a claim this device has not been told and has no way to check.
+ *
+ * GENERIC ON PURPOSE, and this is where 0061's jsonb pays for itself and also shows its cost.
+ * The disposal policy above draws "30 → 7 day(s)" because its log has typed columns for
+ * exactly those two parameters. This one renders whichever tables are under attribution, so it
+ * can only say "`retain_read_days`: 30 → 7" — the column name as the database spells it. That
+ * is honest for an administrator reading their own settings and it is NOT what you would put
+ * in front of a rep, which is the whole reason 0059's log was not converted to this shape.
+ *
+ * Both values are read THROUGH `changed_columns` rather than by walking the documents: the
+ * records carry the whole row before and after, and a client that iterated them would print
+ * every column the table has, including the dozen nobody touched.
+ */
+function renderConfigHistory(): string {
+  if (!state.roles.includes("administrator")) return "";
+  if (state.configChanges.length === 0) {
+    return `<section>
+      <h2>Configuration history</h2>
+      <p class="note">Nothing in this tenant's settings has been changed. Every change to the
+        notification horizons or the expense account map is recorded here with who made it and
+        why — the database refuses one that names nobody.</p>
+    </section>`;
+  }
+  return `<section>
+    <h2>Configuration history</h2>
+    <ul class="list">
+      ${state.configChanges.map(renderConfigChange).join("")}
+    </ul>
+    <p class="note">The five most recent. Each one names the row it changed, every column that
+      moved, and the sentence its author gave.</p>
+  </section>`;
+}
+
+/** One record: what moved, from what to what, by whom, and why. */
+function renderConfigChange(change: ConfigChange): string {
+  const moved = change.changed_columns
+    .map((column) => {
+      const after = renderConfigValue(change.after[column]);
+      // A creation has no `before`, which `action` also says. Printing "null → 6200" there
+      // would invent a previous value for a row that had none.
+      if (change.before === null || change.before === undefined) return `${column}: ${after}`;
+      return `${column}: ${renderConfigValue(change.before[column])} → ${after}`;
+    })
+    .join(" · ");
+  const key = Object.entries(change.row_key)
+    // The tenant is every row's key here and saying so on every line tells an administrator
+    // nothing they do not already know about the tenant they are signed into.
+    .filter(([column]) => column !== "tenant_id")
+    .map(([column, value]) => `${column} ${renderConfigValue(value)}`)
+    .join(", ");
+  const subject = key === "" ? change.table_name : `${change.table_name} (${key})`;
+  return `<li><span class="grow">
+    <span class="name">${escapeHtml(subject)}</span>
+    <span class="meta">${escapeHtml(moved)}</span>
+    <span class="meta">${escapeHtml(change.changed_by_name)} · ${escapeHtml(change.changed_at.slice(0, 10))} · ${escapeHtml(change.reason)}</span>
+  </span></li>`;
+}
+
+/**
+ * One jsonb value, as a person reads it.
+ *
+ * `JSON.stringify` for anything that is not a string, number or boolean, because the
+ * alternative is `[object Object]` on screen. `null` is printed as the word rather than as a
+ * blank: in a before/after pair a blank would read as "and then nothing", when the fact being
+ * recorded is that the column held no value.
+ */
+function renderConfigValue(value: unknown): string {
+  if (value === null || value === undefined) return "none";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return JSON.stringify(value);
 }
 
 /**
@@ -2628,6 +2716,27 @@ async function refreshReference(): Promise<void> {
     policyChangesResult.kind === "ok" ? PolicyChangeList.safeParse(policyChangesResult.body) : null;
   const rolesResult = await transport.get("/v1/me/roles");
   const roles = rolesResult.kind === "ok" ? MyRoles.safeParse(rolesResult.body) : null;
+  /**
+   * The tenant's configuration history (0061) — fetched only for an administrator.
+   *
+   * CONDITIONAL, unlike every read above it, and on the roles this same refresh just
+   * learned rather than on the ones in state: `GET /v1/admin/config-changes` is
+   * administrator-only, so asking unconditionally would mean every rep's device taking a
+   * 403 on every refresh. A read that is expected to fail is a read that trains whoever
+   * watches the logs to ignore them.
+   *
+   * It is also the only reference read here that is NOT cached, deliberately. The policy
+   * above is cached because a deadline is the point and does not move while a rep is
+   * offline; this is an audit trail an administrator reads at a desk, with a network, and
+   * writing a tenant's configuration history to a SHARED device's IndexedDB would leave it
+   * there for whoever signs in next — the hazard the role reset below exists to close.
+   */
+  const mayAdminister = roles !== null && roles.success && roles.data.roles.includes("administrator");
+  const configResult = mayAdminister ? await transport.get("/v1/admin/config-changes?limit=5") : null;
+  const configChanges =
+    configResult !== null && configResult.kind === "ok"
+      ? ConfigChangeList.safeParse(configResult.body)
+      : null;
 
   state.me = me.data;
   // Stamp the session with the rep it turned out to be, so a later cold start can tell
@@ -2647,6 +2756,9 @@ async function refreshReference(): Promise<void> {
   if (warehouses !== null && warehouses.success) state.warehouses = warehouses.data.data;
   if (policy !== null && policy.success) state.policy = policy.data;
   if (policyChanges !== null && policyChanges.success) state.policyChanges = policyChanges.data.data;
+  // Assigned from the ANSWER, and emptied when there was no answer to have: a rep who lost
+  // the administrator grant this morning must not keep last night's history on screen.
+  state.configChanges = configChanges !== null && configChanges.success ? configChanges.data.data : [];
   // Assigned even when the list is EMPTY, unlike the reads above: an empty set of roles is a
   // real answer and the one that must stick, or a rep who lost their grant this morning
   // would keep a form the server now refuses.
@@ -2694,6 +2806,7 @@ function adoptSession(session: Session): void {
     // provenance on screen beside somebody else's name is no better.
     state.policy = null;
     state.policyChanges = [];
+    state.configChanges = [];
     state.roles = [];
     state.editingPolicy = false;
     state.cachedAt = null;

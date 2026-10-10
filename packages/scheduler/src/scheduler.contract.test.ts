@@ -18,6 +18,7 @@ import {
   TENANT_SCHEDULER_LOOP as LOOP_TENANT,
   TENANT_SCHEDULER_RESULT as RESULT_TENANT,
   appPool,
+  withFixtureAttribution,
 } from "@crm/db/testing";
 
 /**

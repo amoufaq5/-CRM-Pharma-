@@ -189,6 +189,46 @@ merely avoided by the code. The disposal policy is 0059; the endpoints are 0060,
 an endpoint *is* was already frozen for the life of the row (0049) so its author is a frozen
 column beside the destination, and only its *tuning* is logged.
 
+**The third one was built as a mechanism rather than a third copy.** 0059 and 0060 cost
+roughly two hundred lines of SQL each — a typed log, a trigger to apply it, a guard, a
+rewritten store function, and a fixture change in every suite that touched the table — and
+0060's closing note said where the line was. 0061 is that line: `crm.config_change`, one
+append-only log, attached to any table with
+`SELECT crm.require_config_attribution('crm.some_table')`. It records
+`crm.notification_policy` and `crm.expense_account_map` today, and the next tenant-wide
+setting costs one statement.
+
+It works the other way round from 0059 and 0060, and the difference is the design rather
+than a shortcut. Those use **projection**: the log is the only write path and a direct
+`UPDATE` is refused outright. 0061 uses **observation**: the row is written normally, an
+`AFTER` trigger records what moved, and the write is refused when nothing has said who is
+making it. The guarantee is the same — the trigger is unconditional and raises rather than
+skipping — but observation needs no change to any store function's signature, because the
+author travels in a transaction-local setting (`app.change_actor` / `app.change_reason`) the
+way the tenant already does. `withAttribution` in `@crm/db` sets both for a block; a route
+opts its write in by wrapping it.
+
+Three rules are worth knowing before putting a fourth table under it:
+
+- **A history a *screen* renders gets typed columns; a history that exists to be *auditable*
+  gets this.** 0061's `before`/`after` are `jsonb`, which is right for an audit trail and
+  wrong for the field client's "30 → 7 day(s)". 0059 and 0060 are deliberately not converted.
+- **An insert is exempt only if every attributable column holds its *declared default*,** read
+  from `pg_attrdef` rather than restated in the trigger. Both tables are provisioned lazily
+  from background code, and a row holding what a migration declared is not a decision anybody
+  made — but a row created at values somebody *chose* is exactly one. A default that cannot be
+  re-derived (`gen_random_uuid()`) reads as chosen and demands an author, which is the safe
+  direction.
+- **A write that moves nothing is not recorded and not refused.** 0059 and 0060 refuse a
+  no-op because each of their routes is an explicit "set this knob". This mechanism also
+  serves routes with *ensure* semantics — `PUT /v1/admin/expense-accounts/:category` is an
+  upsert — so the universal half is kept (an empty change is never recorded) and the
+  opinionated half is left to the route, which is the only layer that knows what its verb
+  promised.
+
+An administrator reads it at `GET /v1/admin/config-changes`, and sees it on the device under
+**Configuration history**.
+
 Four rules, all of them in the database (`db/migrations/0023_roles.sql`), so a route cannot
 forget one:
 
@@ -832,7 +872,7 @@ same bypass with extra steps.
 The trigger is the layer doing the work today. The key only pins a tenant that has been
 *erased*; the trigger pins one that has been *stopped*, which is every deleted tenant from the
 moment the watcher sees the tombstone until somebody runs the erasure — a window that stays
-open while the twenty-one undecided dispositions stay undecided.
+open while the twenty-two undecided dispositions stay undecided.
 
 **It does not erase anything, and that is a decision rather than an omission.** Some of the
 CRM's copies may be records a jurisdiction requires us to keep; a deletion that destroys an
@@ -841,7 +881,7 @@ that is defensible today. The vocabulary for the other half is below.
 
 ## What happens to each table, and who decided
 
-**21 of this CRM's 44 tenant-scoped tables have no answer yet, and that is now a fact you can
+**22 of this CRM's 45 tenant-scoped tables have no answer yet, and that is now a fact you can
 read rather than a gap nobody mentioned.** Migration 0051 adds `crm.data_disposition`: one row
 per tenant-scoped table saying `erase`, `retain` with a lawful basis, or `undecided` with the
 question somebody has to answer.
@@ -1179,16 +1219,17 @@ pass vacuously. **83 files / 2,123 tests green on both transports.**
 accounts, record a visit with no network, disburse samples with a signature on glass, hand
 material to a colleague and accept theirs, count the bag, write off what has expired, send
 stock back to a depot, read the SOP parameters you are measured against — and change them, if
-you hold the compliance grant — watch all of it sync, read a refusal.** Roughly 70 of the 106
-routes still have no screen — call plans, expenses, notifications, the manager's views, all
-of admin.
+you hold the compliance grant — read who changed this tenant's settings and why, if you hold
+the administrator one, watch all of it sync, read a refusal.** Roughly 70 of the 108 routes
+still have no screen — call plans, expenses, notifications, the manager's views, most of
+admin.
 
 What it settles is the part that was a guess. Everything built for an offline device —
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **248 checks in four
-real Chromium profiles — four devices, two reps — taken offline mid-session, against the
+and `pnpm client:verify` proves it the only way that means anything: **272 checks in five
+real Chromium profiles — five devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
 - a visit recorded with the network down lands in IndexedDB, pending, with a device-minted
@@ -1268,6 +1309,19 @@ real API binary, counting rows in Postgres.** The sequence it drives:
   and a queued one would take effect whenever a phone next found signal and overwrite a
   colleague's. A rep with no grant is offered nothing and is refused 403 if the screen is
   bypassed;
+- **and who changed this tenant's settings, and why** — 0061's log on screen under
+  *Configuration history*, administrator only. The gate drives the mechanism rather than a
+  form, because the notification horizons have no form: reading the probe limits provisions
+  the tenant's policy row at its declared defaults and records **nothing**, which is the
+  exemption background code depends on; an `UPDATE` nobody has signed is then refused by the
+  database **through psql as the superuser**, because a trigger is not a permission; one
+  signed request through the route lands **two** records under **one** sentence, since the
+  route writes twice and the honest unit is the administrative action; a second identical
+  request answers 200 and records nothing, because its verb promises *ensure*; the `before`
+  carries `120`, the column default the row was provisioned at, which no part of the request
+  mentioned. Then it is on the screen as `probe_cooldown_seconds: 120 → 600` with the author
+  and her sentence — and Grace, holding no grant, gets **no section at all** rather than an
+  empty one, and a 403 if she asks the route directly;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

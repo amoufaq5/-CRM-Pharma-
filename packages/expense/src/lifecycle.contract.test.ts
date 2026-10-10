@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { randomUUID } from "node:crypto";
 import { withTenantContext } from "@crm/db";
-import { TENANT_EXPENSE_LIFECYCLE as TENANT, appPool } from "@crm/db/testing";
+import { TENANT_EXPENSE_LIFECYCLE as TENANT, appPool, wipeConfigChanges, withFixtureAttribution } from "@crm/db/testing";
 
 import {
   EXPENSE_CLAIM_STATES,
@@ -126,6 +126,8 @@ describe("0044 — the expense claim lifecycle is in the database", () => {
     await clear();
     await inTenant(async (tx) => {
       await tx.query("DELETE FROM crm.expense_account_map WHERE tenant_id = $1", [TENANT]);
+      // 0061's configuration log before its authors, ON DELETE RESTRICT.
+      await wipeConfigChanges(tx, TENANT);
       await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [TENANT]);
     });
     client?.release();
@@ -638,7 +640,9 @@ describe("0044 — the expense claim lifecycle is in the database", () => {
      */
     it("admits the whole chain through createClaim/submit/approve/post/reimburse", async () => {
       await inTenant((tx) =>
-        upsertAccountMapping(tx, TENANT, { crmCategory: "congress", erpLedgerAccountCode: "6000" }),
+        withFixtureAttribution(tx, TENANT, (t) =>
+          upsertAccountMapping(t, TENANT, { crmCategory: "congress", erpLedgerAccountCode: "6000" }),
+        ),
       );
       const id = await draftClaim();
       const seen: string[] = ["draft"];
@@ -897,11 +901,13 @@ describe("0044 — the expense claim lifecycle is in the database", () => {
      */
     it("lets submitClaim stamp the account snapshot on the way out of draft", async () => {
       await inTenant((tx) =>
-        upsertAccountMapping(tx, TENANT, {
-          crmCategory: "congress",
-          erpLedgerAccountCode: "6100",
-          erpCostCenterCode: "CC-SM",
-        }),
+        withFixtureAttribution(tx, TENANT, (t) =>
+          upsertAccountMapping(t, TENANT, {
+            crmCategory: "congress",
+            erpLedgerAccountCode: "6100",
+            erpCostCenterCode: "CC-SM",
+          }),
+        ),
       );
       const id = await draftClaim();
       const submitted = await inTenant((tx) => submitClaim(tx, TENANT, id, new Date("2026-09-10T08:00:00Z")));

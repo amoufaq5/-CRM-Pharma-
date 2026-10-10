@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_EXPENSE_STORE as TENANT, appPool } from "@crm/db/testing";
+import { TENANT_EXPENSE_STORE as TENANT, appPool, withFixtureAttribution } from "@crm/db/testing";
 import { claimBatch, markDead } from "@crm/relay";
 
 import { upsertAccountMapping } from "./accounts.js";
@@ -160,12 +160,17 @@ describe("expense claims", () => {
       await tx.query("ALTER TABLE crm.expense_claim ENABLE TRIGGER expense_claim_check_lifecycle");
     });
 
+  // Through `withFixtureAttribution`, because 0061 refuses a write to
+  // `crm.expense_account_map` that nothing has claimed — and this suite's subject is the
+  // claim lifecycle rather than who mapped the category, so it says so in one place.
   const map = (tx: PoolClient, costCentre: string | null = "CC-SM"): Promise<unknown> =>
-    upsertAccountMapping(tx, TENANT, {
-      crmCategory: "congress",
-      erpLedgerAccountCode: "6200",
-      erpCostCenterCode: costCentre,
-    });
+    withFixtureAttribution(tx, TENANT, (t) =>
+      upsertAccountMapping(t, TENANT, {
+        crmCategory: "congress",
+        erpLedgerAccountCode: "6200",
+        erpCostCenterCode: costCentre,
+      }),
+    );
 
   const draft = (tx: PoolClient, rep = REP, category = "congress"): Promise<ExpenseClaim> =>
     createClaim(tx, TENANT, {
@@ -399,11 +404,13 @@ describe("expense claims", () => {
 
     it("refuses when the only mapping is inactive", async () => {
       await inTenant(async (tx) => {
-        await upsertAccountMapping(tx, TENANT, {
-          crmCategory: "congress",
-          erpLedgerAccountCode: "6200",
-          isActive: false,
-        });
+        await withFixtureAttribution(tx, TENANT, (t) =>
+          upsertAccountMapping(t, TENANT, {
+            crmCategory: "congress",
+            erpLedgerAccountCode: "6200",
+            isActive: false,
+          }),
+        );
         const claim = await draft(tx);
         await expect(submitClaim(tx, TENANT, claim.id, new Date())).rejects.toBeInstanceOf(
           UnmappedCategoryError,
@@ -444,11 +451,13 @@ describe("expense claims", () => {
         return claim.id;
       });
       await inTenant((tx) =>
-        upsertAccountMapping(tx, TENANT, {
-          crmCategory: "congress",
-          erpLedgerAccountCode: "9999",
-          erpCostCenterCode: "CC-OTHER",
-        }),
+        withFixtureAttribution(tx, TENANT, (t) =>
+          upsertAccountMapping(t, TENANT, {
+            crmCategory: "congress",
+            erpLedgerAccountCode: "9999",
+            erpCostCenterCode: "CC-OTHER",
+          }),
+        ),
       );
       await inTenant(async (tx) => {
         const claim = await requireClaim(tx, TENANT, id);

@@ -223,6 +223,27 @@ function policyChangeRows() {
   });
 }
 
+/**
+ * 0061's generic configuration log, read from outside the app.
+ *
+ * The same discipline as `policyChangeRows` above and for a sharper reason: this log is
+ * written by a TRIGGER rather than by a store function, so the only way to know it fired is
+ * to look. `changed_columns` and both documents come back as text and are parsed here,
+ * because what the screen renders and what the database holds are two different claims.
+ */
+function configChangeRows() {
+  const out = sql(
+    `SELECT c.table_name, c.action, array_to_string(c.changed_columns, ','), r.display_name,
+            c.reason, coalesce(c.before::text, ''), c.after::text
+       FROM crm.config_change c JOIN crm.rep_profile r ON r.id = c.changed_by
+      WHERE c.tenant_id = '${tenant}' ORDER BY c.changed_at DESC, c.id DESC`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [table, action, columns, who, reason, before, after] = line.split("|");
+    return { table, action, columns, who, reason, before, after };
+  });
+}
+
 /** How many receipts the receiving rep has of her own. The premise of the return chapter. */
 function graceReceipts() {
   const out = sql(
@@ -1441,6 +1462,155 @@ async function main() {
       await gracePolicy.screenshot(join(work, "app-26-policy-readonly.png"));
     } finally {
       await policyBrowser.close();
+    }
+
+    // ---- 21. who changed this tenant's SETTINGS, and why -------------------
+    // THE SECOND ADMINISTRATIVE SCREEN, and a different guarantee from the one above.
+    // 0059 made the disposal policy a PROJECTION of its log: the row cannot be written at
+    // all except through a change record. 0061 is the other arrangement — the row is
+    // written normally and an AFTER trigger records what moved, refusing the write when
+    // nothing has said who is making it. The reason to do it the second way is that it
+    // costs one trigger per table instead of one apparatus per table, and the reason to
+    // prove it live is that the refusal is a trigger reading a transaction-local setting,
+    // which no fake connection can observe.
+    //
+    // Driven through the API from the browser rather than through a form, because there is
+    // no form: the notification horizons have no screen (one of ~70 routes that do not),
+    // and inventing one here would be testing a screen rather than the mechanism. What
+    // this chapter asserts is the mechanism, the read route, and the screen that renders
+    // its result.
+    const beforeAnyConfigChange = await page.evaluate(`
+      const h = [...document.querySelectorAll("h2")].find((x) => /Configuration history/.test(x.textContent ?? ""));
+      const sec = h?.parentElement;
+      return { present: h !== undefined, text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null };`);
+    is(beforeAnyConfigChange.present, true, "the administrator is shown a configuration-history section");
+    is(/Nothing in this tenant's settings has been changed/.test(String(beforeAnyConfigChange.text)), true,
+      "saying so in words — a device that printed an empty list would be claiming it had looked");
+
+    // FIRST, THE ROW HAS TO EXIST, and getting it there is itself a check worth making.
+    // `crm.notification_policy` is provisioned LAZILY — every read upserts the tenant's row
+    // at the column defaults, from the scheduler, with no human anywhere near it — so 0061
+    // exempts an insert that holds nothing but what a migration declared. Without that
+    // exemption the first background read of a new tenant would be refused for naming
+    // nobody. The exemption is asserted here rather than assumed: the row appears and the
+    // log stays empty.
+    //
+    // It is also what makes the refusal below mean anything. A `FOR EACH ROW` trigger
+    // cannot refuse an UPDATE that matches zero rows, so an unsigned UPDATE against a
+    // tenant with no policy row would be "accepted" having done nothing — which is how the
+    // same assertion passed for the wrong reason in 0059's suite, and the reason it is
+    // sequenced this way here.
+    const provisioning = await page.evaluate(`
+      const s = JSON.parse(localStorage.getItem("crm.field.session"));
+      const res = await fetch("/v1/admin/notifications/probe-limits", {
+        headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)} },
+      });
+      return { status: res.status, body: await res.text() };`);
+    is(provisioning.status, 200, "reading the probe limits provisions the tenant's policy row");
+    is(Number(sql(`SELECT count(*) FROM crm.notification_policy WHERE tenant_id = '${tenant}'`).trim()), 1,
+      "the row is there");
+    is(configChangeRows().length, 0,
+      "and nothing was recorded, because a row holding only what a migration declared is not a decision anybody made");
+
+    // The write nobody signed, refused by the database. Through psql as the SUPERUSER,
+    // which bypasses row-level security — and the refusal still lands, because a trigger
+    // is not a permission. That is the guarantee: the configuration cannot be changed
+    // without a record by anybody, including whoever holds the application password.
+    let unsigned = "ACCEPTED";
+    try {
+      sql(`UPDATE crm.notification_policy SET retain_read_days = 5 WHERE tenant_id = '${tenant}'`);
+    } catch (err) {
+      unsigned = String(err.stderr ?? err.message ?? "");
+    }
+    is(/config-change-unattributed/.test(unsigned), true,
+      `an UPDATE nobody has signed is refused by the database (${unsigned.replace(/\s+/g, " ").slice(0, 90)})`);
+    is(configChangeRows().length, 0, "with nothing recorded, so a refused change leaves no trace to explain away");
+
+    // And the route, which signs it. One request, TWO store writes — `setProbeCooldownSeconds`
+    // and `setProbeBudget` are two functions over one row — under ONE reason, which is why
+    // 0061's attribution is scoped to a block rather than consumed by the first write.
+    const signed = await page.evaluate(`
+      const s = JSON.parse(localStorage.getItem("crm.field.session"));
+      const res = await fetch("/v1/admin/notifications/probe-limits", {
+        method: "PUT",
+        headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)}, "content-type": "application/json" },
+        body: JSON.stringify({ cooldownSeconds: 600, maxProbes: 40, reason: "throttling the probes after the webhook host complained" }),
+      });
+      return { status: res.status, body: await res.text() };`);
+    is(signed.status, 200, `the administrator's signed change is accepted (${String(signed.body).slice(0, 60)})`);
+
+    const configRows = configChangeRows();
+    is(configRows.length, 2, "two records for one request — the honest unit is the action, not the statement");
+    is(new Set(configRows.map((r) => r.reason)).size, 1, "both under the one sentence the request carried");
+    is(configRows.every((r) => r.who === "Ada Lovelace"), true,
+      "attributed to the administrator in the TOKEN — the body never named her");
+    is(configRows.every((r) => r.table === "notification_policy" && r.action === "amended"), true,
+      "naming the table the trigger was attached to, and the row as amended rather than created");
+    is(new Set(configRows.flatMap((r) => String(r.columns).split(","))).has("probe_cooldown_seconds"), true,
+      "with the column that moved named, not the dozen the table happens to have");
+    // The `before` is the DATABASE's: 120 is the column default this row was provisioned at,
+    // and no part of the request mentioned it. A log whose previous value is whatever the
+    // writer claimed is not evidence of anything.
+    const cooldownRow = configRows.find((r) => String(r.columns).includes("probe_cooldown_seconds"));
+    is(/"probe_cooldown_seconds": ?120/.test(String(cooldownRow?.before)), true,
+      `carrying what the cooldown WAS, read from the row rather than claimed (${String(cooldownRow?.before).replace(/\s+/g, " ").slice(0, 70)})`);
+
+    // A second identical request records NOTHING and still answers 200: the route's verb
+    // promises ensure, so refusing a no-op would make an idempotent route non-idempotent.
+    const again = await page.evaluate(`
+      const s = JSON.parse(localStorage.getItem("crm.field.session"));
+      const res = await fetch("/v1/admin/notifications/probe-limits", {
+        method: "PUT",
+        headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)}, "content-type": "application/json" },
+        body: JSON.stringify({ cooldownSeconds: 600, reason: "asking for exactly what is already in force" }),
+      });
+      return res.status;`);
+    is(again, 200, "a request that changes nothing is accepted");
+    is(configChangeRows().length, 2, "and recorded nowhere, so the log a reader relies on to be short stays short");
+
+    // Now the screen. The read route existed and was reachable from nothing, which is the
+    // defect this repository has shipped five times.
+    await page.click("#refresh");
+    await page.waitFor(`/probe_cooldown_seconds/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the configuration history" });
+    const historyOnScreen = await page.evaluate(`
+      const h = [...document.querySelectorAll("h2")].find((x) => /Configuration history/.test(x.textContent ?? ""));
+      const sec = h?.parentElement;
+      return { text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null, rows: sec?.querySelectorAll("li").length ?? 0 };`);
+    is(historyOnScreen.rows, 2, "both records are on screen");
+    is(/probe_cooldown_seconds: 120 → 600/.test(String(historyOnScreen.text)), true,
+      `rendered as the change it was, column name and all (${String(historyOnScreen.text).slice(0, 110)})`);
+    is(/Ada Lovelace/.test(String(historyOnScreen.text)), true, "with the author");
+    is(/webhook host complained/.test(String(historyOnScreen.text)), true, "and the sentence she gave");
+    await shot("27-config-history");
+
+    // AND THE REP WHO MAY NOT SEE IT. Grace holds neither grant: no section at all — not an
+    // empty one, which would tell her a tenant-wide fact she has not been told — and the
+    // route refuses her if she asks anyway.
+    const configBrowser = await launchBrowser();
+    const graceConfig = await newPage(configBrowser);
+    try {
+      await graceConfig.goto(appUrl);
+      await graceConfig.waitFor(`document.querySelector("#app")?.getAttribute("aria-busy") === "false"`, { label: "Grace's fourth device to boot" });
+      await graceConfig.fill("#dev-token", token2);
+      await graceConfig.fill("#dev-tenant", tenant);
+      await graceConfig.click("#dev-login");
+      await graceConfig.waitFor(`/day\\(s\\) to dispose of expired stock/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "Grace's reference data" });
+      const hersConfig = await graceConfig.evaluate(`
+        return { present: [...document.querySelectorAll("h2")].some((x) => /Configuration history/.test(x.textContent ?? "")),
+                 leaked: /probe_cooldown_seconds/.test(document.body.textContent ?? "") };`);
+      is(hersConfig.present, false, "a rep with no administrator grant gets no configuration-history section at all");
+      is(hersConfig.leaked, false, "and nothing from it anywhere else on her screen");
+      const refusedRead = await graceConfig.evaluate(`
+        const s = JSON.parse(localStorage.getItem("crm.field.session"));
+        const res = await fetch("/v1/admin/config-changes", {
+          headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)} },
+        });
+        return { status: res.status, body: await res.text() };`);
+      is(refusedRead.status, 403, "and the server refuses her even when the screen is bypassed");
+      is(/administrator/.test(String(refusedRead.body)), true, "naming the role she would need");
+      await graceConfig.screenshot(join(work, "app-28-config-history-denied.png"));
+    } finally {
+      await configBrowser.close();
     }
 
     // ---- 20. the ERP deletes the tenant, and the queue STOPS ---------------

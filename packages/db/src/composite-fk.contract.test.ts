@@ -164,6 +164,10 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   // because 0049 already freezes what an endpoint IS and a frozen fact is row data.
   notification_endpoint_created_by_fkey: { table: "notification_endpoint", column: "created_by", parent: "rep_profile", onDelete: "RESTRICT" },
   notification_endpoint_probe_requested_by_fkey: { table: "notification_endpoint_probe", column: "requested_by", parent: "rep_profile", onDelete: "RESTRICT" },
+  // 0061. The generic configuration log, which names its author for EVERY table under
+  // attribution rather than one. RESTRICT, like every audit child here: a configuration
+  // change whose author has been deleted is a change nobody made.
+  config_change_changed_by_fkey: { table: "config_change", column: "changed_by", parent: "rep_profile", onDelete: "RESTRICT" },
 
   // 0052: the CRM's own deletion receipt, and the only reference added since 0046 dropped two.
   // RESTRICT rather than CASCADE, and for this table that is the whole point: the attestations
@@ -624,6 +628,19 @@ const PROBES: Readonly<Record<string, Probe>> = {
              min_severity_from, min_severity_to, enabled_from, enabled_to)
           VALUES ($1, $2, $3, 'probing the composite key', 'warning', 'urgent', true, true)`,
     params: [TENANT_FK_B, B.endp, A.rep1],
+  },
+  config_change_changed_by_fkey: {
+    what: "a configuration change attributed to another tenant's rep",
+    // Inserted DIRECTLY, which no production path does — 0061's log is written by an AFTER
+    // trigger on the table that changed, and the trigger reads the author from a setting
+    // rather than from a caller. That is exactly why the key has to be composite anyway: the
+    // referential check runs with row-level security off, so without the tenant column a row
+    // in tenant B could name an author in tenant A and the constraint would be satisfied.
+    sql: `INSERT INTO crm.config_change
+            (tenant_id, table_name, row_key, action, changed_by, reason, changed_columns, after)
+          VALUES ($1, 'notification_policy', '{"tenant_id": "x"}'::jsonb, 'created', $2,
+                  'probing the composite key', ARRAY['retain_read_days'], '{}'::jsonb)`,
+    params: [TENANT_FK_B, A.rep1],
   },
   notification_endpoint_created_by_fkey: {
     what: "an endpoint opened by another tenant's rep",

@@ -19,6 +19,8 @@ export {
   MyRoles,
   Obligation,
   ObligationList,
+  ConfigChange,
+  ConfigChangeList,
   PolicyBody,
   PolicyChange,
   PolicyChangeList,

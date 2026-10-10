@@ -8,8 +8,10 @@ import {
   withRegistryTriggersOff,
   TENANT_API as TENANT,
   TENANT_API_OTHER as OTHER,
-  endpointAuthor,
+  fixtureAuthor,
+  wipeConfigChanges,
   wipeEndpoints,
+  withFixtureAttribution,
 } from "@crm/db/testing";
 
 import { startApi, type RunningApi } from "./server.js";
@@ -19,6 +21,15 @@ const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const KEYS: readonly JwksKey[] = [{ kid: "k1", alg: "RS256", key: rsa.publicKey }];
 const ISSUER = "https://idp.test/";
 const AUDIENCE = "crm-pharma";
+
+/**
+ * The sentence the administrative bodies below carry.
+ *
+ * Since migration 0061 a route that writes a tenant's configuration takes a `reason` and signs
+ * the change with it, so a body without one is refused by the route's own schema — which is why
+ * the empty-body tests still expect a 422 and still mean what they meant.
+ */
+const WHY = "an administrator adjusting a limit in the suite";
 
 const b64 = (o: unknown): string => Buffer.from(JSON.stringify(o)).toString("base64url");
 
@@ -162,6 +173,8 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.account_snapshot WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.product_snapshot WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.warehouse_snapshot WHERE tenant_id = $1", [t]);
+        // And 0061's configuration log before the reps who signed it, ON DELETE RESTRICT.
+        await wipeConfigChanges(tx, t);
         await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [t]);
       });
     }
@@ -2316,7 +2329,7 @@ describe("the API, end to end", () => {
       await grantAdmin();
       const cooled = await call("PUT", "/v1/admin/notifications/probe-limits", {
         auth: asAdmin(),
-        body: { cooldownSeconds: 600 },
+        body: { cooldownSeconds: 600, reason: WHY },
       });
       expect(cooled.status).toBe(200);
       expect(cooled.body.cooldownSeconds).toBe(600);
@@ -2324,7 +2337,7 @@ describe("the API, end to end", () => {
 
       const budgeted = await call("PUT", "/v1/admin/notifications/probe-limits", {
         auth: asAdmin(),
-        body: { maxProbes: 50 },
+        body: { maxProbes: 50, reason: WHY },
       });
       expect(budgeted.body.budget).toMatchObject({ maxProbes: 50, windowSeconds: 3600 });
       expect(budgeted.body.cooldownSeconds).toBe(600);
@@ -2339,11 +2352,11 @@ describe("the API, end to end", () => {
       await grantAdmin();
       await call("PUT", "/v1/admin/notifications/probe-limits", {
         auth: asAdmin(),
-        body: { maxProbes: 30, windowSeconds: 7200 },
+        body: { maxProbes: 30, windowSeconds: 7200, reason: WHY },
       });
       const after = await call("PUT", "/v1/admin/notifications/probe-limits", {
         auth: asAdmin(),
-        body: { maxProbes: 31 },
+        body: { maxProbes: 31, reason: WHY },
       });
       expect(after.body.budget).toMatchObject({ maxProbes: 31, windowSeconds: 7200 });
     });
@@ -2357,17 +2370,109 @@ describe("the API, end to end", () => {
       await grantAdmin();
       const zero = await call("PUT", "/v1/admin/notifications/probe-limits", {
         auth: asAdmin(),
-        body: { maxProbes: 0 },
+        body: { maxProbes: 0, reason: WHY },
       });
       expect(zero.status).toBe(422);
       expect(zero.body.detail).toMatch(/between 1 and 3600/);
 
       const tooLong = await call("PUT", "/v1/admin/notifications/probe-limits", {
         auth: asAdmin(),
-        body: { cooldownSeconds: 86_401 },
+        body: { cooldownSeconds: 86_401, reason: WHY },
       });
       expect(tooLong.status).toBe(422);
       expect(tooLong.body.detail).toMatch(/86400/);
+    });
+
+    /**
+     * The route that writes TWICE under one signature, which is why attribution is scoped to a
+     * block rather than consumed by the first write (0061).
+     *
+     * `setProbeCooldownSeconds` and `setProbeBudget` are two store functions over one row, and
+     * a request naming both calls both. A one-shot reason would fail on the second — so this
+     * asserts the honest unit is the administrative ACTION: one author, one sentence, two
+     * records. It is also the test that would have caught the two writers this route had that
+     * no reading of it turned up.
+     */
+    it("records both of its writes under the one reason the request carried", async () => {
+      await grantAdmin();
+      const res = await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { cooldownSeconds: 300, maxProbes: 40, windowSeconds: 1800, reason: "tightening the probe limits for a noisy tenant" },
+      });
+      expect(res.status).toBe(200);
+
+      const log = await call("GET", "/v1/admin/config-changes?table=notification_policy", {
+        auth: asAdmin(),
+      });
+      expect(log.status).toBe(200);
+      const entries = log.body.data as readonly {
+        action: string;
+        reason: string;
+        changed_by_name: string;
+        changed_columns: readonly string[];
+        before: Record<string, unknown>;
+        after: Record<string, unknown>;
+      }[];
+      expect(entries.length).toBe(2);
+      expect(new Set(entries.map((e) => e.reason))).toEqual(
+        new Set(["tightening the probe limits for a noisy tenant"]),
+      );
+      // The author is the AUTHENTICATED principal, never a name in the body.
+      expect(new Set(entries.map((e) => e.changed_by_name))).toEqual(new Set(["Rep Two"]));
+      expect(new Set(entries.flatMap((e) => e.changed_columns))).toEqual(
+        new Set(["probe_cooldown_seconds", "probe_budget_max_probes", "probe_budget_window_seconds"]),
+      );
+      // And the `before` is the DATABASE's, not the caller's: 120 is the column default the
+      // policy row was provisioned at, which no part of the request mentioned.
+      const cooldown = entries.find((e) => e.changed_columns.includes("probe_cooldown_seconds"));
+      expect(cooldown?.action).toBe("amended");
+      expect(cooldown?.before).toMatchObject({ probe_cooldown_seconds: 120 });
+      expect(cooldown?.after).toMatchObject({ probe_cooldown_seconds: 300 });
+    });
+
+    it("keeps the log administrator-only, and bounds the page", async () => {
+      expect((await call("GET", "/v1/admin/config-changes")).status).toBe(403);
+      await grantAdmin();
+      expect((await call("GET", "/v1/admin/config-changes", { auth: asAdmin() })).status).toBe(200);
+      expect((await call("GET", "/v1/admin/config-changes?limit=201", { auth: asAdmin() })).status).toBe(422);
+      expect((await call("GET", "/v1/admin/config-changes?limit=0", { auth: asAdmin() })).status).toBe(422);
+      // An unknown table is not an error — it is a table nothing has changed.
+      expect(
+        (await call("GET", "/v1/admin/config-changes?table=no_such_table", { auth: asAdmin() })).body.data,
+      ).toEqual([]);
+    });
+
+    /**
+     * A route whose verb promises ENSURE must stay idempotent, so 0061 does not refuse a write
+     * that moves nothing — it simply does not record it. The route still answers 200, and the
+     * log does not grow a row saying nothing happened.
+     */
+    it("does not record a request that changes nothing, and still answers 200", async () => {
+      await grantAdmin();
+      await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { cooldownSeconds: 300, reason: "setting the cooldown the first time" },
+      });
+      const again = await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { cooldownSeconds: 300, reason: "setting the very same cooldown again" },
+      });
+      expect(again.status).toBe(200);
+      const log = await call("GET", "/v1/admin/config-changes?table=notification_policy", {
+        auth: asAdmin(),
+      });
+      expect((log.body.data as readonly unknown[]).length).toBe(1);
+    });
+
+    it("refuses a body with no reason, before anything is written", async () => {
+      await grantAdmin();
+      const res = await call("PUT", "/v1/admin/notifications/probe-limits", {
+        auth: asAdmin(),
+        body: { cooldownSeconds: 600 },
+      });
+      expect(res.status).toBe(422);
+      expect((await call("GET", "/v1/admin/notifications/probe-limits", { auth: asAdmin() })).body.cooldownSeconds).toBe(120);
+      expect((await call("GET", "/v1/admin/config-changes", { auth: asAdmin() })).body.data).toEqual([]);
     });
 
     it("refuses an empty body and an unknown field", async () => {
@@ -2408,7 +2513,7 @@ describe("the API, end to end", () => {
 
       const set = await call("PUT", "/v1/admin/notifications/delivery-retention", {
         auth: admin1(),
-        body: { retainDeliveryDays: 900 },
+        body: { retainDeliveryDays: 900, reason: WHY },
       });
       expect(set.status).toBe(200);
       expect(set.body.retain_delivery_days).toBe(900);
@@ -2417,7 +2522,7 @@ describe("the API, end to end", () => {
       // under the unread one is refused with a 422 naming which number to raise.
       const tooShort = await call("PUT", "/v1/admin/notifications/delivery-retention", {
         auth: admin1(),
-        body: { retainDeliveryDays: 1 },
+        body: { retainDeliveryDays: 1, reason: WHY },
       });
       expect(tooShort.status).toBe(422);
     });
@@ -2426,7 +2531,7 @@ describe("the API, end to end", () => {
       await makeAdministrator();
       let notificationId = "";
       await withTenantContext(admin, TENANT, async (tx) => {
-        await endpointAuthor(tx, TENANT);
+        await fixtureAuthor(tx, TENANT);
         const ep = await tx.query<{ id: string }>(
           `INSERT INTO crm.notification_endpoint
              (tenant_id, channel, url, secret_env, min_severity, created_by, created_reason)
@@ -2585,12 +2690,16 @@ describe("the API, end to end", () => {
    */
   describe("expense claims", () => {
     const mapCategory = async (): Promise<void> => {
+      // Signed, because since 0061 `crm.expense_account_map` refuses a change nobody has
+      // claimed. The claim lifecycle is what this block is about; the mapping is scenery.
       await withTenantContext(admin, TENANT, (tx) =>
-        tx.query(
+        withFixtureAttribution(tx, TENANT, (c) =>
+          c.query(
           `INSERT INTO crm.expense_account_map
              (tenant_id, crm_category, erp_ledger_account_code, is_active)
            VALUES ($1, 'client_meal', '6100', true)`,
-          [TENANT],
+            [TENANT],
+          ),
         ),
       );
     };
@@ -2756,7 +2865,7 @@ describe("the API, end to end", () => {
       );
       expect(id.rows).toHaveLength(1);
       const res = await call("PUT", "/v1/admin/expense-accounts/client_meal", {
-        body: { erpLedgerAccountCode: "6".repeat(33) },
+        body: { erpLedgerAccountCode: "6".repeat(33), reason: WHY },
       });
       expect(res.status).toBe(422);
     });
@@ -2892,11 +3001,15 @@ describe("the API, end to end", () => {
 
     describe("expense receipts, and the claim-state rule the route holds", () => {
       const aClaim = async (): Promise<string> => {
+        // Signed: 0061 refuses an unsigned change to the account map, and a receipt needs a
+        // claim, which needs a mapped category.
         await withTenantContext(admin, TENANT, (tx) =>
-          tx.query(
-            `INSERT INTO crm.expense_account_map (tenant_id, crm_category, erp_ledger_account_code, is_active)
-             VALUES ($1,'client_meal','6100',true) ON CONFLICT DO NOTHING`,
-            [TENANT],
+          withFixtureAttribution(tx, TENANT, (c) =>
+            c.query(
+              `INSERT INTO crm.expense_account_map (tenant_id, crm_category, erp_ledger_account_code, is_active)
+               VALUES ($1,'client_meal','6100',true) ON CONFLICT DO NOTHING`,
+              [TENANT],
+            ),
           ),
         );
         const res = await call("POST", "/v1/expenses", {
@@ -3621,7 +3734,7 @@ describe("the API, end to end", () => {
       it("sets the horizons for an administrator", async () => {
         await grant(() => rep, "administrator", () => manager);
         const res = await call("PUT", "/v1/admin/notifications/retention", {
-          body: { retainReadDays: 14, retainUnreadDays: 180 },
+          body: { retainReadDays: 14, retainUnreadDays: 180, reason: WHY },
         });
         expect(res.status).toBe(200);
         expect(res.body).toEqual({ retain_read_days: 14, retain_unread_days: 180 });
@@ -3631,7 +3744,7 @@ describe("the API, end to end", () => {
       it("refuses an unread horizon shorter than the read one, as a 422", async () => {
         await grant(() => rep, "administrator", () => manager);
         const res = await call("PUT", "/v1/admin/notifications/retention", {
-          body: { retainReadDays: 90, retainUnreadDays: 7 },
+          body: { retainReadDays: 90, retainUnreadDays: 7, reason: WHY },
         });
         expect(res.status).toBe(422);
         expect(JSON.stringify(res.body)).toContain("sooner than a read one");
@@ -3682,19 +3795,23 @@ describe("the API, end to end", () => {
             ]),
           );
           const res = await call("POST", "/v1/admin/notifications/prune-guard/override", {
-            body: { hours: 1 },
+            body: { hours: 1, reason: WHY },
             auth: token({ sub: subject }),
           });
           expect(res.status, `subject length ${String(n)}`).toBe(200);
           expect((res.body.prune_guard_override_by as string).length).toBeLessThanOrEqual(200);
           // The window has to be closed again or the next iteration hits the live-override
           // branch instead of the attribution it is here to exercise.
+          // Signed, because 0061 refuses an unsigned change to `crm.notification_policy` —
+          // including this one, which is a fixture reaching past the route to reset state.
           await withTenantContext(admin, TENANT, (tx) =>
-            tx.query(
-              `UPDATE crm.notification_policy SET prune_guard_override_until = NULL,
-                      prune_guard_override_by = NULL, prune_guard_override_granted_at = NULL
-                WHERE tenant_id = $1`,
-              [TENANT],
+            withFixtureAttribution(tx, TENANT, (c) =>
+              c.query(
+                `UPDATE crm.notification_policy SET prune_guard_override_until = NULL,
+                        prune_guard_override_by = NULL, prune_guard_override_granted_at = NULL
+                  WHERE tenant_id = $1`,
+                [TENANT],
+              ),
             ),
           );
         }
@@ -3707,7 +3824,7 @@ describe("the API, end to end", () => {
           tx.query("UPDATE crm.rep_profile SET display_name = $2 WHERE id = $1", [rep, long]),
         );
         const res = await call("POST", "/v1/admin/notifications/prune-guard/override", {
-          body: { hours: 2 },
+          body: { hours: 2, reason: WHY },
         });
         expect(res.status).toBe(200);
         const by = res.body.prune_guard_override_by as string;

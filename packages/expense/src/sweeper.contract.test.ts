@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_EXPENSE_SWEEP as TENANT, appPool } from "@crm/db/testing";
+import { TENANT_EXPENSE_SWEEP as TENANT, appPool, wipeConfigChanges, withFixtureAttribution } from "@crm/db/testing";
 import { inbox } from "@crm/notify";
 import { claimBatch, markDead, markDelivered, raiseDeadLetterAlarm, reviveDeadLetter } from "@crm/relay";
 
@@ -97,6 +97,8 @@ describe("the expense posting sweep", () => {
     await inTenant(async (tx) => {
       await tx.query("DELETE FROM crm.territory_assignment WHERE tenant_id = $1", [TENANT]);
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1", [TENANT]);
+      // 0061's configuration log before its authors, ON DELETE RESTRICT.
+      await wipeConfigChanges(tx, TENANT);
       await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [TENANT]);
     });
     client?.release();
@@ -166,11 +168,13 @@ describe("the expense posting sweep", () => {
     amount = "1234.50",
   ): Promise<string> =>
     inTenant(async (tx) => {
-      await upsertAccountMapping(tx, TENANT, {
-        crmCategory: "congress",
-        erpLedgerAccountCode: "6200",
-        erpCostCenterCode: "CC-SM",
-      });
+      await withFixtureAttribution(tx, TENANT, (t) =>
+        upsertAccountMapping(t, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6200",
+          erpCostCenterCode: "CC-SM",
+        }),
+      );
       const claim = await createClaim(tx, TENANT, {
         repProfileId: rep,
         crmCategory: "congress",
@@ -252,11 +256,13 @@ describe("the expense posting sweep", () => {
 
     it("leaves draft, submitted and rejected claims alone", async () => {
       await inTenant(async (tx) => {
-        await upsertAccountMapping(tx, TENANT, {
-          crmCategory: "congress",
-          erpLedgerAccountCode: "6200",
-          erpCostCenterCode: null,
-        });
+        await withFixtureAttribution(tx, TENANT, (t) =>
+          upsertAccountMapping(t, TENANT, {
+            crmCategory: "congress",
+            erpLedgerAccountCode: "6200",
+            erpCostCenterCode: null,
+          }),
+        );
         const draft = await createClaim(tx, TENANT, {
           repProfileId: REP,
           crmCategory: "congress",

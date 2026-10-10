@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { withTenantContext } from "@crm/db";
-import { TENANT_EXPENSE_MAP as TENANT, appPool } from "@crm/db/testing";
+import { CONFIG_LOG_LIMIT, configChanges, withAttribution, withTenantContext } from "@crm/db";
+import { TENANT_EXPENSE_MAP as TENANT, appPool, wipeConfigChanges } from "@crm/db/testing";
 
 import {
   activeAccountMapping,
@@ -35,13 +35,30 @@ describe("expense account map", () => {
 
   const REP = "e5100000-0000-4000-8000-000000000001";
 
+  /** The sentence every signed write in this file carries, asserted on below. */
+  const REASON = "Finance re-pointing a category in the test suite";
+
+  /**
+   * Tenant context AND attribution, because `crm.expense_account_map` is one of the two
+   * tables migration 0061 put under it.
+   *
+   * This suite signs with its OWN rep rather than the shared fixture author, because here the
+   * log is not incidental — the last block reads it back and asserts who wrote what. A fixture
+   * author would make those assertions say "a fixture did it", which is true and useless.
+   */
   const inTenant = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> =>
+    withTenantContext(client, TENANT, (tx) =>
+      withAttribution(tx, { repProfileId: REP, reason: REASON }, fn),
+    );
+
+  /** Tenant context with NOBODY named — for the one test that asserts the refusal. */
+  const unsigned = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> =>
     withTenantContext(client, TENANT, fn);
 
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
-    await inTenant(async (tx) => {
+    await unsigned(async (tx) => {
       await tx.query(
         `INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name)
          VALUES ($1, $2, 'expensemap-rep', 'E-EXPMAP-1', 'Map Rep')
@@ -52,12 +69,14 @@ describe("expense account map", () => {
   });
 
   afterAll(async () => {
-    await inTenant(async (tx) => {
+    await unsigned(async (tx) => {
       await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1 AND rep_profile_id = $2", [
         TENANT,
         REP,
       ]);
       await tx.query("DELETE FROM crm.expense_account_map WHERE tenant_id = $1", [TENANT]);
+      // The log before its author: 0061 names the rep ON DELETE RESTRICT.
+      await wipeConfigChanges(tx, TENANT);
       await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1 AND id = $2", [TENANT, REP]);
     });
     client?.release();
@@ -65,12 +84,14 @@ describe("expense account map", () => {
   });
 
   beforeEach(async () => {
-    await inTenant(async (tx) => {
+    await unsigned(async (tx) => {
       await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1 AND rep_profile_id = $2", [
         TENANT,
         REP,
       ]);
       await tx.query("DELETE FROM crm.expense_account_map WHERE tenant_id = $1", [TENANT]);
+      // So the attribution block below reads only its own test's history.
+      await wipeConfigChanges(tx, TENANT);
     });
   });
 
@@ -371,6 +392,149 @@ describe("expense account map", () => {
           { crm_category: "congress", draft_claims: 1 },
         ]);
       });
+    });
+  });
+  /**
+   * Migration 0061: a change to this table is refused unless somebody signs it, and recorded
+   * when they do.
+   *
+   * The table is Finance's and the question it has to answer is not "what does congress post
+   * to" — `listAccountMappings` answers that — it is "who re-pointed it, when, and why". Every
+   * other test in this file writes through `inTenant`, which signs; this block is where the
+   * signature is the subject rather than the precondition.
+   *
+   * Asserted against a real Postgres because all of it is a trigger: the refusal is a `RAISE`
+   * from `crm.record_config_change`, the exemption is a lookup in `pg_attrdef`, and
+   * `changed_columns` is computed by comparing two `jsonb` images of the row.
+   */
+  describe("attribution", () => {
+    it("refuses a write nobody has signed", async () => {
+      await unsigned(async (tx) => {
+        await expect(
+          upsertAccountMapping(tx, TENANT, {
+            crmCategory: "congress",
+            erpLedgerAccountCode: "6200",
+          }),
+        ).rejects.toThrow(/config-change-unattributed/);
+      });
+      // And refused means refused: nothing landed.
+      expect(await unsigned((tx) => listAccountMappings(tx, TENANT))).toEqual([]);
+    });
+
+    it("records a new mapping as a creation, naming the author and the reason", async () => {
+      await inTenant((tx) =>
+        upsertAccountMapping(tx, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6200",
+        }),
+      );
+      const log = await unsigned((tx) => configChanges(tx, TENANT));
+      expect(log.length).toBe(1);
+      expect(log[0]!.table_name).toBe("expense_account_map");
+      expect(log[0]!.action).toBe("created");
+      expect(log[0]!.changed_by).toBe(REP);
+      expect(log[0]!.changed_by_name).toBe("Map Rep");
+      expect(log[0]!.reason).toBe(REASON);
+      // `before` is null on a creation — there was nothing to be before.
+      expect(log[0]!.before).toBeNull();
+      // The account code is what MOVED off its declared default; `is_active` defaults to true
+      // and was not chosen, so it is not listed.
+      expect(log[0]!.changed_columns).toContain("erp_ledger_account_code");
+      expect(log[0]!.changed_columns).not.toContain("is_active");
+    });
+
+    it("records a re-point as an amendment, naming only the column that moved", async () => {
+      await inTenant(async (tx) => {
+        await upsertAccountMapping(tx, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6200",
+        });
+        await upsertAccountMapping(tx, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6300",
+        });
+      });
+      const log = await unsigned((tx) => configChanges(tx, TENANT));
+      // Newest first, so the amendment is at the head. `clock_timestamp()` rather than `now()`
+      // is what makes that true inside one transaction.
+      expect(log.map((c) => c.action)).toEqual(["amended", "created"]);
+      expect(log[0]!.changed_columns).toEqual(["erp_ledger_account_code"]);
+      expect(log[0]!.before).toMatchObject({ erp_ledger_account_code: "6200" });
+      expect(log[0]!.after).toMatchObject({ erp_ledger_account_code: "6300" });
+      expect(log[0]!.row_key).toMatchObject({ tenant_id: TENANT, crm_category: "congress" });
+    });
+
+    it("records a deactivation as the is_active change it is", async () => {
+      await inTenant(async (tx) => {
+        await upsertAccountMapping(tx, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6200",
+        });
+        await deactivateAccountMapping(tx, TENANT, "congress");
+      });
+      const log = await unsigned((tx) => configChanges(tx, TENANT));
+      expect(log[0]!.action).toBe("amended");
+      expect(log[0]!.changed_columns).toEqual(["is_active"]);
+      expect(log[0]!.before).toMatchObject({ is_active: true });
+      expect(log[0]!.after).toMatchObject({ is_active: false });
+    });
+
+    it("does not record a deactivation that deactivates nothing", async () => {
+      await inTenant(async (tx) => {
+        await upsertAccountMapping(tx, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6200",
+        });
+        await deactivateAccountMapping(tx, TENANT, "congress");
+        // The second call matches a row that is already inactive. `updated_at` is ignored and
+        // nothing else moves, so there is nothing to record — and 0061 does not refuse it,
+        // because a route with ensure semantics is entitled to be called twice.
+        expect(await deactivateAccountMapping(tx, TENANT, "congress")).toBe(false);
+      });
+      const log = await unsigned((tx) => configChanges(tx, TENANT));
+      expect(log.map((c) => c.changed_columns)).toEqual([["is_active"], ["erp_ledger_account_code"]]);
+    });
+
+    it("refuses to let the log be edited or deleted", async () => {
+      await inTenant((tx) =>
+        upsertAccountMapping(tx, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6200",
+        }),
+      );
+      await unsigned(async (tx) => {
+        await expect(
+          tx.query("UPDATE crm.config_change SET reason = $2 WHERE tenant_id = $1", [
+            TENANT,
+            "a reason somebody preferred",
+          ]),
+        ).rejects.toThrow(/append-only|config_change/i);
+      });
+      await unsigned(async (tx) => {
+        await expect(
+          tx.query("DELETE FROM crm.config_change WHERE tenant_id = $1", [TENANT]),
+        ).rejects.toThrow(/append-only|config_change/i);
+      });
+    });
+
+    it("filters by table and caps what it returns", async () => {
+      await inTenant((tx) =>
+        upsertAccountMapping(tx, TENANT, {
+          crmCategory: "congress",
+          erpLedgerAccountCode: "6200",
+        }),
+      );
+      expect(
+        (await unsigned((tx) => configChanges(tx, TENANT, { table: "expense_account_map" }))).length,
+      ).toBe(1);
+      expect(
+        await unsigned((tx) => configChanges(tx, TENANT, { table: "notification_policy" })),
+      ).toEqual([]);
+      // A limit over the ceiling is clamped to it rather than honoured.
+      expect(
+        (await unsigned((tx) => configChanges(tx, TENANT, { limit: CONFIG_LOG_LIMIT + 500 })))
+          .length,
+      ).toBe(1);
     });
   });
 });

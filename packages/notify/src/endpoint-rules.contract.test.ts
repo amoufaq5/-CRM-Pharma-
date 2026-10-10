@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { TENANT_ENDPOINT_RULES as TENANT, appPool, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
+import { TENANT_ENDPOINT_RULES as TENANT, appPool, fixtureAuthor, wipeEndpoints } from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import { InvalidEndpointError, createEndpoint, getEndpoint, updateEndpoint } from "./endpoints.js";
@@ -67,7 +67,7 @@ describe("endpoint rules (0049)", () => {
       // 0060 refuses an endpoint that names nobody, and the raw-SQL probes below create one
       // to be refused for OTHER reasons — so they need an author, or the attribution guard
       // answers first and the constraint under test never runs.
-      await endpointAuthor(tx, TENANT);
+      await fixtureAuthor(tx, TENANT);
     });
   });
 

@@ -4,8 +4,10 @@ import {
   appPool,
   TENANT_PRUNE_GUARD,
   TENANT_RETENTION as TENANT,
-  endpointAuthor,
+  fixtureAuthor,
+  wipeConfigChanges,
   wipeEndpoints,
+  withFixtureAttribution,
 } from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
@@ -43,8 +45,18 @@ describe("notification retention", () => {
   const REP = "e6100000-0000-4000-8000-000000000001";
   const OTHER = "e6200000-0000-4000-8000-000000000002";
 
+  /**
+   * Tenant context AND attribution, because this suite's fixtures write configuration.
+   *
+   * Migration 0061 refuses a change to `crm.notification_policy` that nobody has signed, and
+   * this suite sets the policy constantly — it is the horizon under test. Wrapping the helper
+   * rather than each call site is the honest edit: the attribution is not what is being
+   * asserted here, it is the precondition for writing a tenant's configuration at all, which
+   * is exactly the kind of thing a suite-wide helper is for. The suite that asserts ON the
+   * log is the config-change suite; this one just has to be a legitimate writer.
+   */
   const inTenant = <T>(fn: (c: PoolClient) => Promise<T>): Promise<T> =>
-    withTenantContext(tx, TENANT, fn);
+    withTenantContext(tx, TENANT, (c) => withFixtureAttribution(c, TENANT, fn));
 
   /** 2026-06-01, so every "days ago" below is a fixed date rather than a moving one. */
   const NOW = new Date("2026-06-01T12:00:00Z");
@@ -105,6 +117,9 @@ describe("notification retention", () => {
       // Endpoints before reps: since 0060 an endpoint names the rep who opened it, ON DELETE
       // RESTRICT, so the fixture author this suite seeds pins any endpoint it created.
       await wipeEndpoints(c, TENANT);
+      // And the configuration log before the reps, for the same reason: since 0061 every
+      // policy write this suite made names its author, ON DELETE RESTRICT.
+      await wipeConfigChanges(c, TENANT);
       await c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [TENANT]);
     });
     tx?.release();
@@ -460,7 +475,7 @@ describe("notification retention", () => {
    */
   describe("an unsettled delivery holds a notification back", () => {
     const endpoint = async (c: PoolClient): Promise<string> => {
-      await endpointAuthor(c, TENANT);
+      await fixtureAuthor(c, TENANT);
       const { rows } = await c.query<{ id: string }>(
         `INSERT INTO crm.notification_endpoint
            (tenant_id, channel, url, secret_env, created_by, created_reason)
@@ -652,7 +667,8 @@ describe("the prune guard", () => {
   const T = TENANT_PRUNE_GUARD;
   const REP = "e6300000-0000-4000-8000-000000000003";
 
-  const inT = <R>(fn: (c: PoolClient) => Promise<R>): Promise<R> => withTenantContext(tx, T, fn);
+  const inT = <R>(fn: (c: PoolClient) => Promise<R>): Promise<R> =>
+    withTenantContext(tx, T, (c) => withFixtureAttribution(c, T, fn));
 
   const NOW = new Date("2026-06-01T12:00:00Z");
   const daysAgo = (n: number): Date => new Date(NOW.getTime() - n * 86_400_000);
@@ -716,7 +732,10 @@ describe("the prune guard", () => {
 
   afterAll(async () => {
     await clear();
-    await inT((c) => c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [T]));
+    await inT(async (c) => {
+      await wipeConfigChanges(c, T);
+      await c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [T]);
+    });
     tx?.release();
     await pool?.end();
   });

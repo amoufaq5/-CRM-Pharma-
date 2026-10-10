@@ -3,6 +3,8 @@ import { resolve as resolvePath } from "node:path";
 
 import { Pool, type PoolClient } from "pg";
 
+import { withAttribution } from "./attribution.js";
+
 /**
  * The FIXTURE connection. Connects as the admin role.
  *
@@ -283,20 +285,32 @@ export const TENANT_WAREHOUSE = "f0580000-0000-4000-8000-000000000024";
 export const TENANT_WAREHOUSE_UNSYNCED = "f1580000-0000-4000-8000-000000000025";
 
 /**
- * A rep to attribute a fixture's notification endpoint to.
+ * packages/db — config-change.contract (migration 0061).
  *
- * 0060 refuses an endpoint that names nobody, because adding one opens a route out of the
- * tenant for records carrying a rep's name. Four suites need an endpoint to exist and none
- * of them is ABOUT authorship — the dispatcher's, the probe's, the channel-coverage check's
- * and the retention sweep's — so the one upsert lives here rather than as four slightly
- * different copies, each of which would have to seed a profile in whichever tenants it uses.
- *
- * Idempotent on `(tenant_id, subject)`, so a `beforeEach` that wipes endpoints and leaves
- * profiles alone can call it every time. It is deliberately NOT a suite's main rep: a
- * fixture author with its own subject cannot be mistaken for one of the people a test is
- * actually about.
+ * Two, and the second is the subject of a test: the configuration log is tenant-scoped by
+ * row-level security, and the only way to assert that is for another tenant to have a change
+ * of its own to not see. Its own pair rather than a shared tenant because the suite attaches
+ * the mechanism to a scratch table and then counts the WHOLE log — a count that any other
+ * suite's configuration write would make wrong.
  */
-export async function endpointAuthor(tx: PoolClient, tenantId: string): Promise<string> {
+export const TENANT_CONFIG_LOG = "f0610000-0000-4000-8000-000000000027";
+export const TENANT_CONFIG_LOG_OTHER = "f1610000-0000-4000-8000-000000000028";
+
+/**
+ * A rep to attribute a fixture's configuration write to.
+ *
+ * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding
+ * one opens a route out of the tenant for records carrying a rep's name; 0061 refuses any
+ * write to a table under `crm.require_config_attribution` that nothing has claimed. A dozen
+ * suites need such a row to exist and none of them is ABOUT authorship, so the one upsert
+ * lives here rather than as a dozen slightly different copies, each of which would have to
+ * seed a profile in whichever tenants it uses.
+ *
+ * Idempotent on `(tenant_id, subject)`, so a `beforeEach` that wipes rows and leaves profiles
+ * alone can call it every time. It is deliberately NOT a suite's main rep: a fixture author
+ * with its own subject cannot be mistaken for one of the people a test is actually about.
+ */
+export async function fixtureAuthor(tx: PoolClient, tenantId: string): Promise<string> {
   const { rows } = await tx.query<{ id: string }>(
     `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name, status)
      VALUES ($1, 'fixture-endpoint-author', 'FIXTURE-EP', 'A Fixture Administrator', 'active')
@@ -305,6 +319,30 @@ export async function endpointAuthor(tx: PoolClient, tenantId: string): Promise<
     [tenantId],
   );
   return rows[0]!.id;
+}
+
+/**
+ * Runs a fixture's configuration write under attribution (0061).
+ *
+ * The honest shape for a suite whose subject is something else: it seeds an author, states a
+ * reason that says it is a fixture, and runs the write through the same `withAttribution` the
+ * routes use — so the guard stays ON for every suite rather than being disabled around the
+ * inconvenient parts.
+ *
+ * A suite whose subject IS the attribution does not use this: it names its own authors and its
+ * own sentences, because those are what it is asserting about.
+ */
+export async function withFixtureAttribution<T>(
+  tx: PoolClient,
+  tenantId: string,
+  fn: (tx: PoolClient) => Promise<T>,
+): Promise<T> {
+  const author = await fixtureAuthor(tx, tenantId);
+  return withAttribution(
+    tx,
+    { repProfileId: author, reason: "a fixture setting the configuration under test" },
+    fn,
+  );
 }
 
 /**
@@ -328,6 +366,32 @@ export async function wipeEndpoints(tx: PoolClient, tenantId: string): Promise<v
     await tx.query("ALTER TABLE crm.notification_endpoint_change ENABLE TRIGGER USER");
   }
   await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [tenantId]);
+}
+
+/**
+ * Wipes a tenant's configuration-change log, for test cleanup only.
+ *
+ * Migration 0061's log names its author `ON DELETE RESTRICT` — the convention for an audit
+ * child here, and the right one: a configuration change whose author has been deleted is a
+ * change nobody made. So a suite that seeds a rep, writes configuration through it and then
+ * deletes the rep in teardown has to retire the history first, explicitly, where it is named.
+ *
+ * The append-only trigger has to come off for that: 0061 refuses a DELETE on its own log, and
+ * it refuses it to a fixture for the same reason it refuses it to a route. A tenant ERASURE
+ * does not need this — `eraseOrder` derives children-before-parents from the live foreign-key
+ * graph and removes the log before the reps with the triggers on — so this is strictly the
+ * borrowed-tenant case.
+ *
+ * Shared, like `wipeEndpoints`, because several suites need it and several copies of a
+ * trigger-disable is how one of them ends up missing the re-enable.
+ */
+export async function wipeConfigChanges(tx: PoolClient, tenantId: string): Promise<void> {
+  await tx.query("ALTER TABLE crm.config_change DISABLE TRIGGER USER");
+  try {
+    await tx.query("DELETE FROM crm.config_change WHERE tenant_id = $1", [tenantId]);
+  } finally {
+    await tx.query("ALTER TABLE crm.config_change ENABLE TRIGGER USER");
+  }
 }
 
 /**

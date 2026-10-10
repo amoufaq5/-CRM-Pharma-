@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool, PoolClient } from "pg";
 import { SET_TENANT_CONTEXT_SQL, withTenantContext } from "@crm/db";
-import { appPool, TENANT_CHANNEL_COVERAGE as TENANT, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
+import { appPool, TENANT_CHANNEL_COVERAGE as TENANT, fixtureAuthor, wipeConfigChanges, wipeEndpoints, withFixtureAttribution } from "@crm/db/testing";
 
 import { NOTIFICATION_KINDS } from "./kinds.js";
 import { verifyWebhook, type FetchLike } from "./sender.js";
@@ -96,6 +96,8 @@ describe("the endpoint probe", () => {
     await wipe();
     for (const tenant of [TENANT, OTHER_TENANT]) {
       await inTenant(tenant, async (tx) => {
+        // 0061's configuration log before its authors, ON DELETE RESTRICT.
+        await wipeConfigChanges(tx, tenant);
         await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [tenant]);
       });
     }
@@ -134,7 +136,7 @@ describe("the endpoint probe", () => {
         ? `mailto:ops-${Math.random().toString(36).slice(2, 8)}@example.com`
         : `https://hooks.example.com/${Math.random().toString(36).slice(2, 10)}`);
     return await inTenant(tenant, async (tx) => {
-      await endpointAuthor(tx, tenant);
+      await fixtureAuthor(tx, tenant);
       const { rows } = await tx.query<{ id: string }>(
         `INSERT INTO crm.notification_endpoint
            (tenant_id, channel, url, secret_env, enabled, created_by, created_reason)
@@ -156,7 +158,9 @@ describe("the endpoint probe", () => {
     });
 
   const noCooldown = (tenant = TENANT): Promise<number> =>
-    inTenant(tenant, (tx) => setProbeCooldownSeconds(tx, tenant, 0));
+    inTenant(tenant, (tx) =>
+      withFixtureAttribution(tx, tenant, (t) => setProbeCooldownSeconds(t, tenant, 0)),
+    );
 
   /**
    * Waits until `expected` backends are WAITING on 0045's advisory lock.
@@ -320,7 +324,11 @@ describe("the endpoint probe", () => {
 
     it("refuses a cooldown that is not a whole number of seconds in range", async () => {
       for (const bad of [-1, 1.5, MAX_PROBE_COOLDOWN_SECONDS + 1, Number.NaN]) {
-        await expect(inTenant(TENANT, (tx) => setProbeCooldownSeconds(tx, TENANT, bad))).rejects.toThrow(
+        await expect(
+          inTenant(TENANT, (tx) =>
+            withFixtureAttribution(tx, TENANT, (t) => setProbeCooldownSeconds(t, TENANT, bad)),
+          ),
+        ).rejects.toThrow(
           InvalidProbeCooldownError,
         );
       }
@@ -330,7 +338,11 @@ describe("the endpoint probe", () => {
     });
 
     it("stores a cooldown an administrator sets", async () => {
-      expect(await inTenant(TENANT, (tx) => setProbeCooldownSeconds(tx, TENANT, 600))).toBe(600);
+      expect(
+        await inTenant(TENANT, (tx) =>
+          withFixtureAttribution(tx, TENANT, (t) => setProbeCooldownSeconds(t, TENANT, 600)),
+        ),
+      ).toBe(600);
       expect(await inTenant(TENANT, (tx) => probeCooldownSeconds(tx, TENANT))).toBe(600);
     });
   });
@@ -349,7 +361,9 @@ describe("the endpoint probe", () => {
    */
   describe("the tenant's total probe budget", () => {
     const setBudget = (maxProbes: number, windowSeconds: number, tenant = TENANT): Promise<ProbeBudgetState> =>
-      inTenant(tenant, (tx) => setProbeBudget(tx, tenant, maxProbes, windowSeconds));
+      inTenant(tenant, (tx) =>
+      withFixtureAttribution(tx, tenant, (t) => setProbeBudget(t, tenant, maxProbes, windowSeconds)),
+    );
 
     const budget = (tenant = TENANT): Promise<ProbeBudgetState> =>
       inTenant(tenant, (tx) => probeBudget(tx, tenant));
@@ -384,12 +398,20 @@ describe("the endpoint probe", () => {
     it("refuses a budget out of range, and refuses 0 in particular", async () => {
       for (const bad of [0, -1, 1.5, MAX_PROBE_BUDGET_MAX_PROBES + 1, Number.NaN]) {
         await expect(
-          inTenant(TENANT, (tx) => setProbeBudget(tx, TENANT, bad, DEFAULT_PROBE_BUDGET_WINDOW_SECONDS)),
+          inTenant(TENANT, (tx) =>
+            withFixtureAttribution(tx, TENANT, (t) =>
+              setProbeBudget(t, TENANT, bad, DEFAULT_PROBE_BUDGET_WINDOW_SECONDS),
+            ),
+          ),
         ).rejects.toThrow(InvalidProbeBudgetError);
       }
       for (const bad of [0, 59, 1.5, MAX_PROBE_BUDGET_WINDOW_SECONDS + 1, Number.NaN]) {
         await expect(
-          inTenant(TENANT, (tx) => setProbeBudget(tx, TENANT, DEFAULT_PROBE_BUDGET_MAX_PROBES, bad)),
+          inTenant(TENANT, (tx) =>
+            withFixtureAttribution(tx, TENANT, (t) =>
+              setProbeBudget(t, TENANT, DEFAULT_PROBE_BUDGET_MAX_PROBES, bad),
+            ),
+          ),
         ).rejects.toThrow(InvalidProbeBudgetError);
       }
       expect(await budget()).toMatchObject({
@@ -461,7 +483,9 @@ describe("the endpoint probe", () => {
      * where the gap was — across endpoints.
      */
     it("lets the cooldown's better-aimed refusal win when both apply", async () => {
-      await inTenant(TENANT, (tx) => setProbeCooldownSeconds(tx, TENANT, 120));
+      await inTenant(TENANT, (tx) =>
+        withFixtureAttribution(tx, TENANT, (t) => setProbeCooldownSeconds(t, TENANT, 120)),
+      );
       await setBudget(1, 3600);
       const one = await addEndpoint();
       const other = await addEndpoint();
@@ -968,7 +992,11 @@ describe("the endpoint probe", () => {
       const endpoint = await addEndpoint();
       await noCooldown();
       const aged = await ageTwentyProbes(endpoint);
-      await inTenant(TENANT, (tx) => setProbeBudget(tx, TENANT, 120, MAX_PROBE_BUDGET_WINDOW_SECONDS));
+      await inTenant(TENANT, (tx) =>
+        withFixtureAttribution(tx, TENANT, (t) =>
+          setProbeBudget(t, TENANT, 120, MAX_PROBE_BUDGET_WINDOW_SECONDS),
+        ),
+      );
       expect(await inTenant(TENANT, (tx) => probeBudget(tx, TENANT))).toMatchObject({ used: 20 });
 
       const live = await inTenant(TENANT, (tx) =>

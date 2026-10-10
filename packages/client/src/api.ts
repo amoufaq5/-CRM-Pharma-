@@ -529,6 +529,44 @@ export type PolicyChange = z.infer<typeof PolicyChange>;
 export const PolicyChangeList = z.object({ data: z.array(PolicyChange) });
 
 /**
+ * A row of `GET /v1/admin/config-changes`: one attributed change to tenant configuration.
+ *
+ * GENERIC where `PolicyChange` above is typed, and the difference is the whole of migration
+ * 0061's design note. That log has `grace_days_from`/`grace_days_to` because a SCREEN draws
+ * "30 → 7 day(s)" out of it, and a jsonb dig would be a worse contract for a device to depend
+ * on. This one records whichever tables are under `crm.require_config_attribution` — today the
+ * notification policy and the expense account map, tomorrow more — so the only honest shape is
+ * "here is what moved, and here are both documents".
+ *
+ * `changed_columns` is therefore the field a reader uses and `before`/`after` are looked up
+ * THROUGH it, never enumerated: a client that iterated the documents would print every column
+ * the table happens to have, including the ones nobody touched.
+ *
+ * `row_key` is loose for the same reason — `crm.notification_policy` keys on `tenant_id` alone
+ * and `crm.expense_account_map` on `(tenant_id, crm_category)`.
+ */
+export const ConfigChange = z
+  .object({
+    id: Uuid,
+    table_name: z.string(),
+    row_key: z.record(z.unknown()),
+    action: z.enum(["created", "amended"]),
+    changed_at: z.string(),
+    changed_by: Uuid,
+    changed_by_name: z.string(),
+    reason: z.string(),
+    changed_columns: z.array(z.string()),
+    // Null on a creation, which `action` also says. Both are carried because the server
+    // carries both, and a client inferring one from the other would be a second opinion.
+    before: z.record(z.unknown()).nullish(),
+    after: z.record(z.unknown()),
+  })
+  .passthrough();
+export type ConfigChange = z.infer<typeof ConfigChange>;
+
+export const ConfigChangeList = z.object({ data: z.array(ConfigChange) });
+
+/**
  * What `PUT /v1/admin/samples/disposal-policy` accepts.
  *
  * THE REASON IS NOT OPTIONAL, and the ten-character floor is the column's own CHECK rather

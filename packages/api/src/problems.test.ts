@@ -195,6 +195,13 @@ describe("toProblem covers every domain error", () => {
       "naming one that does not come before the declaring file. A repository defect caught " +
       "at deploy time by a CLI, so there is no request to answer and the sentence is for " +
       "whoever wrote the declaration",
+    UnattributedChangeError:
+      "0061: the database refused a configuration write because nothing had said who was " +
+      "making it. A missing reason in a request body is refused by the route's own schema " +
+      "long before the database sees it, so reaching this means OUR code forgot to open an " +
+      "attribution block — a deployment bug, and dressing it as a 422 would send an " +
+      "administrator looking for something to retype. The detail is the generic one: the " +
+      "trigger's sentence names a schema object, and no 500 body in this API does that",
   };
 
   /**

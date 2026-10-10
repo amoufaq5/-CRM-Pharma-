@@ -3,7 +3,12 @@ import type { Pool, PoolClient } from "pg";
 import {
   TENANT_DELIVERY_RETENTION as TENANT,
   TENANT_DELIVERY_RETENTION_OTHER as OTHER_TENANT,
-  appPool, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
+  appPool,
+  fixtureAuthor,
+  wipeConfigChanges,
+  wipeEndpoints,
+  withFixtureAttribution,
+} from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import { claimDue, settleOrphanedDeliveries } from "./dispatch.js";
@@ -43,10 +48,16 @@ describe("delivery retention", () => {
   const REP = "e7100000-0000-4000-8000-000000000101";
   const OTHER_REP = "e8100000-0000-4000-8000-000000000102";
 
+  /**
+   * Tenant context AND attribution — 0061 refuses an unsigned configuration write, and the
+   * delivery horizon this suite moves lives in `crm.notification_policy`. Wrapped once here
+   * rather than at each call site: the signature is a precondition for writing configuration,
+   * not the thing under test.
+   */
   const inTenant = <T>(fn: (c: PoolClient) => Promise<T>): Promise<T> =>
-    withTenantContext(client, TENANT, fn);
+    withTenantContext(client, TENANT, (c) => withFixtureAttribution(c, TENANT, fn));
   const inOther = <T>(fn: (c: PoolClient) => Promise<T>): Promise<T> =>
-    withTenantContext(client, OTHER_TENANT, fn);
+    withTenantContext(client, OTHER_TENANT, (c) => withFixtureAttribution(c, OTHER_TENANT, fn));
 
   /** 2026-06-01, so every "days ago" is a fixed date rather than a moving one. */
   const NOW = new Date("2026-06-01T12:00:00Z");
@@ -80,7 +91,7 @@ describe("delivery retention", () => {
 
   const endpoint = async (c: PoolClient, tenant: string): Promise<string> => {
     seq += 1;
-    await endpointAuthor(c, tenant);
+    await fixtureAuthor(c, tenant);
     const { rows } = await c.query<{ id: string }>(
       `INSERT INTO crm.notification_endpoint
          (tenant_id, channel, url, secret_env, created_by, created_reason)
@@ -153,8 +164,16 @@ describe("delivery retention", () => {
 
   afterAll(async () => {
     await clear();
-    await inTenant((c) => c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [TENANT]));
-    await inOther((c) => c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [OTHER_TENANT]));
+    // The configuration log before the reps: since 0061 every policy write this suite made
+    // names its author, ON DELETE RESTRICT.
+    await inTenant(async (c) => {
+      await wipeConfigChanges(c, TENANT);
+      await c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [TENANT]);
+    });
+    await inOther(async (c) => {
+      await wipeConfigChanges(c, OTHER_TENANT);
+      await c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [OTHER_TENANT]);
+    });
     client?.release();
     await pool?.end();
   });

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { appPool, TENANT_CHANNEL_COVERAGE as TENANT, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
+import { appPool, TENANT_CHANNEL_COVERAGE as TENANT, fixtureAuthor, wipeEndpoints } from "@crm/db/testing";
 
 import {
   CHANNEL_COVERAGE_VERDICTS,
@@ -204,7 +204,7 @@ describe("channel coverage", () => {
       const tag = opts.tag ?? Math.random().toString(36).slice(2, 10);
       const url = opts.channel === "email" ? `mailto:${tag}@example.com` : `https://hooks.example.com/${tag}`;
       return await inTenant(tenant, async (tx) => {
-        await endpointAuthor(tx, tenant);
+        await fixtureAuthor(tx, tenant);
         const { rows } = await tx.query<{ id: string }>(
           `INSERT INTO crm.notification_endpoint
              (tenant_id, channel, url, secret_env, enabled, created_by, created_reason)

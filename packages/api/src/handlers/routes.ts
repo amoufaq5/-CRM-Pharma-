@@ -72,7 +72,12 @@ import {
   summariseAttemptHistory,
   teamDeadLetters,
 } from "@crm/relay";
-import { withTenantContext } from "@crm/db";
+import {
+  CONFIG_LOG_LIMIT,
+  configChanges,
+  withAttribution,
+  withTenantContext,
+} from "@crm/db";
 import {
   ACCOUNT_CODE_MAX,
   EXPENSE_CATEGORY_MAX,
@@ -196,6 +201,25 @@ async function inTenant<T>(deps: HandlerDeps, p: Principal, fn: (tx: PoolClient)
   } finally {
     client.release();
   }
+}
+
+/**
+ * The same, with the author and reason set for the whole transaction (0061).
+ *
+ * Every write to a table under `crm.require_config_attribution` goes through this, and the
+ * database refuses it otherwise — so a route that forgets is a 500 rather than an unattributed
+ * change. The author is the authenticated principal and the reason comes from the body, which
+ * is the only division that makes sense: a client may say WHY, never WHO.
+ */
+async function asChange<T>(
+  deps: HandlerDeps,
+  p: Principal,
+  reason: string,
+  fn: (tx: PoolClient) => Promise<T>,
+): Promise<T> {
+  return inTenant(deps, p, (tx) =>
+    withAttribution(tx, { repProfileId: p.repProfileId, reason }, fn),
+  );
 }
 
 /** `?on=YYYY-MM-DD`, for asking a historical question. Defaults to today. */
@@ -2588,6 +2612,43 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
   // exist and always 409.
 
   /**
+   * What has been changed about this tenant's configuration, and by whom.
+   *
+   * ONE READ ACROSS EVERY ATTRIBUTED TABLE (0061), which is the point of a generic mechanism:
+   * the inbox retention horizons, the prune guard and the expense account map all record here,
+   * so "what did somebody change last week" is one question rather than three. `?table=` narrows
+   * it to one; an unknown name returns nothing, which is the same answer a table that has never
+   * been changed gives.
+   *
+   * ADMINISTRATOR ONLY. Every table it records is administrator-settable, so its history is for
+   * the same audience — and unlike the disposal policy's log next door, nothing here is a rule a
+   * rep is measured against.
+   *
+   * The two tables with their own typed logs are deliberately NOT here: `crm.disposal_policy`
+   * (0059) and `crm.notification_endpoint` (0060) are read through their own routes, where the
+   * history is typed because a screen draws it. The rule for a future table is in 0061's header.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/config-changes",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const table = ctx.query.get("table");
+      const limit = parse(
+        z.coerce.number().int().min(1).max(CONFIG_LOG_LIMIT).optional(),
+        ctx.query.get("limit") ?? undefined,
+      );
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        configChanges(tx, ctx.principal.tenantId, {
+          table,
+          ...(limit !== undefined ? { limit } : {}),
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
    * The tenant's notification endpoints. Administrator only.
    *
    * No secret is ever in a request or a response: `secretEnv` names an environment
@@ -2870,6 +2931,9 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         z.object({
           retainReadDays: z.number().int().min(1).max(3650).optional(),
           retainUnreadDays: z.number().int().min(1).max(3650).optional(),
+          // REQUIRED (0061). Ten characters is the column's own floor; the author comes from
+          // the token, and the database refuses the write if neither is set.
+          reason: z.string().min(10).max(1000),
         }),
         ctx.body,
       );
@@ -2878,7 +2942,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           _: "supply retainReadDays, retainUnreadDays, or both",
         });
       }
-      const body = await inTenant(deps, ctx.principal, (tx) =>
+      const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
         setNotificationPolicy(tx, ctx.principal.tenantId, {
           ...(input.retainReadDays !== undefined ? { retainReadDays: input.retainReadDays } : {}),
           ...(input.retainUnreadDays !== undefined ? { retainUnreadDays: input.retainUnreadDays } : {}),
@@ -2935,6 +2999,10 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
             cooldownSeconds: z.number().int().optional(),
             maxProbes: z.number().int().optional(),
             windowSeconds: z.number().int().optional(),
+            // REQUIRED (0061). These two decide how much real traffic this deployment sends
+            // to somebody else's server, which is the kind of number an operator has to be
+            // able to answer for later.
+            reason: z.string().min(10).max(1000),
           })
           .strict(),
         ctx.body,
@@ -2951,7 +3019,11 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       // The budget is ONE rule with two numbers, so changing either means writing both —
       // and the one not supplied has to come from the current state rather than a default,
       // or raising the count would silently reset the window to an hour.
-      const body = await inTenant(deps, ctx.principal, async (tx) => {
+      //
+      // TWO WRITES, ONE REASON, which is why 0061's attribution is scoped to a block rather
+      // than consumed by the first write: a one-shot reason would refuse the second of these
+      // and the honest unit here is the administrative action, not the statement.
+      const body = await asChange(deps, ctx.principal, input.reason, async (tx) => {
         if (input.cooldownSeconds !== undefined) {
           await setProbeCooldownSeconds(tx, ctx.principal.tenantId, input.cooldownSeconds);
         }
@@ -3000,14 +3072,17 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       requireRole(ctx.principal, "administrator");
       const input = parse(
-        z.object({ retainDeliveryDays: z.number().int().min(1).max(3650) }),
+        z.object({
+          retainDeliveryDays: z.number().int().min(1).max(3650),
+          reason: z.string().min(10).max(1000),
+        }),
         ctx.body,
       );
       // The pairing with `retainUnreadDays` — evidence must outlive the message — is the
       // database's (0046) and surfaces as a 422 naming which number to raise. Deliberately
       // not restated here: it is judged against the row as it WILL be, which only the CHECK
       // can see, and a second opinion about one fact is how two of them come to disagree.
-      const body = await inTenant(deps, ctx.principal, (tx) =>
+      const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
         setNotificationDeliveryRetention(tx, ctx.principal.tenantId, {
           retainDeliveryDays: input.retainDeliveryDays,
         }),
@@ -3097,6 +3172,9 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         z.object({
           maxSharePercent: z.number().int().min(1).max(99).optional(),
           guardFloorRows: z.number().int().min(0).max(MAX_PRUNE_GUARD_FLOOR_ROWS).optional(),
+          // REQUIRED (0061). Ten characters is the column's own floor; the author comes from
+          // the token, and the database refuses the write if neither is set.
+          reason: z.string().min(10).max(1000),
         }),
         ctx.body,
       );
@@ -3105,7 +3183,7 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           _: "supply maxSharePercent, guardFloorRows, or both",
         });
       }
-      const body = await inTenant(deps, ctx.principal, (tx) =>
+      const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
         setNotificationPruneGuard(tx, ctx.principal.tenantId, {
           ...(input.maxSharePercent !== undefined ? { maxSharePercent: input.maxSharePercent } : {}),
           ...(input.guardFloorRows !== undefined ? { guardFloorRows: input.guardFloorRows } : {}),
@@ -3130,8 +3208,17 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     pattern: "/v1/admin/notifications/prune-guard/override",
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       requireRole(ctx.principal, "administrator");
-      const input = parse(z.object({ hours: z.number().int().min(1).max(168) }), ctx.body);
-      const body = await inTenant(deps, ctx.principal, (tx) =>
+      const input = parse(
+        z.object({
+          hours: z.number().int().min(1).max(168),
+          // The window already names who opened it in `prune_guard_override_by` (0026), as a
+          // label for the guard's own message. The reason is the other half, and it goes
+          // where every other configuration change's reason goes.
+          reason: z.string().min(10).max(1000),
+        }),
+        ctx.body,
+      );
+      const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
         grantPruneGuardOverride(tx, ctx.principal.tenantId, {
           // Attributed to the caller, not to a string they supply: an override that could
           // name anyone would be an override that names nobody.
@@ -3148,9 +3235,23 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     pattern: "/v1/admin/notifications/prune-guard/override",
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       requireRole(ctx.principal, "administrator");
-      const body = await inTenant(deps, ctx.principal, (tx) =>
-        revokePruneGuardOverride(tx, ctx.principal.tenantId),
+      const input = parse(
+        z.object({ reason: z.string().min(10).max(1000) }),
+        // A DELETE with a body, which is unusual and is the lesser of two awkwardnesses:
+        // closing a window early is a configuration change like any other and 0061 wants its
+        // sentence, and a reason in a query string is one that ends up in an access log.
+        ctx.body,
       );
+      const body = await asChange(deps, ctx.principal, input.reason, async (tx) => {
+        // IDEMPOTENT, deliberately. Revoking when no window is open writes the same three
+        // NULLs over three NULLs, which 0061 refuses as a change that changes nothing — and
+        // answering 409 to "make sure this is closed" would be the wrong reading of a DELETE.
+        // So the state is read first and the write only happens when there is something to
+        // close.
+        const guard = await notificationPruneGuard(tx, ctx.principal.tenantId);
+        if (guard.prune_guard_override_until === null) return guard;
+        return revokePruneGuardOverride(tx, ctx.principal.tenantId);
+      });
       return { status: 200, body };
     },
   });
@@ -3349,10 +3450,13 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           // the route cannot advertise a longer one than the layer behind it accepts.
           erpLedgerAccountCode: z.string().min(1).max(ACCOUNT_CODE_MAX),
           erpCostCenterCode: z.string().min(1).max(ACCOUNT_CODE_MAX).nullish(),
+          // REQUIRED (0061). Ten characters is the column's own floor; the author comes from
+          // the token, and the database refuses the write if neither is set.
+          reason: z.string().min(10).max(1000),
         }),
         ctx.body,
       );
-      const body = await inTenant(deps, ctx.principal, (tx) =>
+      const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
         upsertAccountMapping(tx, ctx.principal.tenantId, {
           crmCategory: category,
           erpLedgerAccountCode: input.erpLedgerAccountCode,
@@ -3369,9 +3473,12 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
     handler: async (ctx: Ctx): Promise<HandlerResult> => {
       requireRole(ctx.principal, "administrator");
       const category = parse(z.string().min(1).max(EXPENSE_CATEGORY_MAX), ctx.params["category"]);
+      const input = parse(z.object({ reason: z.string().min(10).max(1000) }), ctx.body);
       // Deactivated, not deleted: a claim already submitted carries its own snapshot, and
-      // the row is the record of what the mapping used to be.
-      const body = await inTenant(deps, ctx.principal, (tx) =>
+      // the row is the record of what the mapping used to be. Which makes it an UPDATE, so
+      // 0061 wants its author and its sentence — and this is the change most worth having
+      // one, because every claim in that category stops being postable the moment it lands.
+      const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
         deactivateAccountMapping(tx, ctx.principal.tenantId, category),
       );
       return { status: 200, body };

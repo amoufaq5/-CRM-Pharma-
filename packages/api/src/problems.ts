@@ -331,6 +331,17 @@ export function toProblem(err: unknown): ApiError {
     // operator typed.
     case "EndpointAmendmentError":
       return new ApiError("conflict", message);
+    // And this one is OURS, not the caller's: a missing `reason` in a request body is refused
+    // by the route's own schema long before the database sees it, so reaching the trigger's
+    // refusal means a route forgot to open an attribution block. 500 is the honest answer;
+    // dressing it as a 422 would send an administrator looking for something to retype.
+    //
+    // WITHOUT THE MESSAGE, deliberately. The trigger's sentence names `crm.notification_policy`
+    // and tells the reader to call `withAttribution`, which is exactly the internal detail this
+    // file refuses to put in a 500 — there is a test asserting no 500 body matches `crm.` — and
+    // it is advice for whoever is reading the server log, not for the caller.
+    case "UnattributedChangeError":
+      return new ApiError("internal", "an unexpected error occurred");
     case "InvalidEndpointError":
     case "InvalidRetentionError":
     // A `mailto:` endpoint that is not one mailbox. Reachable from an admin route

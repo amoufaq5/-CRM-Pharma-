@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { appPool, TENANT_NOTIFY as TENANT, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
+import { appPool, TENANT_NOTIFY as TENANT, fixtureAuthor, wipeEndpoints } from "@crm/db/testing";
 
 import { NotificationDispatcher, MAX_ATTEMPTS, nextDelayMs } from "./dispatch.js";
 import { inbox, markAllRead, markRead, unreadCount } from "./inbox.js";
@@ -111,7 +111,7 @@ describe("notifications", () => {
     tx: PoolClient,
     opts: { url: string; minSeverity?: string; kinds?: readonly string[] | null; enabled?: boolean },
   ): Promise<string> => {
-    await endpointAuthor(tx, TENANT);
+    await fixtureAuthor(tx, TENANT);
     const { rows } = await tx.query<{ id: string }>(
       `INSERT INTO crm.notification_endpoint
          (tenant_id, channel, url, secret_env, min_severity, kinds, enabled,
