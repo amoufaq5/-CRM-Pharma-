@@ -71,7 +71,22 @@ export async function launchBrowser({ headless = true } = {}) {
 
   const wsUrl = await new Promise((resolve, reject) => {
     let buffer = "";
-    const timer = setTimeout(() => reject(new Error(`the browser never printed a DevTools URL:\n${buffer}`)), 30_000);
+    // NINETY SECONDS, not thirty, and the number is the whole of the fix.
+    //
+    // A GitHub run failed here: the FIRST browser of the run never printed a DevTools URL
+    // inside thirty seconds, so nothing about the page under test was involved. A cold
+    // Chrome on a shared runner — paging its binary off a disk it shares with a Postgres
+    // container — is slower than any local measurement suggests, and a launch timeout a
+    // HEALTHY start can lose to is a gate that fails for a reason nobody can act on.
+    //
+    // The log also carried three `Failed to connect to the bus: Could not parse server
+    // address` lines, five seconds apart, which read exactly like the cause. They are not.
+    // Chrome prints them on a perfectly healthy start too — measured, with the same
+    // malformed `DBUS_SESSION_BUS_ADDRESS`, launching in 140 ms — so the bus has nothing
+    // to do with it and the flags that would have "fixed" it are not here. Noise that
+    // appears next to a failure is not evidence about the failure, and this comment exists
+    // because it took a control run to tell the two apart.
+    const timer = setTimeout(() => reject(new Error(`the browser never printed a DevTools URL:\n${buffer}`)), 90_000);
     const onData = (chunk) => {
       buffer += String(chunk);
       const match = /DevTools listening on (ws:\/\/\S+)/.exec(buffer);

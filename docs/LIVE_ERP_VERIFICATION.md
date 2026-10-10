@@ -1905,6 +1905,27 @@ and force row-level security while they exist, because two suites derive their c
 live catalog and relying on `fileParallelism: false` is the "it happens to be set" reasoning
 this repository has been bitten by before.
 
+### One CI failure that was not this change, and the control that said so
+
+The first run of this commit failed the browser job, and the failure was the FIRST browser
+of the run never printing a DevTools URL inside the launcher's thirty-second window —
+before any of this increment's code ran. The log carried three
+`Failed to connect to the bus: Could not parse server address` lines five seconds apart,
+which read exactly like the cause, and the obvious fix was the set of Chrome flags that
+stop it reaching for a session bus.
+
+Those flags are not in the fix, because a control run says they are not the cause: Chrome
+prints the same three lines on a perfectly healthy start, launching in **140 ms**, with the
+same malformed `DBUS_SESSION_BUS_ADDRESS` set deliberately. The whole fix is the timeout —
+thirty seconds is simply too tight for a cold Chrome on a runner sharing a disk with a
+Postgres container, and a launch window a healthy start can lose to is a gate that fails
+for a reason nobody can act on.
+
+This is the same mistake as a flake declared without a root cause, one step earlier: noise
+that appears next to a failure is not evidence about the failure. It cost one control run to
+tell them apart, and the comment in `scripts/client/cdp.mjs` says so, so the flags are not
+added by the next person who reads that log.
+
 ### What this cost, and what it caught
 
 - **The guard found two writers no reading of the routes had turned up.**
