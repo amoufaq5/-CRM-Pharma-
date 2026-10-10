@@ -310,6 +310,17 @@ export const TENANT_FOUR_EYES = "f0620000-0000-4000-8000-000000000029";
 export const TENANT_FOUR_EYES_LONE = "f1620000-0000-4000-8000-00000000002a";
 
 /**
+ * packages/notify — approvals.contract (migration 0063).
+ *
+ * Its own pair for the same reason the suite above needs one, and the second is the subject
+ * rather than a spare: the sweep's whole purpose is the moment a tenant's roster CHANGES
+ * under a pending proposal, so it needs a tenant whose roster it can change — appointing an
+ * officer, revoking a grant — without any other suite's assertions moving with it.
+ */
+export const TENANT_APPROVAL_SWEEP = "f0630000-0000-4000-8000-00000000002b";
+export const TENANT_APPROVAL_SWEEP_OTHER = "f1630000-0000-4000-8000-00000000002c";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding

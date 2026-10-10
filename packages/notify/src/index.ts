@@ -1,4 +1,8 @@
 export {
+  notifyPendingApprovals,
+  type PendingApprovalSweep,
+} from "./approvals.js";
+export {
   NOTIFICATION_KINDS,
   SEVERITIES,
   meetsSeverity,

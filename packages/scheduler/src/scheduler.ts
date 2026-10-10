@@ -1,6 +1,11 @@
 import { withTenantContext } from "@crm/db";
 import type { OutboxRelay } from "@crm/relay";
-import { pruneNotifications, type EndpointProbeRunner, type NotificationDispatcher } from "@crm/notify";
+import {
+  notifyPendingApprovals,
+  pruneNotifications,
+  type EndpointProbeRunner,
+  type NotificationDispatcher,
+} from "@crm/notify";
 import { sweepExpiredStock } from "@crm/sample";
 import { summariseExpensePostSweep, sweepApprovedExpenseClaims } from "@crm/expense";
 import {
@@ -374,6 +379,34 @@ export class Scheduler {
             (r.delivery.refused
               ? ` REFUSED: ${r.delivery.refusalReason ?? "over the ceiling"}`
               : "")
+          );
+        } finally {
+          client.release();
+        }
+      }
+      case "notify_approvals": {
+        // In the CRM's own tables only, like the two sweeps above, so it runs in one
+        // transaction: either this pass's notices land or none of them do.
+        //
+        // The counters are the whole value of the line. `notified` is zero on a healthy
+        // tenant and non-zero exactly when the audience MOVED — an officer appointed since
+        // the last tick — which is the state this job exists for. `blocked` is the one
+        // condition the product cannot fix for itself: a proposal nobody in the tenant may
+        // decide, waiting on an administrator to appoint a second holder of the grant. It is
+        // prefixed rather than folded in, like the relay's `LOST=`, so a non-zero value is
+        // legible at a glance in a line that is otherwise all zeroes.
+        const client = await this.options.pool.connect();
+        try {
+          const r = await withTenantContext(client, tenantId, (tx) =>
+            notifyPendingApprovals(tx, tenantId),
+          );
+          return (
+            `${r.blocked > 0 ? `BLOCKED=${r.blocked} ` : ""}` +
+            // A blocked proposal with nobody to tell is the end of the chain: the only
+            // administrator is the person waiting. Named separately because it is the one
+            // case where a non-zero `blocked` produced no notification and never will.
+            `${r.unreportable > 0 ? `UNREPORTABLE=${r.unreportable} ` : ""}` +
+            `pending=${r.pending} notified=${r.notified} alreadyKnown=${r.alreadyKnown}`
           );
         } finally {
           client.release();

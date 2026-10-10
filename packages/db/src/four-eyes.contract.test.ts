@@ -370,7 +370,7 @@ describe("two people for the dangerous ones (0062)", () => {
     });
 
     it("names who could decide it, and never the person who asked", async () => {
-      const { proposal, deciders } = await inTenant((tx) =>
+      const { proposal } = await inTenant((tx) =>
         proposeConfigChange(tx, TENANT, {
           tableName: "disposal_policy",
           rowKey: POLICY_ROW,
@@ -379,9 +379,12 @@ describe("two people for the dangerous ones (0062)", () => {
           reason: "arming it after the volume review",
         }),
       );
+      // A READ, not something the propose path hands back. 0063 removed that seam: who gets
+      // TOLD is `notifyPendingApprovals`'s question, asked from the live roster every tick,
+      // and this is just the answer to "who could decide this" for anybody who wants it.
+      const deciders = await inTenant((tx) => proposalDeciders(tx, TENANT, proposal.id));
       expect(deciders.map((d) => d.display_name)).toEqual(["Grace Hopper"]);
       expect(proposal.eligible_deciders).toBe(1);
-      expect(await inTenant((tx) => proposalDeciders(tx, TENANT, proposal.id))).toEqual(deciders);
     });
 
     /**
@@ -391,7 +394,7 @@ describe("two people for the dangerous ones (0062)", () => {
      * the count is what the screen uses to say nobody can approve it yet.
      */
     it("is accepted in a tenant with nobody to approve it, and says so", async () => {
-      const { proposal, deciders } = await inLone((tx) =>
+      const { proposal } = await inLone((tx) =>
         proposeConfigChange(tx, LONE, {
           tableName: "disposal_policy",
           rowKey: { tenant_id: LONE },
@@ -400,7 +403,7 @@ describe("two people for the dangerous ones (0062)", () => {
           reason: "the only officer here asking for it",
         }),
       );
-      expect(deciders).toEqual([]);
+      expect(await inLone((tx) => proposalDeciders(tx, LONE, proposal.id))).toEqual([]);
       expect(proposal.eligible_deciders).toBe(0);
       expect(proposal.decision).toBeNull();
     });

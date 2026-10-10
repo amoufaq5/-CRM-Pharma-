@@ -17,6 +17,7 @@ export const JOB_NAMES = [
   "notify_prune",
   "expense_post",
   "tenant_deletion_watch",
+  "notify_approvals",
 ] as const;
 export type JobName = (typeof JOB_NAMES)[number];
 
@@ -50,6 +51,17 @@ export type JobName = (typeof JOB_NAMES)[number];
  *   can do anything about it. It is not daily, because a rep who is owed money should not
  *   wait for a night to pass. Five minutes matches the snapshot: long enough to be a
  *   separate act, short enough that nobody plans around it.
+ * - **notify_approvals (15 min).** Tells whoever can act on a configuration change that takes
+ *   two people, and the cadence is an argument about WHAT IT IS FOR rather than about cost.
+ *   The common case is already immediate: the route that creates a proposal tells every holder
+ *   of the grant through the same function this job calls. What this catches is the audience
+ *   MOVING afterwards — a tenant whose only officer asked for something, and an officer
+ *   appointed later who is now eligible for everything pending. The act that creates that
+ *   state is a role grant, which happens in a session an administrator is sitting in, so what
+ *   matters is "before they have moved on", not "within the minute". Fifteen minutes is longer
+ *   than `expense_post`, because nothing here is owed to anybody; far shorter than daily,
+ *   because the thing waiting is a person. The pass is one query returning zero rows on a
+ *   tenant with nothing pending, which is almost every tenant almost always.
  * - **tenant_deletion_watch (24h).** Asks the ERP whether a tenant has been deleted
  *   (`GET /v1/platform/tenants/{id}/tombstones`), and on a `tenant_deletion` tombstone marks
  *   the tenant `erp_deleted`, which removes it from every job above. Daily, and the interval
@@ -73,6 +85,7 @@ export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   notify_prune: 24 * 60 * 60_000,
   expense_post: 5 * 60_000,
   tenant_deletion_watch: 24 * 60 * 60_000,
+  notify_approvals: 15 * 60_000,
 };
 
 /**

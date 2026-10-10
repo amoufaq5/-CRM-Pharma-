@@ -36,10 +36,13 @@
 #     The scheduler's per-tenant loop runs with exactly ONE tenant and ONE
 #     instance, so neither tenant isolation inside a tick nor the claim/skip-locked
 #     story for two instances is tested.
-#   * Nothing about the jobs other than relay_drain and the snapshots. expiry_sweep,
-#     notify_prune, notify_dispatch and expense_post all run in the first tick
-#     against the live database and are observed to succeed; nothing is asserted
-#     about what they did, because the rows they act on are not seeded.
+#   * Nothing about the jobs other than relay_drain, the snapshots and
+#     notify_approvals. expiry_sweep, notify_prune, notify_dispatch and
+#     expense_post all run in the first tick against the live database and are
+#     observed to succeed; nothing is asserted about what they did, because the
+#     rows they act on are not seeded. `notify_approvals` IS seeded — §10 leaves a
+#     four-eyes proposal pending with a second officer who was never told — so §11
+#     asserts the notice it raised rather than only the tick.
 #   * Nothing about an RS256 human token. The stand-in IdP signs EdDSA, and RS256
 #     is the format every real OIDC provider defaults to (jwt.ts supports it, and
 #     only packages/api/src/jwt.test.ts exercises it).
@@ -468,10 +471,49 @@ SELECT '$TENANT', a.id, 'administrator', g.id, CURRENT_DATE - 1,
  WHERE a.subject = 'rep-ada' AND g.subject = 'rep-grace'
    AND NOT EXISTS (SELECT 1 FROM crm.rep_role x
                     WHERE x.rep_profile_id = a.id AND x.role = 'administrator' AND x.valid_to IS NULL);
+
+-- AND A PENDING FOUR-EYES PROPOSAL, with both reps holding the grant it answers to (0062),
+-- so the scheduler notify_approvals tick has something real to do. §11 asserts what it
+-- DID rather than only that it ran, which is the limitation this file's header records for
+-- every other job: a tick that reports zeroes proves the dispatcher case exists and nothing
+-- about the query behind it.
+--
+-- Inserted directly rather than through the route, because the API binary is not up yet and
+-- the claim being measured is the SCHEDULER's. `four_eyes_columns` and `role` are written out
+-- for the same reason: the store stamps them from crm.four_eyes_rule, and a fixture going
+-- through the store would be testing that here instead of where it belongs.
+--
+-- NO BACKTICKS ANYWHERE IN THIS HEREDOC. It is unquoted, because the fixture needs $TENANT
+-- expanded — which also makes a backtick command substitution, and the first version of this
+-- comment ran "notify_approvals" as a shell command.
+INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+SELECT '$TENANT', a.id, 'compliance', g.id, CURRENT_DATE - 1,
+       'the live gate needs two officers so a four-eyed change can be approved at all'
+  FROM crm.rep_profile a, crm.rep_profile g
+ WHERE a.subject = 'rep-ada' AND g.subject = 'rep-grace'
+   AND NOT EXISTS (SELECT 1 FROM crm.rep_role x
+                    WHERE x.rep_profile_id = a.id AND x.role = 'compliance' AND x.valid_to IS NULL);
+INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+SELECT '$TENANT', g.id, 'compliance', a.id, CURRENT_DATE - 1,
+       'and the second of the two, granted by the first'
+  FROM crm.rep_profile a, crm.rep_profile g
+ WHERE a.subject = 'rep-ada' AND g.subject = 'rep-grace'
+   AND NOT EXISTS (SELECT 1 FROM crm.rep_role x
+                    WHERE x.rep_profile_id = g.id AND x.role = 'compliance' AND x.valid_to IS NULL);
+INSERT INTO crm.config_proposal
+  (tenant_id, table_name, row_key, changes, four_eyes_columns, role, proposed_by, proposed_reason)
+SELECT '$TENANT', 'disposal_policy', jsonb_build_object('tenant_id', '$TENANT'::uuid),
+       '{"auto_writeoff_promo": true}'::jsonb, ARRAY['auto_writeoff_promo'], 'compliance', a.id,
+       'the live gate asking to arm the unattended promotional write-off'
+  FROM crm.rep_profile a
+ WHERE a.subject = 'rep-ada'
+   AND NOT EXISTS (SELECT 1 FROM crm.config_proposal p
+                    WHERE p.tenant_id = '$TENANT' AND p.decision IS NULL);
 COMMIT;
 SQL
 ok "crm.rep_profile maps rep-ada → Employee emp-1, and lot LOT-LIVE-1 of itm-1 exists"
 ok "rep-ada holds the administrator grant — granted by Grace, because 0023 lets nobody grant themselves one"
+ok "and a pending four-eyes proposal is waiting, with two compliance officers to decide it"
 
 # PORT=0: the binary logs the port it actually bound, so no fourth fixed socket is
 # reserved and a stale listener cannot be mistaken for this one.
@@ -529,6 +571,29 @@ SCHED_PID=$!
 wait_for_line "$WORK/sched.out" '"type":"job_ok".*"job":"relay_drain"' "$SCHED_PID" 240 \
   "the scheduler's own relay_drain tick"
 ok "the scheduler booted and reported a relay_drain tick of its own"
+
+# 0063's sweep, in the deployed binary. The one job besides the relay and the snapshots whose
+# WORK this file asserts rather than merely observing: the fixture above left a proposal
+# pending with a second officer who was never told about it, which is the state the sweep
+# exists for, and the line has to say it told somebody.
+wait_for_line "$WORK/sched.out" '"type":"job_ok".*"job":"notify_approvals"' "$SCHED_PID" 120 \
+  "the scheduler's notify_approvals tick"
+# The job_ok line, not the job_start one that precedes it — `job_start` ends right after the
+# job name, so matching the first occurrence found a line with no `detail` at all and reported
+# a sweep that had notified nobody. Measured, not reasoned about: the run said so.
+APPROVAL_LINE="$(grep '"type":"job_ok".*"job":"notify_approvals"' "$WORK/sched.out" | head -1)"
+case "$APPROVAL_LINE" in
+  *'notified=1'*) ok "notify_approvals told the officer who could decide it — $APPROVAL_LINE" ;;
+  *) fail "notify_approvals ran and notified nobody: $APPROVAL_LINE" ;;
+esac
+# And the notification is a row, in the right inbox, raised by the scheduler rather than by
+# anything this harness did — which is the half a log line cannot prove.
+TOLD="$(psql -d "$CRM_DB" -At -c "
+  SELECT count(*) FROM crm.notification n JOIN crm.rep_profile r ON r.id = n.recipient_rep_profile_id
+   WHERE n.tenant_id = '$TENANT' AND n.kind = 'config_change_awaiting_approval'
+     AND r.subject = 'rep-grace'")"
+[ "$TOLD" = "1" ] || fail "expected exactly one approval notice for rep-grace, found $TOLD"
+ok "and the notice is a row in Grace's inbox, naming the proposal it is about"
 
 stop_gracefully "$SCHED_PID" "the scheduler"
 SCHED_PID=""

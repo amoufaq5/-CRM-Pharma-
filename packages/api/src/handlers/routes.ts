@@ -36,7 +36,7 @@ import {
   listEndpoints,
   markAllRead,
   markRead,
-  raiseNotification,
+  notifyPendingApprovals,
   deliveryHistory,
   notificationDeliveryRetention,
   probeBudget,
@@ -237,45 +237,6 @@ async function asChange<T>(
       fn,
     ),
   );
-}
-
-/**
- * Tells everybody who could approve a proposal that one is waiting (0062).
- *
- * At the route layer rather than in `@crm/db`, which depends on `pg` and nothing else and
- * therefore cannot reach `@crm/notify`. `proposeConfigChange` returns the reps rather than a
- * count for exactly this reason: a seam a caller can forget is a seam a caller forgets, and a
- * route that ignored a LIST OF PEOPLE would read as more obviously wrong than one that
- * ignored a number.
- *
- * Never the proposer, who already knows — the store's query excludes them — and keyed on the
- * proposal, so a second raise for the same one is deduplicated rather than nagging.
- */
-async function tellTheDeciders(
-  tx: PoolClient,
-  tenantId: string,
-  proposal: ConfigProposal,
-  deciders: readonly { readonly rep_profile_id: string; readonly display_name: string }[],
-): Promise<void> {
-  const what = proposal.four_eyes_columns.join(", ");
-  for (const decider of deciders) {
-    await raiseNotification(tx, tenantId, {
-      recipientRepProfileId: decider.rep_profile_id,
-      kind: "config_change_awaiting_approval",
-      // `warning` rather than `info`: nothing is broken, but something a colleague needs is
-      // blocked on this reader specifically, and the queue is short by design.
-      severity: "warning",
-      subject: `${proposal.proposed_by_name} needs a second signature on ${what}`,
-      body:
-        `${proposal.proposed_by_name} asked to change ${what} on ${proposal.table_name} — ` +
-        `"${proposal.proposed_reason}". It takes two people, so it cannot happen until you or ` +
-        `another holder of the ${proposal.role} grant approves it. You cannot approve your own.`,
-      dedupKey: `config_proposal:${proposal.id}:awaiting`,
-      subjectTable: "crm.config_proposal",
-      subjectId: proposal.id,
-      payload: { tableName: proposal.table_name, columns: proposal.four_eyes_columns },
-    });
-  }
 }
 
 /**
@@ -2540,7 +2501,16 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
             proposedBy: ctx.principal.repProfileId,
             reason: input.reason,
           });
-          await tellTheDeciders(tx, ctx.principal.tenantId, result.proposal, result.deciders);
+          // THE SAME FUNCTION THE SWEEP CALLS (0063), scoped to the proposal just made.
+          //
+          // 0062 had the store return the people who should be told and told them here, which
+          // meant the immediate notice and the scheduled catch-up were two pieces of code
+          // writing two sentences about one fact. There is one sentence now, and a route that
+          // forgot this call would be a route not calling an obvious function rather than a
+          // route ignoring a returned list.
+          await notifyPendingApprovals(tx, ctx.principal.tenantId, {
+            onlyProposalId: result.proposal.id,
+          });
           return result.proposal;
         });
         return { status: 202, body: proposed };
@@ -3857,7 +3827,16 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
             proposedBy: ctx.principal.repProfileId,
             reason: input.reason,
           });
-          await tellTheDeciders(tx, ctx.principal.tenantId, result.proposal, result.deciders);
+          // THE SAME FUNCTION THE SWEEP CALLS (0063), scoped to the proposal just made.
+          //
+          // 0062 had the store return the people who should be told and told them here, which
+          // meant the immediate notice and the scheduled catch-up were two pieces of code
+          // writing two sentences about one fact. There is one sentence now, and a route that
+          // forgot this call would be a route not calling an obvious function rather than a
+          // route ignoring a returned list.
+          await notifyPendingApprovals(tx, ctx.principal.tenantId, {
+            onlyProposalId: result.proposal.id,
+          });
           return result.proposal;
         });
         return { status: 202, body: proposed };

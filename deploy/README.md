@@ -405,6 +405,15 @@ report `more=true` while the backlog drains 50,000 rows at a time. Ask
 `GET /v1/admin/notifications/prune-candidates` first if you want to see what it
 will take before it takes it.
 
+`notify_approvals` arrived the same way and behaves the opposite way round: its
+first tick on an existing deployment tells every holder of a grant about every
+configuration change still waiting for a second signature, which on a tenant
+that has been ignoring its approval queue is a burst of one notice per person
+per pending proposal. That is the backfill working rather than a surprise — the
+whole reason the job exists is that those people were never told — but it is
+worth knowing before the first deploy. `GET /v1/admin/four-eyes?pending=true`
+says what is waiting, before anything is sent.
+
 ## Notifications
 
 Two channels. **In-app** needs no configuration: a notification is a row, written by

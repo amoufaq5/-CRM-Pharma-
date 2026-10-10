@@ -285,6 +285,30 @@ switch — so the proposal is accepted, waits, and reports `eligible_deciders: 0
 failing silently. The officer's own device shows the queue under **Waiting for a second
 signature**, with no approve button on their own request.
 
+**And the audience moves, so a signal raised once is not enough.** A proposal made while the
+tenant had one officer reached nobody; an officer appointed next week was eligible for
+everything pending and told about none of it. The `notify_approvals` job (0063, every 15
+minutes) answers *who should know about this now* from the live roster, and the route that
+creates a proposal calls the **same function** scoped to the one it just made — so the
+immediate notice and the catch-up are one sentence rather than two about the same fact. It is
+idempotent by the notification's own `(tenant, recipient, dedup_key)` key, so nobody is nagged;
+the cost of that is no escalation, which is recorded as open rather than hidden.
+
+It also closes the loop rather than only reporting it. A proposal **nobody** can decide is
+blocked on an act its author cannot perform — appointing a second holder of the grant is an
+administrator's job — so the administrators are told what it *needs*, with a different sentence
+and a different dedup key, because what the reader can do about it is not the same:
+
+```
+notify_approvals  pending=1 notified=1 alreadyKnown=0
+notify_approvals  BLOCKED=1 pending=1 notified=1 alreadyKnown=0
+notify_approvals  BLOCKED=1 UNREPORTABLE=1 pending=1 notified=0 alreadyKnown=0
+```
+
+`UNREPORTABLE` is the end of the chain and the one state the product cannot fix for itself: a
+tenant whose only administrator proposed an administrator-governed change is both the person
+waiting and the only person who could appoint a colleague.
+
 Four rules, all of them in the database (`db/migrations/0023_roles.sql`), so a route cannot
 forget one:
 

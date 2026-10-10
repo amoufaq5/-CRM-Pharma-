@@ -2112,3 +2112,119 @@ Both were things an earlier comment asserted and nothing measured.
   a refusal at migration time.
 - **The queue is not paged or filtered**, and `crm.four_eyes_rule` has no screen. For two
   columns across the whole schema both are the right size; neither is a general approval inbox.
+
+## A proposal nobody was told about
+
+*2026-10-10, `./scripts/verify-live-erp.sh` (133 driver checks) and `npx vitest run`
+(99 files / 2,526 tests). `pnpm client:verify` is unchanged at 310.*
+
+The chapter above ends with a limitation its own gate **measured**:
+
+```
+ok: and nobody was notified, because at that moment nobody could approve it  (0)
+```
+
+A notification about a change that takes two people goes to whoever holds the governing grant
+*at the moment the proposal is made*. That is right, and the audience **moves** afterwards —
+which is the one thing a signal raised once cannot follow. A tenant whose only compliance
+officer asks for something reaches nobody, and nothing tells the second officer when one is
+appointed next week. An officer appointed into a tenant that already had one is eligible for
+everything pending and was told about none of it.
+
+`notify_approvals` (every 15 minutes) answers *who should know about this now* from the live
+roster. The route that creates a proposal calls the **same function**, scoped to the one it just
+made, so the immediate notice and the catch-up are one sentence rather than two.
+
+### In the deployed scheduler binary, with something real to do
+
+This is now the one job besides the relay and the snapshots whose **work** this gate asserts
+rather than merely observing — the limitation this file's header records for the others
+("nothing is asserted about what they did, because the rows they act on are not seeded"). §10's
+fixture seeds it: two compliance officers, and a proposal pending that only one of them knows
+about.
+
+```
+ok: and a pending four-eyes proposal is waiting, with two compliance officers to decide it
+ok: the scheduler booted and reported a relay_drain tick of its own
+ok: notify_approvals told the officer who could decide it —
+    {"type":"job_ok","job":"notify_approvals","durationMs":8,
+     "detail":"pending=1 notified=1 alreadyKnown=0"}
+ok: and the notice is a row in Grace's inbox, naming the proposal it is about
+```
+
+The last line is the half a log line cannot prove. `notified=1` is the job's own account of
+itself; the row in the right inbox, read from outside the process, is the fact.
+
+### The counters, which are the whole value of the line
+
+```
+notify_approvals  pending=1 notified=1 alreadyKnown=0
+notify_approvals  BLOCKED=1 pending=1 notified=1 alreadyKnown=0
+notify_approvals  BLOCKED=1 UNREPORTABLE=1 pending=1 notified=0 alreadyKnown=0
+```
+
+`notified` is zero on a healthy tenant and non-zero **exactly** when the audience moved since
+the last tick, which is the state the job exists for. `BLOCKED` is the one condition the product
+cannot fix for itself — a proposal nobody in the tenant may decide, waiting on an administrator
+to appoint a second holder of the grant — and the sweep tells those administrators what it
+*needs* rather than telling them to approve something they may not. `UNREPORTABLE` is the end of
+the chain: a tenant whose only administrator proposed an administrator-governed change is both
+the person waiting and the only person who could appoint a colleague, so there is nobody to tell
+and never will be. Prefixed rather than folded in, like the relay's `LOST=`, so a non-zero value
+is legible in a line that is otherwise all zeroes.
+
+### Twelve assertions, every one of them moving the roster
+
+The audience is the subject, so a test that did not change who holds a grant would be asserting
+nothing this increment is about.
+
+```
+ok: reports zeroes for a tenant with no proposals
+ok: says nothing about a decided proposal, however it was decided
+ok: tells an officer appointed after the proposal was made
+ok: tells each of several newly-eligible officers, exactly once
+ok: says nothing new on a second pass, and nothing at all on a hundredth
+ok: stops telling an officer whose grant has been revoked
+ok: tells the administrators, with the sentence that names what it needs
+ok: counts a proposal nobody can approve AND nobody can be told about
+ok: stops calling it blocked the moment a second officer exists
+ok: treats an administrator's own re-pointing the same way
+ok: is never told about this one's proposals            (another tenant)
+ok: tells only about the proposal it names              (scoped, as the route calls it)
+```
+
+Two of those are worth naming. **"Exactly once" for several officers** depends on
+`crm.notification`'s uniqueness being `(tenant_id, recipient, dedup_key)` rather than
+`(tenant_id, dedup_key)` — one dedup key, two notices — and the test asserts the key count is
+one while both inboxes hold a notice, so a future narrowing of that constraint fails here rather
+than silently telling only the first officer. And **"nothing at all on a hundredth"** is the
+property that makes a fifteen-minute job safe: the second pass is all `alreadyKnown`, which also
+means there is no escalation, recorded as open rather than hidden.
+
+### Two defects of my own, both found by running it
+
+- **The suite's `beforeEach` reset a hand-picked list of grants** and left one behind, so a test
+  that appointed one officer saw two and the number it asserted depended on which test had run
+  before it. That is the same shape of coupling the previous chapter found in the
+  expense-lifecycle suite — written fresh, two increments later, in a suite whose entire subject
+  is the roster. It resets every role on every rep now.
+- **The gate's new assertion read the wrong log line.** `grep -o '"job":"notify_approvals"…'`
+  matched `job_start` first, which ends before `detail` — so it reported a sweep that had
+  notified nobody while the `job_ok` line directly beneath it said `notified=1`. And a comment I
+  added inside that gate's **unquoted** heredoc used backticks, which are command substitution:
+  the run failed with `notify_approvals: command not found`.
+
+### What is still not built
+
+- **No escalation.** One notice per person per proposal, forever. A weekly reminder needs a dedup
+  key carrying a period, which is nagging by construction; the honest alternative is an age in
+  the queue read on a screen rather than pushed.
+- **A blocked proposal still needs somebody to read the log line.** `BLOCKED` and `UNREPORTABLE`
+  are in the scheduler's output and in no screen and no route. An operator watching a tenant
+  sees them; an administrator inside it sees `eligible_deciders: 0` per proposal, which is the
+  same fact one proposal at a time.
+- **Nothing expires**, which the previous chapter already carried and this does not change.
+- **The sweep is per tenant per tick**, like every other job here, so a deployment with thousands
+  of tenants runs thousands of queries that almost always return nothing. That is the
+  scheduler's shape rather than this job's — and this is the first job cheap enough that one
+  cross-tenant query would have been a plausible alternative.

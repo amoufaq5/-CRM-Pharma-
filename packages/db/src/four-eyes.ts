@@ -16,12 +16,18 @@ import { translateAttributionError } from "./attribution.js";
  * substrate every one of them depends on. So the approve path lives at the route layer,
  * where both are already in scope, and this file stops at the record.
  *
- * NEITHER DOES IT NOTIFY, for the same reason: `@crm/db` depends on `pg` and nothing else,
- * so it cannot reach `@crm/notify`. `proposeConfigChange` therefore RETURNS the reps who
- * could decide the proposal rather than telling them, and the route raises the signal. That
- * is a seam a caller can forget, which is a defect this repository has shipped more than
- * once, so the return type names them rather than counting them: a route that ignores a list
- * of people is more obviously wrong than one that ignores a number.
+ * NEITHER DOES IT NOTIFY, for the same reason: `@crm/db` depends on `pg` and nothing else, so
+ * it cannot reach `@crm/notify`. 0062 answered that by having `proposeConfigChange` RETURN the
+ * reps who could decide the proposal and leaving the route to tell them — a seam a caller can
+ * forget, defended at the time on the grounds that a returned list of people is harder to
+ * ignore than a number.
+ *
+ * 0063 removed the seam instead. `notifyPendingApprovals` in `@crm/notify` answers "who should
+ * know about this now" from the live roster, the scheduler calls it every tick and the route
+ * calls it scoped to the proposal it just made — so there is nothing to forget and one
+ * sentence rather than two about the same fact. `proposalDeciders` below stays as a READ,
+ * because "who could decide this" is a question worth asking; it is no longer how anybody
+ * gets told.
  */
 
 /**
@@ -158,7 +164,6 @@ export interface ProposeInput {
 
 export interface ProposeResult {
   readonly proposal: ConfigProposal;
-  readonly deciders: readonly ProposalDecider[];
 }
 
 /**
@@ -207,8 +212,7 @@ export async function proposeConfigChange(
       `changing ${Object.keys(input.changes).sort().join(", ")} of crm.${input.tableName} does not need a second person, so there is nothing to propose — make the change`,
     );
   }
-  const proposal = await requireProposal(tx, tenantId, id);
-  return { proposal, deciders: await proposalDeciders(tx, tenantId, id) };
+  return { proposal: await requireProposal(tx, tenantId, id) };
 }
 
 /**

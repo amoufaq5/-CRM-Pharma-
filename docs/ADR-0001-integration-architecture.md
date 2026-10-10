@@ -2004,9 +2004,8 @@ Concretely, and these specifics are the decision, not commentary on it:
     **Still open.**
 
     * **A proposal made before a second officer exists notifies nobody, and appointing one later
-      sends no signal.** Measured rather than assumed — the browser gate asserts the zero case —
-      and the remedy is a sweep that re-raises for newly-eligible deciders, or a signal on the
-      grant itself. Today the request waits in the queue for somebody to open the screen.
+      sends no signal** — **answered by item 36**, which builds the sweep. Measured rather than
+      assumed: the browser gate asserts the zero case.
     * **Nothing expires.** A proposal nobody decides sits pending forever, and a tenant that
       asked for something in March will find it waiting in December with its original reason.
       A TTL would need a decision about what expiry MEANS — rejected by the system is not a
@@ -2027,6 +2026,99 @@ Concretely, and these specifics are the decision, not commentary on it:
     * **The queue is not paged and not filtered**, and the device shows every pending proposal.
       For two columns across the whole schema that is the right size; it is not a general
       approval inbox.
+
+36. **A proposal nobody was told about — the first of item 35's open notes.**
+    That item closed with a limitation its own browser gate had MEASURED rather than guessed:
+
+        ok: and nobody was notified, because at that moment nobody could approve it  (0)
+
+    `config_change_awaiting_approval` goes to whoever holds the governing grant at the moment a
+    proposal is made. That is right and it is not sufficient, because the audience MOVES
+    afterwards, and the two states a single raise cannot cover are the two that matter: a
+    tenant whose only compliance officer asks for something (nobody to tell, and nothing tells
+    the second officer when one is appointed next week), and an officer appointed into a tenant
+    that already had one (now eligible for everything pending, told about none of it).
+
+    **A SWEEP, NOT A TRIGGER ON THE GRANT**, and item 35 offered both. A trigger on
+    `crm.rep_role` would be immediate and is the wrong mechanism twice: it would raise
+    notifications from inside a role grant, so an administrator appointing a colleague would own
+    the failure of a webhook enqueue; and it would cover only the second case — a proposal made
+    with nobody to tell, in a tenant whose roster never changes again, would stay invisible
+    forever. `notify_approvals` answers "who should know about this now" from the live roster
+    every tick, which is the question.
+
+    **THE ROUTE CALLS THE SAME FUNCTION**, scoped to the proposal it just made. Item 34's
+    arrangement had the proposal store RETURN the people who should be told and the route tell
+    them, defended at the time because "a route that ignores a list of people is more obviously
+    wrong than one that ignores a number". The seam is gone rather than better defended: there
+    is one function, both callers call it, and the immediate notice and the scheduled catch-up
+    cannot drift into two sentences about one fact. `ProposeResult.deciders` is removed and the
+    comment that justified it now says what happened to it.
+
+    **IT CLOSES THE LOOP RATHER THAN ONLY REPORTING IT.** A proposal with no eligible decider is
+    blocked on an act its author cannot perform — appointing a second holder of the grant is an
+    administrator's job, and a compliance officer cannot do it for themselves. So the
+    administrators are told what it NEEDS, with a different sentence and a different dedup key,
+    because "approve this" to somebody who may not is worse than silence. Same notification
+    kind: 0049 made that vocabulary a closed list so a reader routing it to a webhook knows
+    what they will get, and "a configuration change is waiting" is one fact with two audiences
+    rather than two facts.
+
+    **IDEMPOTENT, WHICH IS THE ONLY THING THAT MAKES A FIFTEEN-MINUTE JOB SAFE.**
+    `crm.notification`'s uniqueness is `(tenant_id, recipient, dedup_key)` and the sweep reuses
+    the key the proposal's own notice carries, so an officer told at proposal time is not told
+    again every tick forever. The cost is stated rather than hidden: there is NO escalation. A
+    proposal that sits for months produces exactly one notice per person, and that is a
+    deliberate choice against nagging rather than an oversight.
+
+    **FIFTEEN MINUTES, and the number is an argument about what the job is FOR.** The common case
+    is already immediate. What this catches is the audience moving, and the act that moves it is
+    a role grant — which happens in a session an administrator is sitting in. So what matters is
+    "before they have moved on", not "within the minute". Longer than `expense_post` (5 min)
+    because nothing here is owed to anybody; far shorter than daily, because the thing waiting is
+    a person. One query returning zero rows on a tenant with nothing pending.
+
+    **Three counters, and two of them are prefixed for the reason the relay's `LOST=` is.**
+    `notified` is zero on a healthy tenant and non-zero exactly when the audience moved;
+    `BLOCKED=` is the one condition the product cannot fix for itself; `UNREPORTABLE=` is the end
+    of the chain — a tenant whose only administrator proposed an administrator-governed change is
+    both the person waiting and the only person who could appoint a colleague, so there is
+    nobody to tell and never will be. All three are legible at a glance in a line that is
+    otherwise all zeroes.
+
+    **Two fixture defects of my own, both found by running it.** The suite's `beforeEach` reset a
+    HAND-PICKED list of grants and left one behind, so a test that appointed one officer saw two
+    and the number it asserted depended on which test ran before it — the same shape of coupling
+    item 35 found in the expense-lifecycle suite, written fresh. It resets every role on every
+    rep now, because the roster is what is under test. And the live-ERP gate's new assertion read
+    the FIRST log line matching the job name, which is `job_start` — a line that ends before
+    `detail` — so it reported a sweep that had notified nobody while the `job_ok` line beside it
+    said `notified=1`. Also: backticks inside that gate's unquoted heredoc are command
+    substitution, and a comment I wrote there ran `notify_approvals` as a shell command.
+
+    **Verified.** 99 files / **2,526 tests** green against a real Postgres, twelve of them over
+    this sweep and every one of them changing the ROSTER under a pending proposal, which is the
+    only way to assert a moving audience. The live-ERP gate now asserts what this job DID rather
+    than only that it ran — the one job besides the relay and the snapshots for which that is
+    true, and the limitation its own header records for the others: the fixture leaves a proposal
+    pending with a second officer who was never told, the deployed scheduler binary's tick
+    reports `notified=1`, and the notice is a row in that officer's inbox. 310 browser checks and
+    133 driver checks unchanged, migration runner green on a fresh database with 63 migrations.
+
+    **Still open.**
+
+    * **No escalation**, as above: one notice per person per proposal, forever. A weekly
+      reminder would need a dedup key carrying a period, which is nagging by construction, and
+      the honest alternative is an age in the queue read on a screen rather than pushed.
+    * **A blocked proposal still needs somebody to read the log line.** `BLOCKED=` and
+      `UNREPORTABLE=` are in the scheduler's output and in no screen and no route; an operator
+      watching a tenant sees them, an administrator inside it does not. The screen shows
+      `eligible_deciders: 0` per proposal, which is the same fact one proposal at a time.
+    * **Nothing expires**, which item 35 already carried and this does not change.
+    * **The sweep is per tenant per tick**, like every other job here, so a deployment with
+      thousands of tenants runs thousands of queries that almost always return nothing. That is
+      the scheduler's shape rather than this job's, and it is the first job cheap enough that a
+      single cross-tenant query would have been a plausible alternative.
 
 ## Alternatives considered
 
@@ -2425,7 +2517,7 @@ commit.
 | **An endpoint can be created and disabled but never removed, and nothing bounds either the endpoints or their dead deliveries.** 0048 argued against a DELETE route (the cascade would erase the record of everything ever sent there) and 0049 froze the destination, so "disable the old endpoint, create a new one" is now the only way to move one — which is right, and leaves `crm.notification_endpoint` with no horizon and no cap while every replacement adds a row. Two things follow that nobody decided. `notification_endpoint_probe_endpoint_id_fkey` is `ON DELETE CASCADE`, and 0045's budget and 0034's cooldown are both counted from those probe rows, so if a DELETE route is ever added, deleting and recreating an endpoint **refunds its share of the hourly budget and clears its cooldown** — the same bypass 0045 found in the retention ring, by a different route. And `crm.notification_delivery`'s prune keys on `unsettled = (state <> 'delivered')`, which is true of the terminal `dead`, so **a delivery settled `dead` is never pruned at any horizon** and pins its notification too. For a real failed push that is arguably correct — it is evidence of a disclosure that did not happen — but `settleOrphanedDeliveries` mints them deliberately, so the set grows without bound and the retention policy quietly does not apply to it. | us | _set a date_ |
 | **0049 left two things in TypeScript that the database still does not say, and one key nothing uses.** `normaliseKinds` dedups and sorts an endpoint's allow-list; `notification_endpoint_kinds_known` only checks containment, so `ARRAY['x','x']` is legal from SQL and two spellings of one allow-list store as two different arrays — which matters only for comparing endpoints, which nothing does yet, so it is recorded rather than fixed. Normalising in a trigger would be the move if anything ever needs to. Separately, `crm.notification` still carries `UNIQUE (tenant_id, id)` and, since 0046 dropped the delivery foreign key, **nothing references it at all** — verified against the live catalog. Harmless but not free: it is a second index on every inbox write. It stays because dropping a unique key is the kind of change that wants its own migration and its own reason, not a line in one about something else. | us | _set a date_ |
 | **An ERP tenant deletion now really erases that tenant, and as of migration 0050 this CRM stops when it does.** Found by reading `origin/main` on 2026-10-06, 11 commits ahead of the checkout this repo builds against. The ERP's ADR-0316 to ADR-0320 give a tenant serving its own activated manifest a Postgres schema of its own, drop it on a GDPR Article 17 deletion, compose a tombstone from attestations and anchor it — closing, in that ADR's own words, a flow that issued a signed `TombstoneRecord` while "every row of the tenant's actual business data survived": the tombstone "was not incomplete. It was false, and it was cryptographically signed." The CRM holds that tenant's `product_snapshot`, `rep_snapshot`, `account_snapshot`, its `crm.outbox` rows, its `crm.expense_claim` rows carrying `erp_ledger_account_code`, and its `crm.erp_service_principal`. Nothing listened, no route and no job knew the concept, and the scheduler kept polling a tenant that no longer existed — so the ERP's proof was true about the ERP and false about the system holding copies of the same personal data. This is the identical defect ADR-0316 describes, one system over, and it is not something the ERP can close for us: it needs a deletion signal we can receive (the webhook producer Q9 is waiting on is the obvious carrier) and a decision about what a CRM tenant-erasure proof commits to. `tenant-lifecycle` is an ERP package; `crm.tenant` is a registry nothing references. WHAT CLOSED IT: `tenant_deletion_watch` reads `GET /v1/platform/tenants/{id}/tombstones` daily and gets one of three answers — `deleted` (a `tenant_deletion` tombstone in hand), `live` (200 and no such tombstone, an AFFIRMATIVE not-deleted) or `unknown` (403, 404, 503, a timeout, an unparseable body). Nothing infers a deletion from an empty list, a 401 or a vanished schema, and nothing reads a refusal as a clean bill of health: every check lands in `crm.tenant_deletion_check` with its reason, because a fail-closed signal that silently never fires is worse than none. The read is possible at all because of a property of the ERP worth recording — the tenant row is retired AFTER the deletion pipeline commits, and the request path never consults `meta.tenants` to authenticate, so a per-tenant token still works after its tenant is gone. A confirmed tombstone sets `crm.tenant.status = 'erp_deleted'`, which the scheduler's own `WHERE status = 'active'` turns into "every job stops" at one point rather than seven; the API refuses in `resolvePrincipal` with its own `tenant-deleted` problem type, so an offline client stops retrying instead of reading it as transient permissions. A CHECK pairs the status with the receipt so no prompt can quarantine a field force with one word, a second CHECK refuses a `data_subject_erasure` tombstone in that column (it is ONE person, in a tenant otherwise alive — reacting to it would stop a working tenant the first time an employee asked to be forgotten), and a trigger makes the mark terminal with the evidence write-once. | us | **closed 2026-10-06** |
-| **Q1's answer is half-built: there is no nightly orphan check.** The answer was "3-degraded. No FKs; ACL-enforced integrity **plus a nightly orphan check**", and `crm.referential_check_run` has existed since migration 0005 to hold its results. Nothing writes it. The scheduler registers seven jobs — `relay_drain`, `snapshot_incremental`, `snapshot_full`, `expiry_sweep`, `notify_dispatch`, `notify_prune`, `expense_post` — and none of them is this one, so the table is empty in every deployment and the half of Q1 that was supposed to catch what the missing foreign keys cannot was never delivered. Recorded as a gap and not fixed in the same breath because what it should CHECK is a real question: a snapshot row naming an ERP record that no longer exists is the obvious case and is also the expected steady state of a full sweep against a system that keeps no per-record tombstone, so an orphan count that is always non-zero teaches nobody anything. | us | _set a date_ |
+| **Q1's answer is half-built: there is no nightly orphan check.** The answer was "3-degraded. No FKs; ACL-enforced integrity **plus a nightly orphan check**", and `crm.referential_check_run` has existed since migration 0005 to hold its results. Nothing writes it. The scheduler registers nine jobs — `relay_drain`, `snapshot_incremental`, `snapshot_full`, `expiry_sweep`, `notify_dispatch`, `notify_prune`, `expense_post`, `tenant_deletion_watch`, `notify_approvals` — and none of them is this one, so the table is empty in every deployment and the half of Q1 that was supposed to catch what the missing foreign keys cannot was never delivered. Recorded as a gap and not fixed in the same breath because what it should CHECK is a real question: a snapshot row naming an ERP record that no longer exists is the obvious case and is also the expected steady state of a full sweep against a system that keeps no per-record tombstone, so an orphan count that is always non-zero teaches nobody anything. | us | _set a date_ |
 | **Migration 0001 says the CRM reads ERP master data over SQL. It does not, and the grant it takes is unused.** The precondition refuses to run without `meta.operate_entity_records` and errors with "the CRM reads ERP master data over SQL and grants itself SELECT on that table", then issues `GRANT SELECT ON meta.operate_entity_records TO crm_app`. No CRM code selects from it: the only occurrences of that name in `packages/` are two test fixtures quoting an ERP unique-constraint message. Every read goes over HTTP through `ErpClient`, which is what Q5's "entity names, not tables" (R17) decided and what the live gate exercises. The ERP's ADR-0314 retires the premise permanently: a tenant serving an activated manifest is now served from its OWN schema, so the SQL path would read zero rows for them — silently, under a fail-closed rule that reads an empty set as "no products". Because we read over HTTP this is transparent to us and 0314 costs us nothing; the hazard is the grant and the sentence, which invite exactly the thing ADR-0001 forbids. Removing both is small, and the one question worth answering first is whether the precondition should check something else instead — "is an ERP in this database at all" is still a thing worth refusing to boot without. | us | _set a date_ |
 | **The live gate verifies against whatever ERP commit the checkout happens to hold, and records which one nowhere.** `scripts/verify-live-erp.sh` builds and boots the real ERP out of `/home/user/CrossEngin` and runs 125 checks against it, which is the strongest evidence in this repository — and on 2026-10-06 that checkout was 11 commits behind `origin/main` (at #185 against #196), so every "verified live" claim was made against an ERP two days stale and nothing said so. Nothing in the gate reads, pins or prints the ERP's `git rev-parse HEAD`. The claims themselves survived — the six ERP-side facts this ADR depends on (no filterable `updated_at`, the empty `WhtCertificate` access lists, the conditional tenant cross-check, the bodiless idempotent replay, the lenient `decimal` validator, the array in `invalid_settings.detail`) were each re-read on `origin/main` and are unchanged — but that was luck, confirmed afterwards, not a property of the gate. Printing the ERP's commit in the gate's output costs one line; deciding whether a stale checkout should FAIL it is the actual question, and it turns on whether this repo wants to track the ERP's main or a pinned revision. | us | _set a date_ |
 | **The CRM has the vocabulary as of migration 0051, and 19 of its 39 tenant-scoped tables are now VISIBLY undecided rather than silently so.** 0050's own header says why: `crm.expense_claim` may be a statutory accounting record, so a deletion that destroys it is as wrong as one that keeps everything, and the CRM cannot decide that for itself. The ERP solved the same shape with `retentionObligation` on a `DeletionAttestation` — "we did not delete this, and here is the law that says so" — and ADR-0316 is worth quoting on what it costs to lack it: the contracts were already right and "there was nothing that could PRODUCE the truth to put in it". The CRM is in that exact position one layer out. What is owed is a per-table decision (erase, retain-with-obligation, or anonymise) and something that composes those into a proof a data subject could be shown. Until then a stopped tenant's rows sit indefinitely, which is a lawful holding position and not an answer. WHAT CLOSED IT: `crm.data_disposition`, one row per tenant-scoped table saying `erase`, `retain` with a lawful basis, or `undecided` with the question — built on ADR-0317's rule verbatim, and complete by construction rather than by diligence. `crm.undeclared_tenant_tables()` is derived from `pg_catalog`, the migration refuses to apply while it is non-empty, and a test fails the day a new tenant-scoped table arrives without a decision. `undecided` is first-class for the reason that makes the whole design work: a table with no row is silence and refuses with "nobody looked at this", where a declared `undecided` refuses with the QUESTION, which is the difference between a bug and an agenda item. The five overlapping obligation codes are the ERP's own spellings and `verify-live-erp.sh` greps the ERP's source to keep them that way; `drug_sample_custody` carries no period because the period is jurisdictional and lives in the row's note. `crm-erasure plan` produces a plan and NEVER a tombstone — composing one before anything is erased would be ADR-0317's "correct proof of a false claim" — and it is a CLI rather than a route because 0050 makes the tenant's own API refuse every request for it, which is correct and leaves no HTTP surface that may answer. WHAT IS STILL OPEN is now two separable things, below: the 19 answers, and the execution that earns a tombstone. | us + Compliance | **closed 2026-10-06** |
