@@ -9,7 +9,7 @@ import {
   TENANT_API as TENANT,
   TENANT_API_OTHER as OTHER,
   fixtureAuthor,
-  wipeConfigChanges,
+  wipeProposals,
   wipeEndpoints,
   withFixtureAttribution,
 } from "@crm/db/testing";
@@ -173,8 +173,9 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.account_snapshot WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.product_snapshot WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.warehouse_snapshot WHERE tenant_id = $1", [t]);
-        // And 0061's configuration log before the reps who signed it, ON DELETE RESTRICT.
-        await wipeConfigChanges(tx, t);
+        // And 0061's configuration log and 0062's proposals before the reps who signed them,
+        // ON DELETE RESTRICT — and the logs reference the proposal, so the order is fixed.
+        await wipeProposals(tx, t);
         await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [t]);
       });
     }
@@ -2872,6 +2873,136 @@ describe("the API, end to end", () => {
   });
 
   /**
+   * Re-pointing where a category of field spend posts — the other change that takes two
+   * people (0062).
+   *
+   * Creating a mapping is one signature, because a category that posts nowhere cannot post
+   * wrongly and requiring two people to write a tenant's first mapping would mean it cannot
+   * start claiming at all. CHANGING one is two, because every claim posted afterwards lands
+   * in the new account and pointing it back does not move them.
+   *
+   * The administrator grant on both sides here, not compliance: the register says this column
+   * answers to `administrator`, and the suite above proves the routes read the grant off the
+   * proposal rather than assuming one.
+   */
+  describe("re-pointing an expense category", () => {
+    const admin1 = token({ sub: "idp|rep1" });
+    const admin2 = token({ sub: "idp|rep2" });
+
+    const twoAdministrators = async (): Promise<void> => {
+      await withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+           VALUES ($1,$2,'administrator',$4,CURRENT_DATE), ($1,$3,'administrator',$4,CURRENT_DATE)`,
+          [TENANT, rep, otherRep, manager],
+        ),
+      );
+    };
+
+    it("maps a category on one signature and re-points it on two", async () => {
+      await twoAdministrators();
+      const created = await call("PUT", "/v1/admin/expense-accounts/congress", {
+        body: { erpLedgerAccountCode: "6200", erpCostCenterCode: "CC-SM", reason: "Finance named the congress account" },
+        auth: admin1,
+      });
+      expect(created.status).toBe(200);
+      expect(created.body.erp_ledger_account_code).toBe("6200");
+
+      const proposed = await call("PUT", "/v1/admin/expense-accounts/congress", {
+        body: { erpLedgerAccountCode: "6300", reason: "Finance split congress into its own account" },
+        auth: admin1,
+      });
+      expect(proposed.status).toBe(202);
+      expect(proposed.body.four_eyes_columns).toEqual(["erp_ledger_account_code"]);
+      expect(proposed.body.row_key).toMatchObject({ crm_category: "congress" });
+      // THE WHOLE INTENDED ROW is carried, not only the column needing approval: the upsert
+      // REPLACES the cost centre, so an approval naming only the account code would apply as
+      // a silent clearing of a dimension the approver saw on screen.
+      expect(proposed.body.changes).toEqual({
+        erp_ledger_account_code: "6300",
+        erp_cost_center_code: null,
+      });
+      // And nothing moved yet.
+      const before = (await call("GET", "/v1/admin/expense-accounts", { auth: admin1 })).body
+        .data as readonly { crm_category: string; erp_ledger_account_code: string }[];
+      expect(before.find((m) => m.crm_category === "congress")?.erp_ledger_account_code).toBe("6200");
+
+      const approved = await call("POST", `/v1/admin/four-eyes/${proposed.body.id as string}/approve`, {
+        body: { reason: "confirmed with Finance on the call" },
+        auth: admin2,
+      });
+      expect(approved.status).toBe(200);
+      expect(approved.body.applied).toMatchObject({
+        erp_ledger_account_code: "6300",
+        erp_cost_center_code: null,
+      });
+      const after = (await call("GET", "/v1/admin/expense-accounts", { auth: admin1 })).body
+        .data as readonly { crm_category: string; erp_ledger_account_code: string }[];
+      expect(after.find((m) => m.crm_category === "congress")?.erp_ledger_account_code).toBe("6300");
+      // One row, not two: an approval applies a change rather than adding a mapping.
+      expect(after.filter((m) => m.crm_category === "congress")).toHaveLength(1);
+
+      // And the configuration log names the APPROVER with the proposal behind it.
+      const log = (await call("GET", "/v1/admin/config-changes?table=expense_account_map", {
+        auth: admin1,
+      })).body.data as readonly { changed_by_name: string; changed_columns: readonly string[] }[];
+      expect(log[0]).toMatchObject({
+        changed_by_name: "Rep Two",
+        // BOTH columns, because both moved: the upsert replaced `CC-SM` with null, which the
+        // proposal carried and the approver saw. That is the whole reason a proposal names
+        // the intended ROW rather than only the column under the rule — if it named just the
+        // account code, this clearing would have happened with nobody having agreed to it.
+        changed_columns: ["erp_cost_center_code", "erp_ledger_account_code"],
+      });
+    });
+
+    it("still deactivates on one signature, because that fails safe", async () => {
+      await twoAdministrators();
+      await call("PUT", "/v1/admin/expense-accounts/congress", {
+        body: { erpLedgerAccountCode: "6200", reason: "Finance named the congress account" },
+        auth: admin1,
+      });
+      const res = await call("DELETE", "/v1/admin/expense-accounts/congress", {
+        body: { reason: "pausing congress claims until the policy is agreed" },
+        auth: admin1,
+      });
+      expect(res.status).toBe(200);
+      const all = (await call("GET", "/v1/admin/expense-accounts", { auth: admin1 })).body
+        .data as readonly { crm_category: string; is_active: boolean }[];
+      expect(all.find((m) => m.crm_category === "congress")?.is_active).toBe(false);
+    });
+
+    /**
+     * REACTIVATING AT A DIFFERENT ACCOUNT IS A RE-POINTING, and this is the case the rule
+     * would be evaded by if the route read only ACTIVE mappings: an inactive row still names
+     * an account, so bringing it back at another one moves where the category posts.
+     */
+    it("treats bringing an inactive mapping back at a new account as a re-pointing", async () => {
+      await twoAdministrators();
+      await call("PUT", "/v1/admin/expense-accounts/congress", {
+        body: { erpLedgerAccountCode: "6200", reason: "Finance named the congress account" },
+        auth: admin1,
+      });
+      await call("DELETE", "/v1/admin/expense-accounts/congress", {
+        body: { reason: "pausing congress claims until the policy is agreed" },
+        auth: admin1,
+      });
+      const res = await call("PUT", "/v1/admin/expense-accounts/congress", {
+        body: { erpLedgerAccountCode: "6300", reason: "bringing it back, pointed somewhere else" },
+        auth: admin1,
+      });
+      expect(res.status).toBe(202);
+      // And bringing it back at the SAME account is just a reactivation, on one signature.
+      const same = await call("PUT", "/v1/admin/expense-accounts/congress", {
+        body: { erpLedgerAccountCode: "6200", reason: "bringing it back exactly as it was" },
+        auth: admin1,
+      });
+      expect(same.status).toBe(200);
+      expect(same.body.is_active).toBe(true);
+    });
+  });
+
+  /**
    * Attachments over HTTP: a disbursement signature and an expense receipt.
    *
    * A 1x1 PNG, because `assertAttachmentContent` sniffs magic bytes — a base64 blob of
@@ -3329,18 +3460,29 @@ describe("the API, end to end", () => {
         expect(res.status).toBe(403);
       });
 
+      /**
+       * The GRACE PERIOD, which one officer may still set alone.
+       *
+       * This test used to move both knobs at once. Since 0062 arming the promo write-off
+       * takes two people, so the body would come back 202 with a proposal and nothing about
+       * provenance would be exercised — and provenance is what this test is for. The arming
+       * path has its own block below, where the two-person dance is the subject.
+       *
+       * Keeping ONE knob here is also the assertion 0059's reasoning turns on: "a tenant with
+       * one compliance officer cannot set its own grace period at all" was the stated reason
+       * not to four-eye this table, and 0062 had to leave that true.
+       */
       it("accepts a write from the compliance officer, and says who made it and why", async () => {
         await grant(() => rep, "compliance", () => manager);
         const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
           body: {
             graceDays: 14,
-            autoWriteoffPromo: true,
-            reason: "a fortnight from now on, and leaflets go back centrally",
+            reason: "a fortnight from now on, after the regional audit",
           },
           auth: repToken,
         });
         expect(res.status).toBe(200);
-        expect(res.body).toEqual({ grace_days: 14, auto_writeoff_promo: true });
+        expect(res.body).toEqual({ grace_days: 14, auto_writeoff_promo: false });
 
         // THE PROVENANCE, which is the whole increment. Before 0059 the write was an
         // `UPDATE … SET grace_days = 14` and this read answered two numbers: a deadline
@@ -3363,10 +3505,231 @@ describe("the API, end to end", () => {
         expect(history.body.data[0]).toMatchObject({
           grace_days_from: 30,
           grace_days_to: 14,
+          // Unmoved, and that is the point: the switch is not touched by a grace-period
+          // change, and a change that did touch it would not have been applied at all.
           auto_writeoff_promo_from: false,
-          auto_writeoff_promo_to: true,
+          auto_writeoff_promo_to: false,
           changed_by_name: "Rep One",
         });
+      });
+
+      /**
+       * ARMING THE UNATTENDED WRITE-OFF JOB, which takes two people (0062).
+       *
+       * The route answers 202 with a proposal rather than 200 with a policy, and that is the
+       * whole shape: not refused, because a refusal leaves the officer with nothing to do but
+       * try again, and not applied, because that is the rule. Then a second officer approves,
+       * and the approval is what performs the write.
+       *
+       * Driven over HTTP end to end because the division of labour is the claim: the route
+       * reads the live policy to decide whether anything four-eyed is MOVING, the database
+       * refuses the write if the transaction does not name an approved proposal for exactly
+       * those values, and the store function is the same one the single-signature path uses.
+       */
+      it("turns an arming into a proposal rather than applying it", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { autoWriteoffPromo: true, reason: "the leaflet volumes have outgrown the manual process" },
+          auth: repToken,
+        });
+        expect(res.status).toBe(202);
+        expect(res.body.table_name).toBe("disposal_policy");
+        expect(res.body.four_eyes_columns).toEqual(["auto_writeoff_promo"]);
+        expect(res.body.changes).toEqual({ auto_writeoff_promo: true });
+        expect(res.body.decision).toBeNull();
+        expect(res.body.proposed_by_name).toBe("Rep One");
+
+        // AND NOTHING HAS CHANGED, which is the half a 202 could otherwise hide.
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.auto_writeoff_promo).toBe(false);
+        expect((await call("GET", "/v1/samples/disposal-policy/history")).body.data).toEqual([]);
+
+        // Nobody else holds the grant yet, so the proposal says it cannot move. A tenant with
+        // one compliance officer cannot arm this job — which is the point of the rule for this
+        // switch — and the number is how a screen says so instead of leaving it to be inferred.
+        expect(res.body.eligible_deciders).toBe(0);
+      });
+
+      it("refuses an approval from the rep who asked, which is what two people means", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        const proposed = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { autoWriteoffPromo: true, reason: "asking to arm the promo write-off" },
+          auth: repToken,
+        });
+        const res = await call("POST", `/v1/admin/four-eyes/${proposed.body.id as string}/approve`, {
+          body: { reason: "approving my own request, which cannot be right" },
+          auth: repToken,
+        });
+        expect(res.status).toBe(409);
+        expect(res.body.detail).toMatch(/four-eyes-same-person/);
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.auto_writeoff_promo).toBe(false);
+      });
+
+      it("applies it when a second officer approves, and records both of them", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        await grant(() => otherRep, "compliance", () => manager);
+        const proposed = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { autoWriteoffPromo: true, reason: "the leaflet volumes have outgrown the manual process" },
+          auth: repToken,
+        });
+        expect(proposed.body.eligible_deciders).toBe(1);
+
+        const approved = await call("POST", `/v1/admin/four-eyes/${proposed.body.id as string}/approve`, {
+          body: { reason: "agreed — I checked the volumes with the warehouse" },
+          auth: token({ sub: "idp|rep2" }),
+        });
+        expect(approved.status).toBe(200);
+        expect(approved.body.proposal.decision).toBe("approved");
+        expect(approved.body.proposal.decided_by_name).toBe("Rep Two");
+        // `applied_at` is stamped by the write rather than promised by the approval, so a
+        // response that said null here would be the screen's only evidence disagreeing with
+        // the database.
+        expect(approved.body.proposal.applied_at).not.toBeNull();
+
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.auto_writeoff_promo).toBe(true);
+        const history = (await call("GET", "/v1/samples/disposal-policy/history")).body
+          .data as readonly { changed_by_name: string; auto_writeoff_promo_to: boolean }[];
+        expect(history).toHaveLength(1);
+        // THE AUTHOR OF RECORD IS THE APPROVER, and the proposal names who asked: before Rep
+        // Two acted, nothing had changed.
+        expect(history[0]).toMatchObject({ changed_by_name: "Rep Two", auto_writeoff_promo_to: true });
+
+        // And the approval is spent: the same proposal cannot re-arm it after a disarm.
+        await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { autoWriteoffPromo: false, reason: "stopping it again, which takes one person" },
+          auth: repToken,
+        });
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.auto_writeoff_promo).toBe(false);
+        const replay = await call("POST", `/v1/admin/four-eyes/${proposed.body.id as string}/approve`, {
+          body: { reason: "trying to re-arm it on the old approval" },
+          auth: token({ sub: "idp|rep2" }),
+        });
+        expect(replay.status).toBe(409);
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.auto_writeoff_promo).toBe(false);
+      });
+
+      /**
+       * WHOEVER CAN APPROVE IS TOLD. A proposal nobody is notified about waits for somebody to
+       * go looking, which is how an approval queue becomes a reason to go back to the psql
+       * prompt this whole lineage exists to get away from.
+       */
+      it("tells the other officers, and never the one who asked", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        await grant(() => otherRep, "compliance", () => manager);
+        await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { autoWriteoffPromo: true, reason: "asking to arm the promo write-off" },
+          auth: repToken,
+        });
+        const theirs = (await call("GET", "/v1/notifications", { auth: token({ sub: "idp|rep2" }) }))
+          .body.data as readonly { kind: string; subject: string }[];
+        expect(theirs.map((n) => n.kind)).toContain("config_change_awaiting_approval");
+        expect(theirs.find((n) => n.kind === "config_change_awaiting_approval")?.subject).toContain(
+          "Rep One",
+        );
+        const mine = (await call("GET", "/v1/notifications")).body.data as readonly {
+          kind: string;
+        }[];
+        expect(mine.map((n) => n.kind)).not.toContain("config_change_awaiting_approval");
+      });
+
+      it("lets a second officer reject it, and the proposer withdraw it", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        await grant(() => otherRep, "compliance", () => manager);
+        const ask = async (reason: string): Promise<string> => {
+          const res = await call("PUT", "/v1/admin/samples/disposal-policy", {
+            body: { autoWriteoffPromo: true, reason },
+            auth: repToken,
+          });
+          expect(res.status).toBe(202);
+          return res.body.id as string;
+        };
+
+        const first = await ask("asking while the audit is still open");
+        const rejected = await call("POST", `/v1/admin/four-eyes/${first}/reject`, {
+          body: { reason: "not while the regional audit is open" },
+          auth: token({ sub: "idp|rep2" }),
+        });
+        expect(rejected.status).toBe(200);
+        expect(rejected.body.decision).toBe("rejected");
+
+        const second = await ask("asking again, then thinking better of it");
+        // A proposer who changes their mind WITHDRAWS; only somebody else rejects. Without the
+        // distinction a reader counting refused changes could not tell a disagreement from a
+        // second thought.
+        expect(
+          (
+            await call("POST", `/v1/admin/four-eyes/${second}/reject`, {
+              body: { reason: "rejecting my own, which is the wrong verb" },
+              auth: repToken,
+            })
+          ).status,
+        ).toBe(409);
+        const withdrawn = await call("POST", `/v1/admin/four-eyes/${second}/withdraw`, {
+          body: { reason: "on reflection, after the quarter closes" },
+          auth: repToken,
+        });
+        expect(withdrawn.body.decision).toBe("withdrawn");
+
+        // Both survive in the register, because a refusal is as much a fact as an approval —
+        // and neither is in the queue.
+        const all = (await call("GET", "/v1/admin/four-eyes", { auth: repToken })).body
+          .data as readonly { decision: string }[];
+        expect(all.map((p) => p.decision).sort()).toEqual(["rejected", "withdrawn"]);
+        expect(
+          (await call("GET", "/v1/admin/four-eyes?pending=true", { auth: repToken })).body.data,
+        ).toEqual([]);
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.auto_writeoff_promo).toBe(false);
+      });
+
+      /**
+       * EVERY ROUTE ANSWERS TO THE GRANT THE PROPOSAL NAMES, not to a fixed role. The disposal
+       * policy answers to `compliance` and the expense account map to `administrator`, so a
+       * route with one `requireRole` would either let an administrator approve an SOP change or
+       * let a compliance officer re-point a ledger account.
+       */
+      it("will not let an administrator approve a compliance change", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        await grant(() => otherRep, "administrator", () => manager);
+        const proposed = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { autoWriteoffPromo: true, reason: "asking to arm the promo write-off" },
+          auth: repToken,
+        });
+        const res = await call("POST", `/v1/admin/four-eyes/${proposed.body.id as string}/approve`, {
+          body: { reason: "an administrator signing off an SOP parameter" },
+          auth: token({ sub: "idp|rep2" }),
+        });
+        expect(res.status).toBe(403);
+        expect(res.body.detail).toContain("compliance");
+        expect((await call("GET", "/v1/samples/disposal-policy")).body.auto_writeoff_promo).toBe(false);
+      });
+
+      it("publishes the register of what takes two people, to every rep", async () => {
+        const res = await call("GET", "/v1/four-eyes-rules");
+        expect(res.status).toBe(200);
+        const rules = res.body.data as readonly {
+          table_name: string;
+          column_name: string;
+          direction: string;
+          role: string;
+        }[];
+        expect(rules.map((r) => `${r.table_name}.${r.column_name}`)).toEqual([
+          "disposal_policy.auto_writeoff_promo",
+          "expense_account_map.erp_ledger_account_code",
+        ]);
+        // Open to every rep on purpose: an administrator who can SEE that re-pointing an
+        // account needs a colleague asks for one instead of meeting the rule as a refusal.
+        expect(rules.find((r) => r.column_name === "auto_writeoff_promo")?.direction).toBe("to_true");
+      });
+
+      it("keeps the queue to the holders of either grant", async () => {
+        expect((await call("GET", "/v1/admin/four-eyes")).status).toBe(403);
+        await grant(() => rep, "compliance", () => manager);
+        expect((await call("GET", "/v1/admin/four-eyes", { auth: repToken })).status).toBe(200);
+        await grant(() => otherRep, "administrator", () => manager);
+        // An administrator who cannot see a stuck SOP change has no way to know a second
+        // compliance officer needs appointing, which is the one act that unblocks it.
+        expect(
+          (await call("GET", "/v1/admin/four-eyes", { auth: token({ sub: "idp|rep2" }) })).status,
+        ).toBe(200);
       });
 
       it("says nobody set it when nobody has", async () => {

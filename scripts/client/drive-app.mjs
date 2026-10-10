@@ -224,6 +224,31 @@ function policyChangeRows() {
 }
 
 /**
+ * 0062's proposals, read from outside the app.
+ *
+ * What the screen renders and what two people actually agreed to are two claims, and only the
+ * second is the record an inspector reads. `applied_at` is the one that matters most here: an
+ * approval and the change it authorised are stamped by the same statement, so a row that is
+ * approved and unapplied would mean they had come apart.
+ */
+function proposalRows() {
+  const out = sql(
+    `SELECT p.table_name, array_to_string(p.four_eyes_columns, ','), p.changes::text,
+            pr.display_name, p.proposed_reason,
+            coalesce(p.decision, ''), coalesce(dr.display_name, ''), coalesce(p.decided_reason, ''),
+            (p.applied_at IS NOT NULL)::text
+       FROM crm.config_proposal p
+       JOIN crm.rep_profile pr ON pr.id = p.proposed_by
+       LEFT JOIN crm.rep_profile dr ON dr.id = p.decided_by
+      WHERE p.tenant_id = '${tenant}' ORDER BY p.proposed_at DESC, p.id DESC`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [table, columns, changes, who, why, decision, decidedBy, decidedWhy, applied] = line.split("|");
+    return { table, columns, changes, who, why, decision, decidedBy, decidedWhy, applied };
+  });
+}
+
+/**
  * 0061's generic configuration log, read from outside the app.
  *
  * The same discipline as `policyChangeRows` above and for a sharper reason: this log is
@@ -1611,6 +1636,239 @@ async function main() {
       await graceConfig.screenshot(join(work, "app-28-config-history-denied.png"));
     } finally {
       await configBrowser.close();
+    }
+
+    // ---- 22. the change that takes two people ------------------------------
+    // 0062. Everything above this point in the policy chapters is one person's signature: an
+    // officer changes the grace period, it is recorded, done. Two settings in this schema are
+    // not like that, and arming the automatic promotional write-off is one of them — it is the
+    // only setting that lets a scheduled job remove material from a balance with no person
+    // involved, which is the very sweep §19 exercised.
+    //
+    // DRIVEN THROUGH THE SCREENS, on TWO devices, because the rule is about two people and a
+    // single browser profile cannot show that. Ada asks on hers; Grace approves on her own,
+    // with her own IndexedDB and her own session.
+    const bothCompliance = () => {
+      // Grace needs the grant too. Granted BY Ada, which is 0023's rule — nobody grants
+      // themselves one — and the same bootstrap shape a real tenant has.
+      sql(`INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+           SELECT '${tenant}', g.id, 'compliance', a.id, CURRENT_DATE - 1, 'the live gate needs a second officer'
+             FROM crm.rep_profile a, crm.rep_profile g
+            WHERE a.subject = 'rep-ada' AND g.subject = 'rep-grace'
+              AND NOT EXISTS (SELECT 1 FROM crm.rep_role r WHERE r.tenant_id = '${tenant}'
+                               AND r.rep_profile_id = g.id AND r.role = 'compliance' AND r.valid_to IS NULL)`);
+    };
+
+    is(policyRow()?.promo, "f", "the automatic promotional write-off is off, as it ships");
+
+    // Ada asks for it on her own device, through the same form §20 used.
+    await page.click("#refresh");
+    await page.waitFor(`document.querySelector("#edit-policy") !== null`, { timeoutMs: 20_000, label: "the change button" });
+    await page.click("#edit-policy");
+    await page.waitFor(`document.querySelector("#policy-form") !== null`, { label: "the policy form" });
+    await page.evaluate(`
+      document.querySelector('#policy-form select[name="autoWriteoffPromo"]').value = "yes";
+      return true;`);
+    await page.fill(`#policy-form input[name="reason"]`, "the leaflet volumes have outgrown the manual process");
+    await page.click("#save-policy");
+    await page.waitFor(`/Asked for, not yet in force/.test(document.querySelector("p.warn")?.textContent ?? "")`,
+      { timeoutMs: 20_000, label: "the proposal's answer" });
+
+    const asked = proposalRows();
+    is(asked.length, 1, "one proposal in crm.config_proposal");
+    is(asked[0]?.columns, "auto_writeoff_promo", "naming the column that needed a second person");
+    is(asked[0]?.who, "Ada Lovelace", "attributed to the officer in the token, never to a name in the body");
+    is(asked[0]?.decision, "", "and undecided");
+    is(policyRow()?.promo, "f",
+      "with the switch STILL OFF — a 202 that had quietly applied the change would be the worst of the three outcomes");
+
+    // SHE CANNOT APPROVE HER OWN, and the screen does not offer it. The server refuses it too,
+    // which is the half a screen can never enforce.
+    await page.click("#refresh");
+    await page.waitFor(`/Waiting for a second signature/.test(document.body.textContent ?? "")`,
+      { timeoutMs: 20_000, label: "her own queue" });
+    const hers = await page.evaluate(`
+      const h = [...document.querySelectorAll("h2")].find((x) => /Waiting for a second signature/.test(x.textContent ?? ""));
+      const sec = h?.parentElement;
+      return {
+        text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
+        canApprove: sec?.querySelector("button[data-approve]") !== null,
+        canWithdraw: sec?.querySelector("button[data-withdraw]") !== null,
+      };`);
+    is(hers.canApprove, false, "the officer who asked is offered no approve button on her own request");
+    is(hers.canWithdraw, true, "only withdraw, which is hers alone — rejecting is somebody else saying no");
+    is(/Nobody in this tenant can approve this yet/.test(String(hers.text)), true,
+      "and she is told why it cannot move: there is no second compliance officer yet");
+    // The id comes from the QUEUE ROUTE rather than from psql, because the next few checks are
+    // about what a client holding that id can and cannot do with it.
+    const firstProposalId = await page.evaluate(`
+      const s = JSON.parse(localStorage.getItem("crm.field.session"));
+      const res = await fetch("/v1/admin/four-eyes?pending=true", {
+        headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)} },
+      });
+      return (await res.json()).data[0].id;`);
+    const selfApproved = await page.evaluate(`
+      const s = JSON.parse(localStorage.getItem("crm.field.session"));
+      const res = await fetch("/v1/admin/four-eyes/" + ${JSON.stringify("PROPOSAL_ID")} + "/approve", {
+        method: "POST",
+        headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)}, "content-type": "application/json" },
+        body: JSON.stringify({ reason: "approving my own request, which cannot be right" }),
+      });
+      return { status: res.status, body: await res.text() };
+    `.replace(JSON.stringify("PROPOSAL_ID"), JSON.stringify(firstProposalId)));
+    is(selfApproved.status, 409, "and the server refuses her even when the screen is bypassed");
+    is(/four-eyes-same-person/.test(String(selfApproved.body)), true, "naming the rule rather than a generic conflict");
+    is(policyRow()?.promo, "f", "with the switch still off");
+    // NOBODY WAS TOLD, because there was nobody to tell — which is a limitation worth
+    // measuring rather than a bug: the signal goes to whoever can approve AT THE MOMENT a
+    // proposal is made, so a tenant that appoints its second officer afterwards gets no
+    // notification and finds the request in the queue instead. Recorded as open.
+    is(Number(sql(`SELECT count(*) FROM crm.notification
+                    WHERE tenant_id = '${tenant}' AND kind = 'config_change_awaiting_approval'`).trim()), 0,
+      "and nobody was notified, because at that moment nobody in the tenant could approve it");
+    await shot("29-four-eyes-asked");
+
+    // SHE TAKES IT BACK, which is hers alone and is the only exit from a request nobody can
+    // act on. Rejecting is somebody else saying no; this is a second thought, and the register
+    // keeps the two apart.
+    await page.evaluate(`
+      document.querySelector('[name^="reason-"]').value = "withdrawing it until there is a second officer";
+      return true;`);
+    await page.click("button[data-withdraw]");
+    await page.waitFor(`/Withdrawn\\. Nothing changed/.test(document.querySelector("p.good")?.textContent ?? "")`,
+      { timeoutMs: 20_000, label: "the withdrawal" });
+    is(proposalRows()[0]?.decision, "withdrawn", "the request is withdrawn");
+    is(proposalRows()[0]?.decidedBy, "Ada Lovelace", "by the officer who made it, which is the only person who may");
+    is(policyRow()?.promo, "f", "and nothing changed");
+
+    // NOW A SECOND OFFICER EXISTS, and Ada asks again. This time somebody can be told.
+    bothCompliance();
+    await page.click("#refresh");
+    await page.waitFor(`document.querySelector("#edit-policy") !== null`, { timeoutMs: 20_000, label: "the change button again" });
+    await page.click("#edit-policy");
+    await page.waitFor(`document.querySelector("#policy-form") !== null`, { label: "the policy form again" });
+    await page.evaluate(`
+      document.querySelector('#policy-form select[name="autoWriteoffPromo"]').value = "yes";
+      return true;`);
+    await page.fill(`#policy-form input[name="reason"]`, "asking again now there is a second officer to agree");
+    await page.click("#save-policy");
+    await page.waitFor(`/Asked for, not yet in force/.test(document.querySelector("p.warn")?.textContent ?? "")`,
+      { timeoutMs: 20_000, label: "the second proposal" });
+    const pending = proposalRows().filter((r) => r.decision === "");
+    is(pending.length, 1, "one proposal waiting");
+    is(proposalRows().length, 2, "and the withdrawn one is still in the record, because a second thought is a fact too");
+    const proposalId = await page.evaluate(`
+      const s = JSON.parse(localStorage.getItem("crm.field.session"));
+      const res = await fetch("/v1/admin/four-eyes?pending=true", {
+        headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)} },
+      });
+      return (await res.json()).data[0].id;`);
+
+    // GRACE, on her own device, with her own IndexedDB and her own session.
+    const approverBrowser = await launchBrowser();
+    const graceApproves = await newPage(approverBrowser);
+    try {
+      await graceApproves.goto(appUrl);
+      await graceApproves.waitFor(`document.querySelector("#app")?.getAttribute("aria-busy") === "false"`, { label: "Grace's fifth device to boot" });
+      await graceApproves.fill("#dev-token", token2);
+      await graceApproves.fill("#dev-tenant", tenant);
+      await graceApproves.click("#dev-login");
+      await graceApproves.waitFor(`/Waiting for a second signature/.test(document.body.textContent ?? "")`,
+        { timeoutMs: 20_000, label: "the queue on Grace's device" });
+
+      const queue = await graceApproves.evaluate(`
+        const h = [...document.querySelectorAll("h2")].find((x) => /Waiting for a second signature/.test(x.textContent ?? ""));
+        const sec = h?.parentElement;
+        return {
+          text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
+          canApprove: sec?.querySelector("button[data-approve]") !== null,
+          canWithdraw: sec?.querySelector("button[data-withdraw]") !== null,
+        };`);
+      is(queue.canApprove, true, "the second officer is offered the approval");
+      is(queue.canWithdraw, false, "and not a withdrawal, which belongs to whoever asked");
+      is(/auto_writeoff_promo: true/.test(String(queue.text)), true,
+        `with what it would change, spelled as the database spells it (${String(queue.text).slice(0, 90)})`);
+      is(/Ada Lovelace/.test(String(queue.text)), true, "who asked");
+      is(/now there is a second officer/.test(String(queue.text)), true, "and why, in her own words");
+
+      // AND SHE IS TOLD, rather than having to think to look. A proposal nobody is notified
+      // about waits for somebody to go looking, which is how an approval queue becomes a
+      // reason to go back to the psql prompt.
+      const told = await graceApproves.evaluate(`
+        const s = JSON.parse(localStorage.getItem("crm.field.session"));
+        const res = await fetch("/v1/notifications", {
+          headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)} },
+        });
+        return (await res.json()).data.map((n) => n.kind + "|" + n.subject);
+      `);
+      is(told.some((n) => n.startsWith("config_change_awaiting_approval|")), true,
+        `the second officer has a notification about it (${String(told.find((n) => n.startsWith("config_change")) ?? "none").slice(0, 80)})`);
+
+      // A decision with no reason is refused at the keyboard, with the typed value kept.
+      await graceApproves.click("button[data-approve]");
+      let noReason = null;
+      for (let i = 0; i < 50; i += 1) {
+        noReason = await graceApproves.evaluate(`return document.querySelector("p.error")?.textContent?.trim() ?? null;`);
+        if (noReason !== null && /Say why/.test(String(noReason))) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      is(/Say why, in a sentence/.test(String(noReason)), true,
+        `an approval with no reason is refused on the device (${String(noReason).slice(0, 60)})`);
+      is(proposalRows()[0]?.decision, "", "with nothing decided");
+
+      await graceApproves.evaluate(`
+        document.querySelector('[name^="reason-"]').value = "agreed — I checked the volumes with the warehouse";
+        return true;`);
+      await graceApproves.click("button[data-approve]");
+      await graceApproves.waitFor(`/Approved, and the change is made/.test(document.querySelector("p.good")?.textContent ?? "")`,
+        { timeoutMs: 20_000, label: "the applied approval" });
+
+      const decided = proposalRows();
+      is(decided[0]?.decision, "approved", "the proposal is approved");
+      is(decided[0]?.decidedBy, "Grace Hopper", "by the second officer, from her token");
+      is(/checked the volumes/.test(String(decided[0]?.decidedWhy)), true, "with her own reason beside Ada's");
+      is(decided[0]?.applied, "true",
+        "and APPLIED — stamped by the write itself, so an approval and the change it authorised cannot come apart");
+      is(policyRow()?.promo, "t", "the switch is on, which it could not be on one signature");
+
+      // The log names the APPROVER and points at the agreement. Before Grace acted, nothing
+      // had changed — which is what every other `*_by` column in this schema means.
+      const changes = policyChangeRows();
+      is(changes[0]?.who, "Grace Hopper", "the policy's own log names whoever made the change true");
+      is(Number(sql(`SELECT count(*) FROM crm.disposal_policy_change
+                      WHERE tenant_id = '${tenant}' AND proposal_id IS NOT NULL`).trim()), 1,
+        "linked to the proposal structurally, not mentioned in prose");
+
+      // AND THE APPROVAL IS SPENT. One person turns it off again — which needs nobody, because
+      // that direction only ever means a person must record each write-off — and the same
+      // approval cannot put it back.
+      const disarmed = await graceApproves.evaluate(`
+        const s = JSON.parse(localStorage.getItem("crm.field.session"));
+        const res = await fetch("/v1/admin/samples/disposal-policy", {
+          method: "PUT",
+          headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)}, "content-type": "application/json" },
+          body: JSON.stringify({ autoWriteoffPromo: false, reason: "stopping it again after the review" }),
+        });
+        return res.status;`);
+      is(disarmed, 200, "turning it off takes one signature and is applied, not proposed");
+      is(policyRow()?.promo, "f", "so it is off again");
+      const replay = await graceApproves.evaluate(`
+        const s = JSON.parse(localStorage.getItem("crm.field.session"));
+        const res = await fetch("/v1/admin/four-eyes/" + ${JSON.stringify(proposalId)} + "/approve", {
+          method: "POST",
+          headers: { authorization: "Bearer " + s.accessToken, "x-tenant-id": ${JSON.stringify(tenant)}, "content-type": "application/json" },
+          body: JSON.stringify({ reason: "trying to re-arm it on the approval we already used" }),
+        });
+        return { status: res.status, body: await res.text() };`);
+      // 409, and naming WHICH rule: a decision cannot be retaken, and the approval it carried
+      // was spent by the write it let through.
+      is(replay.status, 409, `the spent approval cannot re-arm it (${String(replay.status)})`);
+      is(/four-eyes-decided|config-proposal/.test(String(replay.body)), true,
+        `naming the rule rather than a generic conflict (${String(replay.body).slice(0, 90)})`);
+      is(policyRow()?.promo, "f", "with the switch still off");
+      await graceApproves.screenshot(join(work, "app-30-four-eyes-approved.png"));
+    } finally {
+      await approverBrowser.close();
     }
 
     // ---- 20. the ERP deletes the tenant, and the queue STOPS ---------------

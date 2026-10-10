@@ -149,6 +149,32 @@ export async function activeAccountMapping(
 }
 
 /**
+ * ANY mapping for a category, active or not.
+ *
+ * Exists because 0062 asks a question the function above cannot answer: does this category
+ * already post somewhere? An INACTIVE row still does — reactivating it through an upsert
+ * fires the UPDATE path, so changing its account code while bringing it back is a
+ * re-pointing and needs two people. Reading only active rows would read that as a creation
+ * and let it through on one signature, which is the whole of the rule it would be evading.
+ *
+ * Deliberately NOT a flag on `activeAccountMapping`: that function's contract is "what the
+ * submit path will use", and a caller passing `includeInactive` to it would get a mapping
+ * that cannot post.
+ */
+export async function anyAccountMapping(
+  tx: PoolClient,
+  tenantId: string,
+  crmCategory: string,
+): Promise<AccountMapping | null> {
+  const { rows } = await tx.query<AccountMapping>(
+    `SELECT ${MAPPING_COLUMNS} FROM crm.expense_account_map
+      WHERE tenant_id = $1 AND crm_category = $2`,
+    [tenantId, crmCategory],
+  );
+  return rows[0] ?? null;
+}
+
+/**
  * The active mapping, or the refusal that names what Finance has to do.
  *
  * The one place the Finance blocker is turned into a sentence. `submitClaim` calls this

@@ -48,6 +48,20 @@ export const NOTIFICATION_KINDS = [
    * above joined it.
    */
   "expense_post_blocked",
+  /**
+   * Somebody asked for a configuration change they cannot make alone (0062).
+   *
+   * The same shape as `call_plan_submitted` above and for the same reason: a request waiting
+   * on a second person is a request that needs the second person TOLD. Goes to every other
+   * holder of the grant the change answers to — the compliance officers for arming the
+   * unattended write-off job, the administrators for re-pointing a ledger account — and
+   * never to whoever asked, who already knows.
+   *
+   * Without it the approval queue is a screen somebody has to think to visit, which is how a
+   * four-eyes rule becomes a reason to go back to the psql prompt that this whole lineage
+   * exists to get away from.
+   */
+  "config_change_awaiting_approval",
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 

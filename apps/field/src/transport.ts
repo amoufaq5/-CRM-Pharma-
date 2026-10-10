@@ -6,6 +6,7 @@ import {
   type CountBody,
   type CountLineBody,
   type DisbursementBody,
+  type DecisionBody,
   type PolicyBody,
   type RecallBody,
   type ReturnBody,
@@ -176,6 +177,30 @@ export class ApiTransport implements SyncTransport {
    */
   async putDisposalPolicy(body: PolicyBody): Promise<TransportResult> {
     return this.request("PUT", "/v1/admin/samples/disposal-policy", body);
+  }
+
+  /**
+   * Decide a change that takes two people (0062).
+   *
+   * NOT QUEUED, for `putDisposalPolicy`'s reason and one more. Everything the outbox holds is
+   * a record of something that HAPPENED in the field; this is a decision about a tenant-wide
+   * rule, made at a desk. And a queued approval is worse than a queued policy change: the
+   * proposal might be withdrawn or rejected by somebody else in the meantime, so an approval
+   * that surfaced hours later could apply a change its author would no longer agree to.
+   *
+   * `approve` is the one that WRITES — the server applies the change in the same transaction —
+   * so a failure here means nothing happened, which is exactly what a caller needs to assume.
+   */
+  async decideProposal(
+    id: string,
+    decision: "approve" | "reject" | "withdraw",
+    body: DecisionBody,
+  ): Promise<TransportResult> {
+    return this.request(
+      "POST",
+      `/v1/admin/four-eyes/${encodeURIComponent(id)}/${decision}`,
+      body,
+    );
   }
 
   /**

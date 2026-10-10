@@ -4,6 +4,7 @@ import { resolve as resolvePath } from "node:path";
 import { Pool, type PoolClient } from "pg";
 
 import { withAttribution } from "./attribution.js";
+import { decideConfigProposal, proposeConfigChange } from "./four-eyes.js";
 
 /**
  * The FIXTURE connection. Connects as the admin role.
@@ -297,6 +298,18 @@ export const TENANT_CONFIG_LOG = "f0610000-0000-4000-8000-000000000027";
 export const TENANT_CONFIG_LOG_OTHER = "f1610000-0000-4000-8000-000000000028";
 
 /**
+ * packages/db — four-eyes.contract (migration 0062).
+ *
+ * Two, and the second earns its place twice: a proposal is tenant-scoped by row-level
+ * security, so the only way to assert that is for another tenant to have one this one cannot
+ * see or spend — and `crm.config_proposal_eligible_deciders` returning ZERO is a real answer
+ * that needs a tenant with exactly one holder of the grant, which no tenant that also tests
+ * the two-person path can be.
+ */
+export const TENANT_FOUR_EYES = "f0620000-0000-4000-8000-000000000029";
+export const TENANT_FOUR_EYES_LONE = "f1620000-0000-4000-8000-00000000002a";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding
@@ -343,6 +356,135 @@ export async function withFixtureAttribution<T>(
     { repProfileId: author, reason: "a fixture setting the configuration under test" },
     fn,
   );
+}
+
+/**
+ * Two reps holding a grant, so a fixture can do what takes two people (0062).
+ *
+ * The four-eyes rule needs two DIFFERENT holders of the governing grant, and `fixtureAuthor`
+ * above gives one. These are a pair, each granted the role BY THE OTHER — which is 0023's
+ * own rule (`rep_role_no_self_grant`) and the shape a real tenant bootstraps into.
+ *
+ * `WHERE NOT EXISTS` rather than `ON CONFLICT DO NOTHING`, because the constraint that would
+ * fire on a second call is an EXCLUDE over a daterange (`rep_role_no_overlap`) and
+ * `ON CONFLICT` does not cover one. A fixture that called this twice would otherwise fail on
+ * its second call with a constraint nobody reading it would expect.
+ */
+export async function fixtureApprovers(
+  tx: PoolClient,
+  tenantId: string,
+  role: "administrator" | "compliance",
+): Promise<{ readonly proposer: string; readonly approver: string }> {
+  const ids: string[] = [];
+  for (const which of ["proposer", "approver"] as const) {
+    const { rows } = await tx.query<{ id: string }>(
+      `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name, status)
+       VALUES ($1, $2, $3, $4, 'active')
+       ON CONFLICT (tenant_id, subject) DO UPDATE SET display_name = EXCLUDED.display_name
+       RETURNING id`,
+      [
+        tenantId,
+        `fixture-four-eyes-${role}-${which}`,
+        `FIXTURE-4E-${which === "proposer" ? "P" : "A"}`,
+        which === "proposer" ? "A Fixture Proposer" : "A Fixture Approver",
+      ],
+    );
+    ids.push(rows[0]!.id);
+  }
+  const [proposer, approver] = ids as [string, string];
+  for (const [holder, grantor] of [
+    [proposer, approver],
+    [approver, proposer],
+  ] as const) {
+    await tx.query(
+      `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+       SELECT $1, $2, $3, $4, CURRENT_DATE - 1, 'a fixture needs two people who may make this change'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM crm.rep_role r
+           WHERE r.tenant_id = $1 AND r.rep_profile_id = $2 AND r.role = $3
+             AND r.valid_from <= CURRENT_DATE AND (r.valid_to IS NULL OR r.valid_to > CURRENT_DATE))`,
+      [tenantId, holder, role, grantor],
+    );
+  }
+  return { proposer, approver };
+}
+
+/**
+ * Runs a fixture's write as a change two people agreed to (0062).
+ *
+ * The companion to `withFixtureAttribution` for the handful of changes a single signature
+ * cannot make: arming the unattended promo write-off, and re-pointing an expense category's
+ * ledger account. A suite whose subject is the expiry sweep needs the switch ON and is not
+ * about how it got there, so it says so in one line.
+ *
+ * IT GOES THE WHOLE WAY ROUND rather than reaching past the rule. Two reps are seeded, one
+ * proposes through the same store function the route uses, the other approves through the
+ * same database function, and `fn` runs with that proposal named — so every suite that needs
+ * a four-eyed value exercises the real path to it, and the guard is never disabled. A fixture
+ * that inserted an approved proposal directly would be a fixture asserting the mechanism it
+ * depends on.
+ *
+ * `changes` must name exactly what `fn` will write for the columns under the rule, because
+ * `crm.require_four_eyes` compares the two. That is the point rather than an inconvenience:
+ * a fixture whose approval said one thing while its write did another is the case the check
+ * exists for.
+ */
+export async function withFourEyes<T>(
+  tx: PoolClient,
+  tenantId: string,
+  input: {
+    readonly tableName: string;
+    readonly rowKey: Readonly<Record<string, unknown>>;
+    readonly changes: Readonly<Record<string, unknown>>;
+    readonly role: "administrator" | "compliance";
+  },
+  fn: (tx: PoolClient) => Promise<T>,
+): Promise<T> {
+  const { proposer, approver } = await fixtureApprovers(tx, tenantId, input.role);
+  const { proposal } = await proposeConfigChange(tx, tenantId, {
+    tableName: input.tableName,
+    rowKey: input.rowKey,
+    changes: input.changes,
+    proposedBy: proposer,
+    reason: "a fixture asking for the change under test",
+  });
+  await decideConfigProposal(
+    tx,
+    tenantId,
+    proposal.id,
+    "approved",
+    approver,
+    "a fixture agreeing to the change under test",
+  );
+  return withAttribution(
+    tx,
+    {
+      repProfileId: approver,
+      reason: "a fixture applying the change two people agreed to",
+      proposalId: proposal.id,
+    },
+    fn,
+  );
+}
+
+/**
+ * Wipes a tenant's proposals, for test cleanup only.
+ *
+ * Same shape and same reason as `wipeConfigChanges`: a proposal names both actors ON DELETE
+ * RESTRICT, so a suite that deletes its reps retires the proposals first — and the two logs
+ * reference the proposal, so they go before it. The decided-once trigger comes off because it
+ * governs an UPDATE and not a DELETE, but `crm.config_change`'s append-only one does, so this
+ * calls `wipeConfigChanges` rather than repeating it.
+ */
+export async function wipeProposals(tx: PoolClient, tenantId: string): Promise<void> {
+  await wipeConfigChanges(tx, tenantId);
+  await tx.query("ALTER TABLE crm.disposal_policy_change DISABLE TRIGGER USER");
+  try {
+    await tx.query("DELETE FROM crm.disposal_policy_change WHERE tenant_id = $1", [tenantId]);
+  } finally {
+    await tx.query("ALTER TABLE crm.disposal_policy_change ENABLE TRIGGER USER");
+  }
+  await tx.query("DELETE FROM crm.config_proposal WHERE tenant_id = $1", [tenantId]);
 }
 
 /**

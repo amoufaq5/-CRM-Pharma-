@@ -229,6 +229,62 @@ Three rules are worth knowing before putting a fourth table under it:
 An administrator reads it at `GET /v1/admin/config-changes`, and sees it on the device under
 **Configuration history**.
 
+### Two of them take two people
+
+A log answers "who did this". It cannot help with a change that is **irreversible in effect
+while being perfectly reversible on paper** — the record says who armed the write-off job, and
+the stock is still gone. Two settings are like that, and migration 0062 makes each of them need
+two different people:
+
+| | | |
+|---|---|---|
+| `disposal_policy.auto_writeoff_promo` | turning it **on** | `compliance` |
+| `expense_account_map.erp_ledger_account_code` | changing it on a mapping that exists | `administrator` |
+
+**The rule is per column and directional, and the asymmetry is its content.** Four eyes to ARM
+the unattended job and one signature to disarm it; four eyes to MOVE the money and one signature
+to stop it moving. Everything else keeps one signature, and the reasons are the ones 0059 gave
+for not four-eyeing anything: a tenant with one compliance officer must be able to set its own
+grace period, or the only way round is the psql prompt this whole lineage exists to get away
+from. So deactivating a mapping is one signature (it fails safe — nothing posts wrongly),
+creating one is one signature (a category that posts nowhere cannot post wrongly, and two
+people to write a tenant's first mapping would mean it cannot start claiming at all), and
+changing a cost centre is one signature (the money still lands in the right account).
+
+**`crm.four_eyes_rule` is a table, so which changes need two people is a query** — and a
+deployment that wants four eyes on the grace period adds a row rather than a migration.
+`GET /v1/four-eyes-rules` publishes it to every rep: an administrator who can *see* that
+re-pointing an account needs a colleague asks for one instead of meeting the rule as a refusal.
+
+**A proposal is a record, and approving it is what applies it.** The write route answers **202
+with a proposal** instead of 200 with a change — not refused, because a refusal leaves the
+officer with nothing to do but try again. A second holder of the grant approves, and the
+approval performs the write in the same transaction, so there is never a window where an
+approved proposal exists and the setting has not moved. Five rules hold it together, all of them
+in the database:
+
+- **`decided_by <> proposed_by`**, written the way this schema has written four eyes since 0015.
+  A proposer who changes their mind **withdraws**; only somebody else **rejects**. Without that
+  distinction a reader counting refused changes could not tell a disagreement from a second
+  thought.
+- **An approval is good for one change.** `applied_at` is stamped by the statement that lets the
+  write through, so an approval cannot be replayed — otherwise one person could re-arm the
+  switch every time somebody else turned it off, on an approval given months ago for a
+  different occasion.
+- **It must match the row and the values.** An approval to point a category at 6200 does not
+  authorise 9999, and one about `congress` does not authorise `hospitality`.
+- **Both actors are re-checked as the write lands**, not only when the approval was given — the
+  gap between the two is exactly where a revocation falls.
+- **The author of record is the approver**, and `proposal_id` on the log row names who asked.
+  Before the approver acted, nothing had changed; both names and both reasons survive.
+
+**Whoever can approve is told.** `config_change_awaiting_approval` goes to every other holder of
+the grant, because a proposal nobody is notified about waits for somebody to think to look. And
+a tenant with one officer **cannot** arm the job — which is the point of the rule for that
+switch — so the proposal is accepted, waits, and reports `eligible_deciders: 0` rather than
+failing silently. The officer's own device shows the queue under **Waiting for a second
+signature**, with no approve button on their own request.
+
 Four rules, all of them in the database (`db/migrations/0023_roles.sql`), so a route cannot
 forget one:
 
@@ -872,7 +928,7 @@ same bypass with extra steps.
 The trigger is the layer doing the work today. The key only pins a tenant that has been
 *erased*; the trigger pins one that has been *stopped*, which is every deleted tenant from the
 moment the watcher sees the tombstone until somebody runs the erasure — a window that stays
-open while the twenty-two undecided dispositions stay undecided.
+open while the twenty-three undecided dispositions stay undecided.
 
 **It does not erase anything, and that is a decision rather than an omission.** Some of the
 CRM's copies may be records a jurisdiction requires us to keep; a deletion that destroys an
@@ -881,7 +937,7 @@ that is defensible today. The vocabulary for the other half is below.
 
 ## What happens to each table, and who decided
 
-**22 of this CRM's 45 tenant-scoped tables have no answer yet, and that is now a fact you can
+**23 of this CRM's 46 tenant-scoped tables have no answer yet, and that is now a fact you can
 read rather than a gap nobody mentioned.** Migration 0051 adds `crm.data_disposition`: one row
 per tenant-scoped table saying `erase`, `retain` with a lawful basis, or `undecided` with the
 question somebody has to answer.
@@ -1220,16 +1276,16 @@ accounts, record a visit with no network, disburse samples with a signature on g
 material to a colleague and accept theirs, count the bag, write off what has expired, send
 stock back to a depot, read the SOP parameters you are measured against — and change them, if
 you hold the compliance grant — read who changed this tenant's settings and why, if you hold
-the administrator one, watch all of it sync, read a refusal.** Roughly 70 of the 108 routes
-still have no screen — call plans, expenses, notifications, the manager's views, most of
-admin.
+the administrator one, approve or refuse a change a colleague cannot make alone, watch all of
+it sync, read a refusal.** Roughly 70 of the 113 routes still have no screen — call plans,
+expenses, notifications, the manager's views, most of admin.
 
 What it settles is the part that was a guess. Everything built for an offline device —
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **272 checks in five
-real Chromium profiles — five devices, two reps — taken offline mid-session, against the
+and `pnpm client:verify` proves it the only way that means anything: **310 checks in six
+real Chromium profiles — six devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
 - a visit recorded with the network down lands in IndexedDB, pending, with a device-minted
@@ -1322,6 +1378,18 @@ real API binary, counting rows in Postgres.** The sequence it drives:
   mentioned. Then it is on the screen as `probe_cooldown_seconds: 120 → 600` with the author
   and her sentence — and Grace, holding no grant, gets **no section at all** rather than an
   empty one, and a 403 if she asks the route directly;
+- **and the change that takes two people**, driven through the screens on two devices (0062).
+  Ada arms the automatic promotional write-off on hers: the form answers *"asked for, not yet in
+  force"*, the switch stays **off**, and her own queue offers her **no approve button** — the
+  server refuses a self-approval too, with `four-eyes-same-person`, which is the half a screen
+  can never enforce. Nobody is notified, because at that moment nobody in the tenant could
+  approve it, so she **withdraws** it — hers alone, and recorded as a second thought rather than
+  a rejection. A second officer is appointed, she asks again, and this time Grace is **told**.
+  On Grace's own device the queue names what would change (`auto_writeoff_promo: true`), who
+  asked and why; an approval with no reason is refused at the keyboard; and her approval
+  **applies** the change, with `applied_at` stamped by the write itself. The policy's log names
+  **Grace** and points at the proposal that holds Ada's half. Then one person turns the switch
+  back off — which needs nobody — and the same approval **cannot** put it back;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

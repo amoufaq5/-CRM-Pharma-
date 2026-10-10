@@ -469,6 +469,15 @@ describe("a configuration change is a record (0061)", () => {
       });
     });
 
+    /**
+     * RESTORES, which with no enclosing block is the same as leaving nothing behind.
+     *
+     * 0062 changed the mechanism from clearing to restoring, because `withFourEyes` nests one
+     * attribution block inside another and clearing would leave the outer block's writes
+     * unattributed. This test is unchanged by that and says why: with nothing set outside, the
+     * value restored is the empty string, so the guard is live again afterwards either way.
+     * The nesting case is the test below it.
+     */
     it("leaves nothing set behind it, so the next write in the transaction is unsigned", async () => {
       await inTenant(async (tx) => {
         await withAttribution(tx, { repProfileId: rep, reason: REASON }, (c) => insertBare(c, "inside"));
@@ -483,6 +492,43 @@ describe("a configuration change is a record (0061)", () => {
           tx.query("UPDATE crm.config_probe SET grace_days = 7 WHERE tenant_id = $1", [TENANT]),
         ).rejects.toThrow(/config-change-unattributed/);
       });
+    });
+
+    /**
+     * And a nested block puts the outer one back, which is the case 0061 argued could not
+     * arise — "the only thing a restore would buy is nesting, which no caller does".
+     *
+     * `withFourEyes` is that caller: a suite whose fixtures are already attributed needs one
+     * change inside them signed by two people, so it opens a block of its own. Under the
+     * clearing behaviour the write after it was refused as unattributed, in a test about the
+     * expiry sweep, which is the kind of failure that gets diagnosed three files away from
+     * its cause.
+     */
+    it("restores the enclosing block's author, so a write after a nested one is still signed", async () => {
+      await inTenant(async (tx) => {
+        await withAttribution(tx, { repProfileId: rep, reason: REASON }, async (outer) => {
+          await withAttribution(
+            outer,
+            { repProfileId: rep, reason: "an inner block with its own sentence" },
+            (inner) => insertBare(inner, "nested-inner"),
+          );
+          const { rows } = await outer.query<{ actor: string; why: string }>(
+            `SELECT current_setting($1, true) AS actor, current_setting($2, true) AS why`,
+            [ACTOR_SETTING, REASON_SETTING],
+          );
+          expect(rows[0]!.actor).toBe(rep);
+          expect(rows[0]!.why).toBe(REASON);
+          // And a real write proves it rather than the settings alone.
+          await outer.query(
+            "INSERT INTO crm.config_probe (tenant_id, knob, grace_days) VALUES ($1,'after-nested',7)",
+            [TENANT],
+          );
+        });
+      });
+      const entries = await inTenant((tx) => configChanges(tx, TENANT));
+      expect(entries.length).toBe(1);
+      expect(entries[0]!.reason).toBe(REASON);
+      expect((entries[0]!.row_key as { knob: string }).knob).toBe("after-nested");
     });
 
     it("translates the trigger's refusal into a named error", async () => {

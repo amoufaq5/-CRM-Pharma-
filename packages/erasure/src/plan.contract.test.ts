@@ -335,16 +335,19 @@ describe("retention dispositions and the erasure plan (0051)", () => {
         expect([...plan.eraseOrder].sort()).toEqual(plan.erase.map((t) => t.table).sort());
       },
     );
-    // And the register is exactly as it was: twenty-two still undecided. Nineteen at 0051,
+    // And the register is exactly as it was: twenty-three still undecided. Nineteen at 0051,
     // plus `disposal_policy_change` (0059) — the record of who changed a regulated deadline,
     // which has to be decided WITH `disposal_obligation` because retaining either alone
     // leaves a record that cannot be read — `notification_endpoint_change` (0060), which
     // poses the same question about the authorisation behind every delivery record, and
-    // `config_change` (0061), which poses it about every configuration table at once.
+    // `config_change` (0061), which poses it about every configuration table at once, and
+    // `config_proposal` (0062), which is the authority those changes rest on and so has to be
+    // decided with it — a retained change whose proposal was erased names an approver nobody
+    // can find.
     const { rows } = await client.query<{ n: string }>(
       "SELECT count(*)::text AS n FROM crm.data_disposition WHERE disposition = 'undecided'",
     );
-    expect(rows[0]!.n).toBe("22");
+    expect(rows[0]!.n).toBe("23");
   });
 
   it("counts real rows, in one snapshot", async () => {

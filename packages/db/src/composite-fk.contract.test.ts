@@ -168,6 +168,15 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   // attribution rather than one. RESTRICT, like every audit child here: a configuration
   // change whose author has been deleted is a change nobody made.
   config_change_changed_by_fkey: { table: "config_change", column: "changed_by", parent: "rep_profile", onDelete: "RESTRICT" },
+  // 0062. The two people a dangerous change took, and the link from each log row to the
+  // agreement it rests on. RESTRICT throughout, for this schema's usual reason: a proposal
+  // whose proposer or approver had been deleted would name an authority nobody can find, and
+  // a change row whose proposal had been deleted would be a four-eyed change with no second
+  // pair of eyes recorded anywhere.
+  config_proposal_proposed_by_fkey: { table: "config_proposal", column: "proposed_by", parent: "rep_profile", onDelete: "RESTRICT" },
+  config_proposal_decided_by_fkey: { table: "config_proposal", column: "decided_by", parent: "rep_profile", onDelete: "RESTRICT" },
+  config_change_proposal_fkey: { table: "config_change", column: "proposal_id", parent: "config_proposal", onDelete: "RESTRICT" },
+  disposal_policy_change_proposal_fkey: { table: "disposal_policy_change", column: "proposal_id", parent: "config_proposal", onDelete: "RESTRICT" },
 
   // 0052: the CRM's own deletion receipt, and the only reference added since 0046 dropped two.
   // RESTRICT rather than CASCADE, and for this table that is the whole point: the attestations
@@ -240,6 +249,8 @@ interface Fixture {
   readonly obl: string;
   readonly ntf: string;
   readonly endp: string;
+  /** 0062's proposal, the parent the two logs' `proposal_id` references need. */
+  readonly prop: string;
   /** An expense claim, which is what an `expense_receipt` attachment hangs off (0033). */
   readonly claim: string;
   /** That claim's receipt — the parent the four `crm.attachment` references need. */
@@ -263,6 +274,7 @@ const fixture = (p: "a" | "b"): Fixture => ({
   obl: `${p}0000000-0000-4000-8000-000000000081`,
   ntf: `${p}0000000-0000-4000-8000-000000000091`,
   endp: `${p}0000000-0000-4000-8000-0000000000a1`,
+  prop: `${p}0000000-0000-4000-8000-0000000000d1`,
   claim: `${p}0000000-0000-4000-8000-0000000000b1`,
   att: `${p}0000000-0000-4000-8000-0000000000c1`,
   // Not uuids: 0052 shapes these `crmtomb_` + 32 hex and `tomb_` + 12-40, deliberately unlike
@@ -642,6 +654,51 @@ const PROBES: Readonly<Record<string, Probe>> = {
                   'probing the composite key', ARRAY['retain_read_days'], '{}'::jsonb)`,
     params: [TENANT_FK_B, A.rep1],
   },
+  config_proposal_proposed_by_fkey: {
+    what: "a proposal asked for by another tenant's rep",
+    sql: `INSERT INTO crm.config_proposal
+            (tenant_id, table_name, row_key, changes, four_eyes_columns, role,
+             proposed_by, proposed_reason)
+          VALUES ($1, 'disposal_policy', jsonb_build_object('tenant_id', $1::uuid),
+                  '{"auto_writeoff_promo": true}'::jsonb, ARRAY['auto_writeoff_promo'],
+                  'compliance', $2, 'probing the composite key')`,
+    params: [TENANT_FK_B, A.rep1],
+  },
+  config_proposal_decided_by_fkey: {
+    what: "a proposal approved by another tenant's rep",
+    // Every decision column supplied, because `config_proposal_decision_paired` wants all
+    // four together — and the proposer is this tenant's rep so the four-eyes CHECK is
+    // satisfied and the foreign key is what answers.
+    sql: `INSERT INTO crm.config_proposal
+            (tenant_id, table_name, row_key, changes, four_eyes_columns, role,
+             proposed_by, proposed_reason, decision, decided_by, decided_at, decided_reason)
+          VALUES ($1, 'disposal_policy', jsonb_build_object('tenant_id', $1::uuid),
+                  '{"auto_writeoff_promo": true}'::jsonb, ARRAY['auto_writeoff_promo'],
+                  'compliance', $2, 'probing the composite key',
+                  'approved', $3, now(), 'probing the composite key')`,
+    params: [TENANT_FK_B, B.rep1, A.rep1],
+  },
+  config_change_proposal_fkey: {
+    what: "a configuration change resting on another tenant's proposal",
+    sql: `INSERT INTO crm.config_change
+            (tenant_id, table_name, row_key, action, changed_by, reason, changed_columns,
+             after, proposal_id)
+          VALUES ($1, 'expense_account_map', '{"tenant_id": "x"}'::jsonb, 'created', $2,
+                  'probing the composite key', ARRAY['erp_ledger_account_code'],
+                  '{}'::jsonb, $3)`,
+    params: [TENANT_FK_B, B.rep1, A.prop],
+  },
+  disposal_policy_change_proposal_fkey: {
+    what: "a policy change resting on another tenant's proposal",
+    // Every from/to column supplied, for 0059's reason restated in this file already: the
+    // probe runs with the table's user triggers off, so the trigger that fills them does not
+    // run and the NOT NULLs would answer before the foreign key could.
+    sql: `INSERT INTO crm.disposal_policy_change
+            (tenant_id, changed_by, reason, grace_days_from, grace_days_to,
+             auto_writeoff_promo_from, auto_writeoff_promo_to, proposal_id)
+          VALUES ($1, $2, 'probing the composite key', 30, 30, false, true, $3)`,
+    params: [TENANT_FK_B, B.rep1, A.prop],
+  },
   notification_endpoint_created_by_fkey: {
     what: "an endpoint opened by another tenant's rep",
     sql: `INSERT INTO crm.notification_endpoint
@@ -766,6 +823,21 @@ describe("a cross-tenant reference is refused by the database", () => {
                  'the composite-key fixture needs an endpoint to reference')`,
         [f.endp, tenant, f.rep1],
       );
+      await tx.query(
+        // A PENDING proposal, because that is all the two logs' references need and because
+        // a decided one would have to name a second rep and satisfy the four-eyes CHECK —
+        // detail this fixture does not use. `four_eyes_columns` and `role` are written out
+        // rather than taken from `crm.four_eyes_rule`: the store stamps them from the
+        // register, and a fixture that went through the register would be testing it here
+        // instead of in the suite that is about it.
+        `INSERT INTO crm.config_proposal
+           (id, tenant_id, table_name, row_key, changes, four_eyes_columns, role,
+            proposed_by, proposed_reason)
+         VALUES ($1, $2, 'disposal_policy', jsonb_build_object('tenant_id', $2::uuid),
+                 '{"auto_writeoff_promo": true}'::jsonb, ARRAY['auto_writeoff_promo'],
+                 'compliance', $3, 'the composite-key fixture needs a proposal to reference')`,
+        [f.prop, tenant, f.rep1],
+      );
       // An `expense_receipt` is the attachment purpose with no cryptographic commitment to
       // satisfy, so a draft claim is all the subject it needs — a `disbursement_signature`
       // would have to hash to whatever the ledger row committed to (0033).
@@ -827,6 +899,9 @@ describe("a cross-tenant reference is refused by the database", () => {
     // 0052: append-only, for the same reason the attachments are — a receipt whose only job is
     // being there afterwards. A fixture still has to be removable.
     "tenant_tombstone", "tenant_tombstone_attestation",
+    // 0061 and 0062, the same shape again: the configuration log is append-only and the
+    // policy's log is too, so a fixture handing back a tenant it borrowed says so.
+    "config_change", "disposal_policy_change",
   ];
 
   const unseed = async (tenant: string): Promise<void> => {
@@ -844,6 +919,10 @@ describe("a cross-tenant reference is refused by the database", () => {
         "sample_holding", "sample_transaction", "sample_lot",
         "visit_product", "visit",
         "call_plan_product", "call_plan_target", "call_plan", "cycle",
+        // 0062's proposal is a parent of both configuration logs and names two reps, so the
+        // logs go before it and it goes before the profiles. `config_change` is append-only,
+        // which is what `SILENCED` is for.
+        "config_change", "disposal_policy_change", "config_proposal",
         "expense_claim", "outbox", "rep_role",
         "account_assignment", "territory_assignment",
         "tenant_tombstone_attestation", "tenant_tombstone",

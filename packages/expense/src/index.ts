@@ -34,6 +34,7 @@ export {
   ACCOUNT_CODE_MAX,
   EXPENSE_CATEGORY_MAX,
   activeAccountMapping,
+  anyAccountMapping,
   deactivateAccountMapping,
   listAccountMappings,
   requireAccountMapping,

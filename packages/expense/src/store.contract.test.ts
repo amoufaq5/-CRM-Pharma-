@@ -1,7 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_EXPENSE_STORE as TENANT, appPool, withFixtureAttribution } from "@crm/db/testing";
+import {
+  TENANT_EXPENSE_STORE as TENANT,
+  appPool,
+  withFixtureAttribution,
+  withFourEyes,
+} from "@crm/db/testing";
 import { claimBatch, markDead } from "@crm/relay";
 
 import { upsertAccountMapping } from "./accounts.js";
@@ -450,13 +455,26 @@ describe("expense claims", () => {
         await submitClaim(tx, TENANT, claim.id, new Date());
         return claim.id;
       });
+      // Through the two-person path, because since 0062 a re-pointing is exactly the change
+      // that takes two: it moves where every claim posted afterwards lands, which is the fact
+      // this test is about from the other side — the already-submitted claim must not move
+      // with it.
       await inTenant((tx) =>
-        withFixtureAttribution(tx, TENANT, (t) =>
-          upsertAccountMapping(t, TENANT, {
-            crmCategory: "congress",
-            erpLedgerAccountCode: "9999",
-            erpCostCenterCode: "CC-OTHER",
-          }),
+        withFourEyes(
+          tx,
+          TENANT,
+          {
+            tableName: "expense_account_map",
+            rowKey: { tenant_id: TENANT, crm_category: "congress" },
+            changes: { erp_ledger_account_code: "9999", erp_cost_center_code: "CC-OTHER" },
+            role: "administrator",
+          },
+          (t) =>
+            upsertAccountMapping(t, TENANT, {
+              crmCategory: "congress",
+              erpLedgerAccountCode: "9999",
+              erpCostCenterCode: "CC-OTHER",
+            }),
         ),
       );
       await inTenant(async (tx) => {

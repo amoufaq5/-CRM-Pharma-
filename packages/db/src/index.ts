@@ -1,7 +1,28 @@
 export { CONFIG_LOG_LIMIT, configChanges, type ConfigChange } from "./config-log.js";
 export {
+  PROPOSAL_LIST_LIMIT,
+  ConfigProposalNotFoundError,
+  NoFourEyesRuleError,
+  configProposal,
+  configProposals,
+  decideConfigProposal,
+  fourEyesRequired,
+  fourEyesRules,
+  proposalDeciders,
+  proposeConfigChange,
+  type ConfigProposal,
+  type FourEyesRule,
+  type ProposalDecider,
+  type ProposalDecision,
+  type ProposeInput,
+  type ProposeResult,
+} from "./four-eyes.js";
+export {
   ACTOR_SETTING,
+  PROPOSAL_SETTING,
   REASON_SETTING,
+  ConfigProposalError,
+  ConfigFourEyesError,
   UnattributedChangeError,
   translateAttributionError,
   withAttribution,

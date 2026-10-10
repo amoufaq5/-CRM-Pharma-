@@ -567,6 +567,54 @@ export type ConfigChange = z.infer<typeof ConfigChange>;
 export const ConfigChangeList = z.object({ data: z.array(ConfigChange) });
 
 /**
+ * A row of `GET /v1/admin/four-eyes`: a change one person asked for and cannot make alone.
+ *
+ * `four_eyes_columns` is the subset of `changes` that is the REASON this needs two people;
+ * `changes` is the whole intended change, because that is what an approver has to see. A
+ * screen that showed only the four-eyed column would hide the rest of what it is agreeing to —
+ * a re-pointing carries the cost centre alongside the account code, and the upsert replaces it.
+ *
+ * `eligible_deciders` is carried because ZERO is the answer that needs saying: a tenant with
+ * one compliance officer cannot arm the unattended write-off job, and an officer staring at a
+ * proposal that will never move deserves to be told why rather than left to infer it.
+ */
+export const ConfigProposal = z
+  .object({
+    id: Uuid,
+    table_name: z.string(),
+    row_key: z.record(z.unknown()),
+    changes: z.record(z.unknown()),
+    four_eyes_columns: z.array(z.string()),
+    role: z.enum(["administrator", "compliance"]),
+    proposed_by: Uuid,
+    proposed_by_name: z.string(),
+    proposed_at: z.string(),
+    proposed_reason: z.string(),
+    decision: z.enum(["approved", "rejected", "withdrawn"]).nullish(),
+    decided_by: Uuid.nullish(),
+    decided_by_name: z.string().nullish(),
+    decided_at: z.string().nullish(),
+    decided_reason: z.string().nullish(),
+    applied_at: z.string().nullish(),
+    eligible_deciders: z.number().int(),
+  })
+  .passthrough();
+export type ConfigProposal = z.infer<typeof ConfigProposal>;
+
+export const ConfigProposalList = z.object({ data: z.array(ConfigProposal) });
+
+/**
+ * What the three decision routes accept.
+ *
+ * A reason, and nothing else. The DECIDER's own sentence rather than the proposer's, because
+ * "we needed this" and "I agree, and here is what I checked" are different statements and the
+ * record keeps both. Ten characters is the column's own floor, as everywhere else in this
+ * lineage; the actor comes from the token, never from the body.
+ */
+export const DecisionBody = z.object({ reason: z.string().min(10).max(1000) });
+export type DecisionBody = z.infer<typeof DecisionBody>;
+
+/**
  * What `PUT /v1/admin/samples/disposal-policy` accepts.
  *
  * THE REASON IS NOT OPTIONAL, and the ten-character floor is the column's own CHECK rather

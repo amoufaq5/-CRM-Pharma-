@@ -138,6 +138,14 @@ describe("0044 — the expense claim lifecycle is in the database", () => {
     await inTenant(async (tx) => {
       await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [TENANT]);
       await tx.query("DELETE FROM crm.expense_claim WHERE tenant_id = $1", [TENANT]);
+      // The account map too, which it did not use to. Two tests here map `congress`, to
+      // different accounts, and the map survived between them — so the second was a
+      // RE-POINTING of the first's mapping, and since 0062 a re-pointing takes two people.
+      // The coupling was there before the rule and was invisible: whichever test ran second
+      // silently depended on what the first had left. Cleared per test, each mapping is its
+      // own creation, which is what both tests actually mean.
+      await tx.query("DELETE FROM crm.expense_account_map WHERE tenant_id = $1", [TENANT]);
+      await wipeConfigChanges(tx, TENANT);
     });
   };
 

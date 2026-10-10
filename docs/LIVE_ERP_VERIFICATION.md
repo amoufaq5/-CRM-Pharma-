@@ -1972,3 +1972,143 @@ added by the next person who reads that log.
   switch, and it stands here too: an administrator can re-point an expense category to any
   ledger account alone, and the only thing stopping a quiet redirection of a tenant's spend is
   that the log will say who did it.
+
+## Two people for the dangerous ones
+
+*2026-10-10, `pnpm client:verify` (310 checks) and `npx vitest run` (98 files / 2,514
+tests). The live-ERP gate is unchanged at 133 — nothing here touches the ERP.*
+
+The two chapters above end with the same open note in different words. The disposal policy's:
+"the promo auto-write-off switch is the one setting here that lets a job remove material from a
+balance, and it is guarded by nothing beyond the role and the log — four eyes is the obvious
+candidate and is not built." The configuration log's: "an administrator can re-point an expense
+category to any ledger account alone, and the only thing stopping a quiet redirection of a
+tenant's spend is that the log will say who did it."
+
+**What a log cannot do.** Both of those changes are irreversible in effect while being perfectly
+reversible on paper. Turning the switch off does not bring the material back; pointing the
+category back does not move the postings. The record says who did it, and the stock is still
+gone. So 0062 makes each of them need two different holders of the governing grant — and
+nothing else, because 0059's reason for refusing blanket four eyes still holds: a tenant with
+one compliance officer must be able to set its own grace period.
+
+### In the browser, on two devices, because the rule is about two people
+
+A single browser profile cannot show a four-eyes rule. Ada asks on hers; Grace approves on her
+own, with her own IndexedDB and her own session.
+
+```
+ok: the automatic promotional write-off is off, as it ships
+ok: one proposal in crm.config_proposal
+ok: naming the column that needed a second person              (auto_writeoff_promo)
+ok: attributed to the officer in the token, never to a name in the body
+ok: with the switch STILL OFF — a 202 that had quietly applied the change would be
+    the worst of the three outcomes
+ok: the officer who asked is offered no approve button on her own request
+ok: only withdraw, which is hers alone — rejecting is somebody else saying no
+ok: and she is told why it cannot move: there is no second compliance officer yet
+ok: and the server refuses her even when the screen is bypassed            (409)
+ok: naming the rule rather than a generic conflict       (four-eyes-same-person)
+ok: and nobody was notified, because at that moment nobody could approve it  (0)
+ok: the request is withdrawn, by the officer who made it
+ok: and the withdrawn one is still in the record, because a second thought is a fact too
+ok: the second officer is offered the approval
+ok: and not a withdrawal, which belongs to whoever asked
+ok: with what it would change, spelled as the database spells it
+    (disposal_policy — auto_writeoff_promo: true ← Ada Lovelace …)
+ok: the second officer has a notification about it
+    (config_change_awaiting_approval|Ada Lovelace needs a second signature on …)
+ok: an approval with no reason is refused on the device
+ok: the proposal is approved, by the second officer, from her token
+ok: and APPLIED — stamped by the write itself, so an approval and the change it
+    authorised cannot come apart
+ok: the switch is on, which it could not be on one signature
+ok: the policy's own log names whoever made the change true          (Grace Hopper)
+ok: linked to the proposal structurally, not mentioned in prose
+ok: turning it off takes one signature and is applied, not proposed        (200)
+ok: the spent approval cannot re-arm it                                   (409)
+```
+
+Three of those cannot be faked anywhere else. **The self-approval is refused by the server**,
+not only hidden by the screen — a button that produced a 409 would teach the reader to distrust
+the screen, and a screen that was the only guard would be no guard. **The approval applies the
+change**, in one transaction, so `applied_at` and the switch move together; there is never a
+window where an approved proposal exists and the setting has not. And **the spent approval
+cannot re-arm it**: one person turns the switch off, which needs nobody, and the same approval
+will not put it back.
+
+### The limitation the gate measured rather than assumed
+
+Ada's first request notified **nobody** — correctly, because at that moment nobody else held the
+grant. The signal goes to whoever can approve *when a proposal is made*, so a tenant that
+appoints its second officer afterwards gets no notification and finds the request in the queue.
+The gate asserts the zero case rather than skipping past it, and the chapter's open list carries
+it. The first version of this chapter granted the second officer too early and so would have
+asserted the happy path and nothing else.
+
+### Three defects found by running it
+
+- **`any_change` fired on a CREATION.** The first live run refused the INSERT that maps a
+  tenant's first expense category — the exact write the migration's header promised would stay
+  on a single signature, in a header that also claimed the direction vocabulary deliberately
+  could not express creation. The missing distinction was not a direction; it was whether
+  anything had a previous value.
+- **`crm.notification_subject_open` lost a branch.** 0062 rewrote it from 0024's text, which has
+  four branches, where the version the database is *running* is 0031's and has five. Every
+  notification about a claim the sweeper could not hand over would have pruned at the normal
+  horizon while a rep was still owed money. `subject-coverage.contract.test.ts` caught it on the
+  first run, because it reads branches out of `pg_proc` rather than out of a file. The lesson is
+  about `CREATE OR REPLACE` on a function several migrations have touched: the newest definition
+  is not in the file that created it, and there is no way to extend one except to write it
+  whole.
+- **A `<button>` in a form with no `type` defaults to `submit`.** Approve, reject and withdraw
+  sit inside one form, so the first version navigated the page on every click and the decision
+  never left the device. The gate caught it as a timeout waiting for a message that could not
+  arrive.
+
+### And two corrections to earlier increments
+
+Both were things an earlier comment asserted and nothing measured.
+
+- **`withAttribution` cleared its settings; its own interface comment said it restored them.**
+  0061 argued for clearing because "the only thing a restore would buy is nesting, which no
+  caller does". 0062 gave it a caller — `withFourEyes` in the test helpers opens a block inside
+  suites that already have one — and clearing left every write after it unattributed, arriving
+  as a refusal in a test about the expiry sweep. It restores now, and with no enclosing block a
+  restore is indistinguishable from a clear, which is why the test that pinned the old behaviour
+  is unchanged.
+- **Error translation lived in `withAttribution`.** Right for every refusal 0061 knew about, and
+  wrong for these: rejecting and withdrawing touch a table that is not under attribution, so
+  their routes open no block — and the first version answered **500** to "you cannot reject your
+  own proposal", which is a sentence the caller needed and a status that told them to report a
+  bug. Translation belongs with the statement that can raise.
+
+### What this cost
+
+- **Ten fixture call sites needed a four-eyed value**, and `withFourEyes` gives them one line
+  each. It goes the whole way round — two reps, a proposal through the store function the route
+  uses, an approval through the database function — rather than disabling the guard, so every
+  suite that needs the switch on exercises the real path to it.
+- **A latent coupling surfaced.** Two tests in the expense lifecycle suite mapped `congress` to
+  different accounts with the map surviving between them, so whichever ran second was silently
+  re-pointing the first one's mapping. It predated the rule and was invisible.
+- **Four new live cross-tenant probes** for the composite-key registry, one of which can only be
+  driven by raw SQL: the configuration log is written by a trigger that reads its author from a
+  setting, so nothing in production inserts into it directly — and the key still has to be
+  composite, because a referential check runs with row security off.
+- **0051's register refused the table until it carried a decision**, taking the undecided count
+  to 23 of 46 tenant-scoped tables.
+
+### What is still not built
+
+- **A proposal made before a second officer exists notifies nobody**, and appointing one later
+  sends no signal. The remedy is a sweep that re-raises for newly-eligible deciders, or a signal
+  on the grant itself.
+- **Nothing expires.** A proposal nobody decides sits pending forever, and a TTL needs a
+  decision about what expiry *means* — rejected by the system is not a refusal anybody made.
+- **The applier is one branch per table, by hand** — deliberately, because a generic applier
+  built from `changes` would be a route that writes arbitrary columns from a request body. But a
+  rule added to the register without a branch is an internal error at approval time rather than
+  a refusal at migration time.
+- **The queue is not paged or filtered**, and `crm.four_eyes_rule` has no screen. For two
+  columns across the whole schema both are the right size; neither is a general approval inbox.

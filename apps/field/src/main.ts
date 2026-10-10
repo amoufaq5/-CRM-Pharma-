@@ -9,6 +9,7 @@ import {
   FailedErpWriteList,
   MyRoles,
   ConfigChangeList,
+  ConfigProposalList,
   PolicyBody,
   PolicyChangeList,
   Obligation,
@@ -54,6 +55,7 @@ import {
   type SyncReport,
   type WriteOffKind,
   type ConfigChange,
+  type ConfigProposal,
   type PolicyChange,
   type TransferPeer,
   type Warehouse,
@@ -120,6 +122,13 @@ interface State {
   /** The tenant's configuration history. Only ever non-empty for an `administrator`. */
   configChanges: readonly ConfigChange[];
   /**
+   * Changes waiting for a second signature (0062).
+   *
+   * Only ever non-empty for a holder of the `administrator` or `compliance` grant, and the
+   * queue is deliberately short: two columns in the whole schema need two people.
+   */
+  proposals: readonly ConfigProposal[];
+  /**
    * The administrative roles this rep holds, from `GET /v1/me/roles`.
    *
    * Empty is the right default for a device that has not asked: offering a form every write
@@ -165,6 +174,7 @@ const state: State = {
   policy: null,
   policyChanges: [],
   configChanges: [],
+  proposals: [],
   roles: [],
   editingPolicy: false,
   cachedAt: null,
@@ -424,6 +434,10 @@ function render(): void {
     // LAST, deliberately. It is the rule the rest of the screen is measured against rather
     // than anything a rep does today, and a tenant-wide parameter above a rep's own work
     // would be the wrong emphasis on a phone.
+    // BEFORE the policy, because it is the only thing on this screen that is waiting on the
+    // reader specifically. The policy below is a rule they are measured against; this is a
+    // colleague blocked until they look.
+    parts.push(renderPendingApprovals());
     parts.push(renderPolicy(now));
     // After the policy, because it is the same kind of thing one layer out: the policy is
     // one tenant-wide rule with a screen of its own, this is every OTHER tenant-wide
@@ -1145,6 +1159,76 @@ function renderPolicyHistory(): string {
 }
 
 /**
+ * Changes waiting for a second signature (0062).
+ *
+ * ABSENT RATHER THAN EMPTY for a rep with neither grant, and for one who holds a grant with
+ * nothing waiting — a section headed "waiting for a second signature" with nothing under it
+ * reads as an invitation to go looking for something that is not there. The queue is short by
+ * construction: two columns in the whole schema need two people.
+ *
+ * ONE FORM FOR THE WHOLE LIST, with a reason field per proposal, because `captureFormDraft`
+ * finds the first `form[id]` on screen — several forms would mean only the first one's typing
+ * survived a re-render, which is precisely the defect `formDraft` exists to prevent and the
+ * one this app has already shipped twice.
+ *
+ * WHOEVER ASKED SEES SOMETHING DIFFERENT: no approve button, because the server refuses it and
+ * a button that produces a 409 is a button that teaches the reader to distrust the screen.
+ * They get withdraw, which is theirs alone — rejecting is somebody else saying no.
+ */
+function renderPendingApprovals(): string {
+  const mine = state.proposals;
+  if (mine.length === 0) return "";
+  return `<section>
+    <h2>Waiting for a second signature (${mine.length})</h2>
+    <form id="approvals-form">
+      <ul class="list">
+        ${mine.map(renderProposal).join("")}
+      </ul>
+    </form>
+    <p class="note">A handful of settings cannot be changed by one person: arming the nightly
+      promotional write-off, and moving which ERP account a category of spend posts to. Both
+      are irreversible in effect — the stock is gone, the postings are made — so they take two.</p>
+  </section>`;
+}
+
+/** One proposal: what it would change, who asked, why, and what this reader may do about it. */
+function renderProposal(p: ConfigProposal): string {
+  const mine = state.me !== null && p.proposed_by === state.me.repProfileId;
+  const moved = Object.entries(p.changes)
+    .map(([column, value]) => {
+      // The four-eyed column is marked, because the rest of the change rides along with it
+      // and an approver should be able to see which part is the reason they were asked.
+      const needsTwo = p.four_eyes_columns.includes(column);
+      return `${column}: ${renderConfigValue(value)}${needsTwo ? " ←" : ""}`;
+    })
+    .join(" · ");
+  const stuck =
+    p.eligible_deciders === 0
+      ? `<span class="meta">Nobody in this tenant can approve this yet: it needs a second holder
+           of the ${escapeHtml(p.role)} grant, and an administrator has to appoint one.</span>`
+      : "";
+  // `type="button"` ON EVERY ONE OF THEM, and it is load-bearing rather than tidy. These sit
+  // inside `#approvals-form`, and a `<button>` in a form with no type defaults to `submit` —
+  // so the first version of this navigated the page on every click and the decision never
+  // left the device. The browser gate caught it as a timeout waiting for a message that could
+  // not arrive. The policy form's buttons have always declared their type for exactly this.
+  const actions = mine
+    ? `<button type="button" class="secondary" data-withdraw="${escapeHtml(p.id)}" ${state.online ? "" : "disabled"}>Withdraw</button>`
+    : `<button type="button" data-approve="${escapeHtml(p.id)}" ${state.online ? "" : "disabled"}>Approve</button>
+       <button type="button" class="secondary" data-reject="${escapeHtml(p.id)}" ${state.online ? "" : "disabled"}>Reject</button>`;
+  return `<li><span class="grow">
+    <span class="name">${escapeHtml(p.table_name)} — ${escapeHtml(moved)}</span>
+    <span class="meta">${escapeHtml(p.proposed_by_name)}${mine ? " (you)" : ""} · ${escapeHtml(p.proposed_at.slice(0, 10))} · ${escapeHtml(p.proposed_reason)}</span>
+    ${stuck}
+    <label>Your reason
+      <input type="text" name="reason-${escapeHtml(p.id)}" maxlength="1000"
+             placeholder="${mine ? "Why you are taking it back" : "What you checked, in a sentence"}" />
+    </label>
+    <span class="actions">${actions}</span>
+  </span></li>`;
+}
+
+/**
  * Who changed this tenant's settings, and why (0061).
  *
  * ADMINISTRATOR ONLY, and absent rather than empty for everyone else: a section headed
@@ -1220,6 +1304,69 @@ function renderConfigValue(value: unknown): string {
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return JSON.stringify(value);
+}
+
+/**
+ * Approve, reject or withdraw a change that takes two people (0062).
+ *
+ * THE REASON IS READ OFF THE SCREEN, from the field belonging to this proposal, because the
+ * list is one form with one input per row — see `renderPendingApprovals` for why it is one
+ * form and not several. Refused at the keyboard when it is too short, with the typed value
+ * still there, which is the rule every attributed write in this app follows.
+ *
+ * SENT, NOT QUEUED. The reasoning is on `decideProposal` in the transport, and the sharper
+ * half of it is this: a queued approval could surface hours later and apply a change the
+ * proposal's author had withdrawn in the meantime.
+ *
+ * Re-read afterwards rather than patched from the reply. An approval APPLIES the change, so
+ * the policy, its history, the configuration log and the queue all moved — and a device that
+ * patched four pieces of state from one response would be assembling the record rather than
+ * reading it.
+ */
+async function decideProposal(
+  id: string,
+  decision: "approve" | "reject" | "withdraw",
+): Promise<void> {
+  if (transport === null) return;
+  const field = document.querySelector(`[name="reason-${CSS.escape(id)}"]`);
+  const reason = field instanceof HTMLInputElement ? field.value.trim() : "";
+  if (reason.length < 10) {
+    captureFormDraft();
+    state.message = {
+      kind: "error",
+      text: "Say why, in a sentence: a change two people agreed to records both of their reasons, and neither can be edited afterwards.",
+    };
+    render();
+    return;
+  }
+
+  const result = await transport.decideProposal(id, decision, { reason });
+  if (result.kind !== "ok") {
+    captureFormDraft();
+    state.message = {
+      kind: result.kind === "network" ? "warn" : "error",
+      text:
+        result.kind === "network"
+          ? "No network, so nothing was decided. A decision that took effect whenever a phone found signal could apply a change somebody had withdrawn in the meantime."
+          : `The server said: ${result.detail ?? result.status}`,
+    };
+    render();
+    return;
+  }
+
+  formDraft = null;
+  state.message = {
+    kind: "good",
+    text:
+      decision === "approve"
+        ? "Approved, and the change is made — with both of your names and both of your reasons on it."
+        : decision === "reject"
+          ? "Rejected, with your reason. It stays in the record: a refusal is as much a fact as an approval."
+          : "Withdrawn. Nothing changed, and the request stays in the record.",
+  };
+  render();
+  await refreshReference();
+  render();
 }
 
 /**
@@ -1465,6 +1612,23 @@ function wireReady(): void {
     event.preventDefault();
     void savePolicy(event.target as HTMLFormElement);
   });
+  // The three decisions on a change that takes two people (0062). One listener shape per
+  // verb rather than one with a parameter, because the verbs are not interchangeable:
+  // approving WRITES the change, rejecting is somebody else saying no, and withdrawing is
+  // only ever the proposer's.
+  for (const [attribute, decision] of [
+    ["data-approve", "approve"],
+    ["data-reject", "reject"],
+    ["data-withdraw", "withdraw"],
+  ] as const) {
+    for (const button of document.querySelectorAll<HTMLButtonElement>(`button[${attribute}]`)) {
+      button.addEventListener("click", () => {
+        const id = button.dataset[decision];
+        if (id !== undefined) void decideProposal(id, decision);
+      });
+    }
+  }
+
   for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-retry-erp]")) {
     button.addEventListener("click", () => {
       const id = button.dataset["retryErp"];
@@ -2459,7 +2623,20 @@ async function savePolicy(form: HTMLFormElement): Promise<void> {
 
   state.editingPolicy = false;
   formDraft = null;
-  state.message = { kind: "good", text: "Recorded, with your name and the reason. It applies to stock the sweep finds from now on." };
+  // 202 MEANS IT HAS NOT HAPPENED YET, and saying "recorded" here would be the screen's one
+  // piece of evidence disagreeing with the database. Arming the promotional write-off takes a
+  // second compliance officer; everything else on this form is applied as it always was.
+  state.message =
+    result.status === 202
+      ? {
+          kind: "warn",
+          text:
+            "Asked for, not yet in force. Arming the automatic promotional write-off takes two people: it lets a nightly job remove material from a balance with nobody involved, so another compliance officer has to approve it. It is now in their queue.",
+        }
+      : {
+          kind: "good",
+          text: "Recorded, with your name and the reason. It applies to stock the sweep finds from now on.",
+        };
   render();
   // Re-read rather than patch the state from the reply: the provenance and the history come
   // from the server, and a device that assembled them locally would be inventing the one
@@ -2737,6 +2914,27 @@ async function refreshReference(): Promise<void> {
     configResult !== null && configResult.kind === "ok"
       ? ConfigChangeList.safeParse(configResult.body)
       : null;
+  /**
+   * What is waiting for a second signature (0062) — for a holder of EITHER grant.
+   *
+   * Conditional on the roles this refresh just learned, like the read above it and for the
+   * same reason: the route answers 403 to a rep with neither grant, and a read expected to
+   * fail trains whoever watches the logs to ignore them.
+   *
+   * Either grant, because the queue spans both: an SOP change answers to `compliance` and a
+   * ledger re-pointing to `administrator`, and an administrator who cannot see that an SOP
+   * change is stuck has no way to know a second compliance officer needs appointing — which
+   * is the one administrative act that unblocks it.
+   */
+  const mayDecide =
+    roles !== null &&
+    roles.success &&
+    (roles.data.roles.includes("administrator") || roles.data.roles.includes("compliance"));
+  const proposalsResult = mayDecide ? await transport.get("/v1/admin/four-eyes?pending=true") : null;
+  const proposals =
+    proposalsResult !== null && proposalsResult.kind === "ok"
+      ? ConfigProposalList.safeParse(proposalsResult.body)
+      : null;
 
   state.me = me.data;
   // Stamp the session with the rep it turned out to be, so a later cold start can tell
@@ -2759,6 +2957,9 @@ async function refreshReference(): Promise<void> {
   // Assigned from the ANSWER, and emptied when there was no answer to have: a rep who lost
   // the administrator grant this morning must not keep last night's history on screen.
   state.configChanges = configChanges !== null && configChanges.success ? configChanges.data.data : [];
+  // Emptied when there was no answer to have, for the roles' own reason: a rep who lost the
+  // grant this morning must not keep an approve button that the server now refuses.
+  state.proposals = proposals !== null && proposals.success ? proposals.data.data : [];
   // Assigned even when the list is EMPTY, unlike the reads above: an empty set of roles is a
   // real answer and the one that must stick, or a rep who lost their grant this morning
   // would keep a form the server now refuses.
@@ -2807,6 +3008,7 @@ function adoptSession(session: Session): void {
     state.policy = null;
     state.policyChanges = [];
     state.configChanges = [];
+    state.proposals = [];
     state.roles = [];
     state.editingPolicy = false;
     state.cachedAt = null;

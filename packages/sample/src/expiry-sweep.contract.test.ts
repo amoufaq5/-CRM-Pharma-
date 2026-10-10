@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_EXPIRY_SWEEP as TENANT, testPool } from "@crm/db/testing";
+import { TENANT_EXPIRY_SWEEP as TENANT, testPool, withFourEyes } from "@crm/db/testing";
 
 import { inbox } from "@crm/notify";
 
@@ -40,6 +40,36 @@ describe("the expiry sweep", () => {
 
   const inTenant = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> =>
     withTenantContext(client, TENANT, fn);
+
+  /**
+   * Turns the switch on, the way a tenant actually has to (0062).
+   *
+   * ARMING THIS TAKES TWO PEOPLE, because it is the one setting that lets a scheduled job
+   * remove material from a balance with no person involved — which is this very sweep, and
+   * which is why the rule exists. So the fixture goes the whole way round: two reps hold
+   * the compliance grant, one proposes, the other approves, and the write names that
+   * approval. `withFourEyes` is the shared helper; the four call sites below say one line.
+   *
+   * The alternative was to turn the guard off around the fixture, and it would have made
+   * every test in this block an assertion about a state the product cannot reach.
+   */
+  const armThePromoWriteOff = (tx: PoolClient): Promise<unknown> =>
+    withFourEyes(
+      tx,
+      TENANT,
+      {
+        tableName: "disposal_policy",
+        rowKey: { tenant_id: TENANT },
+        changes: { auto_writeoff_promo: true },
+        role: "compliance",
+      },
+      (c) =>
+        setDisposalPolicy(c, TENANT, {
+          autoWriteoffPromo: true,
+          changedBy: REP,
+          reason: "a fixture setting the SOP parameter under test",
+        }),
+    );
 
   const reset = async (): Promise<void> => {
     await inTenant(async (tx) => {
@@ -565,7 +595,7 @@ describe("the expiry sweep", () => {
 
     it("writes off promotional material once the tenant opts in, and closes the obligation", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
+        await armThePromoWriteOff(tx);
         const lot = await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 50 });
 
         const result = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
@@ -590,7 +620,7 @@ describe("the expiry sweep", () => {
     /** Opting in must not reach a drug sample. The flag is named for what it covers. */
     it("never writes off a drug sample, even with the flag on", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
+        await armThePromoWriteOff(tx);
         const drug = await heldStock(tx, { expiry: "2026-03-31", kind: "drug_sample", quantity: 10 });
         const promo = await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 20 });
 
@@ -607,7 +637,7 @@ describe("the expiry sweep", () => {
 
     it("is idempotent with the flag on", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
+        await armThePromoWriteOff(tx);
         await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 20 });
         expect((await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") })).autoWrittenOff).toBe(1);
         expect((await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-11") })).autoWrittenOff).toBe(0);
@@ -685,7 +715,7 @@ describe("the expiry sweep", () => {
 
     it("tells nobody about an automatic promo write-off, which is not news", async () => {
       await inTenant(async (tx) => {
-        await setDisposalPolicy(tx, TENANT, { autoWriteoffPromo: true, changedBy: REP, reason: "a fixture setting the SOP parameter under test" });
+        await armThePromoWriteOff(tx);
         await heldStock(tx, { expiry: "2026-03-31", kind: "promo_material", quantity: 20 });
         const result = await sweepExpiredStock(tx, TENANT, { asOf: day("2026-04-10") });
         expect(result.autoWrittenOff).toBe(1);

@@ -194,6 +194,16 @@ describe("CRM schema invariants", () => {
         "the retention disposition register (0051): one row per tenant-scoped TABLE, saying " +
         "erase, retain with an obligation, or undecided with the question. A statement about " +
         "the schema, identical for every tenant by construction",
+      // 0062, and the same reasoning as the row above it — with one addition that matters
+      // more here. Which changes need two people is a property of what the CRM does with
+      // them, not of who is using it, so a per-tenant copy would be identical by
+      // construction. AND a tenant that could edit its own four-eyes rules would be a
+      // tenant with no four-eyes rules: the one thing the register must not be is
+      // relaxable by the people it constrains.
+      four_eyes_rule:
+        "which configuration changes require two different people (0062): table, column, " +
+        "direction and the grant both actors must hold. Platform-wide so a tenant cannot " +
+        "relax its own, and holding no tenant's data for a policy to confine",
     };
     const { rows } = await client.query<{ relname: string }>(`
       SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

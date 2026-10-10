@@ -36,6 +36,7 @@ import {
   listEndpoints,
   markAllRead,
   markRead,
+  raiseNotification,
   deliveryHistory,
   notificationDeliveryRetention,
   probeBudget,
@@ -74,14 +75,25 @@ import {
 } from "@crm/relay";
 import {
   CONFIG_LOG_LIMIT,
+  PROPOSAL_LIST_LIMIT,
   configChanges,
+  configProposal,
+  configProposals,
+  decideConfigProposal,
+  fourEyesRequired,
+  fourEyesRules,
+  proposalDeciders,
+  proposeConfigChange,
   withAttribution,
   withTenantContext,
+  type ConfigProposal,
+  type ProposalDecision,
 } from "@crm/db";
 import {
   ACCOUNT_CODE_MAX,
   EXPENSE_CATEGORY_MAX,
   EXPENSE_CLAIM_STATES,
+  anyAccountMapping,
   approveClaim,
   claimPostingStatus,
   createClaim,
@@ -161,7 +173,7 @@ import {
 import type { Pool, PoolClient } from "pg";
 import { z } from "zod";
 
-import { requireRole, type Principal } from "../principal.js";
+import { requireAnyRole, requireRole, type Principal } from "../principal.js";
 import { ApiError, forbidden, notFound, validationFailed } from "../problems.js";
 import { Router, type HandlerResult, type RequestContext } from "../router.js";
 
@@ -216,9 +228,157 @@ async function asChange<T>(
   p: Principal,
   reason: string,
   fn: (tx: PoolClient) => Promise<T>,
+  proposalId?: string,
 ): Promise<T> {
   return inTenant(deps, p, (tx) =>
-    withAttribution(tx, { repProfileId: p.repProfileId, reason }, fn),
+    withAttribution(
+      tx,
+      { repProfileId: p.repProfileId, reason, ...(proposalId !== undefined ? { proposalId } : {}) },
+      fn,
+    ),
+  );
+}
+
+/**
+ * Tells everybody who could approve a proposal that one is waiting (0062).
+ *
+ * At the route layer rather than in `@crm/db`, which depends on `pg` and nothing else and
+ * therefore cannot reach `@crm/notify`. `proposeConfigChange` returns the reps rather than a
+ * count for exactly this reason: a seam a caller can forget is a seam a caller forgets, and a
+ * route that ignored a LIST OF PEOPLE would read as more obviously wrong than one that
+ * ignored a number.
+ *
+ * Never the proposer, who already knows — the store's query excludes them — and keyed on the
+ * proposal, so a second raise for the same one is deduplicated rather than nagging.
+ */
+async function tellTheDeciders(
+  tx: PoolClient,
+  tenantId: string,
+  proposal: ConfigProposal,
+  deciders: readonly { readonly rep_profile_id: string; readonly display_name: string }[],
+): Promise<void> {
+  const what = proposal.four_eyes_columns.join(", ");
+  for (const decider of deciders) {
+    await raiseNotification(tx, tenantId, {
+      recipientRepProfileId: decider.rep_profile_id,
+      kind: "config_change_awaiting_approval",
+      // `warning` rather than `info`: nothing is broken, but something a colleague needs is
+      // blocked on this reader specifically, and the queue is short by design.
+      severity: "warning",
+      subject: `${proposal.proposed_by_name} needs a second signature on ${what}`,
+      body:
+        `${proposal.proposed_by_name} asked to change ${what} on ${proposal.table_name} — ` +
+        `"${proposal.proposed_reason}". It takes two people, so it cannot happen until you or ` +
+        `another holder of the ${proposal.role} grant approves it. You cannot approve your own.`,
+      dedupKey: `config_proposal:${proposal.id}:awaiting`,
+      subjectTable: "crm.config_proposal",
+      subjectId: proposal.id,
+      payload: { tableName: proposal.table_name, columns: proposal.four_eyes_columns },
+    });
+  }
+}
+
+/**
+ * A rule whose change nothing knows how to make.
+ *
+ * Reachable only by adding a row to `crm.four_eyes_rule` without adding a branch below, which
+ * is a deployment defect rather than anything a caller did — so it is an internal error with
+ * a sentence for whoever reads the log, and the switch below is written to make the omission
+ * findable rather than silent. The alternative, a generic UPDATE built from `changes`, would
+ * be a route that can write any column of any table from a request body.
+ */
+class UnappliableProposalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnappliableProposalError";
+  }
+}
+
+/**
+ * Performs the change an approved proposal authorises.
+ *
+ * ONE BRANCH PER TABLE, by hand, and that is the point: the write goes through the same store
+ * function the single-signature route uses, so an approved change and an ordinary one take
+ * exactly the same path into the database and meet the same validation. A generic applier
+ * built from `changes` would be shorter and would be a route that writes arbitrary columns.
+ *
+ * The attribution block around this names the APPROVER as the author and the proposal as the
+ * authority, which is why `changedBy` is the principal here and not `proposal.proposed_by`:
+ * before the approver acted, nothing had changed. The proposal is what records who asked.
+ *
+ * The whole of `changes` is applied, not only the four-eyes columns. A re-pointing carries the
+ * cost centre alongside the account code because `upsertAccountMapping` REPLACES it — an
+ * applier that sent only the approved column would silently clear a dimension the approver
+ * saw on the screen and never agreed to drop.
+ */
+async function applyProposal(
+  tx: PoolClient,
+  p: Principal,
+  proposal: ConfigProposal,
+  reason: string,
+): Promise<unknown> {
+  const changes = proposal.changes;
+  switch (proposal.table_name) {
+    case "disposal_policy":
+      return setDisposalPolicy(tx, p.tenantId, {
+        ...(typeof changes["grace_days"] === "number" ? { graceDays: changes["grace_days"] } : {}),
+        ...(typeof changes["auto_writeoff_promo"] === "boolean"
+          ? { autoWriteoffPromo: changes["auto_writeoff_promo"] }
+          : {}),
+        changedBy: p.repProfileId,
+        reason,
+      });
+    case "expense_account_map": {
+      const category = proposal.row_key["crm_category"];
+      const code = changes["erp_ledger_account_code"];
+      if (typeof category !== "string" || typeof code !== "string") {
+        throw new UnappliableProposalError(
+          `proposal ${proposal.id} names no category or no account code, so there is nothing to apply`,
+        );
+      }
+      const centre = changes["erp_cost_center_code"];
+      return upsertAccountMapping(tx, p.tenantId, {
+        crmCategory: category,
+        erpLedgerAccountCode: code,
+        ...(centre === null || typeof centre === "string" ? { erpCostCenterCode: centre } : {}),
+      });
+    }
+    default:
+      throw new UnappliableProposalError(
+        `crm.four_eyes_rule has a rule for crm.${proposal.table_name} and nothing here knows how to apply one`,
+      );
+  }
+}
+
+/**
+ * The two decisions that only record, shared because they differ by one word.
+ *
+ * Approval is NOT here: it also applies the change, which needs an attribution block, the
+ * table dispatcher and a re-read — and folding that into a function with a `decision`
+ * parameter would make the one path that writes look like the two that do not.
+ */
+async function decideFourEyes(
+  deps: HandlerDeps,
+  ctx: Ctx,
+  id: string,
+  decision: Exclude<ProposalDecision, "approved">,
+  reason: string,
+  opts: { readonly requireGrant?: boolean } = {},
+): Promise<unknown> {
+  const pending = await inTenant(deps, ctx.principal, (tx) =>
+    configProposal(tx, ctx.principal.tenantId, id),
+  );
+  if (pending === null) throw notFound(`no proposal ${id} in this tenant`);
+  if (opts.requireGrant !== false) requireRole(ctx.principal, pending.role);
+  return inTenant(deps, ctx.principal, (tx) =>
+    decideConfigProposal(
+      tx,
+      ctx.principal.tenantId,
+      id,
+      decision,
+      ctx.principal.repProfileId,
+      reason,
+    ),
   );
 }
 
@@ -2314,9 +2474,20 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
    * author comes from the token rather than the body, like every other attributed write
    * here.
    *
-   * Not four-eyed, deliberately: a tenant with one compliance officer must be able to set
-   * its own grace period, and the alternative is the psql prompt this whole lineage exists
-   * to get away from. The reasoning is at length in 0059.
+   * NOT FOUR-EYED FOR THE GRACE PERIOD, and four-eyed for the switch (0062). A tenant with
+   * one compliance officer must be able to set its own grace period, which is 0059's
+   * reasoning and still holds; arming `auto_writeoff_promo` is the one setting here that
+   * lets a scheduled job remove material from a balance with no person involved, and one
+   * officer should not do that alone. Turning it OFF takes one signature, because that only
+   * ever means a person must record each write-off.
+   *
+   * So this route has two answers. A change nobody needs to approve is applied and comes
+   * back 200, as it always has. A change that needs a second signature is RECORDED AS A
+   * PROPOSAL and comes back 202 with it — not refused, because a refusal would leave the
+   * officer with nothing to do but try again, and not applied, because that is the whole
+   * rule. The read of the live policy before either is what makes the choice honest: the
+   * rule is about what MOVES, so a request restating a switch that is already on is not an
+   * arming and must not be sent for approval.
    */
   router.add({
     method: "PUT",
@@ -2337,6 +2508,44 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       if (input.graceDays === undefined && input.autoWriteoffPromo === undefined) {
         throw validationFailed("nothing to change", { _: "supply graceDays, autoWriteoffPromo, or both" });
       }
+
+      const decided = await inTenant(deps, ctx.principal, async (tx) => {
+        const current = await disposalPolicyDetail(tx, ctx.principal.tenantId);
+        // What would actually MOVE, in the database's own column names, because that is what
+        // `crm.four_eyes_rule` is written against and what the trigger will ask about. A
+        // request that restates a value already in force moves nothing, and asking about the
+        // whole request rather than the delta is how a grace-period change ends up waiting
+        // for a second officer because the switch happened to be on.
+        const moving: Record<string, unknown> = {};
+        if (input.graceDays !== undefined && input.graceDays !== current.grace_days) {
+          moving["grace_days"] = input.graceDays;
+        }
+        if (
+          input.autoWriteoffPromo !== undefined &&
+          input.autoWriteoffPromo !== current.auto_writeoff_promo
+        ) {
+          moving["auto_writeoff_promo"] = input.autoWriteoffPromo;
+        }
+        const needed = await fourEyesRequired(tx, "disposal_policy", moving);
+        return { moving, needed };
+      });
+
+      if (decided.needed.length > 0) {
+        const proposed = await inTenant(deps, ctx.principal, async (tx) => {
+          const result = await proposeConfigChange(tx, ctx.principal.tenantId, {
+            tableName: "disposal_policy",
+            // The policy keys on the tenant alone, which is the whole of its primary key.
+            rowKey: { tenant_id: ctx.principal.tenantId },
+            changes: decided.moving,
+            proposedBy: ctx.principal.repProfileId,
+            reason: input.reason,
+          });
+          await tellTheDeciders(tx, ctx.principal.tenantId, result.proposal, result.deciders);
+          return result.proposal;
+        });
+        return { status: 202, body: proposed };
+      }
+
       const body = await inTenant(deps, ctx.principal, (tx) =>
         setDisposalPolicy(tx, ctx.principal.tenantId, {
           ...(input.graceDays !== undefined ? { graceDays: input.graceDays } : {}),
@@ -2658,6 +2867,165 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
    * here would answer confidently about the wrong one. A missing secret surfaces where
    * it is true: the delivery dead-letters rather than going out unsigned.
    */
+  // ---- the changes that take two people (0062) ---------------------------------
+  //
+  // Every route here answers to the grant the PROPOSAL names rather than to a fixed role,
+  // which is the only arrangement that can be right: `crm.four_eyes_rule` says the disposal
+  // policy answers to `compliance` and the expense account map to `administrator`, and a
+  // route with one `requireRole` would either let an administrator approve an SOP change or
+  // let a compliance officer re-point a ledger account. The database checks it too —
+  // `crm.decide_config_proposal` refuses a decision from somebody without the grant — so
+  // this is the readable refusal and that is the one that cannot be forgotten.
+
+  /**
+   * Which configuration changes take two people, as a register anybody may read.
+   *
+   * OPEN TO EVERY REP, deliberately, and it is the same reasoning as the disposal policy
+   * itself: this is a statement about how the system is governed, not about anybody's data.
+   * An administrator who can see that re-pointing a ledger account needs a colleague is an
+   * administrator who asks for one instead of discovering the rule as a refusal.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/four-eyes-rules",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const data = await inTenant(deps, ctx.principal, (tx) => fourEyesRules(tx));
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * What is waiting for a second signature, and what has already had one.
+   *
+   * `?pending=true` is the approver's queue; the default is the record, which includes the
+   * rejected and the withdrawn — a proposal somebody refused is as much a fact as one they
+   * allowed, and a list that quietly dropped them would make a refusal look like it never
+   * happened.
+   *
+   * Readable by the holder of EITHER grant rather than by the one a given row names. Two
+   * reasons: a proposal is not secret within the tenant (its subject is a setting every rep
+   * can already read), and an administrator who cannot see that an SOP change is stuck has
+   * no way to know a second compliance officer needs appointing — which is the one
+   * administrative act that unblocks it.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/four-eyes",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireAnyRole(ctx.principal, ["administrator", "compliance"]);
+      const limit = parse(
+        z.coerce.number().int().min(1).max(PROPOSAL_LIST_LIMIT).optional(),
+        ctx.query.get("limit") ?? undefined,
+      );
+      const pendingOnly = ctx.query.get("pending") === "true";
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        configProposals(tx, ctx.principal.tenantId, {
+          pendingOnly,
+          ...(limit !== undefined ? { limit } : {}),
+        }),
+      );
+      return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * Approve a proposal — which APPLIES it, in the same transaction.
+   *
+   * The decision is the act. The alternative was to mark the row and leave the proposer to
+   * re-issue the write, and it opens a window in which an approved proposal exists and the
+   * setting has not changed, so the tenant's configuration and its approved intent disagree
+   * and nothing says which is current. Here `crm.decide_config_proposal` records the
+   * agreement, the store function performs the write with the proposal named in its
+   * attribution block, and `crm.require_four_eyes` stamps `applied_at` as it lets the write
+   * through — so an approval and the change it authorised cannot come apart.
+   *
+   * ONE TRANSACTION, so a refusal at the write rolls the approval back with it. An approval
+   * that stood while its change had been refused would be the worst of the three possible
+   * outcomes: a record saying two people agreed, over a setting that never moved.
+   *
+   * The approver supplies their OWN reason. The proposer's survives on the proposal, and the
+   * change's log row carries the approver's — which is the honest division, because "we
+   * needed this" and "I agree, and here is what I checked" are different statements.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/admin/four-eyes/:id/approve",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const input = parse(z.object({ reason: z.string().min(10).max(1000) }), ctx.body);
+      const pending = await inTenant(deps, ctx.principal, (tx) =>
+        configProposal(tx, ctx.principal.tenantId, id),
+      );
+      if (pending === null) throw notFound(`no proposal ${id} in this tenant`);
+      // The grant the PROPOSAL answers to, read from the row rather than assumed.
+      requireRole(ctx.principal, pending.role);
+
+      const body = await asChange(
+        deps,
+        ctx.principal,
+        input.reason,
+        async (tx) => {
+          const proposal = await decideConfigProposal(
+            tx,
+            ctx.principal.tenantId,
+            id,
+            "approved",
+            ctx.principal.repProfileId,
+            input.reason,
+          );
+          const applied = await applyProposal(tx, ctx.principal, proposal, input.reason);
+          // Re-read, so `applied_at` on the way back is the stamped one rather than the null
+          // it held a statement ago. A response that said `applied_at: null` about a change
+          // that had just landed would be the screen's only evidence disagreeing with the
+          // database.
+          return { proposal: await configProposal(tx, ctx.principal.tenantId, id), applied };
+        },
+        id,
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Reject a proposal. Somebody ELSE saying no.
+   *
+   * A proposer who changes their mind withdraws instead, and the distinction is not
+   * pedantry: without it "rejected" would cover both, and a reader counting refused changes
+   * could not tell a disagreement from a second thought. The database holds the rule
+   * (`config_proposal_rejected_by_another`), so this cannot be relaxed by a route.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/admin/four-eyes/:id/reject",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const input = parse(z.object({ reason: z.string().min(10).max(1000) }), ctx.body);
+      const body = await decideFourEyes(deps, ctx, id, "rejected", input.reason);
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Withdraw a proposal. Only the rep who made it.
+   *
+   * No grant is required beyond the one the proposal names, and not even that is checked by
+   * the database for a withdrawal: somebody who has lost the compliance grant must still be
+   * able to take back a request nobody has acted on, or the queue fills with proposals that
+   * can only be rejected. The route holds the same line — it asks who, not what they hold.
+   */
+  router.add({
+    method: "POST",
+    pattern: "/v1/admin/four-eyes/:id/withdraw",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const id = parse(UUID, ctx.params["id"]);
+      const input = parse(z.object({ reason: z.string().min(10).max(1000) }), ctx.body);
+      const body = await decideFourEyes(deps, ctx, id, "withdrawn", input.reason, {
+        requireGrant: false,
+      });
+      return { status: 200, body };
+    },
+  });
+
   router.add({
     method: "GET",
     pattern: "/v1/admin/notification-endpoints",
@@ -3456,6 +3824,45 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         }),
         ctx.body,
       );
+      // 0062. Re-pointing an EXISTING mapping takes two people: every claim posted
+      // afterwards lands in the new account, and pointing it back does not move them.
+      // Creating one takes a single signature — a category that posts nowhere cannot post
+      // wrongly, and requiring two people to write a tenant's first mapping would mean a
+      // tenant cannot start claiming at all.
+      //
+      // `anyAccountMapping`, not `activeAccountMapping`: an INACTIVE row still names an
+      // account, so bringing it back at a different one is a re-pointing. Reading only
+      // active rows would read that as a creation and let it through on one signature,
+      // which is the whole of the rule it would be evading.
+      const existing = await inTenant(deps, ctx.principal, (tx) =>
+        anyAccountMapping(tx, ctx.principal.tenantId, category),
+      );
+      const repointing =
+        existing !== null && existing.erp_ledger_account_code !== input.erpLedgerAccountCode;
+
+      if (repointing) {
+        const proposed = await inTenant(deps, ctx.principal, async (tx) => {
+          const result = await proposeConfigChange(tx, ctx.principal.tenantId, {
+            tableName: "expense_account_map",
+            rowKey: { tenant_id: ctx.principal.tenantId, crm_category: category },
+            // THE WHOLE INTENDED ROW, not only the column needing approval. The upsert
+            // REPLACES the cost centre (0061's suite pins that), so a proposal naming only
+            // the account code would apply as a silent clearing of a dimension the approver
+            // never saw. `crm.require_four_eyes` checks the four-eyes columns and ignores
+            // the rest, which is what makes carrying both safe.
+            changes: {
+              erp_ledger_account_code: input.erpLedgerAccountCode,
+              erp_cost_center_code: input.erpCostCenterCode ?? null,
+            },
+            proposedBy: ctx.principal.repProfileId,
+            reason: input.reason,
+          });
+          await tellTheDeciders(tx, ctx.principal.tenantId, result.proposal, result.deciders);
+          return result.proposal;
+        });
+        return { status: 202, body: proposed };
+      }
+
       const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
         upsertAccountMapping(tx, ctx.principal.tenantId, {
           crmCategory: category,

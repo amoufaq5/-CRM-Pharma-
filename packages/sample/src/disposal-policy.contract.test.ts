@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { withTenantContext } from "@crm/db";
-import { TENANT_DISPOSAL_POLICY as TENANT, appPool } from "@crm/db/testing";
+import { TENANT_DISPOSAL_POLICY as TENANT, appPool, withFourEyes } from "@crm/db/testing";
 
 import {
   DEFAULT_GRACE_DAYS,
@@ -251,14 +251,34 @@ describe("the disposal policy and its history", () => {
     expect(await inTenant((tx) => disposalPolicyHistory(tx, TENANT))).toHaveLength(1);
   });
 
-  it("changes both knobs in one record when both move", async () => {
+  /**
+   * Both knobs in one record — and since 0062 that record needs two people, because one of
+   * the two knobs is the switch that arms the unattended write-off job.
+   *
+   * The four-eyes rule is per COLUMN, so a change carrying a four-eyed column and an ordinary
+   * one needs the approval; the grace period does not become free because it travelled with
+   * something dangerous, and the switch does not become free because it travelled with
+   * something routine. The proposal names both values and the log row points at it.
+   */
+  it("changes both knobs in one record when both move, which takes two people", async () => {
     const after = await inTenant((tx) =>
-      setDisposalPolicy(tx, TENANT, {
-        graceDays: 0,
-        autoWriteoffPromo: true,
-        changedBy: OFFICER,
-        reason: "same-day disposal, and leaflets go centrally from now on",
-      }),
+      withFourEyes(
+        tx,
+        TENANT,
+        {
+          tableName: "disposal_policy",
+          rowKey: { tenant_id: TENANT },
+          changes: { grace_days: 0, auto_writeoff_promo: true },
+          role: "compliance",
+        },
+        (c) =>
+          setDisposalPolicy(c, TENANT, {
+            graceDays: 0,
+            autoWriteoffPromo: true,
+            changedBy: OFFICER,
+            reason: "same-day disposal, and leaflets go centrally from now on",
+          }),
+      ),
     );
     expect(after).toEqual({ grace_days: 0, auto_writeoff_promo: true });
     const [change] = await inTenant((tx) => disposalPolicyHistory(tx, TENANT));
@@ -268,6 +288,75 @@ describe("the disposal policy and its history", () => {
       auto_writeoff_promo_from: false,
       auto_writeoff_promo_to: true,
     });
+    // The authority the change rests on, linked structurally rather than mentioned in prose.
+    const { rows } = await inTenant((tx) =>
+      tx.query<{ linked: boolean }>(
+        "SELECT proposal_id IS NOT NULL AS linked FROM crm.disposal_policy_change WHERE tenant_id = $1",
+        [TENANT],
+      ),
+    );
+    expect(rows.map((r) => r.linked)).toEqual([true]);
+  });
+
+  /**
+   * And a grace-period change on its own still takes one signature, with nothing to point at.
+   *
+   * The control for the test above, and the assertion 0059's reasoning turns on: "a tenant
+   * with one compliance officer cannot set its own grace period at all" was the stated reason
+   * not to four-eye this table, and 0062 had to leave that true.
+   */
+  it("still takes one person to move the grace period, and records no proposal", async () => {
+    await inTenant((tx) =>
+      setDisposalPolicy(tx, TENANT, {
+        graceDays: 14,
+        changedBy: OFFICER,
+        reason: "a fortnight, after the regional audit",
+      }),
+    );
+    const { rows } = await inTenant((tx) =>
+      tx.query<{ linked: boolean }>(
+        "SELECT proposal_id IS NOT NULL AS linked FROM crm.disposal_policy_change WHERE tenant_id = $1",
+        [TENANT],
+      ),
+    );
+    expect(rows.map((r) => r.linked)).toEqual([false]);
+  });
+
+  /**
+   * Disarming it takes one person too, which is the asymmetry the rule is made of.
+   *
+   * Turning the switch OFF only ever means a person must record each write-off, so it fails
+   * safe and needs nobody's agreement. A rule that covered both directions would mean a
+   * tenant that armed the job could not stop it without finding a second officer, which is
+   * the opposite of what the rule is for.
+   */
+  it("takes one person to turn it back off", async () => {
+    await inTenant((tx) =>
+      withFourEyes(
+        tx,
+        TENANT,
+        {
+          tableName: "disposal_policy",
+          rowKey: { tenant_id: TENANT },
+          changes: { auto_writeoff_promo: true },
+          role: "compliance",
+        },
+        (c) =>
+          setDisposalPolicy(c, TENANT, {
+            autoWriteoffPromo: true,
+            changedBy: OFFICER,
+            reason: "arming it, which took two people",
+          }),
+      ),
+    );
+    const off = await inTenant((tx) =>
+      setDisposalPolicy(tx, TENANT, {
+        autoWriteoffPromo: false,
+        changedBy: OFFICER,
+        reason: "and one person stopping it again",
+      }),
+    );
+    expect(off).toMatchObject({ auto_writeoff_promo: false });
   });
 
   it("caps the history and takes the newest, which is what a screen shows", async () => {

@@ -135,3 +135,19 @@ export function requireRole(p: Principal, role: Role): void {
     throw forbidden(`this action requires the ${role} role`);
   }
 }
+
+/**
+ * The same, for a route either grant may reach.
+ *
+ * One route rather than two, and the refusal names both so an operator can see which they
+ * would need. 0062's approval queue is the case: a proposal about the disposal policy answers
+ * to `compliance` and one about the expense account map to `administrator`, and the LIST of
+ * what is waiting has to be readable by both — an administrator who cannot see that an SOP
+ * change is stuck has no way to know a second compliance officer needs appointing, which is
+ * the one administrative act that unblocks it.
+ */
+export function requireAnyRole(p: Principal, roles: readonly Role[]): void {
+  if (!roles.some((role) => p.roles.includes(role))) {
+    throw forbidden(`this action requires one of these roles: ${[...roles].sort().join(", ")}`);
+  }
+}

@@ -1,7 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { CONFIG_LOG_LIMIT, configChanges, withAttribution, withTenantContext } from "@crm/db";
-import { TENANT_EXPENSE_MAP as TENANT, appPool, wipeConfigChanges } from "@crm/db/testing";
+import {
+  TENANT_EXPENSE_MAP as TENANT,
+  appPool,
+  wipeProposals,
+  withFourEyes,
+} from "@crm/db/testing";
 
 import {
   activeAccountMapping,
@@ -75,8 +80,9 @@ describe("expense account map", () => {
         REP,
       ]);
       await tx.query("DELETE FROM crm.expense_account_map WHERE tenant_id = $1", [TENANT]);
-      // The log before its author: 0061 names the rep ON DELETE RESTRICT.
-      await wipeConfigChanges(tx, TENANT);
+      // The logs and the proposals before their actors: 0061 and 0062 both name reps ON
+      // DELETE RESTRICT, and the logs reference the proposal, so the order is fixed.
+      await wipeProposals(tx, TENANT);
       await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1 AND id = $2", [TENANT, REP]);
     });
     client?.release();
@@ -91,9 +97,45 @@ describe("expense account map", () => {
       ]);
       await tx.query("DELETE FROM crm.expense_account_map WHERE tenant_id = $1", [TENANT]);
       // So the attribution block below reads only its own test's history.
-      await wipeConfigChanges(tx, TENANT);
+      await wipeProposals(tx, TENANT);
     });
   });
+
+  /**
+   * Re-pointing a category, the way a tenant actually has to (0062).
+   *
+   * CHANGING WHERE A CATEGORY POSTS TAKES TWO PEOPLE: every claim posted afterwards lands in
+   * the new account, and pointing it back does not move them. So three tests below that used
+   * to be one `upsertAccountMapping` call now go the whole way round — two reps hold the
+   * administrator grant, one proposes, the other approves — and what each of them is actually
+   * about (one row not two, `updated_at` moving, the log naming one column) is unchanged.
+   *
+   * The approval names the cost centre as well as the account code, because the upsert
+   * REPLACES it: an approval covering only the four-eyed column would apply as a silent
+   * clearing of a dimension nobody agreed to drop. That is the route's shape too.
+   */
+  const repoint = (
+    tx: PoolClient,
+    category: string,
+    code: string,
+    centre: string | null = null,
+  ): Promise<unknown> =>
+    withFourEyes(
+      tx,
+      TENANT,
+      {
+        tableName: "expense_account_map",
+        rowKey: { tenant_id: TENANT, crm_category: category },
+        changes: { erp_ledger_account_code: code, erp_cost_center_code: centre },
+        role: "administrator",
+      },
+      (c) =>
+        upsertAccountMapping(c, TENANT, {
+          crmCategory: category,
+          erpLedgerAccountCode: code,
+          erpCostCenterCode: centre,
+        }),
+    );
 
   describe("the empty table", () => {
     it("has no mapping for any category", async () => {
@@ -180,10 +222,8 @@ describe("expense account map", () => {
           erpLedgerAccountCode: "6200",
           erpCostCenterCode: "CC-SM",
         });
-        const after = await upsertAccountMapping(tx, TENANT, {
-          crmCategory: "congress",
-          erpLedgerAccountCode: "6300",
-        });
+        await repoint(tx, "congress", "6300");
+        const after = (await listAccountMappings(tx, TENANT))[0]!;
         expect(after.erp_ledger_account_code).toBe("6300");
         // The cost centre is REPLACED, not merged: an upsert that kept a stale dimension
         // would attribute new spend to a cost centre nobody re-stated.
@@ -199,10 +239,8 @@ describe("expense account map", () => {
           erpLedgerAccountCode: "6200",
         });
         await tx.query("SELECT pg_sleep(0.01)");
-        const second = await upsertAccountMapping(tx, TENANT, {
-          crmCategory: "congress",
-          erpLedgerAccountCode: "6300",
-        });
+        await repoint(tx, "congress", "6300");
+        const second = (await listAccountMappings(tx, TENANT))[0]!;
         expect(second.updated_at.getTime()).toBeGreaterThanOrEqual(first.updated_at.getTime());
       });
     });
@@ -449,10 +487,7 @@ describe("expense account map", () => {
           crmCategory: "congress",
           erpLedgerAccountCode: "6200",
         });
-        await upsertAccountMapping(tx, TENANT, {
-          crmCategory: "congress",
-          erpLedgerAccountCode: "6300",
-        });
+        await repoint(tx, "congress", "6300");
       });
       const log = await unsigned((tx) => configChanges(tx, TENANT));
       // Newest first, so the amendment is at the head. `clock_timestamp()` rather than `now()`

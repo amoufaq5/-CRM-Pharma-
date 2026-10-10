@@ -330,7 +330,23 @@ export function toProblem(err: unknown): ApiError {
     // too. `InvalidEndpointError` below stays a 422, because that one is about what the
     // operator typed.
     case "EndpointAmendmentError":
+    // 0062. Every `four-eyes-*` refusal, and every refusal to re-decide or rewrite a
+    // proposal. All of them are well-formed requests that the state refuses — the change
+    // takes two people and nobody has agreed, the approval was for another row or another
+    // value, it has already been spent, somebody decided a moment earlier — and the last of
+    // those is a RACE as often as a mistake: two approvers clicking at once is the ordinary
+    // case. `conflict` is the reading that carries, and the message is the trigger's, because
+    // every one of them names what to do next.
+    case "ConfigFourEyesError":
+    case "ConfigProposalError":
       return new ApiError("conflict", message);
+    // Not a conflict and not an error the state produced: there is no rule requiring a second
+    // person for this change, so the remedy is cheerful — make it. 422, because what was
+    // wrong is what was asked for.
+    case "NoFourEyesRuleError":
+      return new ApiError("validation_failed", message);
+    case "ConfigProposalNotFoundError":
+      return new ApiError("not_found", message);
     // And this one is OURS, not the caller's: a missing `reason` in a request body is refused
     // by the route's own schema long before the database sees it, so reaching the trigger's
     // refusal means a route forgot to open an attribution block. 500 is the honest answer;
