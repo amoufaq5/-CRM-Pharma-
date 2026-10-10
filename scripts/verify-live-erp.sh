@@ -450,9 +450,28 @@ ON CONFLICT (tenant_id, subject) DO UPDATE
 INSERT INTO crm.sample_lot (id, tenant_id, erp_item_id, lot_number, expiry_date, material_kind)
 VALUES ('$LOT_ID', '$TENANT', 'itm-1', 'LOT-LIVE-1', CURRENT_DATE + 365, 'drug_sample')
 ON CONFLICT (tenant_id, erp_item_id, lot_number) DO NOTHING;
+
+-- A SECOND REP, and the administrator grant. 0023's four-eyes rule means nobody grants
+-- themselves a role, so the second rep grants Ada — the same shape a real tenant has, where
+-- the first administrator is inserted by whoever runs the migrations.
+--
+-- The grant is what makes §10's endpoint checks reachable at all: since 0060 adding a
+-- notification endpoint is an administrator action that names its author and its reason, and
+-- the whole point of the check is that the author comes from the token.
+INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name, status)
+VALUES ('$TENANT', 'rep-grace', 'E-2', 'Grace Hopper', 'active')
+ON CONFLICT (tenant_id, subject) DO UPDATE SET status = 'active';
+INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from, grant_reason)
+SELECT '$TENANT', a.id, 'administrator', g.id, CURRENT_DATE - 1,
+       'the live gate needs somebody who may configure where signals are pushed'
+  FROM crm.rep_profile a, crm.rep_profile g
+ WHERE a.subject = 'rep-ada' AND g.subject = 'rep-grace'
+   AND NOT EXISTS (SELECT 1 FROM crm.rep_role x
+                    WHERE x.rep_profile_id = a.id AND x.role = 'administrator' AND x.valid_to IS NULL);
 COMMIT;
 SQL
 ok "crm.rep_profile maps rep-ada → Employee emp-1, and lot LOT-LIVE-1 of itm-1 exists"
+ok "rep-ada holds the administrator grant — granted by Grace, because 0023 lets nobody grant themselves one"
 
 # PORT=0: the binary logs the port it actually bound, so no fourth fixed socket is
 # reserved and a stale listener cannot be mistaken for this one.

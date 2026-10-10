@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { appPool, TENANT_NOTIFY as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_NOTIFY as TENANT, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
 
 import { NotificationDispatcher, MAX_ATTEMPTS, nextDelayMs } from "./dispatch.js";
 import { inbox, markAllRead, markRead, unreadCount } from "./inbox.js";
@@ -87,7 +87,7 @@ describe("notifications", () => {
     await inTenant(async (tx) => {
       await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [TENANT]);
       await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
-      await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [TENANT]);
+      await wipeEndpoints(tx, TENANT);
     });
   };
 
@@ -111,10 +111,15 @@ describe("notifications", () => {
     tx: PoolClient,
     opts: { url: string; minSeverity?: string; kinds?: readonly string[] | null; enabled?: boolean },
   ): Promise<string> => {
+    await endpointAuthor(tx, TENANT);
     const { rows } = await tx.query<{ id: string }>(
       `INSERT INTO crm.notification_endpoint
-         (tenant_id, channel, url, secret_env, min_severity, kinds, enabled)
-       VALUES ($1,'webhook',$2,'CRM_TEST_HOOK_SECRET',$3,$4,$5) RETURNING id`,
+         (tenant_id, channel, url, secret_env, min_severity, kinds, enabled,
+          created_by, created_reason)
+       VALUES ($1,'webhook',$2,'CRM_TEST_HOOK_SECRET',$3,$4,$5,
+               (SELECT id FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'fixture-endpoint-author'),
+               'a fixture needs an endpoint, and 0060 refuses one that names nobody')
+       RETURNING id`,
       [TENANT, opts.url, opts.minSeverity ?? "warning", opts.kinds ?? null, opts.enabled ?? true],
     );
     return rows[0]!.id;
@@ -246,8 +251,14 @@ describe("notifications", () => {
         await inTenant(async (tx) => {
           await expect(
             tx.query(
-              `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env)
-               VALUES ($1,'webhook','https://h.example.com/x','hunter2')`,
+              // Attributed, so the constraint under test is the one that answers: 0060's
+              // BEFORE INSERT guard runs before a CHECK and would otherwise refuse this
+              // for the wrong reason.
+              `INSERT INTO crm.notification_endpoint
+                 (tenant_id, channel, url, secret_env, created_by, created_reason)
+               VALUES ($1,'webhook','https://h.example.com/x','hunter2',
+                       (SELECT id FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'fixture-endpoint-author'),
+                       'probing that a secret VALUE is refused where a variable NAME belongs')`,
               [TENANT],
             ),
           ).rejects.toThrow(/secret_env/);

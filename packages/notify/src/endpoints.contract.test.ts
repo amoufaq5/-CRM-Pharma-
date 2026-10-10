@@ -1,12 +1,13 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_ENDPOINTS as TENANT, testPool } from "@crm/db/testing";
+import { TENANT_ENDPOINTS as TENANT, testPool, wipeEndpoints } from "@crm/db/testing";
 
 import {
   ENDPOINT_CHANNELS,
   InvalidEndpointError,
   createEndpoint,
+  endpointHistory,
   getEndpoint,
   listEndpoints,
   updateEndpoint,
@@ -29,15 +30,32 @@ describe("notification endpoints", () => {
   const inTenant = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> =>
     withTenantContext(client, TENANT, fn);
 
+  const AUTHOR = "d3000000-0000-4000-8000-0000000000a1";
+  const SECOND = "d3000000-0000-4000-8000-0000000000a2";
+
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
     await client.query("SET ROLE crm_app");
+    // Two administrators, because since 0060 every write here names one — and because the
+    // history has to be able to show two different people turning the same endpoint's knobs.
+    await inTenant(async (tx) => {
+      for (const [id, subject, name] of [
+        [AUTHOR, "ep-author", "The Administrator"],
+        [SECOND, "ep-second", "A Second Administrator"],
+      ] as const) {
+        await tx.query(
+          `INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name, status)
+           VALUES ($1,$2,$3,$3,$4,'active') ON CONFLICT (id) DO NOTHING`,
+          [id, TENANT, subject, name],
+        );
+      }
+    });
   });
 
   afterAll(async () => {
     await inTenant(async (tx) => {
-      await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [TENANT]);
+      await wipeEndpoints(tx, TENANT);
     });
     await client?.query("RESET ROLE");
     client?.release();
@@ -46,7 +64,7 @@ describe("notification endpoints", () => {
 
   beforeEach(async () => {
     await inTenant(async (tx) => {
-      await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [TENANT]);
+      await wipeEndpoints(tx, TENANT);
     });
   });
 
@@ -55,6 +73,19 @@ describe("notification endpoints", () => {
       channel: "webhook",
       url: "https://hooks.example.test/crm",
       secretEnv: "CRM_TEST_WEBHOOK_SECRET",
+      createdBy: AUTHOR,
+      reason: "ops asked for disposal signals in their on-call channel",
+      ...over,
+    });
+
+  const amend = (
+    tx: PoolClient,
+    id: string,
+    over: Partial<Parameters<typeof updateEndpoint>[2]> = {},
+  ) =>
+    updateEndpoint(tx, id, {
+      changedBy: AUTHOR,
+      reason: "a fixture turning a knob, with a sentence attached",
       ...over,
     });
 
@@ -209,7 +240,7 @@ describe("notification endpoints", () => {
     it("changes the thresholds and leaves the rest alone", async () => {
       await inTenant(async (tx) => {
         const ep = await create(tx, { description: "the ops channel" });
-        const updated = await updateEndpoint(tx, ep.id, { minSeverity: "urgent" });
+        const updated = await amend(tx, ep.id, { minSeverity: "urgent" });
         expect(updated?.min_severity).toBe("urgent");
         expect(updated?.description).toBe("the ops channel");
         expect(updated?.url).toBe(ep.url);
@@ -219,7 +250,7 @@ describe("notification endpoints", () => {
     it("can clear an allow-list back to every kind", async () => {
       await inTenant(async (tx) => {
         const ep = await create(tx, { kinds: ["erp_write_failed"] });
-        expect((await updateEndpoint(tx, ep.id, { kinds: null }))?.kinds).toBeNull();
+        expect((await amend(tx, ep.id, { kinds: null }))?.kinds).toBeNull();
       });
     });
 
@@ -231,21 +262,21 @@ describe("notification endpoints", () => {
     it("disables an endpoint without removing its history", async () => {
       await inTenant(async (tx) => {
         const ep = await create(tx);
-        expect((await updateEndpoint(tx, ep.id, { enabled: false }))?.enabled).toBe(false);
+        expect((await amend(tx, ep.id, { enabled: false }))?.enabled).toBe(false);
         expect((await getEndpoint(tx, ep.id))?.id).toBe(ep.id);
       });
     });
 
     it("returns null for an endpoint that is not there", async () => {
       await inTenant(async (tx) => {
-        expect(await updateEndpoint(tx, "e8000000-0000-4000-8000-00000000000f", { enabled: false })).toBeNull();
+        expect(await amend(tx, "e8000000-0000-4000-8000-00000000000f", { enabled: false })).toBeNull();
       });
     });
 
     it("refuses an unknown kind on update too", async () => {
       await inTenant(async (tx) => {
         const ep = await create(tx);
-        await expect(updateEndpoint(tx, ep.id, { kinds: ["nope"] })).rejects.toBeInstanceOf(InvalidEndpointError);
+        await expect(amend(tx, ep.id, { kinds: ["nope"] })).rejects.toBeInstanceOf(InvalidEndpointError);
       });
     });
   });
@@ -263,6 +294,193 @@ describe("notification endpoints", () => {
       const all = await listEndpoints(tx, TENANT);
       expect(all).toHaveLength(2);
       expect(all.map((e) => e.description)).toEqual(["ay", "bee"]);
+    });
+  });
+
+  /**
+   * Who opened the route, and who changed what it receives (0060).
+   *
+   * 0023's header named this table and `crm.disposal_policy` as the two that were "settable
+   * by anyone with the application password, with no record of who changed what"; 0059
+   * answered the policy and this answers the endpoint. The asymmetry between the two halves
+   * is the design: what an endpoint IS was already frozen for the life of the row (0049), so
+   * its author is a frozen column beside it, while how it is TUNED changes over time and gets
+   * a log the tunable columns are a projection of.
+   */
+  describe("attribution", () => {
+    it("records who opened the route and why, and hands both back", async () => {
+      const ep = await inTenant((tx) => create(tx));
+      expect(ep.created_by).toBe(AUTHOR);
+      expect(ep.created_by_name).toBe("The Administrator");
+      expect(ep.created_reason).toContain("on-call channel");
+      // And through the list, which is where an administrator actually reads it.
+      const [listed] = await inTenant((tx) => listEndpoints(tx, TENANT));
+      expect(listed).toMatchObject({ created_by: AUTHOR, created_by_name: "The Administrator" });
+    });
+
+    it("refuses an endpoint that names nobody, from raw SQL", async () => {
+      // The route cannot produce this — the author comes from the token — so the guard is
+      // measured where it matters: a statement typed at a psql prompt, which is the access
+      // 0023's header was written about.
+      await inTenant(async (tx) => {
+        const err = await refuses(tx, () =>
+          tx.query(
+            `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env)
+             VALUES ($1,'webhook','https://hooks.example.test/anon','CRM_TEST_WEBHOOK_SECRET')`,
+            [TENANT],
+          ),
+        );
+        expect(err.message).toMatch(/must name the rep who added it/);
+      });
+    });
+
+    it("refuses to let the creation record be rewritten, in its own words", async () => {
+      // 0049's freeze now covers `created_by` and `created_reason` — and gives them a
+      // different sentence, because its original one ("has delivery records naming url = …")
+      // would send an operator hunting a problem that is not there.
+      const ep = await inTenant((tx) => create(tx));
+      await inTenant(async (tx) => {
+        const err = await refuses(tx, () =>
+          tx.query("UPDATE crm.notification_endpoint SET created_by = $2 WHERE id = $1", [ep.id, SECOND]),
+        );
+        expect(err.message).toMatch(/endpoint-creation-frozen/);
+        expect(err.message).toMatch(/not editable/);
+      });
+    });
+
+    it("records an amendment with both halves of every knob", async () => {
+      const ep = await inTenant((tx) => create(tx, { minSeverity: "info", kinds: ["erp_write_failed"] }));
+      await inTenant((tx) =>
+        updateEndpoint(tx, ep.id, {
+          minSeverity: "urgent",
+          enabled: false,
+          changedBy: SECOND,
+          reason: "too noisy for the on-call channel, and off until the receiver is rebuilt",
+        }),
+      );
+      const [change] = await inTenant((tx) => endpointHistory(tx, ep.id));
+      expect(change).toMatchObject({
+        changed_by: SECOND,
+        changed_by_name: "A Second Administrator",
+        min_severity_from: "info",
+        min_severity_to: "urgent",
+        enabled_from: true,
+        enabled_to: false,
+      });
+      // THE KNOB THAT WAS NOT NAMED keeps its value on both sides, so the row reads as a
+      // complete statement of the tuning before and after rather than a diff with holes in
+      // it — which is what makes "did the allow-list change" answerable without a flag.
+      expect(change?.kinds_from).toEqual(["erp_write_failed"]);
+      expect(change?.kinds_to).toEqual(["erp_write_failed"]);
+    });
+
+    it("tells a cleared allow-list apart from one nobody mentioned", async () => {
+      // The reason the caller sends the complete desired state rather than a patch: `kinds`
+      // NULL means every kind, so in a partial record "not specified" and "set to null" are
+      // the same thing and a COALESCE would read "clear it" as "leave it alone".
+      const ep = await inTenant((tx) => create(tx, { kinds: ["erp_write_failed"] }));
+      await inTenant((tx) =>
+        updateEndpoint(tx, ep.id, {
+          kinds: null,
+          changedBy: AUTHOR,
+          reason: "subscribing it to everything, now that the receiver can take it",
+        }),
+      );
+      const [cleared] = await inTenant((tx) => endpointHistory(tx, ep.id));
+      expect(cleared?.kinds_from).toEqual(["erp_write_failed"]);
+      expect(cleared?.kinds_to).toBeNull();
+
+      await inTenant((tx) =>
+        updateEndpoint(tx, ep.id, {
+          minSeverity: "urgent",
+          changedBy: AUTHOR,
+          reason: "raising the threshold and leaving the allow-list alone",
+        }),
+      );
+      const [untouched] = await inTenant((tx) => endpointHistory(tx, ep.id));
+      expect(untouched?.kinds_from).toBeNull();
+      expect(untouched?.kinds_to).toBeNull();
+      expect((await inTenant((tx) => getEndpoint(tx, ep.id)))?.kinds).toBeNull();
+    });
+
+    it("refuses a direct amendment, which is what makes the log the record", async () => {
+      const ep = await inTenant((tx) => create(tx));
+      await inTenant(async (tx) => {
+        const err = await refuses(tx, () =>
+          tx.query("UPDATE crm.notification_endpoint SET enabled = false WHERE id = $1", [ep.id]),
+        );
+        expect(err.message).toMatch(/cannot be updated directly/);
+      });
+      expect((await inTenant((tx) => getEndpoint(tx, ep.id)))?.enabled).toBe(true);
+    });
+
+    it("refuses an amendment that changes nothing rather than recording it", async () => {
+      const ep = await inTenant((tx) => create(tx));
+      await inTenant(async (tx) => {
+        const err = await refuses(tx, () =>
+          updateEndpoint(tx, ep.id, {
+            enabled: true,
+            changedBy: AUTHOR,
+            reason: "writing down the state that is already in force",
+          }),
+        );
+        expect(err.name).toBe("EndpointAmendmentError");
+        expect(err.message).toMatch(/changes nothing/);
+      });
+      expect(await inTenant((tx) => endpointHistory(tx, ep.id))).toEqual([]);
+    });
+
+    it("is append-only: an amendment cannot be edited or deleted afterwards", async () => {
+      const ep = await inTenant((tx) => create(tx));
+      await inTenant((tx) =>
+        updateEndpoint(tx, ep.id, {
+          enabled: false,
+          changedBy: AUTHOR,
+          reason: "off while the receiver is rebuilt, and this row stays either way",
+        }),
+      );
+      await inTenant(async (tx) => {
+        const edited = await refuses(tx, () =>
+          tx.query("UPDATE crm.notification_endpoint_change SET reason = 'something else'"),
+        );
+        expect(edited.message).toMatch(/append-only/);
+        const removed = await refuses(tx, () => tx.query("DELETE FROM crm.notification_endpoint_change"));
+        expect(removed.message).toMatch(/append-only/);
+      });
+      expect(await inTenant((tx) => endpointHistory(tx, ep.id))).toHaveLength(1);
+    });
+
+    it("keeps each endpoint's history to itself", async () => {
+      const a = await inTenant((tx) => create(tx, { url: "https://hooks.example.test/a" }));
+      const b = await inTenant((tx) => create(tx, { url: "https://hooks.example.test/b" }));
+      await inTenant((tx) =>
+        updateEndpoint(tx, a.id, {
+          enabled: false,
+          changedBy: AUTHOR,
+          reason: "turning off the first one and not the second",
+        }),
+      );
+      expect(await inTenant((tx) => endpointHistory(tx, a.id))).toHaveLength(1);
+      expect(await inTenant((tx) => endpointHistory(tx, b.id))).toEqual([]);
+    });
+
+    it("reads newest first, and caps what it returns", async () => {
+      const ep = await inTenant((tx) => create(tx));
+      for (const severity of ["info", "warning", "urgent"] as const) {
+        await inTenant((tx) =>
+          updateEndpoint(tx, ep.id, {
+            minSeverity: severity,
+            changedBy: AUTHOR,
+            reason: `moving the threshold to ${severity}`,
+          }),
+        );
+      }
+      const all = await inTenant((tx) => endpointHistory(tx, ep.id));
+      expect(all.map((c) => c.min_severity_to)).toEqual(["urgent", "warning", "info"]);
+      // Deterministic because `changed_at` is `clock_timestamp()` rather than `now()`: the
+      // transaction clock would tie for two amendments written in one transaction.
+      expect((await inTenant((tx) => endpointHistory(tx, ep.id, { limit: 2 }))).map((c) => c.min_severity_to))
+        .toEqual(["urgent", "warning"]);
     });
   });
 });

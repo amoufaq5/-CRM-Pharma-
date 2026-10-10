@@ -133,8 +133,9 @@ authorisation on its own.
 | `POST /v1/admin/roles` | grant a role (**administrator**); never to oneself |
 | `POST /v1/admin/roles/:id/revoke` | end a grant (**administrator**); the grant stays, with an end date |
 | `PUT /v1/admin/samples/disposal-policy` | the grace period and the promo switch (**compliance**); a **reason is required** and the change is an append-only record |
-| `GET\|POST /v1/admin/notification-endpoints` | where signals are pushed (**administrator**) |
-| `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; there is no DELETE |
+| `GET\|POST /v1/admin/notification-endpoints` | where signals are pushed (**administrator**); creating one needs a **reason** and records who |
+| `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; a **reason is required** and the change is an append-only record; there is no DELETE |
+| `GET /v1/admin/notification-endpoints/:id/history` | every amendment to one endpoint, newest first, with both halves of each knob |
 | `POST /v1/admin/notification-endpoints/:id/test` | ask the scheduler to probe it; `202`, because it is queued, not answered |
 | `GET /v1/admin/notification-endpoints/:id/test` | the verdict the scheduler recorded |
 | `GET /v1/admin/notification-endpoints/:id/tests` | the last twenty, newest first |
@@ -176,6 +177,17 @@ The split is not arbitrary. A `compliance` parameter is one reps are **measured 
 an `administrator` one is a statement about the system itself. Retention is the second
 kind — the regulated facts a notification refers to live in their own tables and a prune
 never touches them.
+
+**And a role answers who MAY, not what happened.** 0023's own header named the debt it was
+clearing in two clauses: `crm.disposal_policy` and `crm.notification_endpoint` were
+"settable by anyone with the application password, **with no record of who changed what**".
+The role model answered the first clause and left the second for two years of migrations.
+Both are closed now, and by the arrangement migration 0018 already used for a sample
+balance: the configuration row is a **projection of an append-only log**, every write names
+an author and carries a reason, and a direct `UPDATE` is refused by the database rather than
+merely avoided by the code. The disposal policy is 0059; the endpoints are 0060, where what
+an endpoint *is* was already frozen for the life of the row (0049) so its author is a frozen
+column beside the destination, and only its *tuning* is logged.
 
 Four rules, all of them in the database (`db/migrations/0023_roles.sql`), so a route cannot
 forget one:
@@ -820,7 +832,7 @@ same bypass with extra steps.
 The trigger is the layer doing the work today. The key only pins a tenant that has been
 *erased*; the trigger pins one that has been *stopped*, which is every deleted tenant from the
 moment the watcher sees the tombstone until somebody runs the erasure — a window that stays
-open while the twenty undecided dispositions stay undecided.
+open while the twenty-one undecided dispositions stay undecided.
 
 **It does not erase anything, and that is a decision rather than an omission.** Some of the
 CRM's copies may be records a jurisdiction requires us to keep; a deletion that destroys an
@@ -829,7 +841,7 @@ that is defensible today. The vocabulary for the other half is below.
 
 ## What happens to each table, and who decided
 
-**20 of this CRM's 43 tenant-scoped tables have no answer yet, and that is now a fact you can
+**21 of this CRM's 44 tenant-scoped tables have no answer yet, and that is now a fact you can
 read rather than a gap nobody mentioned.** Migration 0051 adds `crm.data_disposition`: one row
 per tenant-scoped table saying `erase`, `retain` with a lawful basis, or `undecided` with the
 question somebody has to answer.
@@ -992,8 +1004,8 @@ PGUSER=… PGHOST=… ./scripts/verify-live-erp.sh
 ```
 
 Boots a real `operate-server` over a real Postgres, points it at the CRM's own JWKS, and
-runs **129 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
-`@crm/relay` as a library, and 39 through the CRM's own `api` and `scheduler` **binaries**,
+runs **133 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
+`@crm/relay` as a library, and 43 through the CRM's own `api` and `scheduler` **binaries**,
 started as processes exactly as `deploy/docker-compose.yml` starts them. It also syncs the
 ERP's warehouses into `crm.warehouse_snapshot` with the shipped `SnapshotRefresher` before
 any rep records a receipt — because since 0058 a receipt naming a depot the ERP does not

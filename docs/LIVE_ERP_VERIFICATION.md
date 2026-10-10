@@ -1728,7 +1728,81 @@ ok: and the server refuses her even when the screen is bypassed — the grant is
 The promo auto-write-off switch is the one setting here that lets a job take material off a
 balance, and nothing guards it beyond the role and the log — four eyes is the obvious
 candidate and is not built. The device shows the last five changes with no way to page
-further. And `crm.notification_endpoint` (0021) is the OTHER table 0023's header named: its
-writes are still an UPDATE with no record of who changed where a tenant's signals are pushed,
-which is the same defect somewhere more sensitive. Roughly 70 of the 106 routes have no
-screen.
+further. Roughly 70 of the 106 routes have no screen.
+
+## Who opened this route out of the tenant
+
+*2026-10-10, `./scripts/verify-live-erp.sh`. The live-ERP gate is 133 checks.*
+
+0023's header named two tables, and the chapter above closed the first. This is the second,
+and the more consequential: a disposal policy is a number reps are measured against, while an
+endpoint is where a notification GOES — and 0021 is explicit that one "carries a rep's name,
+an account id and sometimes a lot number". Adding a row to `crm.notification_endpoint` opens
+a route out of the tenant for exactly that, and the row recorded when it was created and
+nothing about by whom.
+
+Driven through the API BINARY at a running `operate-server`, because the claim being measured
+is that the author comes from the TOKEN and not from the body — which is only true of the
+route:
+
+```
+ok: an endpoint created with no reason is refused — a route out of the tenant that nobody
+    signed for                                                                       (422)
+ok: and one that does names the rep in the token, never a name in the body
+    (201 created_by=1b9661f7 reason=ops asked for overdue disposals in their…)
+ok: turning the signals off is a record with both halves, not an UPDATE that moves a
+    timestamp                                            (200 true->false by Ada Lovelace)
+ok: and an endpoint typed at a psql prompt with no author is refused by the database itself
+```
+
+That last line is the one 0023's header is actually about. This harness's psql runs as the
+SUPERUSER — it bypasses row-level security and owns everything — and the refusal still lands,
+because a trigger is not a permission.
+
+### The shape, and why it is not one mechanism
+
+Two kinds of fact, so two mechanisms. What an endpoint IS — channel, url, secret_env — has
+been frozen for the life of the row since 0049, because a delivery record names the
+destination it went to; a frozen fact is row data rather than an event, so the creation's
+author and reason join it as columns and 0049's existing freeze covers them. How an endpoint
+is TUNED changes over time, so `min_severity`, `kinds`, `enabled` and `description` are a
+projection of an append-only log, the same arrangement 0018 uses for a holding over the
+custody ledger.
+
+```
+ok: records who opened the route and why, and hands both back
+ok: refuses an endpoint that names nobody, from raw SQL
+ok: refuses to let the creation record be rewritten, in its own words
+ok: records an amendment with both halves of every knob
+ok: tells a cleared allow-list apart from one nobody mentioned
+ok: refuses a direct amendment, which is what makes the log the record
+ok: refuses an amendment that changes nothing rather than recording it
+ok: is append-only: an amendment cannot be edited or deleted afterwards
+```
+
+### What this cost, and what it caught
+
+- **Extending a frozen list exposed a flaw in reusing its message.** 0049's refusal explains
+  a destination — "has delivery records naming url = …, so it cannot become …" — and
+  measured against a `created_by` rewrite it sends an operator hunting through delivery
+  records for a problem that is not there. One list, one trigger, two sentences now.
+- **Eight suites inserted endpoint rows directly and seven wiped them.** All of them now
+  attribute the row and retire the log first, through two shared helpers rather than eight
+  copies — because seven copies of a trigger-disable is how one ends up missing the
+  re-enable. Two tests got stronger on the way: the kinds-vocabulary check now arrives by
+  the amendment path, which is the only way an allow-list changes at all.
+- **A latent defect the churn exposed, unrelated to any of this.** The expense-store suite
+  and the notification-retention suite seeded their reps with the same three uuids in
+  DIFFERENT tenants. `crm.rep_profile.id` is a global primary key, so whichever ran first
+  created them in its tenant and the other got `ON CONFLICT DO NOTHING`, no row, and a
+  foreign-key failure on a rep it believed it had seeded. Which suite won depended on file
+  order: flaky by construction, and passing on luck for as long as both files existed.
+
+### What is still not built
+
+There is no screen, and the line is principled: the disposal policy is on the device because
+every rep is measured against it, while an endpoint list is the third parties a tenant talks
+to and belongs in an admin console that does not exist. `crm.notification_policy`,
+`crm.notification_prune_guard` and `crm.expense_account_map` are the same shape of
+configuration with the same gap — and three bespoke logs is the point at which this should
+become one mechanism rather than a fourth copy.

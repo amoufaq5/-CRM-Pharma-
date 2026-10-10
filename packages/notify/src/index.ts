@@ -44,13 +44,17 @@ export {
 export { inbox, markAllRead, markRead, unreadCount, type InboxItem } from "./inbox.js";
 export {
   ENDPOINT_CHANNELS,
+  ENDPOINT_HISTORY_LIMIT,
+  EndpointAmendmentError,
   InvalidEndpointError,
   createEndpoint,
+  endpointHistory,
   getEndpoint,
   isSeverity,
   listEndpoints,
   updateEndpoint,
   type CreateEndpointInput,
+  type EndpointChange,
   type EndpointChannel,
   type EndpointRow,
   type UpdateEndpointInput,

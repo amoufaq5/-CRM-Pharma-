@@ -54,10 +54,20 @@ describe("expense claims", () => {
   let pool: Pool;
   let client: PoolClient;
 
-  const REP = "e6100000-0000-4000-8000-000000000001";
-  const MGR = "e6200000-0000-4000-8000-000000000002";
+  /**
+   * Derived from this suite's OWN tenant (`TENANT_EXPENSE_STORE`), and that is not
+   * cosmetic. These three were `e6100000-…`, `e6200000-…`, `e6300000-…` — byte for byte the
+   * ids `packages/notify/src/retention.contract.test.ts` uses for its own reps in a
+   * DIFFERENT tenant. `crm.rep_profile.id` is a global primary key, so the two suites were
+   * claiming the same three rows: whichever ran first created them in its tenant, the other
+   * got `ON CONFLICT DO NOTHING` and no row at all, and its next insert failed an FK on a
+   * rep it believed it had seeded. Which suite won depended on file order, so the pair was
+   * flaky by construction and had been passing on luck.
+   */
+  const REP = "da100000-0000-4000-8000-00000000e001";
+  const MGR = "da100000-0000-4000-8000-00000000e002";
   /** Deliberately never reconciled: `erp_employee_id` stays null. */
-  const ORPHAN = "e6300000-0000-4000-8000-000000000003";
+  const ORPHAN = "da100000-0000-4000-8000-00000000e003";
 
   const inTenant = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> =>
     withTenantContext(client, TENANT, fn);
@@ -81,9 +91,14 @@ describe("expense claims", () => {
         [ORPHAN, "expensestore-orphan", "E-EXPST-3", "Unreconciled Rep", null],
       ] as const) {
         await tx.query(
+          // `ON CONFLICT (tenant_id, subject)`, not the bare form, and the narrowing is the
+          // guard: a bare `ON CONFLICT DO NOTHING` swallows a PRIMARY KEY collision with
+          // another tenant's row as well as this suite's own re-run, which is exactly how
+          // the id clash above stayed invisible. Narrowed, a taken id raises a duplicate-key
+          // error naming `rep_profile_pkey` and the next collision is loud.
           `INSERT INTO crm.rep_profile
              (id, tenant_id, subject, employee_number, display_name, erp_employee_id)
-           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
+           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (tenant_id, subject) DO NOTHING`,
           [id, TENANT, subject, employee, name, erpId],
         );
       }

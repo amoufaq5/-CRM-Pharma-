@@ -392,6 +392,87 @@ if (PHASE === "api-write") {
     `outbox rows for the refused depots=${refusedWrote}`,
   );
 
+  // 10j. WHERE THIS TENANT'S SIGNALS LEAVE THE BUILDING, and who said so.
+  //
+  // 0023's header named `crm.notification_endpoint` and `crm.disposal_policy` as the two
+  // tables "settable by anyone with the application password, with no record of who changed
+  // what". 0059 answered the policy; 0060 answers this one, which is the more consequential
+  // of the two: a notification carries a rep's name, an account id and sometimes a lot
+  // number, so adding an endpoint opens a route out of the tenant for exactly that.
+  //
+  // Driven through the API BINARY rather than the store, because the claim being measured is
+  // that the author comes from the TOKEN and not from the body — which is only true of the
+  // route.
+  const unsigned = await api("/v1/admin/notification-endpoints", {
+    method: "POST",
+    token,
+    body: {
+      channel: "webhook",
+      url: "https://hooks.live.example/ops",
+      secretEnv: "CRM_LIVE_OPS_SECRET",
+    },
+  });
+  expect(
+    unsigned.status === 422,
+    "an endpoint created with no reason is refused — a route out of the tenant that nobody signed for",
+    `${unsigned.status} ${String(unsigned.body?.detail ?? "").slice(0, 80)}`,
+  );
+
+  const opened = await api("/v1/admin/notification-endpoints", {
+    method: "POST",
+    token,
+    body: {
+      channel: "webhook",
+      url: "https://hooks.live.example/ops",
+      secretEnv: "CRM_LIVE_OPS_SECRET",
+      minSeverity: "urgent",
+      description: "the on-call channel",
+      reason: "ops asked for overdue disposals in their on-call channel",
+    },
+  });
+  expect(
+    opened.status === 201 && typeof opened.body?.created_by === "string",
+    "and one that does names the rep in the token, never a name in the body",
+    `${opened.status} created_by=${String(opened.body?.created_by).slice(0, 8)} reason=${String(opened.body?.created_reason ?? "").slice(0, 40)}`,
+  );
+
+  const silenced = await api(`/v1/admin/notification-endpoints/${opened.body?.id}`, {
+    method: "PATCH",
+    token,
+    body: { enabled: false, reason: "the receiver is being rebuilt this week" },
+  });
+  const endpointLog = await api(`/v1/admin/notification-endpoints/${opened.body?.id}/history`, { token });
+  const amendment = endpointLog.body?.data?.[0];
+  expect(
+    silenced.status === 200 &&
+      silenced.body?.enabled === false &&
+      amendment?.enabled_from === true &&
+      amendment?.enabled_to === false,
+    "turning the signals off is a record with both halves, not an UPDATE that moves a timestamp",
+    `${silenced.status} ${String(amendment?.enabled_from)}->${String(amendment?.enabled_to)} by ${String(amendment?.changed_by_name)}`,
+  );
+
+  // THE ACCESS 0023'S HEADER IS ABOUT, measured. This harness's psql runs as the superuser
+  // — which bypasses RLS and owns nothing it cannot write — and the refusal still lands,
+  // because a trigger is not a permission.
+  const direct = await inCrm(async (tx) => {
+    try {
+      await tx.query(
+        `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env)
+         VALUES ($1, 'webhook', 'https://hooks.live.example/anon', 'CRM_LIVE_ANON_SECRET')`,
+        [TENANT],
+      );
+      return "ACCEPTED";
+    } catch (err) {
+      return String(err instanceof Error ? err.message : err);
+    }
+  });
+  expect(
+    /must name the rep who added it/.test(direct),
+    "and an endpoint typed at a psql prompt with no author is refused by the database itself",
+    direct.replace(/\s+/g, " ").slice(0, 90),
+  );
+
   // 10i. THE FINDING, MADE INTO A CHECK. Nothing in the API reaches the ERP: it
   // constructs no `ErpClient`, opens no socket to it, and every read it serves
   // comes from a `crm.*` snapshot. So the boundary is crossed asynchronously, by

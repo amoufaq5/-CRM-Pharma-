@@ -283,6 +283,54 @@ export const TENANT_WAREHOUSE = "f0580000-0000-4000-8000-000000000024";
 export const TENANT_WAREHOUSE_UNSYNCED = "f1580000-0000-4000-8000-000000000025";
 
 /**
+ * A rep to attribute a fixture's notification endpoint to.
+ *
+ * 0060 refuses an endpoint that names nobody, because adding one opens a route out of the
+ * tenant for records carrying a rep's name. Four suites need an endpoint to exist and none
+ * of them is ABOUT authorship — the dispatcher's, the probe's, the channel-coverage check's
+ * and the retention sweep's — so the one upsert lives here rather than as four slightly
+ * different copies, each of which would have to seed a profile in whichever tenants it uses.
+ *
+ * Idempotent on `(tenant_id, subject)`, so a `beforeEach` that wipes endpoints and leaves
+ * profiles alone can call it every time. It is deliberately NOT a suite's main rep: a
+ * fixture author with its own subject cannot be mistaken for one of the people a test is
+ * actually about.
+ */
+export async function endpointAuthor(tx: PoolClient, tenantId: string): Promise<string> {
+  const { rows } = await tx.query<{ id: string }>(
+    `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name, status)
+     VALUES ($1, 'fixture-endpoint-author', 'FIXTURE-EP', 'A Fixture Administrator', 'active')
+     ON CONFLICT (tenant_id, subject) DO UPDATE SET display_name = EXCLUDED.display_name
+     RETURNING id`,
+    [tenantId],
+  );
+  return rows[0]!.id;
+}
+
+/**
+ * Wipes a tenant's notification endpoints, and the amendment log that pins them.
+ *
+ * Two statements and a disabled trigger, which is the shape of a fixture undoing a
+ * guarantee rather than working around one. 0060's log references the endpoint `ON DELETE
+ * RESTRICT` — the convention for an audit child in this schema — and refuses a DELETE on
+ * itself, so wiping endpoints means retiring the history first and saying so. A tenant
+ * erasure does not need this: `eraseOrder` derives children-before-parents from the live
+ * foreign-key graph, so it removes the log and then the endpoints with the triggers on.
+ *
+ * Shared because seven suites wipe endpoints and seven copies of a trigger-disable is how
+ * one of them ends up missing the re-enable.
+ */
+export async function wipeEndpoints(tx: PoolClient, tenantId: string): Promise<void> {
+  await tx.query("ALTER TABLE crm.notification_endpoint_change DISABLE TRIGGER USER");
+  try {
+    await tx.query("DELETE FROM crm.notification_endpoint_change WHERE tenant_id = $1", [tenantId]);
+  } finally {
+    await tx.query("ALTER TABLE crm.notification_endpoint_change ENABLE TRIGGER USER");
+  }
+  await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [tenantId]);
+}
+
+/**
  * Runs `fn` with `crm.tenant`'s protective triggers off, for test cleanup only.
  *
  * Migration 0053 made a stopped tenant's registry row undeletable, because deleting it

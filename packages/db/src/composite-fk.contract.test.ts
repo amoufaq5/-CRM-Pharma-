@@ -154,6 +154,15 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   attachment_access_read_by_fkey: { table: "attachment_access", column: "read_by", parent: "rep_profile", onDelete: "RESTRICT" },
 
   notification_endpoint_probe_endpoint_id_fkey: { table: "notification_endpoint_probe", column: "endpoint_id", parent: "notification_endpoint", onDelete: "CASCADE" },
+  // 0060. The amendment log: who narrowed what a third party is told, or turned the signals
+  // off. RESTRICT on both, because the log is the audit trail and outlives nothing — unlike
+  // `crm.notification_delivery`, whose two keys 0046 and 0048 dropped so the evidence of a
+  // push survives either parent being tidied up.
+  notification_endpoint_change_endpoint_id_fkey: { table: "notification_endpoint_change", column: "endpoint_id", parent: "notification_endpoint", onDelete: "RESTRICT" },
+  notification_endpoint_change_changed_by_fkey: { table: "notification_endpoint_change", column: "changed_by", parent: "rep_profile", onDelete: "RESTRICT" },
+  // 0060. Who opened this route out of the tenant. Frozen on the row rather than logged,
+  // because 0049 already freezes what an endpoint IS and a frozen fact is row data.
+  notification_endpoint_created_by_fkey: { table: "notification_endpoint", column: "created_by", parent: "rep_profile", onDelete: "RESTRICT" },
   notification_endpoint_probe_requested_by_fkey: { table: "notification_endpoint_probe", column: "requested_by", parent: "rep_profile", onDelete: "RESTRICT" },
 
   // 0052: the CRM's own deletion receipt, and the only reference added since 0046 dropped two.
@@ -597,6 +606,33 @@ const PROBES: Readonly<Record<string, Probe>> = {
     sql: `INSERT INTO crm.attachment_access (tenant_id, attachment_id, read_by) VALUES ($1, $2, $3)`,
     params: [TENANT_FK_B, B.att, A.rep1],
   },
+  notification_endpoint_change_endpoint_id_fkey: {
+    what: "an amendment to another tenant's endpoint",
+    // Every from/to column is supplied, unlike the store, which supplies only the desired
+    // state and lets 0060's trigger stamp the rest — this file runs with the table's user
+    // triggers off, so the NOT NULLs would answer before the foreign key is reached.
+    sql: `INSERT INTO crm.notification_endpoint_change
+            (tenant_id, endpoint_id, changed_by, reason,
+             min_severity_from, min_severity_to, enabled_from, enabled_to)
+          VALUES ($1, $2, $3, 'probing the composite key', 'warning', 'urgent', true, true)`,
+    params: [TENANT_FK_B, A.endp, B.rep1],
+  },
+  notification_endpoint_change_changed_by_fkey: {
+    what: "an amendment attributed to another tenant's rep",
+    sql: `INSERT INTO crm.notification_endpoint_change
+            (tenant_id, endpoint_id, changed_by, reason,
+             min_severity_from, min_severity_to, enabled_from, enabled_to)
+          VALUES ($1, $2, $3, 'probing the composite key', 'warning', 'urgent', true, true)`,
+    params: [TENANT_FK_B, B.endp, A.rep1],
+  },
+  notification_endpoint_created_by_fkey: {
+    what: "an endpoint opened by another tenant's rep",
+    sql: `INSERT INTO crm.notification_endpoint
+            (tenant_id, channel, url, secret_env, created_by, created_reason)
+          VALUES ($1, 'webhook', 'https://fk-probe.example/hook', 'CRM_FK_PROBE', $2,
+                  'probing the composite key')`,
+    params: [TENANT_FK_B, A.rep1],
+  },
   notification_endpoint_probe_endpoint_id_fkey: {
     what: "a probe aimed at another tenant's endpoint",
     // `notification_endpoint_probe_guard` would refuse this first with
@@ -705,9 +741,13 @@ describe("a cross-tenant reference is refused by the database", () => {
         [f.ntf, tenant, f.rep1],
       );
       await tx.query(
-        `INSERT INTO crm.notification_endpoint (id, tenant_id, channel, url, secret_env)
-         VALUES ($1, $2, 'webhook', 'https://fk.example.test/hook', 'FK_FIXTURE_SECRET')`,
-        [f.endp, tenant],
+        // Attributed, because 0060 refuses an endpoint that names nobody — a fixture is not
+        // exempt from the rule that a route out of a tenant has an author.
+        `INSERT INTO crm.notification_endpoint
+           (id, tenant_id, channel, url, secret_env, created_by, created_reason)
+         VALUES ($1, $2, 'webhook', 'https://fk.example.test/hook', 'FK_FIXTURE_SECRET', $3,
+                 'the composite-key fixture needs an endpoint to reference')`,
+        [f.endp, tenant, f.rep1],
       );
       // An `expense_receipt` is the attachment purpose with no cryptographic commitment to
       // satisfy, so a draft claim is all the subject it needs — a `disbursement_signature`

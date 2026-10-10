@@ -1,6 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { appPool, TENANT_PRUNE_GUARD, TENANT_RETENTION as TENANT } from "@crm/db/testing";
+import {
+  appPool,
+  TENANT_PRUNE_GUARD,
+  TENANT_RETENTION as TENANT,
+  endpointAuthor,
+  wipeEndpoints,
+} from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import {
@@ -96,6 +102,9 @@ describe("notification retention", () => {
     await clear();
     await inTenant(async (c) => {
       await c.query("DELETE FROM crm.notification_policy WHERE tenant_id = $1", [TENANT]);
+      // Endpoints before reps: since 0060 an endpoint names the rep who opened it, ON DELETE
+      // RESTRICT, so the fixture author this suite seeds pins any endpoint it created.
+      await wipeEndpoints(c, TENANT);
       await c.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [TENANT]);
     });
     tx?.release();
@@ -451,9 +460,14 @@ describe("notification retention", () => {
    */
   describe("an unsettled delivery holds a notification back", () => {
     const endpoint = async (c: PoolClient): Promise<string> => {
+      await endpointAuthor(c, TENANT);
       const { rows } = await c.query<{ id: string }>(
-        `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env)
-         VALUES ($1,'webhook','https://hooks.example.test/ret','CRM_RET_SECRET') RETURNING id`,
+        `INSERT INTO crm.notification_endpoint
+           (tenant_id, channel, url, secret_env, created_by, created_reason)
+         VALUES ($1,'webhook','https://hooks.example.test/ret','CRM_RET_SECRET',
+                 (SELECT id FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'fixture-endpoint-author'),
+                 'a fixture needs an endpoint, and 0060 refuses one that names nobody')
+         RETURNING id`,
         [TENANT],
       );
       return rows[0]!.id;

@@ -3,8 +3,7 @@ import type { Pool, PoolClient } from "pg";
 import {
   TENANT_DELIVERY_RETENTION as TENANT,
   TENANT_DELIVERY_RETENTION_OTHER as OTHER_TENANT,
-  appPool,
-} from "@crm/db/testing";
+  appPool, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import { claimDue, settleOrphanedDeliveries } from "./dispatch.js";
@@ -81,9 +80,14 @@ describe("delivery retention", () => {
 
   const endpoint = async (c: PoolClient, tenant: string): Promise<string> => {
     seq += 1;
+    await endpointAuthor(c, tenant);
     const { rows } = await c.query<{ id: string }>(
-      `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env)
-       VALUES ($1,'webhook',$2,'CRM_DR_SECRET') RETURNING id`,
+      `INSERT INTO crm.notification_endpoint
+         (tenant_id, channel, url, secret_env, created_by, created_reason)
+       VALUES ($1,'webhook',$2,'CRM_DR_SECRET',
+               (SELECT id FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'fixture-endpoint-author'),
+               'a fixture needs an endpoint, and 0060 refuses one that names nobody')
+       RETURNING id`,
       [tenant, `https://hooks.example.test/dr-${seq}`],
     );
     return rows[0]!.id;
@@ -123,7 +127,7 @@ describe("delivery retention", () => {
       await fn(async (c) => {
         await c.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [tenant]);
         await c.query("DELETE FROM crm.notification WHERE tenant_id = $1", [tenant]);
-        await c.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [tenant]);
+        await wipeEndpoints(c, tenant);
         await c.query("DELETE FROM crm.notification_policy WHERE tenant_id = $1", [tenant]);
       });
     }

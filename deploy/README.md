@@ -417,16 +417,33 @@ tenant that has no administrator yet:
 
 ```http
 POST /v1/admin/notification-endpoints
-{"url":"https://hooks.slack.com/services/…","secretEnv":"CRM_HOOK_OPS_SECRET",
- "minSeverity":"warning","description":"ops channel"}
+{"channel":"webhook","url":"https://hooks.slack.com/services/…",
+ "secretEnv":"CRM_HOOK_OPS_SECRET","minSeverity":"warning","description":"ops channel",
+ "reason":"ops asked for overdue disposals in their on-call channel"}
 ```
 
 ```sql
 INSERT INTO crm.notification_endpoint
-  (tenant_id, channel, url, secret_env, min_severity, description)
+  (tenant_id, channel, url, secret_env, min_severity, description,
+   created_by, created_reason)
 VALUES ('<tenant uuid>', 'webhook', 'https://hooks.slack.com/services/…',
-        'CRM_HOOK_OPS_SECRET', 'warning', 'ops channel');
+        'CRM_HOOK_OPS_SECRET', 'warning', 'ops channel',
+        '<the rep_profile id of whoever decided this>',
+        'why this route exists, in at least ten characters');
 ```
+
+**`reason` is not optional and the author is not yours to choose.** Adding an endpoint opens
+a route out of the tenant for records carrying a rep's name and an account id, so since 0060
+the database refuses one that names nobody; over HTTP the author comes from the token, and
+from a psql prompt it has to be supplied. `description` says what the endpoint is for and
+can be amended; `created_reason` says why the route was opened at all and is frozen with the
+destination.
+
+**Changing one afterwards is an INSERT, not an UPDATE.** `min_severity`, `kinds`, `enabled`
+and `description` are a projection of `crm.notification_endpoint_change`, so a direct UPDATE
+is refused and every amendment carries an author and a reason —
+`PATCH /v1/admin/notification-endpoints/:id` does it, `GET …/:id/history` reads it back, and
+`enabled: false` is how an endpoint stops.
 
 `secret_env` is the NAME of an environment variable, never the secret — the same discipline
 as the service signing key. Put the value in `deploy/.env`, give it to the **scheduler**

@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool, PoolClient } from "pg";
 import { SET_TENANT_CONTEXT_SQL, withTenantContext } from "@crm/db";
-import { appPool, TENANT_CHANNEL_COVERAGE as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_CHANNEL_COVERAGE as TENANT, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
 
 import { NOTIFICATION_KINDS } from "./kinds.js";
 import { verifyWebhook, type FetchLike } from "./sender.js";
@@ -109,7 +109,7 @@ describe("the endpoint probe", () => {
       await inTenant(tenant, async (tx) => {
         // The probes go with the endpoints by the cascade 0034 declares; deleting them
         // explicitly first would hide a broken cascade rather than exercise it.
-        await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [tenant]);
+        await wipeEndpoints(tx, tenant);
         await tx.query("DELETE FROM crm.notification_policy WHERE tenant_id = $1", [tenant]);
       });
     }
@@ -134,9 +134,14 @@ describe("the endpoint probe", () => {
         ? `mailto:ops-${Math.random().toString(36).slice(2, 8)}@example.com`
         : `https://hooks.example.com/${Math.random().toString(36).slice(2, 10)}`);
     return await inTenant(tenant, async (tx) => {
+      await endpointAuthor(tx, tenant);
       const { rows } = await tx.query<{ id: string }>(
-        `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env, enabled)
-         VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+        `INSERT INTO crm.notification_endpoint
+           (tenant_id, channel, url, secret_env, enabled, created_by, created_reason)
+         VALUES ($1,$2,$3,$4,$5,
+                 (SELECT id FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'fixture-endpoint-author'),
+                 'a fixture needs an endpoint, and 0060 refuses one that names nobody')
+         RETURNING id`,
         [tenant, channel, url, opts.secretEnv ?? SECRET_ENV, opts.enabled ?? true],
       );
       return rows[0]!.id;

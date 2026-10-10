@@ -1573,6 +1573,117 @@ Concretely, and these specifics are the decision, not commentary on it:
     table 0023's header named: its writes are still an UPDATE with no record of who changed
     where a tenant's signals are pushed, which is the same defect in a more sensitive place.
 
+33. **Who opened this route out of the tenant — 0023's header, closed.**
+    That migration named two tables as the debt it existed to clear: `crm.disposal_policy`
+    and `crm.notification_endpoint`, both "settable only by someone with a psql prompt —
+    which in practice means settable by anyone with the application password, WITH NO RECORD
+    OF WHO CHANGED WHAT". Item 32 answered the policy. This is the endpoint, and it is the
+    more consequential of the two.
+
+    **Because an endpoint is not a parameter, it is an egress.** 0021 is explicit about what
+    travels through one — a notification "carries a rep's name, an account id and sometimes a
+    lot number", which is why its url CHECK admits `https://` and loopback and nothing else.
+    Adding a row to this table opens a route out of the tenant for exactly that, and the row
+    recorded when it was created and nothing about by whom or why. Disabling one is the
+    mirror image: the signals stop, the nightly sweep goes on raising obligations, and nobody
+    is told — the `enabled`-but-silent state 0034's probe exists to expose, arrived at by an
+    UPDATE nobody can attribute.
+
+    **TWO MECHANISMS, BECAUSE THERE ARE TWO KINDS OF FACT HERE.** Using one for both would
+    have been the mistake, and the shape fell out of a rule that was already there:
+
+    * What an endpoint IS — channel, url, secret_env — has been FROZEN for the life of the
+      row since 0049, because a delivery record names the destination it went to and a
+      repointed url makes every earlier record wrong. A frozen fact is row data rather than
+      an event, so the creation's author and reason join it as columns and 0049's own frozen
+      list is extended to cover them. The creation record is then as immutable as the
+      destination it describes, by the mechanism that already guards it.
+    * How an endpoint is TUNED — min_severity, kinds, enabled, description — changes over
+      time, so it gets a log, and `crm.notification_endpoint_change` is what those four
+      columns are a projection of. Same arrangement as item 32's policy and as 0018's
+      holding-over-ledger, including `pg_trigger_depth() > 1` as the test for "we were
+      reached from the log's trigger rather than from a client statement".
+
+    **One frozen list, one trigger, two sentences.** Extending the frozen set exposed a flaw
+    in reusing it: 0049's refusal explains a destination — "endpoint X has delivery records
+    naming url = …, so it cannot become … — every notification already pushed would start
+    claiming it went somewhere it did not" — and measured against a `created_by` rewrite that
+    sentence sends an operator hunting through delivery records for a problem that is not
+    there. The columns are frozen for related but distinct reasons: one so the delivery log
+    stays true about WHERE, the other so it stays true about WHO AUTHORISED it. So the trigger
+    now branches, and the list stays queryable, which is 0049's reason for publishing it as a
+    function in the first place. Same class of fix as `visit_final` versus
+    `invalid_transition`.
+
+    **The complete state goes into an amendment, not just what moved**, and the reason is a
+    NULL. `kinds` NULL means every kind and `description` NULL means none, so in a partial
+    record "not specified" and "set to null" are indistinguishable and a COALESCE against the
+    live row reads "clear the allow-list" as "leave it alone". The caller therefore merges a
+    partial PATCH against a row read `FOR UPDATE` and sends all four `*_to` values; the
+    trigger stamps all four `*_from` itself, because a log whose previous value is whatever
+    the writer claimed is not evidence of anything. That lock is load-bearing rather than
+    decorative: without it two administrators amending at once would each merge a stale copy
+    and the second would silently revert a knob it never meant to touch.
+
+    **NO BACKFILL, which is 0047's distinction rather than a concession.** The two new columns
+    are nullable and a BEFORE INSERT trigger requires them, because the rule is about the ACT
+    of creating an endpoint — "a freeze governs an act, so no existing row can be wrong"
+    (0040, quoted by 0049). An endpoint created before this migration is not in violation; it
+    is from before the rule, and its NULL author is the honest record of that. A NOT NULL with
+    a default would have invented an author, which is worse than admitting there is none.
+
+    **DELETE is still allowed, and that is deliberate.** `crm.data_disposition` says `erase`
+    for this table and `executeTenantErasure` removes it with a plain statement at trigger
+    depth 1, so a guard that refused would break a tenant erasure — far worse than what it
+    would prevent. Nothing else deletes an endpoint: there is no DELETE route, and
+    `enabled = false` is how one stops.
+
+    **NO SCREEN, and the line is principled rather than lazy.** Item 32 put the disposal
+    policy on the device because it is a rule every rep is measured against and the read is
+    open to all of them. An endpoint is the opposite: a list of the third parties a tenant
+    talks to, administrator-only, and exactly the shape of information an attacker would want
+    first. It belongs in an admin console, which does not exist — so the surface stays the
+    API, and `GET …/:id/history` is the read that was missing.
+
+    **The fixture tax, which is the guarantee being real.** Eight suites inserted endpoint
+    rows directly and seven wiped them; all of them now attribute the row and retire the log
+    first. Two shared helpers in `@crm/db/testing` rather than eight copies —
+    `endpointAuthor` and `wipeEndpoints` — because seven copies of a trigger-disable is how
+    one of them ends up missing the re-enable. Two tests got *stronger* on the way: the
+    kinds-vocabulary check now arrives by the amendment path, which is the only way an
+    allow-list changes at all, rather than by an UPDATE nothing uses.
+
+    **A latent defect the churn exposed, unrelated to any of this.**
+    `packages/expense/src/store.contract.test.ts` and
+    `packages/notify/src/retention.contract.test.ts` seeded their reps with the same three
+    uuids in DIFFERENT tenants. `crm.rep_profile.id` is a global primary key, so the two
+    suites were claiming the same rows: whichever ran first created them in its tenant, the
+    other got `ON CONFLICT DO NOTHING` and no row at all, and its next insert failed a
+    foreign key on a rep it believed it had seeded. Which suite won depended on file order,
+    so the pair was flaky by construction and had been passing on luck for as long as both
+    files existed. The ids are now derived from the expense suite's own tenant, and its
+    `ON CONFLICT` is narrowed to `(tenant_id, subject)` so the next primary-key collision
+    raises instead of being swallowed.
+
+    **Verified live.** Twenty-eight contract assertions in the endpoints suite, the ones that
+    matter being the database refusing something: an endpoint that names nobody, a rewrite of
+    the creation record, a direct amendment, a no-op, an edit of the history. Then through the
+    API BINARY at a running `operate-server`, because the claim is that the author comes from
+    the TOKEN and not the body: an endpoint created with no reason is refused 422, one created
+    with a reason names the rep in the token, turning the signals off lands as a record
+    carrying `true → false` and the officer's name, and the same INSERT typed at a psql
+    prompt with no author is refused by the database — with the harness's own superuser
+    connection, because a trigger is not a permission. **133 live-ERP checks, 0 failures**
+    (129 before).
+
+    **Still open.** `crm.notification_policy` (inbox retention), `crm.notification_prune_guard`
+    and `crm.expense_account_map` are the same shape of tenant configuration with the same
+    gap, and three bespoke logs is the point at which this should become one mechanism rather
+    than a fourth copy — a generic `(table, row, before, after, actor, reason)` with the actor
+    taken from a transaction-local setting the way `app.current_tenant_id` already is, and a
+    trigger that REFUSES a write with no actor set. Recorded here rather than built, because
+    the generic version is only worth its indirection once the third instance is real.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -1917,7 +2028,7 @@ commit.
 | Nothing picks up `ALTER ROLE crm_app BYPASSRLS` on a running system. The privilege verdict is cached per role NAME for the life of the process, because asking the catalog costs ~82 µs and asking it on every transaction is the wrong trade. A restart notices; so does `/healthz` in a new process. Altering the role is a superuser action on a role the deployment creates `NOSUPERUSER NOBYPASSRLS`, so the exposure is an operator deliberately widening their own application role. | Platform | _set a date_ |
 | **Deleting a notification took its `crm.notification_delivery` rows with it until 0046 dropped the foreign key.** By the `ON DELETE CASCADE` migration 0021 wrote, the retention period for a notification was also the retention period for the record of where that signal was pushed — coherent (the policy says the tenant no longer keeps this) but it meant delivery history could not be retained longer than the notification it described. The answer this row asked for was the one 0046 took: "separating them needs the delivery rows to stop depending on the notification row", so the key was dropped, the row copies what it needs, and the trigger that makes the copies is the tenant guard the key used to be. | Platform | **closed 2026-10-06** |
 | **The SMTP sender has now spoken to one third-party server and no production relay.** `scripts/crosscheck-smtp.sh` drives it against **aiosmtpd**, which rules out a mistake the client and our own sink share — deliberately a cross-check a reviewer runs rather than a CI gate, because making the suite depend on an undeclared Python package would trade a real verification for a brittle one. Beyond that it is verified end to end against a sink written alongside it — reply classification at every stage, dot-stuffing, RFC 2047 subjects, STARTTLS with certificate verification, AUTH PLAIN and LOGIN — and the sink is faithful to RFC 5321/3207/4616 as far as it goes, but neither it nor aiosmtpd is Postfix, Exchange or SES. Untested in the wild: PIPELINING, a relay that enforces SIZE rather than advertising it, reply codes outside the ranges covered, and whether a given provider accepts `8bit`. It also does no DKIM signing, which is not claimed anywhere. | Platform | _set a date_ |
-| Roles now cover six administrative surfaces — the disposal policy (whose changes are, since 0059, an attributed append-only record rather than an UPDATE; `crm.notification_endpoint` is the other table 0023's header named and has not had the same treatment), notification endpoints and their probe limits, notification retention, the delivery log, dead ERP writes, and the expense account map (`crm.expense_account_map` left this list when its routes landed, which is the sequence this row asks for: the route first, then the role that honours it). `crm.cycle`, `crm.territory`, `crm.territory_assignment` and `crm.sample_lot` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |
+| Roles now cover six administrative surfaces — the disposal policy and the notification endpoints, both of which 0023's header named as having "no record of who changed what" and both of which now have one (0059, 0060: the configuration row is a projection of an append-only attributed log, and a direct UPDATE is refused), their probe limits, notification retention, the delivery log, dead ERP writes, and the expense account map (`crm.expense_account_map` left this list when its routes landed, which is the sequence this row asks for: the route first, then the role that honours it). `crm.cycle`, `crm.territory`, `crm.territory_assignment` and `crm.sample_lot` are still SQL-only — not oversight: each needs a decision about *which* role owns it, and inventing roles ahead of the routes that honour them is how a permission model becomes decoration. | Product | _set a date_ |
 | **The disposal deadline is carried per (rep, lot), so a FIRST hand-off between two cooperating reps can still move the material's effective deadline.** Closed as of 0030 for the unilateral recall path and for any pair that has each held the lot once: the sweep now asks `crm.disposal_carry_forward` and inserts a CONTINUATION obligation inheriting `discovered_on` and `due_by` verbatim, naming the row it continues. What is left open is deliberate and pinned by a test — a genuine hand-over to a rep who has never held the lot starts that rep's own grace period, because holding someone to a deadline they were never given is the mirror image of the bug. Closing it means deciding that an obligation attaches to the MATERIAL rather than to a person, which changes what the table means. | Compliance | _set a date_ |
 | **`created_at` is the transaction clock, and when this was written only the outbox had a `seq` to fall back on. Five tables have one now.** 0027 added the first after proving the tie, and `crm.disposal_obligation` had nothing equivalent, so two obligations written in one transaction — which a catch-up sweep does — could not be ordered at all. 0036 gave it one and pointed `open_disposal_obligations` at it; `crm.attachment_access` (0033), `crm.notification_endpoint_probe` (0034), `crm.outbox_dead_letter` (0041) and `crm.notification_delivery` (0046) were each written with one from the start. The lesson is kept because it is the one every new append-only table has to be told: `disposal_obligation_chain` sidesteps it by walking `continues_obligation_id` recursively from the root rather than ordering by time, bounded at 10,000 so a hand-edited cycle fails short instead of hanging. `crm.open_disposal_obligations` would have the same problem if it ever needed a stable order. | Platform | **closed 2026-10-06** |
 | **The prune guard's floor is capped at 1,000 rows (0032), which is a judgement and not a derivation.** The floor short-circuits the share ceiling, so an uncapped one is a permanent unattributed bypass — it shipped capped at a million. 1,000 is ten times the default and bounds what a misconfigured floor can cost to a number an operator can read and recover from, and a pass the floor lets through is now reported as `FLOOR-WAIVED` rather than reading like an ordinary pass. What nobody has decided is whether the right number for a two-million-row inbox is the same as for an eight-hundred-row one; the honest answer may be that the floor should be a share too. | Product | _set a date_ |

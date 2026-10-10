@@ -5,6 +5,15 @@
  * it could restrict the write to (0023 gives it one). The store is here rather than in
  * @crm/role because the table belongs to notifications; the role only decides who may
  * call these functions.
+ *
+ * SINCE 0060, EVERY WRITE HERE IS ATTRIBUTED AND REASONED. 0023's header named this table
+ * and `crm.disposal_policy` as the two that were "settable by anyone with the application
+ * password, with no record of who changed what"; it answered who may, and left what
+ * happened. Creating an endpoint adds a route out of the tenant for records carrying a
+ * rep's name and an account id, and disabling one stops the signals with nobody told — so
+ * the creation's author and reason are frozen columns on the row, and every amendment is a
+ * row in an append-only log the tunable columns are a projection of. Neither is optional
+ * and neither is this store's choice: the database refuses the write without them.
  */
 import type { PoolClient } from "pg";
 import { NOTIFICATION_KINDS, SEVERITIES, type NotificationKind, type Severity } from "./kinds.js";
@@ -20,6 +29,22 @@ import { NOTIFICATION_KINDS, SEVERITIES, type NotificationKind, type Severity } 
  */
 export const ENDPOINT_CHANNELS = ["webhook", "email"] as const;
 export type EndpointChannel = (typeof ENDPOINT_CHANNELS)[number];
+
+/**
+ * An amendment the database refuses (0060).
+ *
+ * Its own class rather than `InvalidEndpointError`'s, because the two want different HTTP
+ * answers and a client does different things with them: an invalid endpoint is a 422 and the
+ * operator fixes what they typed, while "that amendment changes nothing" and "this column is
+ * derived from the log" are well-formed requests the endpoint's own state refuses — a 409,
+ * and nothing to retype.
+ */
+export class EndpointAmendmentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EndpointAmendmentError";
+  }
+}
 
 export class InvalidEndpointError extends Error {
   constructor(message: string) {
@@ -37,6 +62,16 @@ export interface EndpointRow {
   readonly kinds: readonly NotificationKind[] | null;
   readonly enabled: boolean;
   readonly description: string | null;
+  /**
+   * Who added this destination, and why (0060).
+   *
+   * NULL only for an endpoint created before that rule, which is the honest record of a row
+   * from before it rather than an invented author — the rule governs the ACT of creating, so
+   * no existing row is in violation (0040's distinction, quoted by 0049).
+   */
+  readonly created_by: string | null;
+  readonly created_by_name: string | null;
+  readonly created_reason: string | null;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -59,6 +94,13 @@ export interface CreateEndpointInput {
   readonly kinds?: readonly string[] | null;
   readonly description?: string | null;
   readonly enabled?: boolean;
+  /**
+   * The rep opening this route, and why. Both required, and the database refuses the INSERT
+   * without them — "adding a webhook" is not an answer to why a tenant's notifications now
+   * leave the building.
+   */
+  readonly createdBy: string;
+  readonly reason: string;
 }
 
 export interface UpdateEndpointInput {
@@ -66,7 +108,29 @@ export interface UpdateEndpointInput {
   readonly kinds?: readonly string[] | null;
   readonly description?: string | null;
   readonly enabled?: boolean;
+  readonly changedBy: string;
+  readonly reason: string;
 }
+
+/** One amendment in an endpoint's history. */
+export interface EndpointChange {
+  readonly id: string;
+  readonly endpoint_id: string;
+  readonly changed_at: Date;
+  readonly changed_by: string;
+  readonly changed_by_name: string;
+  readonly reason: string;
+  readonly min_severity_from: Severity;
+  readonly min_severity_to: Severity;
+  readonly kinds_from: readonly NotificationKind[] | null;
+  readonly kinds_to: readonly NotificationKind[] | null;
+  readonly enabled_from: boolean;
+  readonly enabled_to: boolean;
+  readonly description_from: string | null;
+  readonly description_to: string | null;
+}
+
+export const ENDPOINT_HISTORY_LIMIT = 200;
 
 /**
  * Lists endpoints. NEVER returns a secret, because it never holds one — `secret_env`
@@ -79,11 +143,16 @@ export interface UpdateEndpointInput {
  */
 export async function listEndpoints(tx: PoolClient, tenantId: string): Promise<readonly EndpointRow[]> {
   const { rows } = await tx.query<EndpointRow>(
-    `SELECT id, channel, url, secret_env, min_severity, kinds, enabled, description,
-            created_at::text AS created_at, updated_at::text AS updated_at
-       FROM crm.notification_endpoint
-      WHERE tenant_id = $1
-      ORDER BY created_at, url, id`,
+    `SELECT e.id, e.channel, e.url, e.secret_env, e.min_severity, e.kinds, e.enabled, e.description,
+            e.created_by::text AS created_by, r.display_name AS created_by_name, e.created_reason,
+            e.created_at::text AS created_at, e.updated_at::text AS updated_at
+       FROM crm.notification_endpoint e
+       -- LEFT, because an endpoint created before 0060 has no author and must still be
+       -- listed: hiding a live destination because nobody signed for it is the opposite of
+       -- what this read is for.
+       LEFT JOIN crm.rep_profile r ON r.id = e.created_by
+      WHERE e.tenant_id = $1
+      ORDER BY e.created_at, e.url, e.id`,
     [tenantId],
   );
   return rows;
@@ -91,9 +160,12 @@ export async function listEndpoints(tx: PoolClient, tenantId: string): Promise<r
 
 export async function getEndpoint(tx: PoolClient, id: string): Promise<EndpointRow | null> {
   const { rows } = await tx.query<EndpointRow>(
-    `SELECT id, channel, url, secret_env, min_severity, kinds, enabled, description,
-            created_at::text AS created_at, updated_at::text AS updated_at
-       FROM crm.notification_endpoint WHERE id = $1`,
+    `SELECT e.id, e.channel, e.url, e.secret_env, e.min_severity, e.kinds, e.enabled, e.description,
+            e.created_by::text AS created_by, r.display_name AS created_by_name, e.created_reason,
+            e.created_at::text AS created_at, e.updated_at::text AS updated_at
+       FROM crm.notification_endpoint e
+       LEFT JOIN crm.rep_profile r ON r.id = e.created_by
+      WHERE e.id = $1`,
     [id],
   );
   return rows[0] ?? null;
@@ -114,8 +186,10 @@ export async function createEndpoint(
   try {
     const { rows } = await tx.query<{ id: string }>(
       `INSERT INTO crm.notification_endpoint
-         (tenant_id, channel, url, secret_env, min_severity, kinds, description, enabled)
-       VALUES ($1, $8, $2, $3, COALESCE($4, 'warning'), $5::text[], $6, COALESCE($7, true))
+         (tenant_id, channel, url, secret_env, min_severity, kinds, description, enabled,
+          created_by, created_reason)
+       VALUES ($1, $8, $2, $3, COALESCE($4, 'warning'), $5::text[], $6, COALESCE($7, true),
+               $9, $10)
        RETURNING id`,
       [
         tenantId,
@@ -126,6 +200,8 @@ export async function createEndpoint(
         input.description ?? null,
         input.enabled ?? null,
         input.channel,
+        input.createdBy,
+        input.reason,
       ],
     );
     id = rows[0]!.id;
@@ -136,16 +212,34 @@ export async function createEndpoint(
 }
 
 /**
- * Changes the knobs, and only the knobs.
+ * Changes the knobs, and only the knobs — by writing the amendment, which is the only way
+ * there is.
  *
- * `url` and `secret_env` are deliberately not updatable. Repointing an endpoint in
- * place would carry its delivery history onto a different destination, so the honest
- * record of "these notifications went there" would start describing somewhere else.
- * Moving a destination is: disable the old endpoint, create a new one.
+ * `url` and `secret_env` are not updatable. Repointing an endpoint in place would carry its
+ * delivery history onto a different destination, so the honest record of "these
+ * notifications went there" would start describing somewhere else. Moving a destination is:
+ * disable the old endpoint, create a new one.
  *
- * Since 0049 that is a rule and not just an omission: `notification_endpoint_freeze_destination`
- * refuses a change to `channel`, `url` or `secret_env` from any writer, so this UPDATE's
- * silence about those columns is the database's answer too and not merely this function's.
+ * Since 0049 that is a rule and not just an omission —
+ * `notification_endpoint_freeze_destination` refuses a change to `channel`, `url` or
+ * `secret_env` from any writer — and since 0060 the same trigger also refuses a rewrite of
+ * `created_by` and `created_reason`, with a sentence of their own.
+ *
+ * SINCE 0060 THIS IS AN INSERT, not an UPDATE. The endpoint's four tunable columns are a
+ * projection of `crm.notification_endpoint_change`; a direct UPDATE is refused by the
+ * database. Two consequences worth stating:
+ *
+ *   * THE COMPLETE DESIRED STATE GOES IN, not just what moved. `kinds` NULL means every kind
+ *     and `description` NULL means none, so in a partial record "not specified" and "set to
+ *     null" are the same thing and a COALESCE against the live row would read "clear the
+ *     allow-list" as "leave it alone". The merge happens here, in one place, over a row read
+ *     `FOR UPDATE`.
+ *   * THAT LOCK IS LOAD-BEARING. The trigger stamps the `*_from` values from the live row, so
+ *     without it two administrators amending at once would each merge a stale copy and the
+ *     second would silently revert a knob it never meant to touch. Reading for update is what
+ *     makes the merge and the apply see one state.
+ *
+ * Returns null for an endpoint that is not there, as it always has.
  */
 export async function updateEndpoint(
   tx: PoolClient,
@@ -154,26 +248,73 @@ export async function updateEndpoint(
 ): Promise<EndpointRow | null> {
   const kindsGiven = Object.prototype.hasOwnProperty.call(input, "kinds");
   const kinds = kindsGiven ? normaliseKinds(input.kinds) : null;
-  const { rowCount } = await tx.query(
-    `UPDATE crm.notification_endpoint
-        SET min_severity = COALESCE($2, min_severity),
-            kinds        = CASE WHEN $3::boolean THEN $4::text[] ELSE kinds END,
-            description  = CASE WHEN $5::boolean THEN $6::text ELSE description END,
-            enabled      = COALESCE($7, enabled),
-            updated_at   = now()
-      WHERE id = $1`,
-    [
-      id,
-      input.minSeverity ?? null,
-      kindsGiven,
-      kinds,
-      Object.prototype.hasOwnProperty.call(input, "description"),
-      input.description ?? null,
-      input.enabled ?? null,
-    ],
+  const { rows: live } = await tx.query<{
+    tenant_id: string;
+    min_severity: Severity;
+    kinds: string[] | null;
+    enabled: boolean;
+    description: string | null;
+  }>(
+    `SELECT tenant_id, min_severity, kinds, enabled, description
+       FROM crm.notification_endpoint WHERE id = $1 FOR UPDATE`,
+    [id],
   );
-  if (rowCount === 0) return null;
+  const current = live[0];
+  if (current === undefined) return null;
+
+  try {
+    await tx.query(
+      `INSERT INTO crm.notification_endpoint_change
+         (tenant_id, endpoint_id, changed_by, reason,
+          min_severity_to, kinds_to, enabled_to, description_to)
+       VALUES ($1, $2, $3, $4, $5, $6::text[], $7, $8)`,
+      [
+        current.tenant_id,
+        id,
+        input.changedBy,
+        input.reason,
+        input.minSeverity ?? current.min_severity,
+        kindsGiven ? kinds : current.kinds,
+        input.enabled ?? current.enabled,
+        Object.prototype.hasOwnProperty.call(input, "description")
+          ? (input.description ?? null)
+          : current.description,
+      ],
+    );
+  } catch (err) {
+    throw translateEndpointError(err, "webhook");
+  }
   return await getEndpoint(tx, id);
+}
+
+/**
+ * How an endpoint got to its current tuning: every amendment, newest first.
+ *
+ * Administrator-only at the route, unlike the disposal policy's history — that one is a rule
+ * every rep is measured against, and this is a list of the third parties a tenant talks to.
+ */
+export async function endpointHistory(
+  tx: PoolClient,
+  endpointId: string,
+  opts: { readonly limit?: number } = {},
+): Promise<readonly EndpointChange[]> {
+  const limit = Math.max(1, Math.min(ENDPOINT_HISTORY_LIMIT, opts.limit ?? 50));
+  const { rows } = await tx.query<EndpointChange>(
+    `SELECT c.id::text AS id, c.endpoint_id::text AS endpoint_id, c.changed_at,
+            c.changed_by::text AS changed_by, r.display_name AS changed_by_name, c.reason,
+            c.min_severity_from, c.min_severity_to, c.kinds_from, c.kinds_to,
+            c.enabled_from, c.enabled_to, c.description_from, c.description_to
+       FROM crm.notification_endpoint_change c
+       -- An INNER join, which cannot hide a row: the composite key to crm.rep_profile is
+       -- ON DELETE RESTRICT, so an author named by an amendment cannot be deleted while the
+       -- amendment exists, and RLS shows the caller every profile in their own tenant.
+       JOIN crm.rep_profile r ON r.id = c.changed_by
+      WHERE c.endpoint_id = $1
+      ORDER BY c.changed_at DESC, c.id DESC
+      LIMIT $2`,
+    [endpointId, limit],
+  );
+  return rows;
 }
 
 /**
@@ -213,6 +354,32 @@ function normaliseKinds(kinds: readonly string[] | null | undefined): string[] |
  */
 function translateEndpointError(err: unknown, channel: string): Error {
   const constraint = (err as { constraint?: string }).constraint;
+  const message = (err as { message?: string }).message ?? "";
+  // 0060's own refusals, which arrive as messages rather than constraint names because the
+  // triggers raise them. Checked before the constraint arms below: a no-op amendment never
+  // reaches a CHECK, because the trigger answers first.
+  if (
+    message.includes("endpoint amendment changes nothing") ||
+    message.includes("cannot be updated directly") ||
+    message.includes("endpoint-creation-frozen") ||
+    message.includes("endpoint-destination-frozen") ||
+    message.includes("must name the rep who added it")
+  ) {
+    return new EndpointAmendmentError(message);
+  }
+  if (constraint === "notification_endpoint_change_is_a_change") {
+    return new EndpointAmendmentError("that endpoint amendment changes nothing");
+  }
+  if (constraint === "notification_endpoint_change_reason_check") {
+    return new EndpointAmendmentError(
+      "an amendment to an endpoint must say why, in at least ten characters — it is where this tenant's signals go",
+    );
+  }
+  if (constraint === "notification_endpoint_created_reason_check") {
+    return new InvalidEndpointError(
+      "a new endpoint must say why it exists, in at least ten characters — it is a route out of this tenant for records carrying a rep's name",
+    );
+  }
   if (constraint === "notification_endpoint_url_check") {
     return new InvalidEndpointError(
       channel === "email"

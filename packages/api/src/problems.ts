@@ -323,6 +323,14 @@ export function toProblem(err: unknown): ApiError {
     case "InvalidProbeCooldownError":
     case "InvalidProbeBudgetError":
       return new ApiError("validation_failed", message);
+    // 0060. A no-op amendment, a direct write to a column that is a projection of the
+    // endpoint's change log, a rewrite of who opened the route, an endpoint created with no
+    // author: every one of them is a well-formed request the endpoint's own state refuses,
+    // which is the reading `conflict` carries for `lot_expired` and `insufficient_stock`
+    // too. `InvalidEndpointError` below stays a 422, because that one is about what the
+    // operator typed.
+    case "EndpointAmendmentError":
+      return new ApiError("conflict", message);
     case "InvalidEndpointError":
     case "InvalidRetentionError":
     // A `mailto:` endpoint that is not one mailbox. Reachable from an admin route

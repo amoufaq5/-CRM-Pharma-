@@ -22,12 +22,14 @@ import {
 import { PostgresServiceKeyRegistry, jwksResponse } from "@crm/credential";
 import {
   ENDPOINT_CHANNELS,
+  ENDPOINT_HISTORY_LIMIT,
   MAX_PRUNE_GUARD_FLOOR_ROWS,
   latestProbe,
   listProbes,
   requestProbe,
   MAX_PRUNE_OVERRIDE_BY_CHARS,
   createEndpoint,
+  endpointHistory,
   getEndpoint,
   grantPruneGuardOverride,
   inbox,
@@ -2624,6 +2626,11 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           kinds: z.array(z.string()).nullish(),
           description: z.string().max(500).nullish(),
           enabled: z.boolean().optional(),
+          // REQUIRED (0060), and not the same field as `description`. A description says
+          // what the endpoint is for and is amendable; this says why a route out of the
+          // tenant was opened at all, is frozen with the destination, and is the thing
+          // 0023's header said did not exist. Ten characters, matching the column's CHECK.
+          reason: z.string().min(10).max(1000),
         }),
         ctx.body,
       );
@@ -2636,6 +2643,10 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           ...(input.kinds !== undefined ? { kinds: input.kinds } : {}),
           ...(input.description !== undefined ? { description: input.description } : {}),
           ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+          // From the token, never the body — like every other attributed write here. A
+          // client that could name the author could open a route under somebody else's name.
+          createdBy: ctx.principal.repProfileId,
+          reason: input.reason,
         }),
       );
       return { status: 201, body };
@@ -2752,21 +2763,76 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           kinds: z.array(z.string()).nullish(),
           description: z.string().max(500).nullish(),
           enabled: z.boolean().optional(),
+          // REQUIRED (0060). `enabled: false` is how a tenant's signals stop, and it used to
+          // be an UPDATE with nothing but `updated_at` to show for it — so an endpoint
+          // silenced last Tuesday by somebody who has since lost the role read exactly like
+          // one that had been off for a year.
+          reason: z.string().min(10).max(1000),
         }),
         ctx.body,
       );
+      if (
+        input.minSeverity === undefined &&
+        input.enabled === undefined &&
+        !Object.prototype.hasOwnProperty.call(input, "kinds") &&
+        !Object.prototype.hasOwnProperty.call(input, "description")
+      ) {
+        throw validationFailed("nothing to change", {
+          _: "supply minSeverity, kinds, description or enabled",
+        });
+      }
       const body = await inTenant(deps, ctx.principal, async (tx) => {
-        if ((await getEndpoint(tx, id)) === null) throw notFound(`no notification endpoint ${id}`);
-        return await updateEndpoint(tx, id, {
+        const amended = await updateEndpoint(tx, id, {
           ...(input.minSeverity !== undefined ? { minSeverity: input.minSeverity } : {}),
           ...(Object.prototype.hasOwnProperty.call(input, "kinds") ? { kinds: input.kinds ?? null } : {}),
           ...(Object.prototype.hasOwnProperty.call(input, "description")
             ? { description: input.description ?? null }
             : {}),
           ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+          changedBy: ctx.principal.repProfileId,
+          reason: input.reason,
         });
+        // The existence check is the store's own read now, rather than a `getEndpoint`
+        // before it: that one answered from outside the lock the amendment takes, so a
+        // concurrent erasure between the two left this route reporting success for an
+        // endpoint that was gone.
+        if (amended === null) throw notFound(`no notification endpoint ${id}`);
+        return amended;
       });
       return { status: 200, body };
+    },
+  });
+
+  /**
+   * How an endpoint got to its current tuning: every amendment, newest first.
+   *
+   * ADMINISTRATOR ONLY, unlike the disposal policy's history next door — and the difference
+   * is the subject, not the sensitivity of the mechanism. A grace period is a rule every rep
+   * is measured against, so its history is theirs to read. This is a list of the third
+   * parties a tenant talks to and when somebody narrowed what they were told, which is no
+   * rep's business and is exactly the shape of information an attacker would want first.
+   *
+   * The creation — who opened the route, and why — is not here: it is frozen on the endpoint
+   * row itself (0049's list, extended by 0060) and comes back from the list route beside the
+   * destination it belongs to.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notification-endpoints/:id/history",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const id = parse(UUID, ctx.params["id"]);
+      const limit = parse(
+        z.coerce.number().int().min(1).max(ENDPOINT_HISTORY_LIMIT).optional(),
+        ctx.query.get("limit") ?? undefined,
+      );
+      const data = await inTenant(deps, ctx.principal, async (tx) => {
+        // 404 before the history, because an endpoint in another tenant is invisible to this
+        // read and an empty array would read as "nothing has ever been amended".
+        if ((await getEndpoint(tx, id)) === null) throw notFound(`no notification endpoint ${id}`);
+        return endpointHistory(tx, id, { ...(limit !== undefined ? { limit } : {}) });
+      });
+      return { status: 200, body: { data } };
     },
   });
 

@@ -8,6 +8,8 @@ import {
   withRegistryTriggersOff,
   TENANT_API as TENANT,
   TENANT_API_OTHER as OTHER,
+  endpointAuthor,
+  wipeEndpoints,
 } from "@crm/db/testing";
 
 import { startApi, type RunningApi } from "./server.js";
@@ -99,7 +101,7 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.outbox_dead_letter WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [t]);
-        await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [t]);
+        await wipeEndpoints(tx, t);
         await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [t]);
         // Before the policy row, and with the log's own append-only trigger turned off: 0059
         // refuses a DELETE on the history, which is the point of it, so a fixture that needs
@@ -2424,9 +2426,13 @@ describe("the API, end to end", () => {
       await makeAdministrator();
       let notificationId = "";
       await withTenantContext(admin, TENANT, async (tx) => {
+        await endpointAuthor(tx, TENANT);
         const ep = await tx.query<{ id: string }>(
-          `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env, min_severity)
-           VALUES ($1,'webhook','https://hooks.example.test/d46','CRM_OPS_WEBHOOK_SECRET','info')
+          `INSERT INTO crm.notification_endpoint
+             (tenant_id, channel, url, secret_env, min_severity, created_by, created_reason)
+           VALUES ($1,'webhook','https://hooks.example.test/d46','CRM_OPS_WEBHOOK_SECRET','info',
+                   (SELECT id FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'fixture-endpoint-author'),
+                   'a fixture needs an endpoint, and 0060 refuses one that names nobody')
            RETURNING id`,
           [TENANT],
         );
@@ -3344,20 +3350,42 @@ describe("the API, end to end", () => {
             minSeverity: "urgent",
             kinds: ["erp_write_failed"],
             description: "ops channel",
+            reason: "ops asked for failed ERP writes in their on-call channel",
           },
         });
         expect(created.status).toBe(201);
         expect(created.body.min_severity).toBe("urgent");
         expect(created.body.secret_env).toBe("CRM_OPS_WEBHOOK_SECRET");
+        // WHO OPENED THE ROUTE (0060). Before it, this row said when it was created and
+        // nothing about by whom or why — for the one table that decides where records
+        // carrying a rep's name and an account id leave the building.
+        expect(created.body.created_by).toBe(rep);
+        expect(created.body.created_reason).toContain("on-call channel");
 
         const listed = await call("GET", "/v1/admin/notification-endpoints");
         expect(listed.body.data).toHaveLength(1);
+        expect(listed.body.data[0].created_by_name).toBe("Rep One");
 
         const patched = await call("PATCH", `/v1/admin/notification-endpoints/${created.body.id}`, {
-          body: { enabled: false },
+          body: { enabled: false, reason: "the receiver is being rebuilt this week" },
         });
         expect(patched.status).toBe(200);
         expect(patched.body.enabled).toBe(false);
+
+        // And the amendment is a record, not an UPDATE: `enabled: false` is how a tenant's
+        // signals stop, and it used to leave nothing but `updated_at` behind.
+        const history = await call("GET", `/v1/admin/notification-endpoints/${created.body.id}/history`);
+        expect(history.status).toBe(200);
+        expect(history.body.data).toHaveLength(1);
+        expect(history.body.data[0]).toMatchObject({
+          enabled_from: true,
+          enabled_to: false,
+          min_severity_from: "urgent",
+          min_severity_to: "urgent",
+          changed_by: rep,
+          changed_by_name: "Rep One",
+        });
+        expect(history.body.data[0].reason).toContain("rebuilt");
         // There is no DELETE: crm.notification_delivery cascades from this row, so
         // removing an endpoint would erase the record of everything sent to it.
         expect((await call("DELETE", `/v1/admin/notification-endpoints/${created.body.id}`)).status).toBe(405);
@@ -3366,7 +3394,12 @@ describe("the API, end to end", () => {
       it("refuses a plaintext destination, as a 422 that says why", async () => {
         await grant(() => rep, "administrator", () => manager);
         const res = await call("POST", "/v1/admin/notification-endpoints", {
-          body: { channel: "webhook", url: "http://hooks.example.test/crm", secretEnv: "CRM_OPS_WEBHOOK_SECRET" },
+          body: {
+            channel: "webhook",
+            url: "http://hooks.example.test/crm",
+            secretEnv: "CRM_OPS_WEBHOOK_SECRET",
+            reason: "pointing it at a plaintext host, which the schema refuses",
+          },
         });
         // 422 and not 500. This assertion was `>= 400` and the refusal was in fact an
         // untranslated CHECK violation surfacing as "an unexpected error occurred" — which
@@ -3378,7 +3411,12 @@ describe("the API, end to end", () => {
       it("refuses a secret VALUE where an environment variable NAME belongs", async () => {
         await grant(() => rep, "administrator", () => manager);
         const res = await call("POST", "/v1/admin/notification-endpoints", {
-          body: { channel: "webhook", url: "https://hooks.example.test/crm", secretEnv: "hunter2-actual-secret" },
+          body: {
+            channel: "webhook",
+            url: "https://hooks.example.test/crm",
+            secretEnv: "hunter2-actual-secret",
+            reason: "pasting a secret where a variable name belongs",
+          },
         });
         expect(res.status).toBe(422);
         expect(JSON.stringify(res.body)).toContain("environment variable");
@@ -3392,6 +3430,7 @@ describe("the API, end to end", () => {
             url: "https://hooks.example.test/crm",
             secretEnv: "CRM_OPS_WEBHOOK_SECRET",
             kinds: ["everything_please"],
+            reason: "subscribing to a kind that does not exist",
           },
         });
         expect(res.status).toBe(422);
@@ -3413,6 +3452,7 @@ describe("the API, end to end", () => {
             url: "mailto:ops@example.test",
             secretEnv: "CRM_SMTP_PASSWORD",
             minSeverity: "urgent",
+            reason: "the duty pharmacist wants urgent signals by email",
           },
         });
         expect(created.status).toBe(201);
@@ -3423,13 +3463,23 @@ describe("the API, end to end", () => {
         // invalid for email, and 0029 checks the PAIR precisely so neither mismatch can be
         // stored with no sender and no error.
         const wrongUrl = await call("POST", "/v1/admin/notification-endpoints", {
-          body: { channel: "email", url: "https://hooks.example.test/crm", secretEnv: "CRM_SMTP_PASSWORD" },
+          body: {
+            channel: "email",
+            url: "https://hooks.example.test/crm",
+            secretEnv: "CRM_SMTP_PASSWORD",
+            reason: "an https url on an email endpoint, which 0029 checks as a pair",
+          },
         });
         expect(wrongUrl.status).toBeGreaterThanOrEqual(400);
         expect(wrongUrl.status).toBeLessThan(500);
 
         const mailboxAsWebhook = await call("POST", "/v1/admin/notification-endpoints", {
-          body: { channel: "webhook", url: "mailto:ops@example.test", secretEnv: "CRM_OPS_WEBHOOK_SECRET" },
+          body: {
+            channel: "webhook",
+            url: "mailto:ops@example.test",
+            secretEnv: "CRM_OPS_WEBHOOK_SECRET",
+            reason: "a mailbox on a webhook endpoint, which 0029 checks as a pair",
+          },
         });
         expect(mailboxAsWebhook.status).toBeGreaterThanOrEqual(400);
         expect(mailboxAsWebhook.status).toBeLessThan(500);
@@ -3457,9 +3507,90 @@ describe("the API, end to end", () => {
       it("404s a PATCH to an endpoint that is not there", async () => {
         await grant(() => rep, "administrator", () => manager);
         const res = await call("PATCH", "/v1/admin/notification-endpoints/e8000000-0000-4000-8000-00000000000f", {
-          body: { enabled: false },
+          body: { enabled: false, reason: "amending an endpoint that does not exist" },
         });
         expect(res.status).toBe(404);
+      });
+
+      it("refuses an amendment with no reason, which is the record it exists to keep", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const created = await call("POST", "/v1/admin/notification-endpoints", {
+          body: {
+            channel: "webhook",
+            url: "https://hooks.example.test/reasons",
+            secretEnv: "CRM_OPS_WEBHOOK_SECRET",
+            reason: "opened so the refusals below have something to aim at",
+          },
+        });
+        expect(created.status).toBe(201);
+
+        const none = await call("PATCH", `/v1/admin/notification-endpoints/${created.body.id}`, {
+          body: { enabled: false },
+        });
+        expect(none.status).toBe(422);
+        const thin = await call("PATCH", `/v1/admin/notification-endpoints/${created.body.id}`, {
+          body: { enabled: false, reason: "." },
+        });
+        expect(thin.status).toBe(422);
+        // Nothing moved and nothing was recorded, so a refused amendment leaves no trace to
+        // explain away.
+        const after = await call("GET", "/v1/admin/notification-endpoints");
+        expect(after.body.data[0].enabled).toBe(true);
+        expect(
+          (await call("GET", `/v1/admin/notification-endpoints/${created.body.id}/history`)).body.data,
+        ).toEqual([]);
+      });
+
+      it("refuses an endpoint created with no reason, which is a route nobody signed for", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const res = await call("POST", "/v1/admin/notification-endpoints", {
+          body: {
+            channel: "webhook",
+            url: "https://hooks.example.test/unsigned",
+            secretEnv: "CRM_OPS_WEBHOOK_SECRET",
+          },
+        });
+        expect(res.status).toBe(422);
+        expect((await call("GET", "/v1/admin/notification-endpoints")).body.data).toEqual([]);
+      });
+
+      it("refuses an amendment that changes nothing as a conflict", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const created = await call("POST", "/v1/admin/notification-endpoints", {
+          body: {
+            channel: "webhook",
+            url: "https://hooks.example.test/noop",
+            secretEnv: "CRM_OPS_WEBHOOK_SECRET",
+            reason: "opened so a no-op amendment has something to aim at",
+          },
+        });
+        // A well-formed request the endpoint's own state refuses, which keeps the history
+        // free of rows that record nothing. 409, as `lot_expired` and `insufficient_stock`
+        // are, rather than a 422 about what was typed.
+        const res = await call("PATCH", `/v1/admin/notification-endpoints/${created.body.id}`, {
+          body: { enabled: true, reason: "writing down the state that is already in force" },
+        });
+        expect(res.status).toBe(409);
+        expect(res.body.detail).toContain("changes nothing");
+      });
+
+      it("hides another tenant's endpoint from the history, as a 404", async () => {
+        await grant(() => rep, "administrator", () => manager);
+        const created = await call("POST", "/v1/admin/notification-endpoints", {
+          body: {
+            channel: "webhook",
+            url: "https://hooks.example.test/scoped",
+            secretEnv: "CRM_OPS_WEBHOOK_SECRET",
+            reason: "opened to be invisible from the other tenant",
+          },
+        });
+        // 404 before an empty array, which would read as "nothing has ever been amended"
+        // about an endpoint this caller cannot see at all.
+        const other = await call("GET", `/v1/admin/notification-endpoints/${created.body.id}/history`, {
+          tenant: OTHER,
+          auth: token({ sub: "idp|rep1", tenant: OTHER }),
+        });
+        expect([403, 404]).toContain(other.status);
       });
     });
 

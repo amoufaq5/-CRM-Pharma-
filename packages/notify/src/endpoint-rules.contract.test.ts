@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { TENANT_ENDPOINT_RULES as TENANT, appPool } from "@crm/db/testing";
+import { TENANT_ENDPOINT_RULES as TENANT, appPool, endpointAuthor, wipeEndpoints } from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import { InvalidEndpointError, createEndpoint, getEndpoint, updateEndpoint } from "./endpoints.js";
@@ -35,6 +35,9 @@ describe("endpoint rules (0049)", () => {
       channel: "webhook",
       url: "https://hooks.example.test/crm",
       secretEnv: "CRM_TEST_WEBHOOK_SECRET",
+      // Required since 0060: an endpoint names the rep who opened the route and why.
+      createdBy: REP,
+      reason: "this suite needs an endpoint whose other rules can be probed",
       ...over,
     });
 
@@ -61,13 +64,17 @@ describe("endpoint rules (0049)", () => {
          VALUES ($1,$2,'er-rep','er-rep','Endpoint Rules') ON CONFLICT DO NOTHING`,
         [REP, TENANT],
       );
+      // 0060 refuses an endpoint that names nobody, and the raw-SQL probes below create one
+      // to be refused for OTHER reasons — so they need an author, or the attribution guard
+      // answers first and the constraint under test never runs.
+      await endpointAuthor(tx, TENANT);
     });
   });
 
   afterAll(async () => {
     await inTenant(async (tx) => {
       await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
-      await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [TENANT]);
+      await wipeEndpoints(tx, TENANT);
     });
     client?.release();
     await pool?.end();
@@ -76,7 +83,7 @@ describe("endpoint rules (0049)", () => {
   beforeEach(async () => {
     await inTenant(async (tx) => {
       await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [TENANT]);
-      await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [TENANT]);
+      await wipeEndpoints(tx, TENANT);
     });
   });
 
@@ -179,20 +186,32 @@ describe("endpoint rules (0049)", () => {
      */
     it("refuses a kind that does not exist, from raw SQL", async () => {
       const r = await refusal(
-        `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env, kinds)
+        `INSERT INTO crm.notification_endpoint
+           (tenant_id, channel, url, secret_env, kinds, created_by, created_reason)
          VALUES ($1,'webhook','https://hooks.example.test/x','CRM_TEST_WEBHOOK_SECRET',
-                 ARRAY['call_plan_submited'])`,
+                 ARRAY['call_plan_submited'],
+                 (SELECT id FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'fixture-endpoint-author'),
+                 'probing the kind allow-list, which answers after 0060 attribution guard')`,
         [TENANT],
       );
       expect(r.constraint).toBe("notification_endpoint_kinds_known");
       expect(r.code).toBe("23514");
     });
 
-    it("refuses one arriving by UPDATE too", async () => {
+    /**
+     * THROUGH THE AMENDMENT LOG, because since 0060 that is the only way an endpoint's
+     * allow-list changes at all — a direct UPDATE is refused before any CHECK is reached.
+     * Which is the stronger version of this test: the constraint now answers on the real
+     * write path rather than on one nothing uses.
+     */
+    it("refuses one arriving by amendment too", async () => {
       const ep = await inTenant((tx) => create(tx, { kinds: ["call_plan_approved"] }));
       const r = await refusal(
-        "UPDATE crm.notification_endpoint SET kinds = ARRAY['not_a_kind'] WHERE id = $1",
-        [ep.id],
+        `INSERT INTO crm.notification_endpoint_change
+           (tenant_id, endpoint_id, changed_by, reason, min_severity_to, kinds_to, enabled_to)
+         VALUES ($1, $2, $3, 'subscribing to a kind that does not exist', 'warning',
+                 ARRAY['not_a_kind'], true)`,
+        [TENANT, ep.id, REP],
       );
       expect(r.constraint).toBe("notification_endpoint_kinds_known");
     });
@@ -204,9 +223,12 @@ describe("endpoint rules (0049)", () => {
      */
     it("leaves emptiness to the constraint that was already asking", async () => {
       const r = await refusal(
-        `INSERT INTO crm.notification_endpoint (tenant_id, channel, url, secret_env, kinds)
+        `INSERT INTO crm.notification_endpoint
+           (tenant_id, channel, url, secret_env, kinds, created_by, created_reason)
          VALUES ($1,'webhook','https://hooks.example.test/y','CRM_TEST_WEBHOOK_SECRET',
-                 ARRAY[]::text[])`,
+                 ARRAY[]::text[],
+                 (SELECT id FROM crm.rep_profile WHERE tenant_id = $1 AND subject = 'fixture-endpoint-author'),
+                 'probing the empty allow-list, which answers after 0060 attribution guard')`,
         [TENANT],
       );
       expect(r.constraint).toBe("notification_endpoint_kinds_not_empty");
@@ -237,7 +259,10 @@ describe("endpoint rules (0049)", () => {
         tx.query<{ frozen: string[] }>("SELECT crm.notification_endpoint_frozen_columns() AS frozen"),
       );
       const frozen = rows[0]!.frozen;
-      expect(frozen).toEqual(["channel", "url", "secret_env"]);
+      // Five since 0060: the destination trio, plus who opened the route and why. The
+      // trigger gives those two their own sentence, because 0049's — "has delivery records
+      // naming url = …" — would send an operator hunting the wrong thing.
+      expect(frozen).toEqual(["channel", "url", "secret_env", "created_by", "created_reason"]);
 
       const { rows: cols } = await inTenant((tx) =>
         tx.query<{ column_name: string }>(
@@ -309,6 +334,8 @@ describe("endpoint rules (0049)", () => {
           kinds: ["erp_write_failed"],
           description: "now it is for failures",
           enabled: false,
+          changedBy: REP,
+          reason: "turning every knob at once, to show that every knob still turns",
         }),
       );
       expect(after).toMatchObject({
@@ -325,16 +352,27 @@ describe("endpoint rules (0049)", () => {
      * that true, and an idempotent re-apply of a config is the shape that would otherwise
      * start failing for no reason.
      */
-    it("allows a write that sets the url to what it already is", async () => {
+    /**
+     * The freeze compares values, not whether a column appeared in the statement — so a
+     * statement that writes the url it already had is not a repointing and is not refused.
+     *
+     * Routed through the amendment log since 0060, because a direct UPDATE is refused by the
+     * guard beside it whatever the url says. What is being measured is unchanged: the freeze
+     * has no opinion about an unchanged value, which is why the amendment's own UPDATE — one
+     * that does not mention the url at all — passes it on every amendment.
+     */
+    it("has no opinion about an unchanged destination", async () => {
       const ep = await inTenant((tx) => create(tx));
       await inTenant((tx) =>
-        tx.query("UPDATE crm.notification_endpoint SET url = $2, enabled = false WHERE id = $1", [
-          ep.id,
-          "https://hooks.example.test/crm",
-        ]),
+        updateEndpoint(tx, ep.id, {
+          enabled: false,
+          changedBy: REP,
+          reason: "turning it off, with the destination left exactly as it was",
+        }),
       );
       const after = await inTenant((tx) => getEndpoint(tx, ep.id));
       expect(after!.enabled).toBe(false);
+      expect(after!.url).toBe("https://hooks.example.test/crm");
     });
 
     /** The freeze is on UPDATE only: creating an endpoint sets all three for the first time. */
