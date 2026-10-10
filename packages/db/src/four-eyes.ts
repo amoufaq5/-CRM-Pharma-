@@ -78,6 +78,22 @@ export interface ConfigProposal {
   readonly decided_reason: string | null;
   readonly applied_at: Date | null;
   /**
+   * When this stops being merely pending and starts being overdue (0064).
+   *
+   * Stamped from the column default when the proposal is made and frozen afterwards, which is
+   * 0020's reason for copying a grace period onto each obligation: a deployment that shortens
+   * the window must not move a deadline somebody was already given. Nothing expires at it.
+   */
+  readonly decide_by: Date;
+  /**
+   * Whether it is past that deadline and still undecided.
+   *
+   * Computed in SQL against the server's clock rather than by the reader, so a device with a
+   * wrong clock cannot disagree with the sweep about which proposals are late — and a DECIDED
+   * proposal is never overdue, however long it took, because the deadline was for deciding.
+   */
+  readonly overdue: boolean;
+  /**
    * How many OTHER holders of the grant could decide it, right now.
    *
    * Carried on the read rather than computed by a screen, because zero is the answer that
@@ -101,7 +117,8 @@ const PROPOSAL_COLUMNS = `
   p.proposed_by::text AS proposed_by, pr.display_name AS proposed_by_name,
   p.proposed_at, p.proposed_reason,
   p.decision, p.decided_by::text AS decided_by, dr.display_name AS decided_by_name,
-  p.decided_at, p.decided_reason, p.applied_at,
+  p.decided_at, p.decided_reason, p.applied_at, p.decide_by,
+  (p.decision IS NULL AND p.decide_by < now()) AS overdue,
   crm.config_proposal_eligible_deciders(p.id) AS eligible_deciders`;
 
 const PROPOSAL_FROM = `

@@ -398,15 +398,23 @@ export class Scheduler {
         const client = await this.options.pool.connect();
         try {
           const r = await withTenantContext(client, tenantId, (tx) =>
-            notifyPendingApprovals(tx, tenantId),
+            // `this.now()` rather than the function's own default, like both sweeps above:
+            // one clock per tick, and a job whose idea of "late" came from somewhere the
+            // scheduler cannot control is a job no test can pin.
+            notifyPendingApprovals(tx, tenantId, { asOf: this.now() }),
           );
           return (
+            // 0064. An escalation is the loudest thing this job can report and the rarest:
+            // it means a proposal passed its deadline undecided and everybody who could have
+            // acted has now been told once, at `urgent`. First in the line for that reason.
+            `${r.escalated > 0 ? `ESCALATED=${r.escalated} ` : ""}` +
             `${r.blocked > 0 ? `BLOCKED=${r.blocked} ` : ""}` +
             // A blocked proposal with nobody to tell is the end of the chain: the only
             // administrator is the person waiting. Named separately because it is the one
             // case where a non-zero `blocked` produced no notification and never will.
             `${r.unreportable > 0 ? `UNREPORTABLE=${r.unreportable} ` : ""}` +
-            `pending=${r.pending} notified=${r.notified} alreadyKnown=${r.alreadyKnown}`
+            `pending=${r.pending} overdue=${r.overdue} ` +
+            `notified=${r.notified} alreadyKnown=${r.alreadyKnown}`
           );
         } finally {
           client.release();

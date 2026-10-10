@@ -3720,6 +3720,35 @@ describe("the API, end to end", () => {
         expect(rules.find((r) => r.column_name === "auto_writeoff_promo")?.direction).toBe("to_true");
       });
 
+      /**
+       * The deadline, over HTTP (0064).
+       *
+       * The queue is what an officer reads, so the age and the deadline have to be in it —
+       * which is the half of 0063's open note that belonged on a screen rather than in a
+       * scheduler log line. `overdue` is the SERVER's answer, computed against the server's
+       * clock, so a device with a wrong clock cannot put a red flag on one screen and not
+       * another.
+       */
+      it("carries the deadline on every proposal in the queue", async () => {
+        await grant(() => rep, "compliance", () => manager);
+        const proposed = await call("PUT", "/v1/admin/samples/disposal-policy", {
+          body: { autoWriteoffPromo: true, reason: "asking to arm the promo write-off" },
+          auth: repToken,
+        });
+        expect(typeof proposed.body.decide_by).toBe("string");
+        expect(proposed.body.overdue).toBe(false);
+
+        const queue = (await call("GET", "/v1/admin/four-eyes?pending=true", { auth: repToken }))
+          .body.data as readonly { decide_by: string; overdue: boolean }[];
+        expect(queue).toHaveLength(1);
+        expect(queue[0]!.overdue).toBe(false);
+        // Seven days out, from the column's own default — which the request never mentioned.
+        const days =
+          (new Date(queue[0]!.decide_by).getTime() - Date.now()) / 86_400_000;
+        expect(days).toBeGreaterThan(6.5);
+        expect(days).toBeLessThan(7.5);
+      });
+
       it("keeps the queue to the holders of either grant", async () => {
         expect((await call("GET", "/v1/admin/four-eyes")).status).toBe(403);
         await grant(() => rep, "compliance", () => manager);

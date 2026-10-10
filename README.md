@@ -309,6 +309,33 @@ notify_approvals  BLOCKED=1 UNREPORTABLE=1 pending=1 notified=0 alreadyKnown=0
 tenant whose only administrator proposed an administrator-governed change is both the person
 waiting and the only person who could appoint a colleague.
 
+**And a proposal nobody decides gets louder once** (0064). 0063 closed by arguing against the
+obvious fix — "a weekly reminder needs a dedup key carrying a period, which is nagging by
+construction" — and both halves of that were right. The answer is the shape this schema already
+uses for a disposal obligation: **escalation is a state change, not a cadence.**
+
+- `crm.config_proposal.decide_by` is stamped when the proposal is made — **seven days**, by the
+  database, not by the asker — and then **frozen**, for 0020's reason: a deployment that shortens
+  the window must not move a deadline somebody was already given. There is no extension, and the
+  exit for a proposal that needs longer is to reject it with a reason and ask again.
+- Crossing it raises `config_change_approval_overdue` at **`urgent`**, **once**, to everybody who
+  could have acted *and* to the administrators — who are told even when the proposal was
+  perfectly decidable, because what has gone wrong is that nobody decided it.
+- Still no period in any dedup key: `…:awaiting` once, `…:overdue` once. Two states, two notices,
+  per person, ever. The escalation says so in its own words — *"This is the only reminder: nobody
+  will be told again."*
+
+```
+notify_approvals  ESCALATED=1 pending=1 overdue=1 notified=2 alreadyKnown=0
+```
+
+**Nothing expires at the deadline**, and that stays deliberate: a TTL needs a decision about what
+expiry *means*, and rejected-by-the-system is not a refusal anybody made. What the deadline buys
+is most of an expiry's value without inventing one — it exists, crossing it is loud, and the
+proposal stays decidable by the two people whose job it is. The device shows the date on every
+row and counts the late ones in the heading, which is the other half of the same answer: an age
+in the queue, read on a screen rather than pushed.
+
 Four rules, all of them in the database (`db/migrations/0023_roles.sql`), so a route cannot
 forget one:
 
@@ -1308,7 +1335,7 @@ What it settles is the part that was a guess. Everything built for an offline de
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **310 checks in six
+and `pnpm client:verify` proves it the only way that means anything: **315 checks in six
 real Chromium profiles — six devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
@@ -1414,6 +1441,10 @@ real API binary, counting rows in Postgres.** The sequence it drives:
   **applies** the change, with `applied_at` stamped by the write itself. The policy's log names
   **Grace** and points at the proposal that holds Ada's half. Then one person turns the switch
   back off — which needs nobody — and the same approval **cannot** put it back;
+- **and a request that sits gets louder, once** (0064). The queue carries the date it should be
+  decided by, and backdating it two days turns the row **OVERDUE** with the heading counting the
+  late ones — because a reader scanning three rows does not notice an order. The row says since
+  *when*, and says there will be no second reminder;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

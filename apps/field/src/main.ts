@@ -1178,11 +1178,16 @@ function renderPolicyHistory(): string {
 function renderPendingApprovals(): string {
   const mine = state.proposals;
   if (mine.length === 0) return "";
+  // OVERDUE FIRST, and the count in the heading, because the thing a reader has to notice is
+  // that something has been waiting too long — not that there is a queue. The order is the
+  // server's `overdue` flag rather than a date comparison here: see `decide_by`'s comment.
+  const late = mine.filter((p) => p.overdue).length;
+  const ordered = [...mine].sort((a, b) => Number(b.overdue) - Number(a.overdue));
   return `<section>
-    <h2>Waiting for a second signature (${mine.length})</h2>
+    <h2>Waiting for a second signature (${mine.length}${late > 0 ? `, ${late} overdue` : ""})</h2>
     <form id="approvals-form">
       <ul class="list">
-        ${mine.map(renderProposal).join("")}
+        ${ordered.map(renderProposal).join("")}
       </ul>
     </form>
     <p class="note">A handful of settings cannot be changed by one person: arming the nightly
@@ -1207,6 +1212,15 @@ function renderProposal(p: ConfigProposal): string {
       ? `<span class="meta">Nobody in this tenant can approve this yet: it needs a second holder
            of the ${escapeHtml(p.role)} grant, and an administrator has to appoint one.</span>`
       : "";
+  // THE AGE AND THE DEADLINE, which is the half of 0063's open note that belonged on a screen
+  // rather than in a log line: "an age in the queue read on a screen rather than pushed".
+  // Overdue is said in words as well as sorted, because a reader scanning a list of three
+  // things does not notice an order.
+  const due = p.overdue
+    ? `<span class="meta">OVERDUE — it should have been decided by
+         ${escapeHtml(p.decide_by.slice(0, 10))}. Everybody who can act on it has been told
+         once, and nobody will be told again.</span>`
+    : `<span class="meta">Due by ${escapeHtml(p.decide_by.slice(0, 10))}.</span>`;
   // `type="button"` ON EVERY ONE OF THEM, and it is load-bearing rather than tidy. These sit
   // inside `#approvals-form`, and a `<button>` in a form with no type defaults to `submit` —
   // so the first version of this navigated the page on every click and the decision never
@@ -1219,6 +1233,7 @@ function renderProposal(p: ConfigProposal): string {
   return `<li><span class="grow">
     <span class="name">${escapeHtml(p.table_name)} — ${escapeHtml(moved)}</span>
     <span class="meta">${escapeHtml(p.proposed_by_name)}${mine ? " (you)" : ""} · ${escapeHtml(p.proposed_at.slice(0, 10))} · ${escapeHtml(p.proposed_reason)}</span>
+    ${due}
     ${stuck}
     <label>Your reason
       <input type="text" name="reason-${escapeHtml(p.id)}" maxlength="1000"

@@ -354,6 +354,82 @@ describe("two people for the dangerous ones (0062)", () => {
       expect(proposal.changes).toEqual({ auto_writeoff_promo: true, grace_days: 7 });
     });
 
+    /**
+     * The deadline, stamped and then frozen (0064).
+     *
+     * STAMPED FROM THE COLUMN DEFAULT, not from a caller: a deadline the asker chose would be
+     * a deadline the asker could set to a century. FROZEN afterwards for 0020's reason —
+     * "a changed policy never rewrites a deadline that has already been communicated" — which
+     * here also means there is no extension: the exit for a proposal that needs longer is to
+     * reject it with a reason and ask again, which resets the clock and leaves both in the
+     * record.
+     */
+    it("is given a deadline it did not choose, and cannot have it moved", async () => {
+      const { proposal } = await inTenant((tx) =>
+        proposeConfigChange(tx, TENANT, {
+          tableName: "disposal_policy",
+          rowKey: POLICY_ROW,
+          changes: ARM,
+          proposedBy: ada,
+          reason: "arming it after the volume review",
+        }),
+      );
+      // Seven days out, which the column declares and nothing in the request mentioned.
+      const days = (proposal.decide_by.getTime() - proposal.proposed_at.getTime()) / 86_400_000;
+      expect(days).toBeGreaterThan(6.9);
+      expect(days).toBeLessThan(7.1);
+      // Not overdue yet, and a fresh proposal never is.
+      expect(proposal.overdue).toBe(false);
+
+      const err = await refusalOf(
+        inTenant((tx) =>
+          tx.query("UPDATE crm.config_proposal SET decide_by = now() + interval '90 days' WHERE id = $1", [
+            proposal.id,
+          ]),
+        ),
+      );
+      expect(err.message).toMatch(/config-proposal-frozen/);
+      expect(err.message).toMatch(/when it is due/);
+    });
+
+    /**
+     * AND THE WRITER DOES NOT GET TO CHOOSE IT, which is 0059's rule for the `from` columns of
+     * a policy change applied to a deadline: "the caller does not get to say what the policy
+     * used to be". A psql prompt naming `decide_by` a century out is not a four-eyes bypass,
+     * but it silently disables the escalation — the same idea in a quieter coat.
+     *
+     * This also pins the TWO COPIES of seven days — the column default and the trigger's
+     * literal — against each other: a bare insert goes through the trigger and this asserts
+     * where it landed, so changing one without the other is red here rather than a deadline
+     * that depends on which path wrote the row.
+     */
+    it("overwrites a deadline a raw insert tried to choose", async () => {
+      const { rows } = await inTenant((tx) =>
+        tx.query<{ days: string }>(
+          `INSERT INTO crm.config_proposal
+             (tenant_id, table_name, row_key, changes, four_eyes_columns, role,
+              proposed_by, proposed_reason, decide_by)
+           VALUES ($1, 'disposal_policy', jsonb_build_object('tenant_id', $1::uuid),
+                   '{"auto_writeoff_promo": true}'::jsonb, ARRAY['auto_writeoff_promo'],
+                   'compliance', $2, 'asking with a deadline of my own choosing',
+                   now() + interval '100 years')
+           RETURNING (EXTRACT(EPOCH FROM (decide_by - clock_timestamp())) / 86400)::text AS days`,
+          [TENANT, ada],
+        ),
+      );
+      expect(Number(rows[0]!.days)).toBeGreaterThan(6.9);
+      expect(Number(rows[0]!.days)).toBeLessThan(7.1);
+    });
+
+    it("stops being overdue the moment it is decided, however late", async () => {
+      const id = await agreed(ARM);
+      const after = await inTenant((tx) => configProposal(tx, TENANT, id));
+      // The deadline was for DECIDING, so a decided proposal is never overdue — and `overdue`
+      // is the server's answer against the server's clock, never a device's arithmetic.
+      expect(after?.decision).toBe("approved");
+      expect(after?.overdue).toBe(false);
+    });
+
     it("is refused outright when nothing about it needs a second person", async () => {
       await expect(
         inTenant((tx) =>

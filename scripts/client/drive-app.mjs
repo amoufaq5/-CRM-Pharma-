@@ -1790,6 +1790,38 @@ async function main() {
         `with what it would change, spelled as the database spells it (${String(queue.text).slice(0, 90)})`);
       is(/Ada Lovelace/.test(String(queue.text)), true, "who asked");
       is(/now there is a second officer/.test(String(queue.text)), true, "and why, in her own words");
+      // 0064. The deadline, on the screen, which is the half of 0063's open note that
+      // belonged here rather than in a scheduler log line: "an age in the queue read on a
+      // screen rather than pushed". Not overdue yet, and it says the date rather than a mood.
+      is(/Due by \d{4}-\d{2}-\d{2}\./.test(String(queue.text)), true,
+        `and when it should be decided by (${String(queue.text).slice(-90)})`);
+      is(/OVERDUE/.test(String(queue.text)), false, "and it is not overdue, because it is not");
+
+      // NOW MAKE IT LATE. The deadline is frozen by `config_proposal_decided_once` — a
+      // deadline that can be moved is not a deadline — so this reaches past that guarantee
+      // explicitly, with the trigger off, which is the only honest way for a fixture to
+      // simulate the passage of a week. The contract suite does it the other way round, by
+      // injecting a clock into the sweep; here what is under test is the SCREEN, and the
+      // screen asks the server, which asks `now()`.
+      sql(`ALTER TABLE crm.config_proposal DISABLE TRIGGER USER;
+           UPDATE crm.config_proposal SET decide_by = now() - interval '2 days'
+            WHERE tenant_id = '${tenant}' AND decision IS NULL;
+           ALTER TABLE crm.config_proposal ENABLE TRIGGER USER`);
+      await graceApproves.click("#refresh");
+      await graceApproves.waitFor(`/OVERDUE/.test(document.body.textContent ?? "")`,
+        { timeoutMs: 20_000, label: "the overdue marking" });
+      const late = await graceApproves.evaluate(`
+        const h = [...document.querySelectorAll("h2")].find((x) => /Waiting for a second signature/.test(x.textContent ?? ""));
+        const sec = h?.parentElement;
+        return { heading: h?.textContent?.trim() ?? null,
+                 text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null };`);
+      is(/1 overdue/.test(String(late.heading)), true,
+        `the heading counts what is late, because a reader scanning three rows does not notice an order (${String(late.heading)})`);
+      is(/should have been decided by \d{4}-\d{2}-\d{2}/.test(String(late.text)), true,
+        "and the row says since when, because OVERDUE without a date is a scolding");
+      is(/nobody will be told again/.test(String(late.text)), true,
+        "and says there will be no second reminder, which is the whole design rather than a limitation");
+      await graceApproves.screenshot(join(work, "app-31-four-eyes-overdue.png"));
 
       // AND SHE IS TOLD, rather than having to think to look. A proposal nobody is notified
       // about waits for somebody to go looking, which is how an approval queue becomes a

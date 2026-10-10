@@ -49,6 +49,22 @@ export interface PendingApprovalSweep {
    * they already know, and this line is the end of the chain.
    */
   readonly unreportable: number;
+  /**
+   * Proposals past their deadline and still undecided (0064).
+   *
+   * Counted separately from `blocked` because they are different problems: a blocked proposal
+   * has nobody who may act on it, an overdue one has somebody who has not. A proposal can be
+   * both, and is counted in both.
+   */
+  readonly overdue: number;
+  /**
+   * Escalation notices raised by this pass — the `urgent` second kind.
+   *
+   * Included in `notified` as well, which this pass's own total is: splitting them out is for
+   * the log line, because a tick that escalated something is the one an operator wants to see
+   * in a column of zeroes.
+   */
+  readonly escalated: number;
 }
 
 interface NoticeRow {
@@ -59,7 +75,11 @@ interface NoticeRow {
   readonly proposed_by_name: string;
   readonly proposed_reason: string;
   readonly recipient: string;
-  readonly why: "can_decide" | "can_unblock";
+  readonly why: "can_decide" | "can_unblock" | "overdue";
+  /** Past `decide_by`, as the SWEEP's clock sees it — see `asOf`. */
+  readonly overdue: boolean;
+  /** Whole days it has been waiting, for the sentence an escalation carries. */
+  readonly waiting_days: number;
 }
 
 /**
@@ -70,15 +90,21 @@ interface NoticeRow {
  * replacing. It is tenant-scoped by row-level security rather than by an argument, like every
  * other read in this schema.
  *
- * TWO AUDIENCES IN ONE QUERY, and `blocked` is defined by the absence of the first: a proposal
+ * THREE AUDIENCES IN ONE QUERY. `blocked` is defined by the absence of the first: a proposal
  * nobody can decide is reported to the administrators, who are the people who can appoint
- * somebody who can. Never the proposer, in either arm — they know, and a notification telling
- * somebody about their own request is how an inbox becomes something to ignore.
+ * somebody who can. `escalation` (0064) is the third and overlaps both on purpose — an overdue
+ * proposal goes to everybody who could have acted on it and to the administrators besides,
+ * because what has gone wrong is that nobody did. Never the proposer, in any arm: they know,
+ * and a notification telling somebody about their own request is how an inbox becomes something
+ * to ignore.
  */
 const NOTICES_SQL = `
   WITH pending AS (
     SELECT p.id, p.role, p.proposed_by, p.table_name, p.four_eyes_columns, p.proposed_reason,
-           pr.display_name AS proposed_by_name
+           pr.display_name AS proposed_by_name,
+           (p.decide_by < $3::timestamptz) AS overdue,
+           GREATEST(0, floor(EXTRACT(EPOCH FROM ($3::timestamptz - p.proposed_at)) / 86400))::int
+             AS waiting_days
       FROM crm.config_proposal p
       JOIN crm.rep_profile pr ON pr.id = p.proposed_by
      WHERE p.tenant_id = $1 AND p.decision IS NULL
@@ -86,7 +112,7 @@ const NOTICES_SQL = `
   ),
   deciders AS (
     SELECT p.id AS proposal_id, p.table_name, p.four_eyes_columns, p.role,
-           p.proposed_by_name, p.proposed_reason,
+           p.proposed_by_name, p.proposed_reason, p.overdue, p.waiting_days,
            h.rep_profile_id AS recipient, 'can_decide' AS why
       FROM pending p
       CROSS JOIN LATERAL crm.role_holders(p.role) h
@@ -94,20 +120,45 @@ const NOTICES_SQL = `
   ),
   blocked AS (
     SELECT p.id AS proposal_id, p.table_name, p.four_eyes_columns, p.role,
-           p.proposed_by_name, p.proposed_reason,
+           p.proposed_by_name, p.proposed_reason, p.overdue, p.waiting_days,
            h.rep_profile_id AS recipient, 'can_unblock' AS why
       FROM pending p
       CROSS JOIN LATERAL crm.role_holders('administrator') h
      WHERE h.rep_profile_id <> p.proposed_by
        AND NOT EXISTS (SELECT 1 FROM deciders d WHERE d.proposal_id = p.id)
+  ),
+  -- 0064. The ESCALATION arm, and it is deliberately not the same set as either arm above.
+  -- An overdue proposal goes to the people who can decide it AND to the administrators — who
+  -- are told even when the proposal is perfectly decidable, because the thing that has gone
+  -- wrong is that nobody decided it, and that is the layer which can ask why. The two arms
+  -- above are mutually exclusive by construction; this one overlaps both on purpose, and the
+  -- dedup key is what stops one person getting the same escalation twice.
+  escalation AS (
+    SELECT p.id AS proposal_id, p.table_name, p.four_eyes_columns, p.role,
+           p.proposed_by_name, p.proposed_reason, p.overdue, p.waiting_days,
+           h.rep_profile_id AS recipient, 'overdue' AS why
+      FROM pending p
+      CROSS JOIN LATERAL (
+        SELECT rep_profile_id FROM crm.role_holders(p.role)
+         UNION
+        SELECT rep_profile_id FROM crm.role_holders('administrator')
+      ) h
+     WHERE p.overdue AND h.rep_profile_id <> p.proposed_by
   )
   SELECT proposal_id::text AS proposal_id, table_name, four_eyes_columns, role,
-         proposed_by_name, proposed_reason, recipient::text AS recipient, why
+         proposed_by_name, proposed_reason, overdue, waiting_days,
+         recipient::text AS recipient, why
     FROM deciders
    UNION ALL
   SELECT proposal_id::text AS proposal_id, table_name, four_eyes_columns, role,
-         proposed_by_name, proposed_reason, recipient::text AS recipient, why
+         proposed_by_name, proposed_reason, overdue, waiting_days,
+         recipient::text AS recipient, why
     FROM blocked
+   UNION ALL
+  SELECT proposal_id::text AS proposal_id, table_name, four_eyes_columns, role,
+         proposed_by_name, proposed_reason, overdue, waiting_days,
+         recipient::text AS recipient, why
+    FROM escalation
    ORDER BY proposal_id, why, recipient`;
 
 /**
@@ -122,32 +173,46 @@ const NOTICES_SQL = `
  *
  * `onlyProposalId` is how the route tells the people who can act on the proposal it just made,
  * through this same function. Without it, the sweep's scope is the tenant.
+ *
+ * `asOf` is the clock the deadline is measured against, injected rather than taken, exactly as
+ * `sweepExpiredStock` and `pruneNotifications` take theirs. It is what lets a test assert an
+ * escalation without a fixture reaching past `config_proposal_decided_once` to back-date a
+ * frozen column — and a sweep whose idea of "late" came from somewhere other than its caller
+ * is a sweep no test can pin.
  */
 export async function notifyPendingApprovals(
   tx: PoolClient,
   tenantId: string,
-  opts: { readonly onlyProposalId?: string } = {},
+  opts: { readonly onlyProposalId?: string; readonly asOf?: Date } = {},
 ): Promise<PendingApprovalSweep> {
+  const asOf = opts.asOf ?? new Date();
   const { rows } = await tx.query<NoticeRow>(NOTICES_SQL, [
     tenantId,
     opts.onlyProposalId ?? null,
+    asOf,
   ]);
 
   // The pending ids, which is also the count. Two queries did this a moment ago — one
   // `count(*)` and one `SELECT id` over the same predicate — which is two chances for the
   // number in the log line and the set the arithmetic below uses to disagree.
-  const { rows: pendingRows } = await tx.query<{ id: string }>(
-    `SELECT id::text AS id FROM crm.config_proposal
+  const { rows: pendingRows } = await tx.query<{ id: string; overdue: boolean }>(
+    `SELECT id::text AS id, (decide_by < $3::timestamptz) AS overdue
+       FROM crm.config_proposal
       WHERE tenant_id = $1 AND decision IS NULL AND ($2::uuid IS NULL OR id = $2::uuid)`,
-    [tenantId, opts.onlyProposalId ?? null],
+    [tenantId, opts.onlyProposalId ?? null, asOf],
   );
 
   let notified = 0;
   let alreadyKnown = 0;
+  let escalated = 0;
   for (const notice of rows) {
     const result = await raiseNotification(tx, tenantId, buildNotice(notice));
-    if (result.created) notified += 1;
-    else alreadyKnown += 1;
+    if (result.created) {
+      notified += 1;
+      if (notice.why === "overdue") escalated += 1;
+    } else {
+      alreadyKnown += 1;
+    }
   }
 
   // Derived from the SAME rows the notices came from rather than counted separately, so the
@@ -165,6 +230,11 @@ export async function notifyPendingApprovals(
     alreadyKnown,
     blocked: blockedIds.length,
     unreportable: blockedIds.filter((id) => !reportable.has(id)).length,
+    // Counted from the pending rows rather than from the notices, because a proposal can be
+    // overdue AND have nobody to tell — the notices would show neither, and the number an
+    // operator needs is how many are late rather than how many letters went out about it.
+    overdue: pendingRows.filter((r) => r.overdue).length,
+    escalated,
   };
 }
 
@@ -194,6 +264,29 @@ function buildNotice(n: NoticeRow): Parameters<typeof raiseNotification>[2] {
     subjectId: n.proposal_id,
     payload: { tableName: n.table_name, columns: n.four_eyes_columns, why: n.why },
   };
+  if (n.why === "overdue") {
+    return {
+      ...common,
+      // THE SECOND KIND, and it has to be named here rather than inherited: `common` carries
+      // the first one, and the first version of this branch overrode the severity and the
+      // sentence and not the kind — so an `urgent` escalation went out as
+      // `config_change_awaiting_approval`, which is the kind an operator routes somewhere
+      // quiet. Caught by the suite asserting on kinds rather than on counts.
+      kind: "config_change_approval_overdue" as const,
+      // URGENT, and it is the only `urgent` this file raises. The two notices above are
+      // `warning` because somebody is blocked on the reader; this one is `urgent` because the
+      // thing that has gone wrong is that nobody acted on the first one.
+      severity: "urgent" as const,
+      subject: `Overdue: ${what} has been waiting ${n.waiting_days} day(s) for a second signature`,
+      body:
+        `${n.proposed_by_name} asked to change ${what} on ${n.table_name} ` +
+        `${n.waiting_days} day(s) ago — "${n.proposed_reason}" — and it is past the date it ` +
+        `should have been decided by. It takes a second holder of the ${n.role} grant to ` +
+        `approve or reject it, and nothing happens until somebody does. This is the only ` +
+        `reminder: nobody will be told again.`,
+      dedupKey: `config_proposal:${n.proposal_id}:overdue`,
+    };
+  }
   if (n.why === "can_decide") {
     return {
       ...common,

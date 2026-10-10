@@ -2228,3 +2228,118 @@ means there is no escalation, recorded as open rather than hidden.
   of tenants runs thousands of queries that almost always return nothing. That is the
   scheduler's shape rather than this job's — and this is the first job cheap enough that one
   cross-tenant query would have been a plausible alternative.
+
+## A deadline is not a reminder
+
+*2026-10-10, `./scripts/verify-live-erp.sh` (133 driver checks), `pnpm client:verify`
+(315 checks) and `npx vitest run` (99 files / 2,537 tests).*
+
+The chapter above closed by arguing against the obvious fix, and the argument was right:
+
+> **No escalation.** One notice per person per proposal, forever. A weekly reminder would need a
+> dedup key carrying a period, which is nagging by construction, and the honest alternative is
+> an age in the queue read on a screen rather than pushed.
+
+A proposal made in March is still pending in December; its notice was read and forgotten in
+March. Sending the same sentence again on a cadence does not fix that — it trains a reader to
+ignore the kind.
+
+**Escalation is a state change, not a cadence**, and this schema already had the shape. 0020's
+disposal obligation has a `due_by` stamped at discovery and a *second* kind for crossing it, at
+`urgent`, raised once. One-for-one: `decide_by` stamped when a proposal is made,
+`config_change_approval_overdue` when it passes. Two states, two notices, per person, ever — and
+the escalation says so in its own words, *"This is the only reminder: nobody will be told
+again."*
+
+### In the deployed scheduler, with a deadline already past
+
+§10's fixture now leaves the proposal two days overdue, so the binary has both facts to raise.
+
+```
+ok: and its deadline is two days past, so the sweep has an escalation to raise as well
+ok: notify_approvals told the officer who could decide it —
+    {"type":"job_ok","job":"notify_approvals",
+     "detail":"ESCALATED=1 pending=1 overdue=1 notified=2 alreadyKnown=0"}
+ok: and escalated it, once, because its deadline had passed
+ok: and both notices are rows in Grace's inbox — the request, and that it is overdue
+ok: and the escalation is urgent, where the first notice was a warning
+```
+
+`notified=2` for one proposal, because it is two facts. The last two lines are the half a log
+line cannot prove: both *kinds* in the right inbox, and the severity of each — a second kind
+rather than a louder first one is what lets an operator route the escalation somewhere the
+request does not go.
+
+**Simulating a week passing meant turning two guarantees off, explicitly.** 0064 stamps the
+deadline on INSERT and freezes it on UPDATE, so the gate disables the table's user triggers,
+back-dates `decide_by`, and re-enables them — which is what a fixture undoing a guarantee should
+look like. The contract suite does it the honest way round instead, by **injecting a clock** into
+the sweep, as every other sweep here is tested; the claim in *this* file is about a deployed
+binary reading the wall clock, which cannot be told otherwise.
+
+### Seven more assertions, every one of them crossing the deadline
+
+```
+ok: says nothing while the deadline is in the future            (six days is inside it)
+ok: escalates once it has passed, to everybody who could have acted
+ok: carries the age and says it will not be sent again
+ok: escalates exactly once, however many ticks follow           (day 8, 9, and 400)
+ok: escalates a blocked proposal to the administrators too, in one notice
+ok: never escalates a decided proposal, however long it took
+ok: escalates to an officer appointed after the deadline had already passed
+```
+
+The fourth is the property the whole design turns on: day 9 and day 400 raise nothing. The last
+is the case the two increments compose into — an officer appointed after the deadline has passed
+gets *both* facts in one pass, and has missed neither.
+
+Two more in the four-eyes suite pin the deadline itself: a proposal **is given** a seven-day
+deadline it did not choose and cannot have moved (`config-proposal-frozen: … and when it is
+due`), and a raw INSERT naming `decide_by` a century out is **overwritten**. That one is 0059's
+rule for a policy change's `from` columns applied to a date — not a four-eyes bypass, but a
+deadline set to the next century silently disables the escalation, which is the same idea in a
+quieter coat. It also pins the two copies of "seven days" (the column default and the trigger's
+literal) against each other.
+
+### One defect, in the thing I had just finished arguing for
+
+The escalation branch spread the shared notice fields and overrode the severity, the sentence and
+the dedup key — **and not the kind**. So an `urgent` escalation went out as
+`config_change_awaiting_approval`: precisely the kind an operator routes somewhere quiet. Every
+counter said the right thing while the notice said the wrong one, and it was caught only because
+the suite classifies notices **by kind** rather than counting them. A test that had asserted
+`escalated: 1` and stopped would have passed.
+
+### On the screen, which is the other half of the same note
+
+"An age in the queue read on a screen rather than pushed" — so the queue carries the date and the
+server's own `overdue` verdict:
+
+```
+ok: and when it should be decided by      (… Due by 2026-10-17. …)
+ok: and it is not overdue, because it is not
+ok: the heading counts what is late, because a reader scanning three rows does not notice
+    an order                              (Waiting for a second signature (1, 1 overdue))
+ok: and the row says since when, because OVERDUE without a date is a scolding
+ok: and says there will be no second reminder, which is the whole design rather than a
+    limitation
+```
+
+`overdue` is computed in SQL against the server's clock rather than by the reader, so a phone
+with a wrong clock cannot put a red flag on one screen and not another.
+
+### What is still not built
+
+- **Nothing expires**, which 0062 recorded and this does not change: "a TTL needs a decision
+  about what expiry *means* — rejected by the system is not a refusal anybody made". The deadline
+  takes most of an expiry's value without inventing one, and that is now the only thing an expiry
+  would still buy.
+- **No per-rule window.** One number for both rules. A proposal may span columns, so two
+  deadlines would need a `min()` and a decision about the mixed case; when something wants two it
+  is a column on `crm.four_eyes_rule` rather than a redesign.
+- **No extension.** Reject-and-re-propose is the exit — correct, and three actions where an
+  operator wanted one.
+- **The escalation is in-app and webhook only.** There is still no email or SMS sender here, so
+  an `urgent` notice about a week-old request reaches whoever opens the app or whoever is
+  listening on a webhook — and the case it is for is precisely somebody who has not opened the
+  app in a week.

@@ -165,12 +165,46 @@ describe("telling whoever can approve (0063)", () => {
   const sweep = (): Promise<Awaited<ReturnType<typeof notifyPendingApprovals>>> =>
     inTenant((tx) => notifyPendingApprovals(tx, TENANT));
 
-  /** The approval notices in somebody's inbox, by the reason they were sent. */
+  /**
+   * The same sweep, run from the future.
+   *
+   * `asOf` is injected, like every other sweep in this repository, so a test can cross a
+   * seven-day deadline without reaching past `config_proposal_decided_once` to back-date a
+   * frozen column. A fixture that edited `decide_by` would be a fixture undoing the guarantee
+   * that a deadline cannot be moved — which is the thing 0064 is partly about.
+   */
+  const sweepInDays = (
+    days: number,
+  ): Promise<Awaited<ReturnType<typeof notifyPendingApprovals>>> =>
+    inTenant((tx) =>
+      notifyPendingApprovals(tx, TENANT, {
+        asOf: new Date(Date.now() + days * 86_400_000),
+      }),
+    );
+
+  /**
+   * The approval notices in somebody's inbox, by what each one is about.
+   *
+   * By KIND first and then by the subject, because 0064's escalation is its own kind: an
+   * `awaiting` notice and an `overdue` one are two facts about one proposal, and a reader of
+   * this helper needs to see which arrived.
+   */
   const noticesFor = async (who: string): Promise<readonly string[]> => {
     const items = await inTenant((tx) => inbox(tx, who));
     return items
-      .filter((n) => n.kind === "config_change_awaiting_approval")
-      .map((n) => (/stuck/.test(n.subject) ? "blocked" : "awaiting"));
+      .filter(
+        (n) =>
+          n.kind === "config_change_awaiting_approval" ||
+          n.kind === "config_change_approval_overdue",
+      )
+      .map((n) =>
+        n.kind === "config_change_approval_overdue"
+          ? "overdue"
+          : /stuck/.test(n.subject)
+            ? "blocked"
+            : "awaiting",
+      )
+      .sort();
   };
 
   describe("nothing to do", () => {
@@ -181,6 +215,8 @@ describe("telling whoever can approve (0063)", () => {
         alreadyKnown: 0,
         blocked: 0,
         unreportable: 0,
+        overdue: 0,
+        escalated: 0,
       });
     });
 
@@ -341,6 +377,107 @@ describe("telling whoever can approve (0063)", () => {
       );
       expect(proposal.role).toBe("administrator");
       expect(await sweep()).toMatchObject({ blocked: 1, notified: 0, unreportable: 1 });
+    });
+  });
+
+  describe("past the deadline", () => {
+    /**
+     * ESCALATION IS A STATE CHANGE, NOT A CADENCE. 0063 argued against a periodic reminder —
+     * "a dedup key carrying a period is nagging by construction" — and this is the shape 0020
+     * already uses for a disposal obligation: a `due_by` stamped when the thing is created, a
+     * SECOND kind at a higher severity when it passes, raised once.
+     */
+    it("says nothing while the deadline is in the future", async () => {
+      await grant(TENANT, grace, "compliance", ada);
+      await ask();
+      expect(await sweep()).toMatchObject({ overdue: 0, escalated: 0, notified: 1 });
+      // Six days is inside the seven-day window: the deadline is a date, not a mood.
+      expect(await sweepInDays(6)).toMatchObject({ overdue: 0, escalated: 0, notified: 0 });
+      expect(await noticesFor(grace)).toEqual(["awaiting"]);
+    });
+
+    it("escalates once it has passed, to everybody who could have acted", async () => {
+      await grant(TENANT, grace, "compliance", ada);
+      await grant(TENANT, admin, "administrator", ada);
+      await ask();
+      expect(await sweep()).toMatchObject({ notified: 1, escalated: 0 });
+
+      const late = await sweepInDays(8);
+      // Grace could have decided it; the administrator could have asked why. Both are told,
+      // and the administrator is told even though the proposal was perfectly decidable — what
+      // has gone wrong is that nobody decided it, and that is the layer which can act on that.
+      expect(late).toMatchObject({ pending: 1, overdue: 1, escalated: 2, notified: 2 });
+      expect(await noticesFor(grace)).toEqual(["awaiting", "overdue"]);
+      expect(await noticesFor(admin)).toEqual(["overdue"]);
+      // Never the proposer, in any arm.
+      expect(await noticesFor(ada)).toEqual([]);
+    });
+
+    it("carries the age and says it will not be sent again", async () => {
+      await grant(TENANT, grace, "compliance", ada);
+      await ask();
+      await sweepInDays(9);
+      const items = await inTenant((tx) => inbox(tx, grace));
+      const notice = items.find((n) => n.kind === "config_change_approval_overdue");
+      expect(notice?.severity).toBe("urgent");
+      expect(notice?.subject).toMatch(/waiting 9 day\(s\)/);
+      expect(notice?.body).toMatch(/This is the only reminder: nobody will be told again/);
+    });
+
+    /**
+     * THE PROPERTY THE WHOLE DESIGN TURNS ON. A reminder that arrives every tick is one a
+     * reader learns to ignore, so the escalation's dedup key carries the proposal and the
+     * state — never a period — and the second pass after the deadline tells nobody anything.
+     */
+    it("escalates exactly once, however many ticks follow", async () => {
+      await grant(TENANT, grace, "compliance", ada);
+      await ask();
+      expect(await sweepInDays(8)).toMatchObject({ escalated: 1 });
+      expect(await sweepInDays(9)).toMatchObject({ escalated: 0, overdue: 1, notified: 0 });
+      expect(await sweepInDays(400)).toMatchObject({ escalated: 0, overdue: 1, notified: 0 });
+      expect(await noticesFor(grace)).toEqual(["awaiting", "overdue"]);
+    });
+
+    it("escalates a blocked proposal to the administrators too, in one notice", async () => {
+      await grant(TENANT, admin, "administrator", ada);
+      await ask();
+      // Before the deadline: blocked, and the administrator is told what it needs.
+      expect(await sweep()).toMatchObject({ blocked: 1, escalated: 0, notified: 1 });
+      const late = await sweepInDays(8);
+      // After it: overdue as well, and the administrator gets the second fact as a second
+      // notice rather than the first one again. A proposal can be both and is counted in both.
+      expect(late).toMatchObject({ blocked: 1, overdue: 1, escalated: 1 });
+      expect(await noticesFor(admin)).toEqual(["blocked", "overdue"]);
+    });
+
+    it("never escalates a decided proposal, however long it took", async () => {
+      await grant(TENANT, grace, "compliance", ada);
+      const id = await ask();
+      await inTenant((tx) =>
+        decideConfigProposal(tx, TENANT, id, "rejected", grace, "not while the audit is open"),
+      );
+      // The deadline was for DECIDING. It was decided, late or not, so there is nothing left
+      // for anybody to do and nothing to say about it.
+      expect(await sweepInDays(400)).toMatchObject({
+        pending: 0,
+        overdue: 0,
+        escalated: 0,
+        notified: 0,
+      });
+      expect(await noticesFor(grace)).toEqual([]);
+    });
+
+    it("escalates to an officer appointed after the deadline had already passed", async () => {
+      await ask();
+      // Nobody at all for eight days: no `awaiting` notice, because there was nobody to tell,
+      // and no escalation either, for the same reason.
+      expect(await sweepInDays(8)).toMatchObject({ overdue: 1, escalated: 0, notified: 0 });
+      await grant(TENANT, grace, "compliance", ada);
+      // Now she is told BOTH facts in one pass — that it is waiting for her, and that it is
+      // already late. Two kinds, because they are two facts, and she has missed neither.
+      const late = await sweepInDays(9);
+      expect(late).toMatchObject({ overdue: 1, escalated: 1, notified: 2 });
+      expect(await noticesFor(grace)).toEqual(["awaiting", "overdue"]);
     });
   });
 

@@ -597,6 +597,16 @@ export const ConfigProposal = z
     decided_reason: z.string().nullish(),
     applied_at: z.string().nullish(),
     eligible_deciders: z.number().int(),
+    /**
+     * When it should have been decided by, and whether it has been (0064).
+     *
+     * `overdue` is the SERVER's answer, computed against the server's clock, and the device
+     * renders it rather than deciding it — a phone with a wrong clock disagreeing with the
+     * sweep about which requests are late would put a red flag on one screen and not another.
+     * The date is carried too, because "overdue" without "since when" is a scolding.
+     */
+    decide_by: z.string(),
+    overdue: z.boolean(),
   })
   .passthrough();
 export type ConfigProposal = z.infer<typeof ConfigProposal>;

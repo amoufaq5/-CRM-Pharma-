@@ -41,8 +41,9 @@
 #     expense_post all run in the first tick against the live database and are
 #     observed to succeed; nothing is asserted about what they did, because the
 #     rows they act on are not seeded. `notify_approvals` IS seeded — §10 leaves a
-#     four-eyes proposal pending with a second officer who was never told — so §11
-#     asserts the notice it raised rather than only the tick.
+#     four-eyes proposal pending with a second officer who was never told, and its
+#     deadline two days past — so §11 asserts the notice it raised, the escalation
+#     beside it and the severity of each, rather than only the tick.
 #   * Nothing about an RS256 human token. The stand-in IdP signs EdDSA, and RS256
 #     is the format every real OIDC provider defaults to (jwt.ts supports it, and
 #     only packages/api/src/jwt.test.ts exercises it).
@@ -515,6 +516,19 @@ ok "crm.rep_profile maps rep-ada → Employee emp-1, and lot LOT-LIVE-1 of itm-1
 ok "rep-ada holds the administrator grant — granted by Grace, because 0023 lets nobody grant themselves one"
 ok "and a pending four-eyes proposal is waiting, with two compliance officers to decide it"
 
+# AND IT IS ALREADY LATE. 0064 stamps the deadline on INSERT and freezes it on UPDATE — a
+# deadline the writer chooses is not a deadline — so simulating a week passing means turning
+# both guarantees off explicitly, which is what a fixture undoing one should look like. The
+# contract suite does it the honest way round, by injecting a clock into the sweep; the claim
+# HERE is about the deployed binary, which reads the wall clock and cannot be told otherwise.
+psql -d "$CRM_DB" -v ON_ERROR_STOP=1 -q -c "
+  ALTER TABLE crm.config_proposal DISABLE TRIGGER USER;
+  UPDATE crm.config_proposal SET decide_by = clock_timestamp() - interval '2 days'
+   WHERE tenant_id = '$TENANT' AND decision IS NULL;
+  ALTER TABLE crm.config_proposal ENABLE TRIGGER USER" \
+  || fail "could not back-date the proposal's deadline"
+ok "and its deadline is two days past, so the sweep has an escalation to raise as well"
+
 # PORT=0: the binary logs the port it actually bound, so no fourth fixed socket is
 # reserved and a stale listener cannot be mistaken for this one.
 export LIVE_KID="$KID"
@@ -583,17 +597,31 @@ wait_for_line "$WORK/sched.out" '"type":"job_ok".*"job":"notify_approvals"' "$SC
 # a sweep that had notified nobody. Measured, not reasoned about: the run said so.
 APPROVAL_LINE="$(grep '"type":"job_ok".*"job":"notify_approvals"' "$WORK/sched.out" | head -1)"
 case "$APPROVAL_LINE" in
-  *'notified=1'*) ok "notify_approvals told the officer who could decide it — $APPROVAL_LINE" ;;
+  *'notified=2'*) ok "notify_approvals told the officer who could decide it — $APPROVAL_LINE" ;;
   *) fail "notify_approvals ran and notified nobody: $APPROVAL_LINE" ;;
 esac
-# And the notification is a row, in the right inbox, raised by the scheduler rather than by
+# TWO notices for one proposal, because it is two facts: it is waiting for her, and it is
+# already late. 0064's escalation is a second KIND rather than a louder first one, so an
+# operator can route it somewhere the first does not go.
+case "$APPROVAL_LINE" in
+  *'ESCALATED=1'*'overdue=1'*) ok "and escalated it, once, because its deadline had passed" ;;
+  *) fail "notify_approvals did not escalate an overdue proposal: $APPROVAL_LINE" ;;
+esac
+# And the notifications are rows, in the right inbox, raised by the scheduler rather than by
 # anything this harness did — which is the half a log line cannot prove.
 TOLD="$(psql -d "$CRM_DB" -At -c "
-  SELECT count(*) FROM crm.notification n JOIN crm.rep_profile r ON r.id = n.recipient_rep_profile_id
-   WHERE n.tenant_id = '$TENANT' AND n.kind = 'config_change_awaiting_approval'
-     AND r.subject = 'rep-grace'")"
-[ "$TOLD" = "1" ] || fail "expected exactly one approval notice for rep-grace, found $TOLD"
-ok "and the notice is a row in Grace's inbox, naming the proposal it is about"
+  SELECT string_agg(DISTINCT n.kind, ',' ORDER BY n.kind)
+    FROM crm.notification n JOIN crm.rep_profile r ON r.id = n.recipient_rep_profile_id
+   WHERE n.tenant_id = '$TENANT' AND r.subject = 'rep-grace'
+     AND n.kind LIKE 'config_change_%'")"
+[ "$TOLD" = "config_change_approval_overdue,config_change_awaiting_approval" ] \
+  || fail "expected both approval kinds in rep-grace's inbox, found: $TOLD"
+ok "and both notices are rows in Grace's inbox — the request, and that it is overdue"
+URGENT="$(psql -d "$CRM_DB" -At -c "
+  SELECT severity FROM crm.notification
+   WHERE tenant_id = '$TENANT' AND kind = 'config_change_approval_overdue'")"
+[ "$URGENT" = "urgent" ] || fail "an overdue approval should be urgent, found: $URGENT"
+ok "and the escalation is urgent, where the first notice was a warning"
 
 stop_gracefully "$SCHED_PID" "the scheduler"
 SCHED_PID=""

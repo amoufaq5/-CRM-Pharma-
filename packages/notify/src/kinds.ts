@@ -62,6 +62,19 @@ export const NOTIFICATION_KINDS = [
    * exists to get away from.
    */
   "config_change_awaiting_approval",
+  /**
+   * A change that takes two people has been waiting past its deadline (0064).
+   *
+   * A SECOND KIND rather than a louder `config_change_awaiting_approval`, and the precedent is
+   * `disposal_obligation_overdue` eight entries up: one subject, two facts, and an operator
+   * routing kinds to a webhook wants to send the second somewhere the first does not go.
+   *
+   * Raised ONCE, at `urgent`, when `crm.config_proposal.decide_by` passes — to the people who
+   * can decide it and to the administrators, who are the layer that can do something a decider
+   * cannot. There is no third notice: escalation here is a state change, not a cadence, because
+   * a reminder that arrives every week is one a reader learns to ignore.
+   */
+  "config_change_approval_overdue",
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 

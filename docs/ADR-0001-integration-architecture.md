@@ -2107,18 +2107,112 @@ Concretely, and these specifics are the decision, not commentary on it:
 
     **Still open.**
 
-    * **No escalation**, as above: one notice per person per proposal, forever. A weekly
-      reminder would need a dedup key carrying a period, which is nagging by construction, and
-      the honest alternative is an age in the queue read on a screen rather than pushed.
+    * **No escalation** — **answered by item 37**, which gives a proposal a deadline and makes
+      crossing it a state change rather than a cadence. A weekly reminder would have been
+      nagging by construction, which is why this stayed open rather than being bolted on.
     * **A blocked proposal still needs somebody to read the log line.** `BLOCKED=` and
       `UNREPORTABLE=` are in the scheduler's output and in no screen and no route; an operator
       watching a tenant sees them, an administrator inside it does not. The screen shows
-      `eligible_deciders: 0` per proposal, which is the same fact one proposal at a time.
+      `eligible_deciders: 0` per proposal, which is the same fact one proposal at a time — and
+      since item 37 it also shows the deadline and counts the late ones, which is the other
+      half of this note answered.
     * **Nothing expires**, which item 35 already carried and this does not change.
     * **The sweep is per tenant per tick**, like every other job here, so a deployment with
       thousands of tenants runs thousands of queries that almost always return nothing. That is
       the scheduler's shape rather than this job's, and it is the first job cheap enough that a
       single cross-tenant query would have been a plausible alternative.
+
+37. **A deadline is not a reminder — item 36's escalation note, answered.**
+    That item closed by arguing against the obvious fix, and the argument was right:
+
+        NO ESCALATION, as above: one notice per person per proposal, forever. A weekly
+        reminder would need a dedup key carrying a period, which is nagging by construction,
+        and the honest alternative is an age in the queue read on a screen rather than pushed.
+
+    A proposal somebody made in March is still pending in December, its notice was read and
+    forgotten in March, and nothing says the waiting has become a problem. That is not fixed by
+    sending the same sentence on a cadence: a reminder whose dedup key carries a week number
+    arrives forever, and what it trains a reader to do is ignore the kind.
+
+    **ESCALATION IS A STATE CHANGE, NOT A CADENCE**, and this schema already had the shape. 0020's
+    disposal obligation has a `due_by` stamped at discovery and a SECOND kind for crossing it —
+    `disposal_obligation_overdue`, at `urgent`, to the rep AND up the hierarchy, exactly once.
+    One-for-one here: `decide_by` stamped when the proposal is made,
+    `config_change_approval_overdue` at `urgent` when it passes, to the people who can decide it
+    AND to the administrators — who are told even when the proposal was perfectly decidable,
+    because what has gone wrong is that nobody decided it and that is the layer which can ask
+    why. The dedup keys still carry no period: `…:awaiting` once, `…:overdue` once. Two states,
+    two notices, per person, ever — and the escalation says so in its own words, *"This is the
+    only reminder: nobody will be told again."*
+
+    **STAMPED BY THE DATABASE AND THEN FROZEN**, in both directions. The column default covers
+    every code path, and a BEFORE INSERT trigger overwrites whatever a raw INSERT supplied — not
+    a four-eyes bypass, but a deadline set to the next century silently disables the escalation,
+    which is the same idea in a quieter coat, and it is 0059's rule for a policy change's `from`
+    columns applied to a date. `config_proposal_decided_once` then covers `decide_by`, because a
+    deadline that can be moved after it was set is not a deadline. **The cost is that there is no
+    extension**: an officer legitimately waiting on Finance cannot buy another week, and the exit
+    is to reject the proposal with a reason and propose it again — which resets the clock and
+    leaves both the refusal and the new request in the record. That is the answer this lineage
+    gives everywhere else, and it is better than a mutable deadline whose history is a column
+    that used to say something else.
+
+    **SEVEN DAYS, argued rather than defaulted.** What waits is one colleague's decision on
+    another colleague's request, so the unit is working days: one day is too short (an officer on
+    leave on Tuesday makes everything overdue by Wednesday) and a month is long enough that the
+    asker has stopped expecting an answer. A week crosses one weekend and one working week,
+    which is the interval after which "I will look at it" has stopped being true.
+
+    **NOT PER RULE**, and this is the one place the shape is deliberately coarser than the rule
+    it serves. `crm.four_eyes_rule` could carry a `decide_within` and arming the unattended
+    write-off could have a shorter fuse than a ledger re-pointing — but a proposal may span
+    columns, so two rules would need a `min()`, a test for the mixed case and a decision about
+    what a proposal matching no deadline means. Nothing wants two numbers today, and when
+    something does it is a column on that table rather than a redesign of this one; the deadline
+    being DATA on the proposal is what makes that cheap.
+
+    **NOTHING EXPIRES**, which 0062 recorded and this does not change. "A TTL needs a decision
+    about what expiry MEANS — rejected by the system is not a refusal anybody made" is still the
+    objection and still unanswered. What the deadline buys is most of an expiry's value without
+    inventing a refusal: it exists, crossing it is loud, and the proposal stays decidable by the
+    two people whose job it is.
+
+    **AND THE OTHER HALF OF ITEM 36'S NOTE, which said so.** "The honest alternative is an age in
+    the queue read on a screen rather than pushed" — so the queue carries `decide_by` and the
+    server's own `overdue` verdict, the device shows the date on every row, sorts the late ones
+    first and counts them in the heading. `overdue` is computed in SQL against the server's clock
+    rather than by the reader, so a phone with a wrong clock cannot put a red flag on one screen
+    and not another.
+
+    **One defect, in the thing I had just finished arguing for.** The escalation branch spread the
+    shared notice fields and overrode the severity, the sentence and the dedup key — and not the
+    KIND. So an `urgent` escalation went out as `config_change_awaiting_approval`, which is
+    precisely the kind an operator routes somewhere quiet, and the counters all said the right
+    thing while the notice said the wrong one. Caught because the suite asserts on KINDS rather
+    than on counts; a test that had checked `escalated: 1` and stopped would have passed.
+
+    **Verified.** 99 files / **2,537 tests** green against a real Postgres — nineteen over the
+    sweep, seven of them crossing the deadline by INJECTING A CLOCK rather than back-dating a
+    frozen column, which is how every other sweep in this repository is tested and the only way
+    to exercise a deadline without undoing the guarantee that it cannot be moved. **315 browser
+    checks** (310 before): the queue carries the date, and back-dating it with the trigger
+    explicitly off turns the row OVERDUE with the heading counting the late ones. The live-ERP
+    gate now asserts the escalation in the DEPLOYED binary — the fixture leaves the proposal two
+    days past its deadline, the tick reports `ESCALATED=1 overdue=1 notified=2`, both kinds are
+    rows in the officer's inbox, and the escalation's severity is `urgent` where the first notice
+    was a `warning`. Migration runner green on a fresh database with 64 migrations.
+
+    **Still open.**
+
+    * **Nothing expires**, as above, and that is now the only thing a deadline could still buy.
+    * **No per-rule window**, as above: one number for both rules, and a column on
+      `crm.four_eyes_rule` when something wants two.
+    * **No extension.** Rejecting and re-proposing is the exit, which is correct and is also
+      three actions where an operator wanted one.
+    * **The escalation is in-app and webhook only.** There is still no email or SMS sender in
+      this repository, so an `urgent` notice about a week-old request reaches somebody who opens
+      the app or whoever is listening on a webhook — and the case this is for is precisely
+      somebody who has not opened the app in a week.
 
 ## Alternatives considered
 
@@ -2534,7 +2628,7 @@ commit.
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
 | **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
-| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 310 checks across SIX browser profiles, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28), then write-offs and the date a disposal was recorded on (item 29), then the return to a warehouse and the first write the ERP must hear about (item 30), then the warehouse list that made a return possible for stock a colleague handed over (item 31), and then the disposal policy — the first administrative screen, and the record of who changed it that 0023 left unbuilt (item 32) — and the configuration history beside it, which is 0061's generic attribution log on screen for an administrator (item 34), and the approval queue for the two changes that take two people (item 35). **What is NOT built is still most of the product**: call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface but those three — roughly 70 of the 113 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
+| **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 315 checks across SIX browser profiles, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28), then write-offs and the date a disposal was recorded on (item 29), then the return to a warehouse and the first write the ERP must hear about (item 30), then the warehouse list that made a return possible for stock a colleague handed over (item 31), and then the disposal policy — the first administrative screen, and the record of who changed it that 0023 left unbuilt (item 32) — and the configuration history beside it, which is 0061's generic attribution log on screen for an administrator (item 34), and the approval queue for the two changes that take two people (item 35). **What is NOT built is still most of the product**: call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface but those three — roughly 70 of the 113 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |
 
