@@ -47,6 +47,19 @@ export interface EndpointConfig {
   readonly url: string;
   /** The NAME of the environment variable holding the HMAC secret, never the secret. */
   readonly secretEnv: string;
+  /**
+   * The mailbox THIS delivery was addressed to, for the `email_recipient` channel (0065).
+   *
+   * On the config object rather than on the payload because it is a property of the
+   * destination and not of the signal: `WebhookPayload` is the body that goes out on the wire
+   * to a webhook receiver, and a rep's mailbox has no business in it. Resolved when the
+   * delivery row was created and copied onto it, so what is sent is what the record says was
+   * sent — never re-resolved at send time, where an address changed in between would make the
+   * row a lie.
+   *
+   * Undefined on every other channel, where `url` is the destination.
+   */
+  readonly toAddress?: string;
 }
 
 export type FetchLike = (

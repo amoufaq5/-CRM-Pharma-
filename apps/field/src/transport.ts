@@ -204,6 +204,33 @@ export class ApiTransport implements SyncTransport {
   }
 
   /**
+   * Sets or withdraws where one rep's notifications are emailed (0065).
+   *
+   * NOT QUEUED, for `decideProposal`'s reasons: it is an administrator's act at a desk about a
+   * tenant-wide setting, not a record of something that happened in the field. And a queued
+   * one would be worse than a queued policy change — an address set hours later, after
+   * somebody else corrected it, would silently overwrite the correction with the stale value
+   * the phone was still holding.
+   *
+   * A DELETE WITH A BODY, which `fetch` permits and which is the lesser evil: the table
+   * requires a reason, and putting a sentence about a person in a query string hands it to
+   * every proxy in between.
+   */
+  async setNotifyAddress(
+    repProfileId: string,
+    body: { readonly address: string; readonly reason: string },
+  ): Promise<TransportResult> {
+    return this.request("PUT", `/v1/admin/reps/${encodeURIComponent(repProfileId)}/notify-address`, body);
+  }
+
+  async clearNotifyAddress(
+    repProfileId: string,
+    body: { readonly reason: string },
+  ): Promise<TransportResult> {
+    return this.request("DELETE", `/v1/admin/reps/${encodeURIComponent(repProfileId)}/notify-address`, body);
+  }
+
+  /**
    * Ask the server to try a dead ERP write again.
    *
    * NOT a queued outbox kind, and that is the one deliberate inconsistency in this client.

@@ -164,6 +164,12 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   // because 0049 already freezes what an endpoint IS and a frozen fact is row data.
   notification_endpoint_created_by_fkey: { table: "notification_endpoint", column: "created_by", parent: "rep_profile", onDelete: "RESTRICT" },
   notification_endpoint_probe_requested_by_fkey: { table: "notification_endpoint_probe", column: "requested_by", parent: "rep_profile", onDelete: "RESTRICT" },
+  // 0065. Where one rep's notifications are emailed. CASCADE, and the only reference to
+  // `crm.rep_profile` in this registry that is not RESTRICT — because this one is not an audit
+  // record. It is a current setting about a person; who set it and why is in
+  // `crm.config_change`, which has its own RESTRICT above, and a tenant erasure that had to
+  // delete addresses before profiles would be a third ordering constraint for nothing.
+  rep_notify_address_rep_fkey: { table: "rep_notify_address", column: "rep_profile_id", parent: "rep_profile", onDelete: "CASCADE" },
   // 0061. The generic configuration log, which names its author for EVERY table under
   // attribution rather than one. RESTRICT, like every audit child here: a configuration
   // change whose author has been deleted is a change nobody made.
@@ -722,6 +728,15 @@ const PROBES: Readonly<Record<string, Probe>> = {
     sql: `INSERT INTO crm.notification_endpoint_probe (tenant_id, endpoint_id, requested_by)
           VALUES ($1, $2, $3)`,
     params: [TENANT_FK_B, B.endp, A.rep1],
+  },
+  rep_notify_address_rep_fkey: {
+    what: "a notification address for another tenant's rep",
+    // `DISABLE TRIGGER USER` is what makes this reach the constraint: 0065 puts this table
+    // under `crm.require_config_attribution`, so with triggers live the INSERT would be
+    // refused first for naming no author — a true refusal, and not the one under test.
+    sql: `INSERT INTO crm.rep_notify_address (tenant_id, rep_profile_id, address)
+          VALUES ($1, $2, 'fk.probe@example.com')`,
+    params: [TENANT_FK_B, A.rep1],
   },
 };
 

@@ -735,3 +735,54 @@ export const FailedErpWriteList = z.object({ data: z.array(FailedErpWrite) });
 
 /** What a retry answers: queued, and how many times it has been asked for. */
 export const RetryResult = z.object({ id: Uuid, queued: z.boolean(), reviveCount: z.number().int() });
+
+/**
+ * `GET /v1/admin/notify-addresses`: who this tenant could email, and who it could not (0065).
+ *
+ * `suggestion` is `crm.rep_profile.work_email_hint`, which 0003 declares a RECONCILIATION HINT
+ * that must never be load-bearing — the ERP reconciler writes it from whatever the Employee
+ * record happens to say. It arrives under a name that cannot be mistaken for a destination,
+ * for an administrator to confirm or replace, and nothing in this system ever sends to it.
+ *
+ * `endpoints` is the count of enabled endpoints on the `email_recipient` channel, and it is
+ * what tells a reader whether the list matters at all: a tenant with none has no gap, because
+ * nothing would have mailed any of these people either way.
+ */
+export const NotifyAddressGap = z
+  .object({
+    rep_profile_id: Uuid,
+    display_name: z.string(),
+    employee_number: z.string(),
+    status: z.string(),
+    address: z.string().nullish(),
+    suggestion: z.string().nullish(),
+  })
+  .passthrough();
+export type NotifyAddressGap = z.infer<typeof NotifyAddressGap>;
+
+export const NotifyAddressCoverage = z
+  .object({
+    endpoints: z.number().int(),
+    reps: z.number().int(),
+    addressed: z.number().int(),
+    missing: z.array(NotifyAddressGap),
+    summary: z.string(),
+  })
+  .passthrough();
+export type NotifyAddressCoverage = z.infer<typeof NotifyAddressCoverage>;
+
+/**
+ * `GET /v1/me/notify-address`: where MY signals go, or that they go nowhere.
+ *
+ * A null address is the answer a rep most needs, and it covers both "never set" and
+ * "withdrawn" — neither is somewhere mail can go, so the screen says the same thing about
+ * both.
+ */
+export const MyNotifyAddress = z
+  .object({
+    repProfileId: Uuid,
+    address: z.string().nullish(),
+    updatedAt: z.string().nullish(),
+  })
+  .passthrough();
+export type MyNotifyAddress = z.infer<typeof MyNotifyAddress>;

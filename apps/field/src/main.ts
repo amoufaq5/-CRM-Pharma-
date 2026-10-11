@@ -10,6 +10,9 @@ import {
   MyRoles,
   ConfigChangeList,
   ConfigProposalList,
+  MyNotifyAddress,
+  NotifyAddressCoverage,
+  NotifyAddressGap,
   PolicyBody,
   PolicyChangeList,
   Obligation,
@@ -129,6 +132,22 @@ interface State {
    */
   proposals: readonly ConfigProposal[];
   /**
+   * Where THIS rep's notifications are emailed (0065), or that they are not.
+   *
+   * Null until a refresh has answered, which is not the same as "nowhere": a device saying
+   * "nothing is emailed to you" before it had asked would be a claim it has not been told, and
+   * the claim a rep would act on by not watching their inbox.
+   */
+  myNotifyAddress: MyNotifyAddress | null;
+  /**
+   * Who this tenant could email and who it could not. Administrator only, null until asked.
+   *
+   * Null rather than a zeroed coverage object for the reason above and one more: `endpoints: 0`
+   * is a real and load-bearing answer — it is what says the gaps do not matter yet — so an
+   * invented one would read as that answer.
+   */
+  notifyAddresses: NotifyAddressCoverage | null;
+  /**
    * The administrative roles this rep holds, from `GET /v1/me/roles`.
    *
    * Empty is the right default for a device that has not asked: offering a form every write
@@ -175,6 +194,8 @@ const state: State = {
   policyChanges: [],
   configChanges: [],
   proposals: [],
+  myNotifyAddress: null,
+  notifyAddresses: null,
   roles: [],
   editingPolicy: false,
   cachedAt: null,
@@ -438,6 +459,12 @@ function render(): void {
     // reader specifically. The policy below is a rule they are measured against; this is a
     // colleague blocked until they look.
     parts.push(renderPendingApprovals());
+    // Right after the queue it belongs to: 0064's escalation is the signal that most needs to
+    // leave the app, and these two sections are why it can. The rep's own line first, because
+    // it answers a question any reader may have about themselves; the to-do list second,
+    // because it is work and only an administrator has it.
+    parts.push(renderMyNotifyAddress());
+    parts.push(renderNotifyAddresses());
     parts.push(renderPolicy(now));
     // After the policy, because it is the same kind of thing one layer out: the policy is
     // one tenant-wide rule with a screen of its own, this is every OTHER tenant-wide
@@ -1244,6 +1271,116 @@ function renderProposal(p: ConfigProposal): string {
 }
 
 /**
+ * Where MY signals go — one line, for any rep (0065).
+ *
+ * Here because of what 0064 built: an `urgent` escalation whose whole case is reaching
+ * somebody who has not opened the app in a week. A rep who is told "we emailed you" and did
+ * not get it needs to be able to see whether anything was ever going to be, and the honest
+ * answer is usually "nowhere" — which is the answer they take to an administrator.
+ *
+ * NO FORM, and that is deliberate rather than unfinished. Letting a rep type their own
+ * destination would make this a self-service mailing list: a notification carries an account
+ * name, a lot number and a reason, so where it goes is a tenant's decision with an author and
+ * a sentence (0061) and not a preference. Reading it needs no author, so reading it is what
+ * this is.
+ *
+ * Absent while the answer is unknown, never guessed: a device that printed "nothing is emailed
+ * to you" before it had asked would be stating the one thing a rep would act on by stopping
+ * watching their inbox.
+ */
+function renderMyNotifyAddress(): string {
+  const mine = state.myNotifyAddress;
+  if (mine === null) return "";
+  const address = mine.address ?? null;
+  if (address === null || address === "") {
+    return `<section>
+      <h2>Where your notifications are emailed</h2>
+      <p class="note">Nowhere. Everything this app tells you is in the list above and nothing is
+        emailed to you — including an overdue approval, which is the one signal meant to reach
+        you when you have not opened this app in a week. An administrator sets a destination;
+        you cannot set your own, because what goes out carries account names and lot numbers.</p>
+    </section>`;
+  }
+  return `<section>
+    <h2>Where your notifications are emailed</h2>
+    <p class="note">${escapeHtml(address)}${mine.updatedAt === null || mine.updatedAt === undefined ? "" : ` — set ${escapeHtml(mine.updatedAt.slice(0, 10))}`}.
+      Only signals your tenant has configured to go out by email are sent there; the rest are
+      in this app. An administrator changes it, with a reason that is recorded.</p>
+  </section>`;
+}
+
+/**
+ * Who this tenant could email, and who it could not (0065). Administrator only.
+ *
+ * ABSENT rather than empty for everyone else, like the configuration history: a heading with
+ * nothing under it reads as "everybody is reachable", which is a claim this device has not
+ * been told.
+ *
+ * `endpoints === 0` IS THE INTERESTING CASE and it is said rather than hidden. A tenant with no
+ * enabled `email_recipient` endpoint has no gap — nothing would have mailed any of these
+ * people either way — so a list of twelve unaddressed reps rendered as urgent is how a to-do
+ * list gets trained out of a reader. The server writes that sentence; this draws it.
+ *
+ * THE SUGGESTION IS A SUGGESTION. `work_email_hint` has sat in `crm.rep_profile` since 0003
+ * with no consumer, and 0003 is explicit that it "must never be the join key" — the ERP
+ * reconciler writes it from whatever the Employee record says. So it arrives labelled as the
+ * ERP's guess, it fills the box, and an administrator presses the button. That press is the
+ * confirmation, and it is what makes the destination a decided fact rather than a copied one.
+ */
+function renderNotifyAddresses(): string {
+  const coverage = state.notifyAddresses;
+  if (coverage === null) return "";
+  const heading = `Notification addresses (${coverage.addressed}/${coverage.reps})`;
+  if (coverage.missing.length === 0) {
+    return `<section>
+      <h2>${heading}</h2>
+      <p class="note">${escapeHtml(coverage.summary)}.</p>
+    </section>`;
+  }
+  return `<section>
+    <h2>${heading}</h2>
+    <p class="${coverage.endpoints === 0 ? "note" : "warn"}">${escapeHtml(coverage.summary)}.</p>
+    <form id="notify-address-form">
+      <ul class="list">
+        ${coverage.missing.map(renderNotifyAddressGap).join("")}
+      </ul>
+    </form>
+    <p class="note">The address the ERP has for someone is a guess — it changes on marriage,
+      rebrand and domain migration — so nothing is sent to it until you confirm it here. Your
+      reason is recorded with your name against the change.</p>
+  </section>`;
+}
+
+/** One rep with nowhere to mail: the ERP's guess, a box, and a button. */
+function renderNotifyAddressGap(gap: NotifyAddressGap): string {
+  const suggestion = gap.suggestion ?? "";
+  const hint =
+    suggestion === ""
+      ? `<span class="meta">The ERP has no email for this person either, so there is nothing
+           to confirm — ask them.</span>`
+      : `<span class="meta">The ERP has ${escapeHtml(suggestion)}. Confirm it or replace it.</span>`;
+  // `type="button"` for 0062's reason, which cost a browser gate to learn: this sits inside a
+  // form, and a `<button>` with no type defaults to `submit`, so the page navigates and the
+  // write never leaves the device.
+  return `<li><span class="grow">
+    <span class="name">${escapeHtml(gap.display_name)} — ${escapeHtml(gap.employee_number)}</span>
+    ${hint}
+    <label>Address
+      <input type="email" name="address-${escapeHtml(gap.rep_profile_id)}" maxlength="254"
+             autocomplete="off" spellcheck="false" value="${escapeHtml(suggestion)}"
+             placeholder="name@example.com" />
+    </label>
+    <label>Your reason
+      <input type="text" name="address-reason-${escapeHtml(gap.rep_profile_id)}" maxlength="1000"
+             placeholder="How you confirmed this is their mailbox" />
+    </label>
+    <span class="actions">
+      <button type="button" data-set-address="${escapeHtml(gap.rep_profile_id)}" ${state.online ? "" : "disabled"}>Set</button>
+    </span>
+  </span></li>`;
+}
+
+/**
  * Who changed this tenant's settings, and why (0061).
  *
  * ADMINISTRATOR ONLY, and absent rather than empty for everyone else: a section headed
@@ -1338,6 +1475,70 @@ function renderConfigValue(value: unknown): string {
  * patched four pieces of state from one response would be assembling the record rather than
  * reading it.
  */
+/**
+ * Sets where one rep's notifications are emailed (0065).
+ *
+ * BOTH FIELDS CHECKED HERE and both checked again by the server, which is not redundancy: the
+ * address has two rules (0065's CHECK and `isMailbox`) that only the server knows in full, so
+ * this checks the one thing a device can be sure of — that something was typed, and that the
+ * reason is a sentence — and lets the server own the shape. A device that reimplemented the
+ * address rule would be a third opinion about what a mailbox is.
+ *
+ * The draft is captured on every refusal, like the policy form and the approvals: a typed
+ * address and a typed reason must survive a re-render, or an administrator working through
+ * twelve reps retypes the one the server just complained about.
+ */
+async function setNotifyAddress(repProfileId: string): Promise<void> {
+  if (transport === null) return;
+  const addressField = document.querySelector(`[name="address-${CSS.escape(repProfileId)}"]`);
+  const reasonField = document.querySelector(`[name="address-reason-${CSS.escape(repProfileId)}"]`);
+  const address = addressField instanceof HTMLInputElement ? addressField.value.trim() : "";
+  const reason = reasonField instanceof HTMLInputElement ? reasonField.value.trim() : "";
+
+  if (address === "") {
+    captureFormDraft();
+    state.message = {
+      kind: "error",
+      text: "Type the address first. The one the ERP has is a guess, and nothing is sent to a guess.",
+    };
+    render();
+    return;
+  }
+  if (reason.length < 10) {
+    captureFormDraft();
+    state.message = {
+      kind: "error",
+      text: "Say how you confirmed it, in a sentence: where a person's notifications go is recorded with your name against it.",
+    };
+    render();
+    return;
+  }
+
+  const result = await transport.setNotifyAddress(repProfileId, { address, reason });
+  if (result.kind !== "ok") {
+    captureFormDraft();
+    state.message = {
+      kind: result.kind === "network" ? "warn" : "error",
+      text:
+        result.kind === "network"
+          ? "No network, so nothing was set. An address that took effect whenever a phone found signal could overwrite a correction somebody else had already made."
+          : `The server said: ${result.detail ?? result.status}`,
+    };
+    render();
+    return;
+  }
+
+  formDraft = null;
+  state.message = {
+    kind: "good",
+    text: "Set. Signals your tenant sends by email now reach that person, and the change is recorded with your reason.",
+  };
+  // Refreshed rather than patched in place: the row leaves the to-do list, the counts in the
+  // heading move, and the sentence under it may change from "nothing is unreachable yet" to
+  // nothing at all. Re-asking the server is the only way all three agree.
+  await refreshReference();
+}
+
 async function decideProposal(
   id: string,
   decision: "approve" | "reject" | "withdraw",
@@ -1642,6 +1843,13 @@ function wireReady(): void {
         if (id !== undefined) void decideProposal(id, decision);
       });
     }
+  }
+
+  for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-set-address]")) {
+    button.addEventListener("click", () => {
+      const id = button.dataset["setAddress"];
+      if (id !== undefined) void setNotifyAddress(id);
+    });
   }
 
   for (const button of document.querySelectorAll<HTMLButtonElement>("button[data-retry-erp]")) {
@@ -2950,6 +3158,33 @@ async function refreshReference(): Promise<void> {
     proposalsResult !== null && proposalsResult.kind === "ok"
       ? ConfigProposalList.safeParse(proposalsResult.body)
       : null;
+  /**
+   * Where this rep's own signals go (0065) — UNCONDITIONAL, unlike the two reads above.
+   *
+   * Every rep may ask, and every rep needs to: 0064's escalation exists to reach somebody who
+   * has not opened the app in a week, and a rep who is told "we emailed you" and did not get
+   * it has nowhere else to look. The honest answer is often "nowhere", which is the answer
+   * worth having — it is what they take to an administrator.
+   *
+   * NOT CACHED, like the configuration history and for a related reason: it is a mailbox,
+   * which is personal data about whoever is signed in, and a shared device's IndexedDB would
+   * keep it for whoever signs in next.
+   */
+  const myAddressResult = await transport.get("/v1/me/notify-address");
+  const myAddress =
+    myAddressResult.kind === "ok" ? MyNotifyAddress.safeParse(myAddressResult.body) : null;
+  /**
+   * The to-do list: who could be emailed, who could not, and whether it matters yet.
+   *
+   * Administrator only and conditional on the roles this refresh just learned, like the
+   * configuration history — and not cached, for the same two reasons, of which the second is
+   * sharper here: this list is every rep's mailbox, not one.
+   */
+  const addressesResult = mayAdminister ? await transport.get("/v1/admin/notify-addresses") : null;
+  const addresses =
+    addressesResult !== null && addressesResult.kind === "ok"
+      ? NotifyAddressCoverage.safeParse(addressesResult.body)
+      : null;
 
   state.me = me.data;
   // Stamp the session with the rep it turned out to be, so a later cold start can tell
@@ -2975,6 +3210,11 @@ async function refreshReference(): Promise<void> {
   // Emptied when there was no answer to have, for the roles' own reason: a rep who lost the
   // grant this morning must not keep an approve button that the server now refuses.
   state.proposals = proposals !== null && proposals.success ? proposals.data.data : [];
+  // NULLED rather than emptied when there was no answer, which is the difference between a
+  // list and a report: an empty `proposals` is a true statement ("nothing is waiting"), where
+  // a zeroed coverage report would state that this tenant has nobody to address.
+  state.myNotifyAddress = myAddress !== null && myAddress.success ? myAddress.data : null;
+  state.notifyAddresses = addresses !== null && addresses.success ? addresses.data : null;
   // Assigned even when the list is EMPTY, unlike the reads above: an empty set of roles is a
   // real answer and the one that must stick, or a rep who lost their grant this morning
   // would keep a form the server now refuses.

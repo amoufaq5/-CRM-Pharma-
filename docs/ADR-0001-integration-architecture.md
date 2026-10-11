@@ -2209,10 +2209,119 @@ Concretely, and these specifics are the decision, not commentary on it:
       `crm.four_eyes_rule` when something wants two.
     * **No extension.** Rejecting and re-proposing is the exit, which is correct and is also
       three actions where an operator wanted one.
-    * **The escalation is in-app and webhook only.** There is still no email or SMS sender in
-      this repository, so an `urgent` notice about a week-old request reaches somebody who opens
-      the app or whoever is listening on a webhook — and the case this is for is precisely
-      somebody who has not opened the app in a week.
+    * **The escalation is in-app and webhook only.** ~~There is still no email or SMS sender in
+      this repository~~ — **this was wrong when it was written**, and item 38 below records
+      what was actually missing. `SmtpSender` had been a real SMTP client over
+      `node:net`/`node:tls` since item 20, exercised against a real server and constructed by
+      the scheduler binary. The sentence was written from memory rather than from the code,
+      which is the one failure this repository keeps a whole file of lessons about. What was
+      true is narrower: email went to a tenant's ENDPOINT, and an endpoint is one frozen
+      mailbox for everybody, so an `urgent` notice about a week-old request reached a shared
+      inbox rather than the one person who had to act. Item 38 closes that; SMS, push and voice
+      are still unbuilt.
+
+38. **A notification is addressed to a person. An email was not.**
+
+    **The correction first, because it is the point.** Item 37's closing note said this
+    repository had no email sender. It had one, and had had one since item 20. The lesson is
+    not about email: a closing note written from memory is a claim nobody checked, and this one
+    survived a whole increment and shipped in two documents. The rule that follows is to read
+    the code before writing down what it lacks — which is how the real gap was found.
+
+    The real gap is structural and nothing above SQL could close it. `crm.notification` is
+    addressed to a PERSON (`recipient_rep_profile_id`, NOT NULL).
+    `crm.notification_delivery` pairs that notification with an ENDPOINT, and endpoints are per
+    TENANT — `raiseNotification` fans out to every enabled row. For `channel = 'email'` the
+    destination is the endpoint's own `url`, a single `mailto:` fixed by item 20's migration and
+    frozen for the life of the row by the destination-immutability rule. So every rep's signals
+    went to the same mailbox. Nobody was personally addressed, so nobody was personally
+    responsible.
+
+    **And `crm.rep_profile.work_email_hint` had sat in the schema since migration 0003 with no
+    consumer in any TypeScript** — while 0003 is explicit about why it must not become one:
+    "work_email is carried as a RECONCILIATION HINT ONLY: it changes on marriage, rebrand and
+    domain migration, and must never be the join key." That rule is kept rather than broken.
+    The hint becomes a SUGGESTION an administrator confirms, and what a notification is sent to
+    is a separate, deliberately-set, attributed fact. Mailing a rep's name and a lot number to
+    an address nobody confirmed is the "fixture kinder than reality" failure wearing a mail
+    header.
+
+    **A third channel, because the policy and the destination are different facts.** An endpoint
+    row holds the POLICY — which kinds, which minimum severity, enabled or not — and for
+    `email_recipient` the destination comes from whoever the notification names. Its `url` is
+    therefore not a destination at all and is pinned to the literal `mailto:*`: a marker that
+    reads as "whichever mailbox this is addressed to". The fixed `email` channel stays, and the
+    two are two policies rather than an old one and a new one: one answers "tell the team", the
+    other "tell the person".
+
+    **Its own table, not a column on `crm.rep_profile`.** A destination for a person's signals
+    is exactly the class item 34's attribution mechanism exists for, so it wants an author and a
+    sentence — but `crm.rep_profile` is written by the ERP reconciler from the scheduler with no
+    human anywhere near it, and `crm.require_config_attribution` would refuse every one of
+    those background writes. A column would have to be either unattributed (the gap item 34
+    closed, reopened) or attributed at the cost of breaking reconciliation.
+
+    **A withdrawal is an amendment, not a deletion**, and that constrains every table that
+    joins item 34's mechanism: `crm.record_config_change` fires `AFTER INSERT OR UPDATE` and
+    reads `NEW`, so a DELETE is neither attributed nor recorded. Removing somebody's mailbox by
+    DELETE would be the one change to this table that nobody signed and nothing logged — the
+    exact hole items 33 and 34 exist to close, reopened at the end that matters, since "stop
+    telling this person" is as consequential as "start". So `address` is nullable and clearing
+    it is an ordinary amendment with a before-image. Teaching the mechanism about DELETE is a
+    change to the mechanism and belongs to its own migration.
+
+    **A recipient with no address produces no delivery, and is counted.** The alternative was a
+    `dead` row saying "this rep has no notification address", which is better evidence and worse
+    behaviour: it would be re-created and re-killed on every raise, forever, filling the one
+    table the delivery-record migration exists to keep honest with rows that describe a
+    configuration gap rather than a push. So the raise counts it, and
+    `GET /v1/admin/notify-addresses` is the to-do list an administrator acts on — the same shape
+    as `unmappedCategoriesWithClaims`, which is Finance's.
+
+    **`to_address` on the delivery**, which is the frozen-destination argument applied to a
+    destination that varies per row. A delivery record outlives the notification it describes
+    *and* the endpoint, and for this channel the endpoint's url says nothing — so the row
+    carries the mailbox it was actually addressed to, copied when the delivery is created, and a
+    CHECK pairs it with the channel in both directions. Both history functions return it, or the
+    column's entire justification would be unreadable by the only two queries a human uses.
+
+    **One sender class, two channels.** `SmtpSender` already took a `channel` option; all that
+    changed is that the delivery's own address wins over the endpoint's url. The conversation,
+    the encoding choice, the AUTH ladder and every refusal are identical, so a second class
+    would be a copy of 983 lines differing in one field. The scheduler registers two instances
+    over one relay config, unconditionally — the alternative is a deployment that mails the ops
+    mailbox and silently retries every personally-addressed signal until it dead-letters.
+    There is no second prober: an `email_recipient` endpoint has no fixed mailbox to probe, and
+    the prober says so in those words rather than reporting that `"*"` is not a mailbox, which
+    is true and useless.
+
+    **Verified live.** The live gate boots a real SMTP server in a process of its own, demanding
+    AUTH PLAIN, and the DEPLOYED scheduler binary — `NODE_ENV=production`, the relay from
+    `SMTP_*` as `docker-compose.yml` spells them — delivers item 37's `urgent` escalation to the
+    officer's own mailbox: `RCPT TO` names `grace@live.example.test`, which the endpoint row
+    (`mailto:*`) does not contain, the AUTH line proves it read the password the endpoint named
+    by variable, and the delivery row records both the marker url and the mailbox. The browser
+    gate drives the administrator's screen end to end: the ERP's guess fills a box, pressing Set
+    with no reason is refused by the device with the typed address surviving, and the row that
+    lands carries her own corrected address and her sentence. 141 live-ERP checks, 329 browser
+    checks, 2,581 tests, migration runner green on a fresh database with 65 migrations.
+
+    **Still open.**
+
+    * **No per-rep opt-out, and no per-user quiet hours** — consistent with the rest of the
+      notification stack, which has neither (item 30's note), rather than a new gap. An
+      administrator withdraws a destination; a rep cannot.
+    * **One mailbox per rep.** A second would be a second verdict per signal with nowhere to
+      record which bounced, which is item 20's reason for one mailbox per endpoint.
+    * **Nothing re-resolves an address.** A delivery already enqueued keeps the mailbox it was
+      written with, which is deliberate — the record must stay true — but it means correcting a
+      typo does not rescue the notice already queued to the wrong address. It will dead-letter,
+      and the to-do list will not show the rep as a gap, because they have an address now.
+    * **Still no SMS, push or voice sender**, and still no provider webhook feeding bounces into
+      the suppression table that exists for exactly that.
+    * **A `dead` delivery on this channel does not say the address was wrong** in any way a
+      query can group by: `last_error` carries the relay's sentence as text. A bounce taxonomy
+      is the suppression work above, not this.
 
 ## Alternatives considered
 

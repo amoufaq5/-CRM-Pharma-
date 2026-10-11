@@ -95,6 +95,7 @@ JWKS_PID=""
 IDP_PID=""
 API_PID=""
 SCHED_PID=""
+SINK_PID=""
 DEV_SCHED_PID=""
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -107,6 +108,7 @@ cleanup() {
   [ -n "$IDP_PID" ] && kill "$IDP_PID" 2>/dev/null || true
   [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
   [ -n "$SCHED_PID" ] && kill "$SCHED_PID" 2>/dev/null || true
+  [ -n "$SINK_PID" ] && kill "$SINK_PID" 2>/dev/null || true
   [ -n "$DEV_SCHED_PID" ] && kill "$DEV_SCHED_PID" 2>/dev/null || true
   if [ "$code" -ne 0 ] && [ -f "$WORK/erp.log" ]; then
     echo; echo "--- last 25 lines of the operate-server log ---" >&2
@@ -114,7 +116,7 @@ cleanup() {
   fi
   # The CRM's binaries write their own diagnosis and then die; without this the
   # failure reads as "the gate timed out waiting for a tick".
-  for log in api.err api.out sched.err sched.out sched2.err sched2.out; do
+  for log in api.err api.out sched.err sched.out sched2.err sched2.out sink.out sink.err; do
     if [ "$code" -ne 0 ] && [ -s "$WORK/$log" ]; then
       echo; echo "--- last 15 lines of $log ---" >&2
       tail -15 "$WORK/$log" >&2
@@ -529,6 +531,54 @@ psql -d "$CRM_DB" -v ON_ERROR_STOP=1 -q -c "
   || fail "could not back-date the proposal's deadline"
 ok "and its deadline is two days past, so the sweep has an escalation to raise as well"
 
+# 0065. SOMEWHERE FOR THAT ESCALATION TO GO, which is the increment this section grew for.
+# Until now the only email endpoint a tenant could have took its destination from its own
+# frozen `mailto:` url, so every rep's signals landed in one mailbox — wrong for an urgent
+# notice whose whole case is reaching the one person who has not opened the app in a week.
+# This seeds the per-recipient channel and a mailbox for Grace, who is the officer the sweep
+# above is about to tell twice.
+#
+# THE ADDRESS IS WRITTEN UNDER ATTRIBUTION, in so many words, because the table refuses it
+# otherwise (0061): a destination for a person's notifications has an author and a sentence.
+# A fixture that had to find a way around that would be a fixture proving the guard off.
+psql -d "$CRM_DB" -v ON_ERROR_STOP=1 -q <<SQL || fail "could not seed the per-recipient mail route"
+BEGIN;
+INSERT INTO crm.notification_endpoint
+  (tenant_id, channel, url, secret_env, min_severity, created_by, created_reason)
+SELECT '$TENANT', 'email_recipient', 'mailto:*', 'CRM_SMTP_PASSWORD', 'urgent', a.id,
+       'the live gate mailing each officer their own urgent signals'
+  FROM crm.rep_profile a
+ WHERE a.subject = 'rep-ada'
+   AND NOT EXISTS (SELECT 1 FROM crm.notification_endpoint e
+                    WHERE e.tenant_id = '$TENANT' AND e.channel = 'email_recipient');
+-- A DO block rather than a bare SELECT, which printed its two return values as a table
+-- into the gate's own output. `PERFORM` is how plpgsql calls a function for its effect.
+DO \$\$
+BEGIN
+  PERFORM set_config('app.change_actor',
+                     (SELECT id::text FROM crm.rep_profile WHERE subject = 'rep-ada'), true);
+  PERFORM set_config('app.change_reason',
+                     'the live gate confirming the mailbox for this officer', true);
+END
+\$\$;
+INSERT INTO crm.rep_notify_address (tenant_id, rep_profile_id, address)
+SELECT '$TENANT', g.id, 'grace@live.example.test'
+  FROM crm.rep_profile g WHERE g.subject = 'rep-grace'
+ON CONFLICT (tenant_id, rep_profile_id) DO UPDATE SET address = EXCLUDED.address;
+COMMIT;
+SQL
+ok "and an email_recipient endpoint exists, with grace@live.example.test as Grace's own mailbox"
+# The proof that the attribution was not merely set but DEMANDED: the same INSERT with no
+# block open has to be refused, or the line above says nothing.
+UNSIGNED="$(psql -d "$CRM_DB" -At -c "
+  INSERT INTO crm.rep_notify_address (tenant_id, rep_profile_id, address)
+  SELECT '$TENANT', a.id, 'unsigned@live.example.test'
+    FROM crm.rep_profile a WHERE a.subject = 'rep-ada'" 2>&1 || true)"
+case "$UNSIGNED" in
+  *config-change-unattributed:*) ok "and the same write with nobody named is refused by the database" ;;
+  *) fail "an unattributed notification address was NOT refused: $UNSIGNED" ;;
+esac
+
 # PORT=0: the binary logs the port it actually bound, so no fourth fixed socket is
 # reserved and a stale listener cannot be mistaken for this one.
 export LIVE_KID="$KID"
@@ -567,6 +617,22 @@ echo "--- 11. the scheduler binary, booted as production does, drains that row -
 # TICK_INTERVAL_MS is the knob the binary already reads, used rather than sleeping
 # blindly: at 1s the loop comes round fast enough that a bounded wait on the
 # process's OWN relay_drain line is the signal, instead of a guess about timing.
+#
+# 0065. A REAL SMTP SERVER, in a process of its own, so the mail crosses a socket between two
+# processes rather than being an object the gate and the sender share. Plaintext on loopback
+# is the one place `assertUsableRelay` permits it; AUTH is DEMANDED rather than offered, so
+# this also proves the binary read the password the endpoint's `secret_env` names.
+SINK_USER="crm@live.example"
+SINK_PASS="a-live-gate-password"
+( cd "$ROOT" && exec env SINK_AUTH_USER="$SINK_USER" SINK_AUTH_PASS="$SINK_PASS" \
+    node "$ROOT/scripts/live-erp/smtp-sink.mjs" "$WORK/mail.json" ) \
+  > "$WORK/sink.out" 2> "$WORK/sink.err" &
+SINK_PID=$!
+wait_for_line "$WORK/sink.out" '"type":"smtp_sink_listening"' "$SINK_PID" 40 "the SMTP sink"
+SINK_PORT="$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$WORK/sink.out" | head -1)"
+[ -n "$SINK_PORT" ] || fail "the SMTP sink logged a listening line with no port in it"
+ok "a real SMTP server is listening on 127.0.0.1:$SINK_PORT, demanding AUTH PLAIN"
+
 SCHED_ENV=(
   PGHOST="$PGHOST" PGUSER="$CRM_PGUSER" PGPASSWORD="$CRM_PGPASSWORD" PGDATABASE="$CRM_DB"
   NODE_ENV=production
@@ -575,6 +641,15 @@ SCHED_ENV=(
   CRM_TOKEN_ISSUER="$ISSUER"
   ERP_TOKEN_AUDIENCE="$AUDIENCE"
   TICK_INTERVAL_MS=1000
+  # deploy/docker-compose.yml's mail variables, name for name. `SMTP_USERNAME` is what makes
+  # the sender read `CRM_SMTP_PASSWORD` at all — absent, it attempts no AUTH, which is the
+  # only sane reading of "no username".
+  SMTP_HOST=127.0.0.1
+  SMTP_PORT="$SINK_PORT"
+  SMTP_TRANSPORT=plaintext
+  SMTP_FROM="$SINK_USER"
+  SMTP_USERNAME="$SINK_USER"
+  CRM_SMTP_PASSWORD="$SINK_PASS"
 )
 echo "    NODE_ENV=production CRM_SIGNING_KEY_FILE=… node packages/scheduler/dist/bin/scheduler.js"
 ( cd "$ROOT" && exec env "${SCHED_ENV[@]}" node "$SCHED_BIN" ) > "$WORK/sched.out" 2> "$WORK/sched.err" &
@@ -623,11 +698,50 @@ URGENT="$(psql -d "$CRM_DB" -At -c "
 [ "$URGENT" = "urgent" ] || fail "an overdue approval should be urgent, found: $URGENT"
 ok "and the escalation is urgent, where the first notice was a warning"
 
+# 0065, AND THIS IS THE ONE THE INCREMENT IS FOR. The sweep above raised an urgent notice for
+# Grace; the endpoint seeded in §10 is on the per-recipient channel, whose url is the marker
+# `mailto:*`; so if the mail that lands below is addressed to her own mailbox, the destination
+# came from the notification rather than from the endpoint. Before this it could only have
+# come from the endpoint, and every officer in the tenant would have been mailed at one
+# address.
+#
+# The `senders` line first, because it is the cheap half and it fails for a different reason:
+# a binary that registered only `email` would retry every one of these until it dead-lettered,
+# and the log would say so eight minutes later.
+grep -q '"type":"senders".*"email_recipient"' "$WORK/sched.out" \
+  || fail "the scheduler did not register a sender for the email_recipient channel"
+ok "the scheduler registered both mail channels: $(grep '"type":"senders"' "$WORK/sched.out" | head -1)"
+
+wait_for_line "$WORK/sched.out" '"type":"job_ok".*"job":"notify_dispatch".*delivered=1' "$SCHED_PID" 120 \
+  "the scheduler's notify_dispatch tick delivering the escalation"
+ok "notify_dispatch delivered it — $(grep '"type":"job_ok".*"job":"notify_dispatch".*delivered=1' "$WORK/sched.out" | head -1)"
+
+# The row's own account of where it went. `to_address` is COPIED when the delivery is created
+# (0049's rule for a destination that varies per row), so this is what the record says — and
+# the sink below is what actually happened. Both, because either alone is half the claim.
+DELIVERED="$(psql -d "$CRM_DB" -At -c "
+  SELECT d.state || ' ' || d.endpoint_channel || ' ' || d.endpoint_url || ' ' || d.to_address
+    FROM crm.notification_delivery d
+    JOIN crm.notification n ON n.tenant_id = d.tenant_id AND n.id = d.notification_id
+   WHERE d.tenant_id = '$TENANT' AND n.kind = 'config_change_approval_overdue'")"
+[ "$DELIVERED" = "delivered email_recipient mailto:* grace@live.example.test" ] \
+  || fail "the delivery row does not say it reached Grace's own mailbox: $DELIVERED"
+ok "and the delivery row records the marker url AND the mailbox it was actually addressed to"
+
 stop_gracefully "$SCHED_PID" "the scheduler"
 SCHED_PID=""
 [ "$(cat "$WORK/last-exit")" = "0" ] || fail "the scheduler did not stop cleanly on SIGTERM"
 grep -q '"type":"shutdown"' "$WORK/sched.out" || fail "the scheduler exited without logging its shutdown"
 ok "and stopped cleanly on SIGTERM, draining the tick in flight first"
+
+# The sink writes what it received on SIGTERM, so it is stopped after the scheduler and read
+# afterwards — reading it while a tick was still in flight is how a gate reports a timing
+# accident as a failure.
+stop_gracefully "$SINK_PID" "the SMTP sink"
+SINK_PID=""
+[ -s "$WORK/mail.json" ] || fail "the SMTP sink exited without writing what it received"
+node "$ROOT/scripts/live-erp/drive-binaries.mjs" mail "$WORK" \
+  || fail "the mail the deployed binary sent is not what it should be (see the lines above)"
 
 node "$ROOT/scripts/live-erp/drive-binaries.mjs" drain "$WORK" \
   || fail "the scheduler binary's checks reported failures (see the ok:/FAIL: lines above)"

@@ -22,6 +22,7 @@
 // Usage: node drive-binaries.mjs <phase> <workdir>
 //   api-write    the API binary, authenticated, up to the outbox row it writes
 //   drain        what the scheduler binary did with that row, and its log lines
+//   mail         the mail a real relay received from the binary, addressed per recipient
 //   role-setup   queues a second row for §12 (no assertions)
 //   role         the ERP role came from the tenant's row, not the environment
 //
@@ -43,7 +44,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const PHASE = process.argv[2];
 const WORK = process.argv[3];
 if (PHASE === undefined || WORK === undefined) {
-  process.stderr.write("usage: drive-binaries.mjs <api-write|drain|role-setup|role> <workdir>\n");
+  process.stderr.write("usage: drive-binaries.mjs <api-write|drain|mail|role-setup|role> <workdir>\n");
   process.exit(2);
 }
 
@@ -487,6 +488,74 @@ if (PHASE === "api-write") {
   );
 
   saveState({ targetRecordId, outboxId: queued?.id ?? null });
+}
+
+// ===========================================================================
+if (PHASE === "mail") {
+  section("11c. the urgent escalation left the building, addressed to the person it names (0065)");
+
+  // WHAT THIS IS THE ONLY EVIDENCE FOR. The row in `crm.notification_delivery` says
+  // `delivered` and carries the mailbox, and the shell asserts that — but a row saying so is
+  // the SENDER's account of itself. These are the bytes a second process received over a
+  // socket, which is the one thing a sender cannot be wrong about and still pass.
+  const mail = JSON.parse(readFileSync(`${WORK}/mail.json`, "utf8"));
+
+  expect(
+    mail.messages.length === 1,
+    "the relay received exactly one message — the urgent escalation, and nothing the first notice should not have sent",
+    `messages=${mail.messages.length}`,
+  );
+  const message = mail.messages[0];
+  if (message === undefined) {
+    fail("there is no message to inspect, so nothing below can be checked");
+  } else {
+    // THE ASSERTION THE INCREMENT EXISTS FOR. The endpoint's url is the marker `mailto:*`, so
+    // this address cannot have come from the endpoint row — it came from the notification's
+    // recipient. Before 0065 every officer in the tenant would have been mailed at whichever
+    // single `mailto:` the tenant's endpoint was frozen to by 0049.
+    expect(
+      JSON.stringify(message.rcptTo) === JSON.stringify(["grace@live.example.test"]),
+      "and RCPT TO names Grace's own mailbox, which the endpoint row does not contain",
+      `rcptTo=${JSON.stringify(message.rcptTo)}`,
+    );
+    expect(
+      message.to === "<grace@live.example.test>",
+      "the To: header agrees with the envelope, so a human reading the mail sees who it was for",
+      `to=${String(message.to)}`,
+    );
+    // The signal, not just any mail: the subject is the one 0064's escalation writes.
+    expect(
+      typeof message.subject === "string" && /overdue/i.test(message.subject),
+      "the subject is the overdue approval, not the first notice — the escalation is a second KIND and only it is urgent",
+      `subject=${JSON.stringify(message.subject)}`,
+    );
+    expect(
+      typeof message.body === "string" && message.body.includes("Grace Hopper"),
+      "and the body names the recipient, which is the footer the composed message carries",
+      `body=${JSON.stringify(String(message.body).slice(0, 90))}`,
+    );
+    // The delivery id, which is how a receiver deduplicates an at-least-once push, and which
+    // ties this message to the row the shell just read.
+    expect(
+      typeof message.deliveryId === "string" && message.deliveryId.length === 36,
+      "carrying the delivery id, so the mail and the row in the database are the same push",
+      `x-crm-delivery=${String(message.deliveryId)}`,
+    );
+  }
+
+  // AUTH, from the transcript. The sink demands it, so a send that skipped it would have been
+  // refused with 530 and never arrived — but asserting it explicitly is what makes this a
+  // check of the secret plumbing rather than a check of the mailbox.
+  expect(
+    mail.transcript.some((line) => line.startsWith("AUTH PLAIN")),
+    "the binary authenticated to the relay with the password CRM_SMTP_PASSWORD holds, which the endpoint named by variable and never by value",
+    `auth=${JSON.stringify(mail.transcript.filter((l) => l.startsWith("AUTH")))}`,
+  );
+  expect(
+    mail.transcript.at(-1) === "QUIT",
+    "and closed the conversation rather than dropping the socket",
+    `last=${JSON.stringify(mail.transcript.at(-1))}`,
+  );
 }
 
 // ===========================================================================

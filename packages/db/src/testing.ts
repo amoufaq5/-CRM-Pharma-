@@ -321,6 +321,18 @@ export const TENANT_APPROVAL_SWEEP = "f0630000-0000-4000-8000-00000000002b";
 export const TENANT_APPROVAL_SWEEP_OTHER = "f1630000-0000-4000-8000-00000000002c";
 
 /**
+ * packages/notify — notify-address.contract (migration 0065).
+ *
+ * Its own pair, and both earn their place. The coverage report counts EVERY rep in the tenant
+ * and every enabled `email_recipient` endpoint, so a suite sharing a tenant would have its
+ * numerator and denominator moved by whoever else seeded a profile — and the second tenant is
+ * the subject rather than a spare, because an address is tenant-scoped by row-level security
+ * and the only way to assert that is for another tenant to have one this one cannot see.
+ */
+export const TENANT_NOTIFY_ADDRESS = "f0650000-0000-4000-8000-00000000002d";
+export const TENANT_NOTIFY_ADDRESS_OTHER = "f1650000-0000-4000-8000-00000000002e";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding

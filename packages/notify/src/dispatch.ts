@@ -47,6 +47,16 @@ export interface ClaimedDelivery {
   readonly channel: string;
   readonly url: string;
   readonly secret_env: string;
+  /**
+   * The mailbox this delivery was addressed to (0065), null on every channel but
+   * `email_recipient`.
+   *
+   * Read from the DELIVERY and never resolved here. The row was written with the address the
+   * recipient had when the signal was raised, and re-resolving it at send time would make the
+   * record say one thing and the envelope another — 0049's rule, which is also why
+   * `endpoint_channel` and `endpoint_url` are copies.
+   */
+  readonly to_address: string | null;
   readonly payload: WebhookPayload;
 }
 
@@ -160,10 +170,14 @@ export async function claimDue(
               attempts = d.attempts + 1,
               next_attempt_at = $2::timestamptz + ($4 || ' milliseconds')::interval
         WHERE d.id IN (SELECT id FROM due)
-        RETURNING d.id, d.tenant_id, d.notification_id, d.endpoint_id, d.attempts, d.seq
+        RETURNING d.id, d.tenant_id, d.notification_id, d.endpoint_id, d.attempts, d.seq,
+                  -- 0065. From the claim's own RETURNING rather than from the endpoint join
+                  -- below, because it is a property of this delivery and not of the
+                  -- destination: the endpoint's url on this channel is the marker.
+                  d.to_address
      )
      SELECT c.id, c.notification_id, c.seq::text AS seq, c.attempts, c.endpoint_id,
-            e.channel, e.url, e.secret_env,
+            e.channel, e.url, e.secret_env, c.to_address,
             jsonb_build_object(
               'deliveryId', c.id,
               'notificationId', n.id,
@@ -322,6 +336,12 @@ export class NotificationDispatcher {
                 id: delivery.endpoint_id,
                 url: delivery.url,
                 secretEnv: delivery.secret_env,
+                // SPREAD rather than `?? undefined`, which `exactOptionalPropertyTypes`
+                // refuses and is right to: an optional property present and holding
+                // `undefined` is a different object from one that is absent, and a sender
+                // asking `=== undefined` must not be told "there is an address, and it is
+                // nothing".
+                ...(delivery.to_address === null ? {} : { toAddress: delivery.to_address }),
               });
 
         await withTenantContext(client, tenantId, async (tx) => {

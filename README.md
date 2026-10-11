@@ -336,6 +336,37 @@ proposal stays decidable by the two people whose job it is. The device shows the
 row and counts the late ones in the heading, which is the other half of the same answer: an age
 in the queue, read on a screen rather than pushed.
 
+**And that urgent notice now reaches the person rather than a shared inbox** (0065). 0064's
+closing note said this repository had no email sender, which was **wrong** — `SmtpSender` has
+been a real SMTP client, exercised against a real server, since 0029. The gap was structural:
+`crm.notification` names a **person**, a delivery names an **endpoint**, and endpoints are per
+tenant, so every rep's email went to whichever single `mailto:` the tenant's endpoint was frozen
+to. For an escalation whose whole premise is reaching somebody who has not opened the app in a
+week, a shared ops mailbox is the wrong destination — nobody is personally addressed, so nobody
+is personally responsible.
+
+| `channel` | `url` | Destination |
+| --- | --- | --- |
+| `webhook` | `https://…` | the url, HMAC-signed |
+| `email` | `mailto:ops@example.com` | that mailbox, for every rep's signals |
+| `email_recipient` | `mailto:*` — a marker, not an address | whoever the notification names |
+
+The two mail channels are two **policies**, not an old one and a new one: "tell the team" is a
+reasonable thing to want, and "tell the person" is what an overdue approval needs. On the second
+the destination comes from `crm.rep_notify_address`, one row per rep, **set deliberately and
+attributed** under 0061 — and it is pointedly *not* `crm.rep_profile.work_email_hint`, which has
+sat in the schema since 0003 with no consumer and which 0003 forbids being load-bearing ("it
+changes on marriage, rebrand and domain migration, and must never be the join key"). The hint is
+offered as a **suggestion** by `GET /v1/admin/notify-addresses`, an administrator confirms or
+replaces it, and that press is what makes the destination a decided fact. **A rep with no
+address produces no delivery and is counted** — a `dead` row saying "this person has no mailbox"
+would be re-created and re-killed on every raise forever, so the gap is a number on a to-do list
+instead of rows in the one table 0046 exists to keep honest.
+
+Withdrawing an address sets it to NULL rather than deleting the row, and that is load-bearing
+rather than tidy: 0061's trigger fires `AFTER INSERT OR UPDATE`, so a DELETE would be the one
+change to this table that nobody signed and nothing logged.
+
 Four rules, all of them in the database (`db/migrations/0023_roles.sql`), so a route cannot
 forget one:
 
@@ -1151,9 +1182,11 @@ PGUSER=… PGHOST=… ./scripts/verify-live-erp.sh
 ```
 
 Boots a real `operate-server` over a real Postgres, points it at the CRM's own JWKS, and
-runs **133 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
-`@crm/relay` as a library, and 43 through the CRM's own `api` and `scheduler` **binaries**,
-started as processes exactly as `deploy/docker-compose.yml` starts them. It also syncs the
+runs **141 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
+`@crm/relay` as a library, and 51 through the CRM's own `api` and `scheduler` **binaries**,
+started as processes exactly as `deploy/docker-compose.yml` starts them. One of those is a real
+**SMTP server in a process of its own**, demanding AUTH, so the gate reads the bytes the deployed
+scheduler actually sent rather than its own account of them (0065). It also syncs the
 ERP's warehouses into `crm.warehouse_snapshot` with the shipped `SnapshotRefresher` before
 any rep records a receipt — because since 0058 a receipt naming a depot the ERP does not
 have is refused at the point of entry, which the gate measures in both directions. The CRM's own
@@ -1335,7 +1368,7 @@ What it settles is the part that was a guess. Everything built for an offline de
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **315 checks in six
+and `pnpm client:verify` proves it the only way that means anything: **329 checks in six
 real Chromium profiles — six devices, two reps — taken offline mid-session, against the
 real API binary, counting rows in Postgres.** The sequence it drives:
 
@@ -1445,6 +1478,12 @@ real API binary, counting rows in Postgres.** The sequence it drives:
   decided by, and backdating it two days turns the row **OVERDUE** with the heading counting the
   late ones — because a reader scanning three rows does not notice an order. The row says since
   *when*, and says there will be no second reminder;
+- **and that notice reaches a person by name** (0065). The administrator's to-do list says
+  *(0/2)* with the ERP's guess **filling a box** — which is the only place 0003's hint is allowed
+  to go — pressing Set with no reason is refused by the device with the typed address still
+  there, and the address that lands is the one she **corrected** rather than the one the ERP
+  guessed, recorded with her name and her sentence. Then the rep's own screen tells her where her
+  signals go, and the count moves to *(1/2)*;
 - a **shared device** refuses to file one rep's work under another's. A rep signing in with
   no network is not handed the previous rep's identity from the cache, and a queue holding
   somebody else's unsent record says so instead of sending it;

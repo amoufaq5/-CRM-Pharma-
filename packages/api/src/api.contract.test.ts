@@ -2492,6 +2492,255 @@ describe("the API, end to end", () => {
     });
   });
 
+  /**
+   * Where a person's notifications are emailed (0065), over HTTP.
+   *
+   * The gap these routes close: `crm.notification` names a PERSON, a delivery names an
+   * ENDPOINT, and endpoints are per tenant — so an `email` endpoint mailed every rep's signals
+   * to one frozen `mailto:`. 0064's `urgent` escalation, whose whole case is reaching somebody
+   * who has not opened the app in a week, landed in a shared ops mailbox.
+   *
+   * `crm.rep_profile.work_email_hint` has existed since 0003 with no consumer in any
+   * TypeScript, and 0003 forbids it being load-bearing: "it changes on marriage, rebrand and
+   * domain migration, and must never be the join key." These routes are its first consumer and
+   * keep that rule — it arrives as `suggestion`, an administrator confirms it, and the
+   * confirmation is what makes the destination a decided fact.
+   */
+  describe("where a person's notifications are emailed", () => {
+    const asAdmin = (): string => token({ sub: "idp|rep2", tenant: TENANT });
+    const grantAdmin = (): Promise<unknown> =>
+      withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+           VALUES ($1,$2,'administrator',$3,CURRENT_DATE)`,
+          [TENANT, otherRep, manager],
+        ),
+      );
+    const WHY_ADDRESS = "confirmed the mailbox with them in person";
+
+    it("refuses every administrative verb without the role", async () => {
+      expect((await call("GET", "/v1/admin/notify-addresses")).status).toBe(403);
+      expect(
+        (
+          await call("PUT", `/v1/admin/reps/${rep}/notify-address`, {
+            body: { address: "rep@example.test", reason: WHY_ADDRESS },
+          })
+        ).status,
+      ).toBe(403);
+      expect(
+        (await call("DELETE", `/v1/admin/reps/${rep}/notify-address`, { body: { reason: WHY_ADDRESS } }))
+          .status,
+      ).toBe(403);
+    });
+
+    it("sets a destination, and the rep can then see where their signals go", async () => {
+      await grantAdmin();
+      // Before: the honest answer, which is the one a rep acts on by not watching an inbox.
+      const before = await call("GET", "/v1/me/notify-address");
+      expect(before.status).toBe(200);
+      expect(before.body).toMatchObject({ repProfileId: rep, address: null, updatedAt: null });
+
+      const set = await call("PUT", `/v1/admin/reps/${rep}/notify-address`, {
+        auth: asAdmin(),
+        body: { address: "rep.one@example.test", reason: WHY_ADDRESS },
+      });
+      // 200 and not 201: one row per rep, and a client cannot tell whether it existed.
+      expect(set.status).toBe(200);
+      expect(set.body).toMatchObject({ address: "rep.one@example.test", display_name: "Rep One" });
+
+      // THE REP'S OWN READ, with no administrator role and no rep id in the path — the id
+      // comes from the token, so there is nobody else to name.
+      const after = await call("GET", "/v1/me/notify-address");
+      expect(after.body.address).toBe("rep.one@example.test");
+      expect(after.body.updatedAt).not.toBeNull();
+    });
+
+    it("records the change with the authenticated author and the reason from the body", async () => {
+      await grantAdmin();
+      await call("PUT", `/v1/admin/reps/${rep}/notify-address`, {
+        auth: asAdmin(),
+        body: { address: "rep.one@example.test", reason: WHY_ADDRESS },
+      });
+      const log = await call("GET", "/v1/admin/config-changes?table=rep_notify_address", {
+        auth: asAdmin(),
+      });
+      expect(log.status).toBe(200);
+      const entries = log.body.data as readonly {
+        action: string;
+        reason: string;
+        changed_by_name: string;
+        changed_columns: readonly string[];
+        after: Record<string, unknown>;
+      }[];
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.action).toBe("created");
+      expect(entries[0]!.changed_columns).toEqual(["address"]);
+      expect(entries[0]!.reason).toBe(WHY_ADDRESS);
+      // The author is the AUTHENTICATED principal, never a name in the body — the rule every
+      // attributed route here follows.
+      expect(entries[0]!.changed_by_name).toBe("Rep Two");
+      expect(entries[0]!.after["address"]).toBe("rep.one@example.test");
+    });
+
+    it("withdraws a destination as an amendment, and refuses a second withdrawal", async () => {
+      await grantAdmin();
+      await call("PUT", `/v1/admin/reps/${rep}/notify-address`, {
+        auth: asAdmin(),
+        body: { address: "rep.one@example.test", reason: WHY_ADDRESS },
+      });
+      const cleared = await call("DELETE", `/v1/admin/reps/${rep}/notify-address`, {
+        auth: asAdmin(),
+        body: { reason: "they asked to be taken off email entirely" },
+      });
+      expect(cleared.status).toBe(200);
+      expect(cleared.body).toEqual({ repProfileId: rep, address: null });
+      // 404, because the route reports the change it made and it made none.
+      expect(
+        (
+          await call("DELETE", `/v1/admin/reps/${rep}/notify-address`, {
+            auth: asAdmin(),
+            body: { reason: "trying to take them off twice" },
+          })
+        ).status,
+      ).toBe(404);
+
+      // AN AMENDMENT IN THE LOG, not a deletion — which is the whole reason the column is
+      // nullable: 0061's trigger fires AFTER INSERT OR UPDATE, so a DELETE would have been
+      // the one change to this table nobody signed and nothing logged.
+      const log = await call("GET", "/v1/admin/config-changes?table=rep_notify_address", {
+        auth: asAdmin(),
+      });
+      const entries = log.body.data as readonly { action: string; reason: string }[];
+      expect(entries.map((e) => e.action)).toEqual(["amended", "created"]);
+      expect(entries[0]!.reason).toBe("they asked to be taken off email entirely");
+    });
+
+    it("refuses a body with no reason, and writes nothing", async () => {
+      await grantAdmin();
+      expect(
+        (
+          await call("PUT", `/v1/admin/reps/${rep}/notify-address`, {
+            auth: asAdmin(),
+            body: { address: "rep.one@example.test" },
+          })
+        ).status,
+      ).toBe(422);
+      // Both halves: nothing set, and nothing logged.
+      expect((await call("GET", "/v1/me/notify-address")).body.address).toBeNull();
+      expect(
+        (await call("GET", "/v1/admin/config-changes?table=rep_notify_address", { auth: asAdmin() })).body
+          .data,
+      ).toEqual([]);
+    });
+
+    it("answers 422 for an address the relay could not be given, not 500", async () => {
+      await grantAdmin();
+      for (const address of [
+        // Passes the column's CHECK (an @, a dotted domain, no space) and `isMailbox`
+        // refuses it: angle brackets are not what goes in a RCPT TO.
+        "<rep@example.test>",
+        // Passes `isMailbox` and the column's CHECK refuses it — the dotless domain, which
+        // is the case that WOULD have been a 500 if the store had checked only one rule.
+        "rep@localhost",
+      ]) {
+        const res = await call("PUT", `/v1/admin/reps/${rep}/notify-address`, {
+          auth: asAdmin(),
+          body: { address, reason: WHY_ADDRESS },
+        });
+        expect(res.status, `${address} did not answer 422`).toBe(422);
+        // And the DETAIL names nothing internal. Scoped to `detail` deliberately: every
+        // problem body's `type` is a `https://crm.pharma/errors/…` url, so the whole-body
+        // check this first tried was asserting against the namespace rather than the message.
+        expect(String(res.body.detail)).not.toContain("crm.");
+        expect(String(res.body.detail)).not.toContain("rep_notify_address");
+      }
+    });
+
+    it("answers 404 for a rep in another tenant, the same as for one that does not exist", async () => {
+      await grantAdmin();
+      // Row-level security makes these indistinguishable, correctly: naming the difference
+      // would turn this route into a cross-tenant existence oracle.
+      for (const id of [otherRep === "" ? rep : "00000000-0000-4000-8000-000000000000", randomUUID()]) {
+        expect(
+          (
+            await call("PUT", `/v1/admin/reps/${id}/notify-address`, {
+              auth: asAdmin(),
+              body: { address: "nope@example.test", reason: WHY_ADDRESS },
+            })
+          ).status,
+        ).toBe(404);
+      }
+    });
+
+    it("lists who could not be emailed, with the ERP's guess, and says whether it matters", async () => {
+      await grantAdmin();
+      await withTenantContext(admin, TENANT, (tx) =>
+        tx.query("UPDATE crm.rep_profile SET work_email_hint = $2 WHERE id = $1", [
+          rep,
+          "rep.one@erp.example.test",
+        ]),
+      );
+
+      const list = await call("GET", "/v1/admin/notify-addresses", { auth: asAdmin() });
+      expect(list.status).toBe(200);
+      expect(list.body.reps).toBe(3);
+      expect(list.body.addressed).toBe(0);
+      expect(list.body.endpoints).toBe(0);
+      const forRep = (list.body.missing as readonly { rep_profile_id: string; suggestion: string | null }[])
+        .find((m) => m.rep_profile_id === rep);
+      // The hint, under a name that cannot be mistaken for a destination — 0003's rule kept
+      // rather than broken, and its first consumer in any TypeScript.
+      expect(forRep?.suggestion).toBe("rep.one@erp.example.test");
+      // Nothing is configured to mail these people, so nothing is unreachable yet. Said out
+      // loud, because a list of three that reads as urgent when nothing uses it is how a
+      // to-do list gets trained out of whoever reads it.
+      expect(list.body.summary).toContain("nothing is unreachable yet");
+
+      // Confirm it, and the list shortens.
+      await call("PUT", `/v1/admin/reps/${rep}/notify-address`, {
+        auth: asAdmin(),
+        body: { address: "rep.one@erp.example.test", reason: WHY_ADDRESS },
+      });
+      const again = await call("GET", "/v1/admin/notify-addresses", { auth: asAdmin() });
+      expect(again.body.addressed).toBe(1);
+      expect(
+        (again.body.missing as readonly { rep_profile_id: string }[]).map((m) => m.rep_profile_id),
+      ).not.toContain(rep);
+    });
+
+    it("tells an administrator when an endpoint would have mailed the people with no address", async () => {
+      await grantAdmin();
+      const made = await call("POST", "/v1/admin/notification-endpoints", {
+        auth: asAdmin(),
+        body: {
+          channel: "email_recipient",
+          url: "mailto:*",
+          secretEnv: "CRM_SMTP_PASSWORD",
+          reason: "mailing each rep their own urgent signals",
+        },
+      });
+      expect(made.status).toBe(201);
+      const list = await call("GET", "/v1/admin/notify-addresses", { auth: asAdmin() });
+      expect(list.body.endpoints).toBe(1);
+      expect(list.body.summary).toContain("their signals go nowhere");
+    });
+
+    it("refuses an email_recipient endpoint with a mailbox of its own, and says what the channel is for", async () => {
+      await grantAdmin();
+      const res = await call("POST", "/v1/admin/notification-endpoints", {
+        auth: asAdmin(),
+        body: {
+          channel: "email_recipient",
+          url: "mailto:ops@example.test",
+          secretEnv: "CRM_SMTP_PASSWORD",
+          reason: "trying to give the per-recipient channel a mailbox",
+        },
+      });
+      expect(res.status).toBe(422);
+      expect(res.body.detail).toContain("whoever the notification names");
+    });
+  });
+
   describe("where a signal was pushed", () => {
     const admin1 = (): string => token({ sub: "idp|rep2", tenant: TENANT });
 

@@ -488,11 +488,46 @@ Dead letters: `SELECT * FROM crm.notification_delivery WHERE state = 'dead'`. A 
 the first attempt (it will not succeed on retry); 408, 429 and 5xx retry eight times over
 roughly twenty minutes.
 
-There is no email or SMS sender. `ChannelSender` in `@crm/notify` is the seam, and nothing
-was written against it deliberately: a provider client could not be verified from the
-environment this was built in, and the ERP's own notification package shows where
-unverifiable senders end up — eighteen declared providers, one implementation. A webhook
-covers the paging case today. ADR-0001 records it as open.
+### Email
+
+**This section was wrong for several releases and is corrected here.** It said "there is no
+email or SMS sender", with the justification that a provider client could not be verified from
+the environment this was built in. An SMTP client landed with ADR-0001 item 20 — a real one
+over `node:net`/`node:tls`, exercised against a real server — and nobody came back to this
+file. SMS and push are still unbuilt and are still named as unbuilt below.
+
+There are **three channels**, and the one you want depends on who should read the mail:
+
+| `channel` | `url` | Destination |
+| --- | --- | --- |
+| `webhook` | `https://…` (or `http://` to loopback) | the url, HMAC-signed |
+| `email` | `mailto:ops@example.com` | that one mailbox, for every rep's signals |
+| `email_recipient` | `mailto:*` — a marker, not an address | whoever the notification names |
+
+`email` and `email_recipient` are two policies rather than an old one and a new one. "Tell the
+team" is a shared ops mailbox and is a reasonable thing to want; "tell the person" is what an
+`urgent` escalation about a week-old approval needs, because the one person who has to act may
+be precisely the one who has not opened the app in a week.
+
+On `email_recipient` the destination comes from `crm.rep_notify_address`, one row per rep, set
+through `PUT /v1/admin/reps/:id/notify-address` with a reason — the write is attributed and
+recorded in `crm.config_change` like any other configuration change. It is deliberately NOT
+`crm.rep_profile.work_email_hint`, which the ERP reconciler writes from whatever the Employee
+record says; that value is offered as a suggestion by `GET /v1/admin/notify-addresses` and
+nothing is ever sent to it unconfirmed. **A rep with no address produces no delivery** and is
+counted on that to-do list, which is the number to watch go to zero after configuring the
+channel. Withdrawing an address sets it to NULL rather than deleting the row, so the
+withdrawal has an author and a reason too.
+
+Configure the relay with the `SMTP_*` variables in `.env` (`SMTP_HOST` is what switches both
+mail senders on; `SMTP_USERNAME` is what makes the process read the password an endpoint's
+`secret_env` names, and without it no AUTH is attempted). TLS is required and refused in the
+constructor rather than per send, so a relay configured without it fails the scheduler at boot
+instead of dead-lettering everything — plaintext is permitted only to a loopback relay.
+
+**Still no SMS, push or voice sender**, and no provider webhook feeding bounces back into a
+suppression list. `ChannelSender` is the seam and the two mail senders are two instances of one
+class over one relay config, so a third channel is a class and not a redesign.
 
 ## Operating it
 

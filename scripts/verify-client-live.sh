@@ -117,16 +117,21 @@ BEGIN;
 SET ROLE crm_app;
 SELECT set_config('app.current_tenant_id', '$TENANT', true);
 
-INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, erp_employee_id, display_name, status)
-VALUES ('$TENANT', 'rep-ada', 'E-1', 'emp-1', 'Ada Lovelace', 'active'),
+-- `work_email_hint` ON ADA AND NOWHERE ELSE, because chapter 23 needs both branches of the
+-- to-do list. 0003 carries this column as a RECONCILIATION HINT the ERP reconciler writes from
+-- whatever the Employee record happens to say, and forbids it being load-bearing — so the
+-- chapter's job is to show it reaching a box a human presses, and the second rep (who has no
+-- hint) is the case an administrator cannot fix by confirming anything.
+INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, erp_employee_id, display_name, status, work_email_hint)
+VALUES ('$TENANT', 'rep-ada', 'E-1', 'emp-1', 'Ada Lovelace', 'active', 'ada@erp.example.test'),
        -- A SECOND REP, with no territory of her own. A transfer needs a colleague and
        -- nothing else: 0017's only rule for a counterparty is that they are a rep in this
        -- tenant and not the sender. Leaving her out of T-LIVE keeps every assertion above
        -- about Ada's accounts true, and proves the peer list is not territory-scoped.
-       ('$TENANT', 'rep-grace', 'E-2', 'emp-2', 'Grace Hopper', 'active'),
+       ('$TENANT', 'rep-grace', 'E-2', 'emp-2', 'Grace Hopper', 'active', NULL),
        -- Departed, and therefore never offered as a destination, though the write would
        -- still accept her. The picker's one narrowing, visible in the run.
-       ('$TENANT', 'rep-gone', 'E-3', NULL, 'Departed Rep', 'departed');
+       ('$TENANT', 'rep-gone', 'E-3', NULL, 'Departed Rep', 'departed', NULL);
 
 -- THE COMPLIANCE GRANT, which is what makes the policy screen reachable at all. 0023's
 -- four-eyes rule means nobody grants themselves a role, so Grace grants Ada — the same

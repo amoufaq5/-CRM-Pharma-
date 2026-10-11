@@ -31,6 +31,16 @@ export interface DeliveryRecord {
   readonly endpoint_id: string;
   readonly endpoint_channel: string;
   readonly endpoint_url: string;
+  /**
+   * The mailbox this push was addressed to, for the `email_recipient` channel (0065).
+   *
+   * Null on every other channel, where `endpoint_url` is the destination — and NOT the other
+   * way round: on this one the url is the marker `mailto:*`, so without this column a reader
+   * of a delivery log would see the push, see where it nominally went, and learn nothing about
+   * who it actually reached. Copied when the row was created, like the two fields above and
+   * for the same reason.
+   */
+  readonly to_address: string | null;
   readonly notification_kind: NotificationKind;
   readonly notification_severity: Severity;
   readonly notification_created_at: Date;

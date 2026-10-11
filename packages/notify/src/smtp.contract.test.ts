@@ -129,6 +129,113 @@ describe("the SMTP channel, against a real server", () => {
     });
   });
 
+  /**
+   * The `email_recipient` channel (0065), against the same relay and the same class.
+   *
+   * WHAT IS NEW IS ONLY WHERE THE DESTINATION COMES FROM. Until 0065 it came from the
+   * endpoint's own `mailto:` url, frozen by 0049 — so every rep in a tenant was mailed at one
+   * address and 0064's `urgent` escalation, whose whole case is reaching somebody who has not
+   * opened the app in a week, reached a shared ops mailbox instead of them. Now a delivery on
+   * that channel carries the mailbox it was addressed to, resolved when the row was written.
+   *
+   * ONE CLASS AND TWO CHANNELS, which these tests are the argument for: the conversation, the
+   * encoding choice, the AUTH ladder and every refusal are identical, so a second sender class
+   * would be a copy of 983 lines differing in one field.
+   */
+  describe("addressing the recipient rather than the endpoint", () => {
+    /** The endpoint row an `email_recipient` delivery actually carries: a marker, not a url. */
+    const PER_RECIPIENT: Partial<EndpointConfig> = { url: "mailto:*" };
+
+    it("sends to the delivery's own mailbox, and the relay sees it in RCPT TO", async () => {
+      const live = await open();
+      expect(
+        await sendTo(live, { endpoint: { ...PER_RECIPIENT, toAddress: "grace@example.com" } }),
+      ).toEqual({ kind: "delivered", status: 250 });
+      // The bytes that crossed the socket, which is the only evidence worth having here: a
+      // recorded call would have reported the same object whichever field the sender read.
+      expect(live.messages[0]!.rcptTo).toEqual(["grace@example.com"]);
+      expect(live.messages[0]!.headers.to).toBe("<grace@example.com>");
+    });
+
+    it("sends two deliveries to two mailboxes through one endpoint row", async () => {
+      const live = await open();
+      for (const to of ["grace@example.com", "omar@example.com"]) {
+        expect((await sendTo(live, { endpoint: { ...PER_RECIPIENT, toAddress: to } })).kind).toBe(
+          "delivered",
+        );
+      }
+      // The whole point of the channel, as the relay saw it.
+      expect(live.messages.map((m) => m.rcptTo)).toEqual([["grace@example.com"], ["omar@example.com"]]);
+    });
+
+    it("prefers the delivery's address over an endpoint that has a real mailbox too", async () => {
+      const live = await open();
+      // Not a configuration this system writes — 0065's CHECK pairs the address with the
+      // channel — but the precedence has to be unambiguous in the code rather than in the
+      // caller: the address on the row is the one the record says was used.
+      expect(
+        (await sendTo(live, { endpoint: { url: "mailto:ops@example.com", toAddress: "grace@example.com" } }))
+          .kind,
+      ).toBe("delivered");
+      expect(live.messages[0]!.rcptTo).toEqual(["grace@example.com"]);
+    });
+
+    it("dead-letters the marker when there is no address, without opening a socket", async () => {
+      const live = await open();
+      const outcome = await sendTo(live, { endpoint: PER_RECIPIENT });
+      // Reachable only through a bug — 0065's CHECK refuses a row on this channel with no
+      // address — so the sentence is written for whoever is reading the log, and it says what
+      // the marker IS rather than that `"*"` is not a mailbox, which is true and useless.
+      expect(outcome.kind).toBe("dead");
+      expect(outcome.error).toContain("the destination comes from whoever the notification names");
+      expect(live.transcript).toEqual([]);
+    });
+
+    it("dead-letters an address the column admitted and this process cannot address", async () => {
+      const live = await open();
+      // 0065's CHECK is broader than `isMailbox`: it wants an @ and a dotted domain and says
+      // nothing about angle brackets. Refusing here rather than handing it to the relay means
+      // the verdict says what is wrong with the address instead of quoting somebody else's
+      // parser back at an administrator.
+      const outcome = await sendTo(live, {
+        endpoint: { ...PER_RECIPIENT, toAddress: "<grace@example.com>" },
+      });
+      expect(outcome.kind).toBe("dead");
+      expect(outcome.error).toContain("not a mailbox this process can address");
+      expect(live.transcript).toEqual([]);
+    });
+
+    it("authenticates to the same relay with the same credential", async () => {
+      // The channel is the destination and nothing else: one relay, one password, one
+      // `secret_env`. A deployment does not configure a second mail server to mail a person.
+      const live = await open({ advertiseAuth: ["PLAIN"], requireAuth: true });
+      expect(
+        (
+          await sendTo(live, {
+            relay: { username: "crm@crm.example" },
+            env: { CRM_SMTP_PASSWORD: "hunter2" },
+            endpoint: { ...PER_RECIPIENT, toAddress: "grace@example.com" },
+          })
+        ).kind,
+      ).toBe("delivered");
+      expect(live.messages[0]!.authMechanism).toBe("PLAIN");
+      expect(live.messages[0]!.rcptTo).toEqual(["grace@example.com"]);
+    });
+
+    it("answers to the channel name it was constructed with", () => {
+      // How the dispatcher finds it: `NotificationDispatcher` keys its senders by `channel`,
+      // so the scheduler registers two instances of this class over one relay config.
+      const relay: SmtpRelayConfig = {
+        host: "127.0.0.1",
+        port: 25,
+        from: "crm@crm.example",
+        transport: "plaintext",
+      };
+      expect(new SmtpSender({ relay }).channel).toBe("email");
+      expect(new SmtpSender({ relay, channel: "email_recipient" }).channel).toBe("email_recipient");
+    });
+  });
+
   describe("AUTH", () => {
     it("authenticates with PLAIN, sending the credentials the relay expects", async () => {
       const live = await open({

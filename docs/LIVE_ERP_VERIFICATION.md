@@ -2339,7 +2339,161 @@ with a wrong clock cannot put a red flag on one screen and not another.
   is a column on `crm.four_eyes_rule` rather than a redesign.
 - **No extension.** Reject-and-re-propose is the exit — correct, and three actions where an
   operator wanted one.
-- **The escalation is in-app and webhook only.** There is still no email or SMS sender here, so
-  an `urgent` notice about a week-old request reaches whoever opens the app or whoever is
-  listening on a webhook — and the case it is for is precisely somebody who has not opened the
-  app in a week.
+- **The escalation is in-app and webhook only.** ~~There is still no email or SMS sender here~~
+  — **wrong when written; see the next chapter.** `SmtpSender` had been a real SMTP client,
+  exercised against a real server, since the email-channel increment, and the scheduler binary
+  had constructed it since the relay options landed. What was actually missing was narrower: an
+  email went to a tenant's ENDPOINT, and an endpoint is one frozen mailbox for everybody.
+
+## A notification is addressed to a person. An email was not.
+
+*2026-10-11, `./scripts/verify-live-erp.sh` (141 driver checks, including a real SMTP server),
+`pnpm client:verify` (329 checks) and `npx vitest run` (100 files / 2,581 tests). The
+migration runner is green on a fresh database with 65 migrations.*
+
+**The correction first.** The closing note above said this repository had no email sender. It
+had one. The sentence was written from memory rather than from the code, which is the one
+failure this file exists to record — and it survived a whole increment and shipped in two
+documents before anyone read the code it described. The habit that catches this is the one that
+found the real gap: open the file before writing down what it lacks.
+
+**The real gap**, which nothing above SQL could close:
+
+- `crm.notification` is addressed to a PERSON — `recipient_rep_profile_id`, NOT NULL.
+- `crm.notification_delivery` pairs that notification with an ENDPOINT, and endpoints are per
+  TENANT: the raise fans out to every enabled row.
+- For `channel = 'email'` the destination is the endpoint's own `url`, one `mailto:` frozen for
+  the life of the row.
+
+So every rep's signals went to the same mailbox. For the case email exists to serve — the
+`urgent` escalation above, whose whole premise is reaching somebody who has not opened the app in
+a week — a shared ops mailbox is the wrong destination: nobody is personally addressed, so nobody
+is personally responsible.
+
+And **`crm.rep_profile.work_email_hint` had sat in the schema since 0003 with no consumer in any
+TypeScript**, while 0003 forbids it being load-bearing in as many words: "it changes on marriage,
+rebrand and domain migration, and must never be the join key". So the hint became a SUGGESTION an
+administrator confirms, and the thing a notification is sent to is a separate, attributed fact.
+
+### In the deployed binary, against a real SMTP server
+
+The gate starts a real SMTP server in a **process of its own** — so the mail crosses a socket
+between two processes rather than being an object the gate and the sender share — demanding
+`AUTH PLAIN` rather than merely offering it, and boots the shipped scheduler with the `SMTP_*`
+variables exactly as `deploy/docker-compose.yml` spells them:
+
+```
+ok: a real SMTP server is listening on 127.0.0.1:42371, demanding AUTH PLAIN
+ok: the scheduler registered both mail channels
+    {"type":"senders","channels":["webhook","email","email_recipient"]}
+ok: notify_dispatch delivered it
+    {"job":"notify_dispatch","detail":"claimed=1 delivered=1 retried=0 dead=0 pending=0"}
+ok: and the delivery row records the marker url AND the mailbox it was actually addressed to
+```
+
+Then the bytes that arrived, which is the one thing a sender cannot be wrong about and still
+pass:
+
+```
+ok: the relay received exactly one message — the urgent escalation, and nothing the first
+    notice should not have sent                                            (messages=1)
+ok: and RCPT TO names Grace's own mailbox, which the endpoint row does not contain
+                                               (rcptTo=["grace@live.example.test"])
+ok: the To: header agrees with the envelope, so a human reading the mail sees who it was for
+ok: the subject is the overdue approval, not the first notice — the escalation is a second
+    KIND and only it is urgent
+ok: and the body names the recipient, which is the footer the composed message carries
+ok: carrying the delivery id, so the mail and the row in the database are the same push
+ok: the binary authenticated to the relay with the password CRM_SMTP_PASSWORD holds, which
+    the endpoint named by variable and never by value
+ok: and closed the conversation rather than dropping the socket                 (last="QUIT")
+```
+
+The endpoint's `url` on this channel is the literal marker `mailto:*`, so **the address cannot
+have come from the endpoint row.** That is the whole claim, and it is the one a recorded-SQL fake
+could not have made: before this, every officer in the tenant would have been mailed at whichever
+single `mailto:` the endpoint was frozen to.
+
+The fixture also proves the guard is demanded rather than merely satisfied — the same INSERT with
+no attribution block open has to be refused, or the attributed one says nothing:
+
+```
+ok: and an email_recipient endpoint exists, with grace@live.example.test as Grace's own mailbox
+ok: and the same write with nobody named is refused by the database
+```
+
+### In a real browser, because the hint has to reach a box a human presses
+
+Two of the three things that matter here can only be seen in a browser. The hint reaching a
+**form field** rather than a code path is the point of keeping 0003's rule; and the button sits
+inside a form, where a `<button>` with no `type` defaults to `submit` — the trap the four-eyes
+chapter learned by watching the page navigate and the write never leave the device.
+
+```
+ok: the administrator is shown how many reps can be emailed, and it is none
+                                                   (Notification addresses (0/2))
+ok: and told that no endpoint uses one yet, so the list is work and not an alarm
+ok: with the ERP's guess named as a guess, for her to confirm or replace
+ok: and the guess fills the box, which is where 0003's hint is allowed to go
+                                                   (value="ada@erp.example.test")
+ok: the typed address survives the refusal, so nobody retypes twelve of them
+ok: and nothing was written
+ok: the destination is a row, and it is what she typed rather than what the ERP guessed
+ok: recorded as a configuration change (0061)
+ok: attributed to the rep in the token, never a name in a body
+ok: with her own sentence, which the database refused to take the write without
+ok: the rep is told where their own signals go
+ok: and the "nowhere" wording is gone now that there is somewhere
+ok: the count moved                                (Notification addresses (1/2))
+ok: and she is off the to-do list, because she is no longer a gap
+```
+
+The address she sets is deliberately **not** the ERP's guess. Correcting what the Employee record
+says is the ordinary case, and a chapter that only ever confirmed the hint would not have shown
+that the box is a box.
+
+### Two decisions worth recording, because both had a tempting opposite
+
+**A withdrawal is an amendment, not a deletion.** The obvious shape is `NOT NULL` and a DELETE.
+It is wrong here for a reason that constrains every table joining 0061: `crm.record_config_change`
+fires `AFTER INSERT OR UPDATE` and reads `NEW`, so a DELETE is neither attributed nor recorded.
+Removing somebody's mailbox that way would be the one change to this table that nobody signed and
+nothing logged — the hole 0060 and 0061 exist to close, reopened at the end that matters, since
+"stop telling this person" is as consequential as "start".
+
+**A recipient with no address produces no delivery, and is counted.** A `dead` row saying "this
+rep has no notification address" is better evidence and worse behaviour: it would be re-created
+and re-killed on every raise, forever, filling the one table 0046 exists to keep honest with rows
+describing a configuration gap rather than a push. So the raise counts it, and
+`GET /v1/admin/notify-addresses` is the to-do list — the same shape as the unmapped-category list,
+which is Finance's.
+
+### One thing I got wrong and the candidate table caught
+
+The store's address check first called `isMailbox` and described it as "deliberately stricter"
+than 0065's CHECK. It is not stricter; it is *different*. `isMailbox` admits a dotless domain
+(`rep@localhost`) and the column does not, so that address would have been stored happily by the
+store and refused by the CHECK — a 500 for something an administrator typed. The column's regex
+admits angle brackets and a display name, which `isMailbox` refuses, so an address passing only
+the column would have dead-lettered every delivery forever. Both rules are now applied, and the
+suite compares the TypeScript copy with the CHECK **by behaviour** rather than by text — twelve
+candidates through both, the database's verdict as ground truth, because the column's POSIX
+character classes are not JavaScript's and no string comparison of the two means anything.
+
+### What is still not built
+
+- **No per-rep opt-out, and no per-user quiet hours.** Consistent with the rest of the
+  notification stack, which has neither, rather than a new gap: an administrator withdraws a
+  destination, a rep cannot.
+- **One mailbox per rep.** A second would be a second verdict per signal with nowhere to record
+  which bounced, which is 0029's reason for one mailbox per endpoint.
+- **Nothing re-resolves an address.** A delivery already enqueued keeps the mailbox it was
+  written with — deliberate, because the record must stay true — so correcting a typo does not
+  rescue the notice already queued to the wrong address. It dead-letters, and the to-do list will
+  not flag the rep, because they have an address now.
+- **Still no SMS, push or voice sender**, and still no provider webhook feeding bounces into the
+  suppression table that exists for exactly that. The seam is two instances of one class over one
+  relay config, so a third channel is a class and not a redesign.
+- **A `dead` delivery does not say the address was wrong** in any way a query can group by:
+  `last_error` carries the relay's sentence as text. A bounce taxonomy is the suppression work
+  above, not this.

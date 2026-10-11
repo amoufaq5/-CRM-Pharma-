@@ -47,6 +47,19 @@ export {
 } from "./dispatch.js";
 export { inbox, markAllRead, markRead, unreadCount, type InboxItem } from "./inbox.js";
 export {
+  InvalidNotifyAddressError,
+  NOTIFY_ADDRESS_MAX,
+  NOTIFY_ADDRESS_SHAPE,
+  RepNotFoundError,
+  clearRepNotifyAddress,
+  notifyAddressCoverage,
+  repNotifyAddress,
+  setRepNotifyAddress,
+  type NotifyAddressCoverage,
+  type NotifyAddressGap,
+  type RepNotifyAddress,
+} from "./notify-address.js";
+export {
   ENDPOINT_CHANNELS,
   ENDPOINT_HISTORY_LIMIT,
   EndpointAmendmentError,
@@ -167,6 +180,8 @@ export {
 export {
   InvalidMailEndpointError,
   InvalidSmtpRelayError,
+  PER_RECIPIENT_MARKER_URL,
+  PER_RECIPIENT_NO_FIXED_MAILBOX,
   SMTP_EXPECTED,
   SMTP_STAGES,
   SmtpProtocolError,

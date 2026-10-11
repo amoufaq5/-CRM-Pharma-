@@ -363,7 +363,16 @@ export function toProblem(err: unknown): ApiError {
     // A `mailto:` endpoint that is not one mailbox. Reachable from an admin route
     // configuring a channel, so it gets a real status rather than a 500.
     case "InvalidMailEndpointError":
+    // 0065. An address this process could not send to. 422 and the message, because both
+    // halves of the refusal — the column's shape and `isMailbox`'s — name exactly what is
+    // wrong with what was typed, and typing it again correctly is the whole remedy.
+    case "InvalidNotifyAddressError":
       return new ApiError("validation_failed", message);
+    // 0065. A notification address set for a rep who is not in this tenant. RLS means "no
+    // such rep" and "another tenant's rep" are the same answer, correctly, and `not_found` is
+    // what both deserve: naming the difference would be a cross-tenant existence oracle.
+    case "RepNotFoundError":
+      return new ApiError("not_found", message);
 
     // Expenses (0006, @crm/expense). ADR-0001 item 11.
     //

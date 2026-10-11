@@ -117,11 +117,19 @@ services:
       # credentials need no second process.
       CRM_HOOK_OPS_SECRET: ${CRM_HOOK_OPS_SECRET:-}
       CRM_SMTP_PASSWORD: ${CRM_SMTP_PASSWORD:-}
-      # The email channel. SMTP_HOST is the switch: unset means this process sends
-      # webhooks only, and an `email` endpoint row retries with a readable reason
-      # rather than dead-lettering. Set, and the sender is constructed AT BOOT — so a
-      # relay configured without TLS, or with a From that is not a mailbox, stops the
+      # The email channels — BOTH of them, from one relay. SMTP_HOST is the switch:
+      # unset means this process sends webhooks only, and an `email` or
+      # `email_recipient` endpoint row retries with a readable reason rather than
+      # dead-lettering. Set, and the senders are constructed AT BOOT — so a relay
+      # configured without TLS, or with a From that is not a mailbox, stops the
       # process instead of being discovered one dead notification at a time.
+      #
+      # Two senders, one class, one relay (0065): `email` takes its mailbox from the
+      # endpoint's own frozen `mailto:` url, `email_recipient` from the address
+      # resolved onto each delivery out of `crm.rep_notify_address`. There is nothing
+      # to configure for the second — registering it is unconditional, because the
+      # alternative is a deployment that mails the ops mailbox and silently retries
+      # every personally-addressed signal until it dead-letters.
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_FROM: ${SMTP_FROM:-}
       # starttls (default) | implicit_tls | plaintext. plaintext is refused to anything

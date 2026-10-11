@@ -17,6 +17,7 @@
  */
 import type { PoolClient } from "pg";
 import { NOTIFICATION_KINDS, SEVERITIES, type NotificationKind, type Severity } from "./kinds.js";
+import { PER_RECIPIENT_MARKER_URL } from "./smtp.js";
 
 /**
  * The channels an endpoint row may name — 0029's
@@ -27,7 +28,7 @@ import { NOTIFICATION_KINDS, SEVERITIES, type NotificationKind, type Severity } 
  * a channel this process cannot send is a 422 naming the legal values, not a constraint
  * violation surfacing as a 500 from the bottom of the stack.
  */
-export const ENDPOINT_CHANNELS = ["webhook", "email"] as const;
+export const ENDPOINT_CHANNELS = ["webhook", "email", "email_recipient"] as const;
 export type EndpointChannel = (typeof ENDPOINT_CHANNELS)[number];
 
 /**
@@ -385,8 +386,16 @@ function translateEndpointError(err: unknown, channel: string): Error {
       channel === "email"
         ? "an email endpoint's url must be a single mailto: mailbox — one delivery has one outcome, " +
           "so one endpoint is one destination"
-        : "a webhook endpoint's url must be https:// (or http:// to loopback, for a local sink) — " +
-          "a notification carries a rep's name and an account id and does not travel in the clear",
+        : channel === "email_recipient"
+          ? // 0065. The url is not a destination on this channel and the CHECK pins it to the
+            // marker, so the sentence has to say what the row is FOR rather than what is
+            // wrong with what was typed — an administrator reaching this was trying to give
+            // it a mailbox, which is the one thing this channel exists not to have.
+            `an email_recipient endpoint's url must be exactly ${JSON.stringify(PER_RECIPIENT_MARKER_URL)} — ` +
+            "on this channel the mailbox comes from whoever the notification names, so the row " +
+            "carries a marker rather than a destination. A fixed mailbox is the email channel."
+          : "a webhook endpoint's url must be https:// (or http:// to loopback, for a local sink) — " +
+            "a notification carries a rep's name and an account id and does not travel in the clear",
     );
   }
   if (constraint === "notification_endpoint_channel_check") {

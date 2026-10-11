@@ -260,12 +260,39 @@ export function isMailbox(address: string): boolean {
 }
 
 /**
+ * The literal url of an `email_recipient` endpoint (0065) — a marker, not a destination.
+ *
+ * Exported so the sender, the prober and the route that creates one all name the same string
+ * rather than three copies of it.
+ */
+export const PER_RECIPIENT_MARKER_URL = "mailto:*";
+
+/**
+ * Why there is nothing to send to when the marker is all you have.
+ *
+ * One sentence, in one place, because three callers reach this state for three reasons and an
+ * operator meeting any of them is meeting one fact: a prober asked to probe an
+ * `email_recipient` endpoint, a sender handed a delivery on that channel with no address (a
+ * bug — 0065's CHECK refuses the row), and anyone who points an `email` endpoint at the marker
+ * by hand.
+ */
+export const PER_RECIPIENT_NO_FIXED_MAILBOX =
+  `${PER_RECIPIENT_MARKER_URL} is the email_recipient channel's marker and not a mailbox: on that channel ` +
+  `the destination comes from whoever the notification names, resolved per delivery. There is no fixed ` +
+  `address here to send to or to probe — an endpoint on the email channel is the one with a mailbox of ` +
+  `its own.`;
+
+/**
  * The endpoint URL for this channel: `mailto:` and one mailbox.
  *
  * One, not a list. `SendOutcome` is a single verdict, and two recipients can produce two
  * different ones — a 550 for a closed mailbox and a 250 for the other — with nowhere to
  * record the difference. A second destination is a second endpoint row, which also gets
  * it its own severity threshold and kind filter.
+ *
+ * 0065's marker is named explicitly rather than left to fall out as "not a usable mailbox",
+ * which is true and useless: an administrator who probes an `email_recipient` endpoint would
+ * read that `"*"` is not a mailbox and go looking for the typo.
  */
 export function parseMailtoEndpoint(url: string): string {
   const prefix = "mailto:";
@@ -273,6 +300,9 @@ export function parseMailtoEndpoint(url: string): string {
     throw new InvalidMailEndpointError(
       `an email endpoint URL must be a mailto:, not ${JSON.stringify(url.slice(0, 60))}`,
     );
+  }
+  if (url === PER_RECIPIENT_MARKER_URL) {
+    throw new InvalidMailEndpointError(PER_RECIPIENT_NO_FIXED_MAILBOX);
   }
   const withoutQuery = url.slice(prefix.length).split("?")[0] ?? "";
   const address = decodeURIComponent(withoutQuery).trim();
@@ -895,11 +925,31 @@ export class SmtpSender implements ChannelSender {
 
   async send(payload: WebhookPayload, endpoint: EndpointConfig): Promise<SendOutcome> {
     let to: string;
-    try {
-      to = parseMailtoEndpoint(endpoint.url);
-    } catch (err) {
-      // Dead: the row will say the same thing on the next attempt.
-      return { kind: "dead", error: err instanceof Error ? err.message : String(err) };
+    // THE DELIVERY'S OWN ADDRESS WINS (0065), and the endpoint's url is the fallback rather
+    // than the other way round. On the `email_recipient` channel the url is a marker and the
+    // mailbox was resolved and frozen onto the delivery row when it was created, so this is
+    // not a preference — it is the only destination there is. One sender class serves both
+    // channels because the conversation, the encoding choice and every refusal are identical;
+    // all that differs is which field says where.
+    if (endpoint.toAddress !== undefined) {
+      if (!isMailbox(endpoint.toAddress)) {
+        // Dead, and reachable only through a row 0065's CHECK admitted and this process would
+        // not: the column's regex is broader than `isMailbox`. Refusing here rather than
+        // handing it to the relay means the verdict says what is wrong with the address
+        // instead of quoting a 501 from somebody else's parser.
+        return {
+          kind: "dead",
+          error: `${JSON.stringify(endpoint.toAddress.slice(0, 80))} is not a mailbox this process can address`,
+        };
+      }
+      to = endpoint.toAddress;
+    } else {
+      try {
+        to = parseMailtoEndpoint(endpoint.url);
+      } catch (err) {
+        // Dead: the row will say the same thing on the next attempt.
+        return { kind: "dead", error: err instanceof Error ? err.message : String(err) };
+      }
     }
 
     const env = this.opts.env ?? process.env;

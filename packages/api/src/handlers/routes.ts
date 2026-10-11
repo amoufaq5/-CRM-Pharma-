@@ -37,6 +37,10 @@ import {
   markAllRead,
   markRead,
   notifyPendingApprovals,
+  clearRepNotifyAddress,
+  notifyAddressCoverage,
+  repNotifyAddress,
+  setRepNotifyAddress,
   deliveryHistory,
   notificationDeliveryRetention,
   probeBudget,
@@ -3003,6 +3007,142 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       requireRole(ctx.principal, "administrator");
       const data = await inTenant(deps, ctx.principal, (tx) => listEndpoints(tx, ctx.principal.tenantId));
       return { status: 200, body: { data } };
+    },
+  });
+
+  // ---- where a person's signals go (0065) -------------------------------------
+  //
+  // `crm.notification` is addressed to a PERSON and a delivery is addressed to an ENDPOINT,
+  // and endpoints are per tenant — so until 0065 every rep's email landed in whichever single
+  // mailbox the tenant's one `email` endpoint was frozen to. These four routes are the
+  // administrative half of closing that: set a destination, withdraw one, read the to-do list,
+  // and let a rep see where their own signals go.
+  //
+  // EVERY WRITE GOES THROUGH `asChange`, because 0065 puts the table under
+  // `crm.require_config_attribution`: a destination for a person's notifications is a decision
+  // with an author and a sentence, and the database refuses the write without both. A `reason`
+  // is therefore required by the schema below and is not optional anywhere.
+
+  /**
+   * Who would be mailed and who would not — the administrator's to-do list.
+   *
+   * Deliberately the same shape as `GET /v1/admin/expense-account-map/unmapped`: a count, a
+   * list, and one sentence. `?includeInactive=true` widens it past active reps, because "why
+   * did nobody tell Omar" has a different answer when Omar is suspended.
+   *
+   * `suggestion` on each row is `crm.rep_profile.work_email_hint`, which 0003 declares a
+   * reconciliation hint that must never be load-bearing — so it arrives under a name that
+   * cannot be mistaken for a destination, for an administrator to confirm or replace. Nothing
+   * in this system ever sends to it.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notify-addresses",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const includeInactive = ctx.query.get("includeInactive") === "true";
+      const body = await inTenant(deps, ctx.principal, (tx) =>
+        notifyAddressCoverage(tx, ctx.principal.tenantId, { includeInactive }),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Sets where one rep's notifications are emailed.
+   *
+   * A PUT, because it is an ensure: one row per rep, and setting the address it already holds
+   * is a success that changes nothing (0061 records only what moved, so the no-op is not
+   * logged either). 200 rather than 201 for the same reason — a client cannot tell whether the
+   * row existed and should not have to care.
+   */
+  router.add({
+    method: "PUT",
+    pattern: "/v1/admin/reps/:id/notify-address",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const repProfileId = parse(UUID, ctx.params["id"]);
+      const input = parse(
+        z.object({
+          // Bounded here only to keep an absurd body out of the store; the SHAPE is the
+          // store's business and its two rules (0065's CHECK and `isMailbox`) are narrower
+          // than anything expressible here. A regex in this schema would be a third opinion
+          // about what an address is, which is how two of them come to disagree.
+          address: z.string().min(3).max(254),
+          reason: z.string().min(10).max(1000),
+        }),
+        ctx.body,
+      );
+      const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
+        setRepNotifyAddress(tx, ctx.principal.tenantId, repProfileId, input.address),
+      );
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * Stops mailing one rep.
+   *
+   * A DELETE on the route and an UPDATE underneath, which is not a mismatch dressed up: 0061's
+   * trigger fires `AFTER INSERT OR UPDATE`, so removing the row would be the one change to
+   * this table that nobody signed and nothing logged. The address goes to NULL, the row stays,
+   * and `crm.config_change` carries the before-image — so "somebody deliberately stopped
+   * Omar's mail, and here is why" is answerable afterwards.
+   *
+   * A DELETE WITH A BODY, which is unusual and is the lesser evil: the reason is required by
+   * the table, and the alternatives are a reason in the query string (logged by every proxy
+   * between here and the client, which is the one place a sentence about a person should not
+   * be) or a POST that is not what this does.
+   *
+   * 404 when there was nothing to withdraw, including a destination already withdrawn — the
+   * route reports the change it made, and it made none.
+   */
+  router.add({
+    method: "DELETE",
+    pattern: "/v1/admin/reps/:id/notify-address",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const repProfileId = parse(UUID, ctx.params["id"]);
+      const input = parse(z.object({ reason: z.string().min(10).max(1000) }), ctx.body);
+      const cleared = await asChange(deps, ctx.principal, input.reason, (tx) =>
+        clearRepNotifyAddress(tx, ctx.principal.tenantId, repProfileId),
+      );
+      // AFTER the write, which is deliberate: the attribution block has already committed
+      // nothing, because there was nothing to amend, and 0061 records only what moved — so a
+      // withdrawal of a destination that was not set leaves no log entry and no row changed.
+      // Throwing here rather than checking first also keeps the decision in one place, where a
+      // read-then-write would be two statements with a race between them.
+      if (!cleared) throw notFound("this rep has no notification address to withdraw");
+      return { status: 200, body: { repProfileId, address: null } };
+    },
+  });
+
+  /**
+   * Where MY signals go. Any authenticated rep, their own row only.
+   *
+   * Here because a rep who is told "we emailed you" and did not get it has nowhere else to
+   * look, and because the honest answer is often "nowhere" — which they can then ask an
+   * administrator to fix. No reason, no write: this is a read of one row, and the id comes from
+   * the token rather than from the path, so there is no rep to name and no way to name
+   * somebody else.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/me/notify-address",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      const row = await inTenant(deps, ctx.principal, (tx) =>
+        repNotifyAddress(tx, ctx.principal.tenantId, ctx.principal.repProfileId),
+      );
+      return {
+        status: 200,
+        body: {
+          repProfileId: ctx.principal.repProfileId,
+          // Null for "no row" and for "withdrawn" alike, which is the same answer to the
+          // question being asked: neither is somewhere mail can go.
+          address: row?.address ?? null,
+          updatedAt: row?.updated_at ?? null,
+        },
+      };
     },
   });
 

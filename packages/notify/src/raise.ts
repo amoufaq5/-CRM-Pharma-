@@ -37,13 +37,36 @@ export interface RaiseResult {
   readonly created: boolean;
   /** Webhook deliveries enqueued. Zero when nothing was created, or no endpoint matched. */
   readonly deliveries: number;
+  /**
+   * Endpoints that wanted this signal and were skipped because the recipient has no mailbox
+   * (0065, the `email_recipient` channel).
+   *
+   * COUNTED RATHER THAN DEAD-LETTERED, and that was the decision. A `dead` delivery saying
+   * "this rep has no notification address" is better evidence and worse behaviour: it would
+   * be re-created and re-killed on every raise, forever, filling the one table 0046 exists to
+   * keep honest with rows that describe a configuration gap rather than a push. So the gap is
+   * a number here, and `notifyAddressCoverage` is the list an administrator acts on.
+   *
+   * Zero on every other channel and on a signal that was already raised.
+   */
+  readonly unaddressable: number;
 }
 
 interface EndpointRow {
   readonly id: string;
+  readonly channel: string;
   readonly min_severity: Severity;
   readonly kinds: readonly string[] | null;
+  /**
+   * The recipient's mailbox, repeated on every row by the join below. Null when they have
+   * none, or when the destination was withdrawn — the two are the same answer here, which is
+   * correct: neither is somewhere mail can go.
+   */
+  readonly to_address: string | null;
 }
+
+/** The channel whose destination comes from whoever the notification names (0065). */
+const PER_RECIPIENT_CHANNEL = "email_recipient";
 
 export async function raiseNotification(
   tx: PoolClient,
@@ -80,36 +103,63 @@ export async function raiseNotification(
         WHERE tenant_id = $1 AND recipient_rep_profile_id = $2 AND dedup_key = $3`,
       [tenantId, input.recipientRepProfileId, input.dedupKey],
     );
-    return { id: existing[0]!.id, created: false, deliveries: 0 };
+    return { id: existing[0]!.id, created: false, deliveries: 0, unaddressable: 0 };
   }
 
   // Fan out to whichever endpoints want this signal. Filtering here rather than at send
   // time means an endpoint added tomorrow does not receive a backlog of today's events —
   // which is what someone turning on a Slack hook would otherwise get.
+  //
+  // The recipient's own mailbox rides along on the same query since 0065, rather than in a
+  // second round trip: every delivery of one raise shares one recipient, so the address is
+  // the same for all of them, and a tenant with no `email_recipient` endpoint must not pay
+  // for a lookup it will not read.
   const { rows: endpoints } = await tx.query<EndpointRow>(
-    `SELECT id, min_severity, kinds FROM crm.notification_endpoint
-      WHERE tenant_id = $1 AND enabled`,
-    [tenantId],
+    `SELECT e.id, e.channel, e.min_severity, e.kinds, a.address AS to_address
+       FROM crm.notification_endpoint e
+       LEFT JOIN crm.rep_notify_address a
+              ON a.tenant_id = e.tenant_id AND a.rep_profile_id = $2
+      WHERE e.tenant_id = $1 AND e.enabled`,
+    [tenantId, input.recipientRepProfileId],
   );
 
   let deliveries = 0;
+  let unaddressable = 0;
   for (const endpoint of endpoints) {
     if (!meetsSeverity(input.severity, endpoint.min_severity)) continue;
     if (endpoint.kinds !== null && !endpoint.kinds.includes(input.kind)) continue;
+
+    // 0065. The filters above come first deliberately: an endpoint that did not want this
+    // signal is not a destination that failed, so a rep with no mailbox is NOT reported
+    // unaddressable by an endpoint that would have skipped them anyway.
+    const perRecipient = endpoint.channel === PER_RECIPIENT_CHANNEL;
+    if (perRecipient && endpoint.to_address === null) {
+      unaddressable += 1;
+      continue;
+    }
+
     await tx.query(
       // The conflict target names `tenant_id` since 0046: a unique index is enforced with
       // row security disabled, so the old `(notification_id, endpoint_id)` key was
       // cross-tenant — latent while the composite foreign key beside it co-guaranteed the
       // pairing, and 0046 drops that key, so the tenant joins the key itself (0043's rule).
-      `INSERT INTO crm.notification_delivery (tenant_id, notification_id, endpoint_id)
-       VALUES ($1, $2, $3)
+      //
+      // `to_address` is copied here and not joined at send time, which is 0049's argument
+      // applied to a destination that varies per row: a delivery record outlives the
+      // notification AND the endpoint, and for this channel the endpoint's url is the marker
+      // `mailto:*`, so the row itself has to carry the mailbox or nothing says where the
+      // signal went. 0065's CHECK pairs it with the channel in both directions, so a null
+      // here on `email_recipient` — or a non-null on any other channel — is refused rather
+      // than stored.
+      `INSERT INTO crm.notification_delivery (tenant_id, notification_id, endpoint_id, to_address)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT (tenant_id, notification_id, endpoint_id) DO NOTHING`,
-      [tenantId, created.id, endpoint.id],
+      [tenantId, created.id, endpoint.id, perRecipient ? endpoint.to_address : null],
     );
     deliveries += 1;
   }
 
-  return { id: created.id, created: true, deliveries };
+  return { id: created.id, created: true, deliveries, unaddressable };
 }
 
 /**

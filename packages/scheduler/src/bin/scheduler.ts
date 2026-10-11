@@ -177,7 +177,20 @@ async function main(): Promise<void> {
   const mailRelay = buildMailRelay();
   const senders: readonly ChannelSender[] = [
     new WebhookSender({ fetch: globalThis.fetch as unknown as NotifyFetch }),
-    ...(mailRelay === null ? [] : [new SmtpSender({ relay: mailRelay, ...SMTP_TIMEOUT() })]),
+    ...(mailRelay === null
+      ? []
+      : [
+          new SmtpSender({ relay: mailRelay, ...SMTP_TIMEOUT() }),
+          // 0065. TWO SENDERS, ONE CLASS, ONE RELAY — the conversation is identical and only
+          // the question "where does this go" differs: the `email` channel takes its mailbox
+          // from the endpoint's frozen url, `email_recipient` from the address resolved onto
+          // each delivery. Registered unconditionally alongside the other, because the
+          // alternative is a deployment that mails the ops mailbox and silently retries every
+          // personally-addressed signal until it dead-letters. There is no second prober: an
+          // `email_recipient` endpoint has no fixed mailbox to probe, and `SmtpProber` says so
+          // on the `email` channel's behalf.
+          new SmtpSender({ relay: mailRelay, channel: "email_recipient", ...SMTP_TIMEOUT() }),
+        ]),
   ];
   const probers: readonly ChannelProber[] = [
     new WebhookProber({ fetch: globalThis.fetch as unknown as NotifyFetch }),

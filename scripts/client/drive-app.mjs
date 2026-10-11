@@ -1903,6 +1903,118 @@ async function main() {
       await approverBrowser.close();
     }
 
+    // ---- 23. where a person's notifications are emailed --------------------
+    // THE GAP THIS CLOSES, in one sentence: `crm.notification` names a PERSON and a delivery
+    // names an ENDPOINT, and endpoints are per tenant — so an `email` endpoint mailed every
+    // rep's signals to one frozen `mailto:`, which is the wrong destination for exactly the
+    // signal chapter 22 just built (an `urgent` escalation whose case is reaching somebody who
+    // has not opened the app in a week).
+    //
+    // WHY IT IS A BROWSER CHAPTER AND NOT ONLY A CONTRACT TEST. Two of the three things it
+    // asserts can only be seen here. `crm.rep_profile.work_email_hint` has sat in the schema
+    // since 0003 with no consumer in any TypeScript and 0003 forbids it being load-bearing —
+    // so what has to be proven is that the hint reaches a BOX A HUMAN PRESSES rather than a
+    // code path that sends to it. And the button is inside a form: a `<button>` with no `type`
+    // defaults to `submit`, which 0062 learned here by watching the page navigate and the
+    // write never leave the device.
+    await page.click("#refresh");
+    await page.waitFor(`/Notification addresses/.test(document.body.textContent ?? "")`,
+      { label: "the notification-address to-do list" });
+
+    const addressSection = await page.evaluate(`
+      const h = [...document.querySelectorAll("h2")].find((x) => /Notification addresses/.test(x.textContent ?? ""));
+      const sec = h?.parentElement;
+      return {
+        heading: h?.textContent?.trim() ?? null,
+        text: sec?.textContent?.replace(/\\s+/g, " ").trim() ?? null,
+        // The value the box is PRE-FILLED with, which is the whole mechanism: the ERP's guess
+        // is offered, and an administrator's press is what makes it a decision.
+        prefilled: [...(sec?.querySelectorAll("input[name^=address-]") ?? [])]
+          .filter((i) => !i.name.startsWith("address-reason-"))
+          .map((i) => ({ name: i.name, value: i.value })),
+      };`);
+    is(/Notification addresses \(0\//.test(String(addressSection.heading)), true,
+      `the administrator is shown how many reps can be emailed, and it is none (${String(addressSection.heading)})`);
+    // THE SENTENCE THAT KEEPS THE LIST FROM BEING IGNORED. Nothing in this tenant is on the
+    // per-recipient channel yet, so nobody is unreachable — said out loud rather than left to
+    // a red count a reader learns to scroll past.
+    is(/nothing is unreachable yet/.test(String(addressSection.text)), true,
+      "and told that no endpoint uses one yet, so the list is work and not an alarm");
+    is(/The ERP has ada@erp.example.test/.test(String(addressSection.text)), true,
+      "with the ERP's guess named as a guess, for her to confirm or replace");
+    is(addressSection.prefilled.some((i) => i.value === "ada@erp.example.test"), true,
+      `and the guess fills the box, which is where 0003's hint is allowed to go (${JSON.stringify(addressSection.prefilled)})`);
+
+    const adaRepId = sql(`SELECT id FROM crm.rep_profile WHERE tenant_id = '${tenant}' AND subject = 'rep-ada'`).trim();
+    const notifyAddressRows = () => {
+      const out = sql(
+        `SELECT r.display_name, coalesce(a.address, 'NULL')
+           FROM crm.rep_notify_address a
+           JOIN crm.rep_profile r ON r.tenant_id = a.tenant_id AND r.id = a.rep_profile_id
+          WHERE a.tenant_id = '${tenant}' ORDER BY r.display_name`,
+      );
+      return out === "" ? [] : out.split("\n").map((line) => {
+        const [who, address] = line.split("|");
+        return { who, address };
+      });
+    };
+
+    // PRESSED WITH NO REASON, which the device refuses before any request leaves it. The point
+    // is not the validation — the route refuses it too — but that the page STAYS, with the
+    // typed address still in the box: a form that navigated would lose both.
+    await page.click(`button[data-set-address="${adaRepId}"]`);
+    await page.waitFor(`/Say how you confirmed it/.test(document.body.textContent ?? "")`,
+      { label: "the device's own refusal of a change with no reason" });
+    const afterRefusal = await page.evaluate(`
+      const box = document.querySelector("input[name='address-${adaRepId}']");
+      return { still: box?.value ?? null, heading: [...document.querySelectorAll("h2")]
+        .find((x) => /Notification addresses/.test(x.textContent ?? ""))?.textContent?.trim() ?? null };`);
+    is(afterRefusal.still, "ada@erp.example.test",
+      "the typed address survives the refusal, so nobody retypes twelve of them");
+    is(notifyAddressRows().length, 0, "and nothing was written");
+
+    // AND NOW THE DECISION, with a sentence. The address is deliberately NOT the ERP's guess:
+    // an administrator correcting what the Employee record says is the ordinary case, and a
+    // chapter that only ever confirmed the hint would not have shown that the box is a box.
+    await page.fill(`input[name="address-${adaRepId}"]`, "ada.lovelace@field.example.test");
+    await page.fill(`input[name="address-reason-${adaRepId}"]`,
+      "confirmed the mailbox with her in person, the ERP has an old domain");
+    await page.click(`button[data-set-address="${adaRepId}"]`);
+    await page.waitFor(`/Signals your tenant sends by email now reach that person/.test(document.body.textContent ?? "")`,
+      { label: "the device's confirmation that the address was set" });
+
+    is(JSON.stringify(notifyAddressRows()), JSON.stringify([{ who: "Ada Lovelace", address: "ada.lovelace@field.example.test" }]),
+      "the destination is a row, and it is what she typed rather than what the ERP guessed");
+    const addressChange = configChangeRows().find((c) => c.table === "rep_notify_address");
+    is(addressChange?.action, "created", "recorded as a configuration change (0061)");
+    is(addressChange?.who, "Ada Lovelace", "attributed to the rep in the token, never a name in a body");
+    is(/confirmed the mailbox with her in person/.test(String(addressChange?.reason)), true,
+      "with her own sentence, which the database refused to take the write without");
+
+    // THE REP'S OWN LINE, which is the half an administrator cannot see. Any rep may ask, and
+    // the id comes from the token, so there is nobody else to name.
+    const mine = await page.evaluate(`
+      const h = [...document.querySelectorAll("h2")].find((x) => /Where your notifications are emailed/.test(x.textContent ?? ""));
+      return h?.parentElement?.textContent?.replace(/\\s+/g, " ").trim() ?? null;`);
+    is(/ada\.lovelace@field\.example\.test/.test(String(mine)), true,
+      `the rep is told where their own signals go (${String(mine).slice(0, 120)})`);
+    is(/cannot set your own/.test(String(mine)), false,
+      "and the \"nowhere\" wording is gone now that there is somewhere");
+
+    // AND THE LIST SHORTENS, which is the number somebody watches go to zero.
+    const shortened = await page.evaluate(`
+      const h = [...document.querySelectorAll("h2")].find((x) => /Notification addresses/.test(x.textContent ?? ""));
+      const sec = h?.parentElement;
+      return {
+        heading: h?.textContent?.trim() ?? null,
+        rows: [...(sec?.querySelectorAll("li") ?? [])].map((li) => li.textContent?.replace(/\\s+/g, " ").trim() ?? ""),
+      };`);
+    is(/Notification addresses \(1\//.test(String(shortened.heading)), true,
+      `the count moved (${String(shortened.heading)})`);
+    is(shortened.rows.some((r) => /Ada Lovelace/.test(r)), false,
+      "and she is off the to-do list, because she is no longer a gap");
+    await page.screenshot(join(work, "app-32-notify-addresses.png"));
+
     // ---- 20. the ERP deletes the tenant, and the queue STOPS ---------------
     // The whole chain, end to end, for the first time: the ERP signs a tombstone, 0050's
     // watcher marks the registry row, the API refuses every request for that tenant with
