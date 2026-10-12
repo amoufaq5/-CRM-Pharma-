@@ -41,6 +41,22 @@ export {
 } from "./refresh.js";
 
 export {
+  ORPHAN_SAMPLE_LIMIT,
+  checkReference,
+  checkableReferences,
+  latestReferentialFindings,
+  recordReferenceCheck,
+  runReferentialCheck,
+  summariseReferentialCheck,
+  unverifiableReferences,
+  type CheckableReference,
+  type ReferenceCheck,
+  type ReferentialCheckResult,
+  type ReferentialRunRow,
+  type ReferentialVerdict,
+  type UnverifiableReference,
+} from "./referential.js";
+export {
   TenantNotRegisteredError,
   recordTenantDeletionCheck,
   summariseTenantDeletionWatch,

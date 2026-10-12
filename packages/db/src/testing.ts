@@ -333,6 +333,18 @@ export const TENANT_NOTIFY_ADDRESS = "f0650000-0000-4000-8000-00000000002d";
 export const TENANT_NOTIFY_ADDRESS_OTHER = "f1650000-0000-4000-8000-00000000002e";
 
 /**
+ * packages/sync — referential.contract (migration 0066).
+ *
+ * Its own pair, and the second is the subject rather than a spare. The orphan check counts EVERY
+ * row of a tenant against that tenant's snapshots, so a suite sharing a tenant would have both
+ * sides of every assertion moved by whoever else seeded a visit — and the whole point of the
+ * check is a tenant-scoped anti-join, which can only be proven by a second tenant holding the
+ * record the first one's rows must NOT resolve against.
+ */
+export const TENANT_REFERENTIAL = "f0660000-0000-4000-8000-00000000002f";
+export const TENANT_REFERENTIAL_OTHER = "f1660000-0000-4000-8000-000000000030";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding

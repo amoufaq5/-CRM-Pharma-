@@ -112,6 +112,10 @@ describe("the API, end to end", () => {
         await tx.query("DELETE FROM crm.outbox_dead_letter WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification_delivery WHERE tenant_id = $1", [t]);
         await tx.query("DELETE FROM crm.notification WHERE tenant_id = $1", [t]);
+        // 0066's findings. Cleared explicitly rather than relying on test order: the route
+        // returns the NEWEST row per reference, so one left behind would make the next test's
+        // "no findings yet" assertion pass or fail depending on which ran first.
+        await tx.query("DELETE FROM crm.referential_check_run WHERE tenant_id = $1", [t]);
         await wipeEndpoints(tx, t);
         await tx.query("DELETE FROM crm.disposal_obligation WHERE tenant_id = $1", [t]);
         // Before the policy row, and with the log's own append-only trigger turned off: 0059
@@ -2489,6 +2493,104 @@ describe("the API, end to end", () => {
           })
         ).status,
       ).toBe(422);
+    });
+  });
+
+  /**
+   * The nightly integrity check's findings (0066), over HTTP.
+   *
+   * ADR-0001 Q1's answer was "no FKs; ACL-enforced integrity plus a nightly orphan check", and
+   * `crm.referential_check_run` held the results of a job that did not exist for sixty-one
+   * migrations. The job exists now; this is the route, because a finding nobody can read is the
+   * same gap one layer up.
+   */
+  describe("the integrity check's findings", () => {
+    const asAdmin = (): string => token({ sub: "idp|rep2", tenant: TENANT });
+    const grantAdmin = (): Promise<unknown> =>
+      withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+           VALUES ($1,$2,'administrator',$3,CURRENT_DATE)`,
+          [TENANT, otherRep, manager],
+        ),
+      );
+
+    it("is administrator only", async () => {
+      expect((await call("GET", "/v1/admin/integrity/references")).status).toBe(403);
+    });
+
+    it("answers with no findings and still names what nothing can check", async () => {
+      await grantAdmin();
+      const res = await call("GET", "/v1/admin/integrity/references", { auth: asAdmin() });
+      expect(res.status).toBe(200);
+      // No job has run in this tenant, so there is nothing to report — and the route says so by
+      // returning an empty list rather than pretending the schema is covered.
+      expect(res.body.findings).toEqual([]);
+      // THE OTHER HALF, which is the one that must not be absent. A reference with no mirror is
+      // a fact about the DEPLOYMENT, not about this tenant's rows, so it is here on the first
+      // request and carries the question a human has to answer.
+      const unmirrored = res.body.unmirrored as readonly {
+        source_table: string;
+        source_column: string;
+        question: string;
+      }[];
+      expect(unmirrored.length).toBeGreaterThan(0);
+      expect(unmirrored.map((u) => `${u.source_table}.${u.source_column}`)).toContain(
+        "visit.erp_contact_id",
+      );
+      expect(unmirrored.every((u) => u.question.length > 10)).toBe(true);
+    });
+
+    it("shows a recorded finding with the mirror's age beside it", async () => {
+      await grantAdmin();
+      // Written directly, because the job that writes these runs in the SCHEDULER: this route's
+      // job is to read, and a test that drove the whole sweep through HTTP would be testing
+      // @crm/sync's contract suite a second time.
+      await withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.referential_check_run
+             (tenant_id, source_table, source_column, erp_entity, checked_count, orphan_count,
+              orphan_sample, verdict, snapshot_table, snapshot_last_success_at, snapshot_age_seconds)
+           VALUES ($1, 'visit', 'erp_account_id', 'Account', 40, 3, '["acct-gone"]'::jsonb,
+                   'orphans', 'account_snapshot', now() - interval '5 minutes', 300)`,
+          [TENANT],
+        ),
+      );
+      const res = await call("GET", "/v1/admin/integrity/references", { auth: asAdmin() });
+      expect(res.status).toBe(200);
+      expect(res.body.findings).toHaveLength(1);
+      const finding = res.body.findings[0] as Record<string, unknown>;
+      expect(finding["verdict"]).toBe("orphans");
+      // bigint as text, this repo's convention since `crm.outbox.seq`.
+      expect(finding["orphan_count"]).toBe("3");
+      expect(finding["orphan_sample"]).toEqual(["acct-gone"]);
+      // The age is what separates "the ERP deleted it" from "our mirror is behind", which is the
+      // first question an operator asks about an orphan.
+      expect(finding["snapshot_age_seconds"]).toBe("300");
+    });
+
+    it("shows the newest answer per reference rather than the history", async () => {
+      await grantAdmin();
+      for (const [verdict, orphans] of [
+        ["orphans", 3],
+        ["clean", 0],
+      ] as const) {
+        await withTenantContext(admin, TENANT, (tx) =>
+          tx.query(
+            `INSERT INTO crm.referential_check_run
+               (tenant_id, source_table, source_column, erp_entity, checked_count, orphan_count,
+                orphan_sample, verdict, snapshot_table, snapshot_last_success_at, snapshot_age_seconds)
+             VALUES ($1, 'visit', 'erp_account_id', 'Account', 40, $2, '[]'::jsonb, $3,
+                     'account_snapshot', now(), 0)`,
+            [TENANT, orphans, verdict],
+          ),
+        );
+      }
+      const res = await call("GET", "/v1/admin/integrity/references", { auth: asAdmin() });
+      expect(res.body.findings).toHaveLength(1);
+      // The newest, by `seq` — and `ran_at` is identical on both rows here only by luck, which
+      // is exactly why 0066 added `seq`.
+      expect((res.body.findings[0] as Record<string, unknown>)["verdict"]).toBe("clean");
     });
   });
 

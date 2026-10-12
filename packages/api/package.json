@@ -30,6 +30,7 @@
     "@crm/role": "workspace:*",
     "@crm/sample": "workspace:*",
     "@crm/storage": "workspace:*",
+    "@crm/sync": "workspace:*",
     "@crm/territory": "workspace:*",
     "@crm/visit": "workspace:*",
     "pg": "^8.13.0",

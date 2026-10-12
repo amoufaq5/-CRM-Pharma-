@@ -75,6 +75,21 @@ export const NOTIFICATION_KINDS = [
    * a reminder that arrives every week is one a reader learns to ignore.
    */
   "config_change_approval_overdue",
+  /**
+   * The nightly integrity check found a CRM row naming an ERP record its own mirror does not
+   * hold (0066).
+   *
+   * ADR-0001 Q1's answer was "no FKs; ACL-enforced integrity plus a nightly orphan check", and
+   * `crm.referential_check_run` held the results of a job that did not exist for sixty-one
+   * migrations. This is what that job raises, to the administrators, once per reference — the
+   * subject is the RUN, so `notification_subject_open` closes the notice when a later check
+   * comes back clean.
+   *
+   * `warning` and not `urgent`. 0005's header names the only two things an orphan can be — an
+   * ERP deletion nobody told us about, or an ACL bug — and both want a human this week rather
+   * than a page tonight. `urgent` stays what 0064 made it: a deadline that has already passed.
+   */
+  "referential_orphans_found",
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 

@@ -414,6 +414,20 @@ whole reason the job exists is that those people were never told — but it is
 worth knowing before the first deploy. `GET /v1/admin/four-eyes?pending=true`
 says what is waiting, before anything is sent.
 
+`referential_check` (0066) arrived the same way and is the one to watch on a first deploy, for a
+reason that is the job working rather than a fault. It checks the CRM's own rows against the CRM's
+own ERP mirrors, and on a tenant whose snapshots have not synced yet **every reference comes back
+`unverifiable`** — which is correct and deliberate: every row would read as an orphan against a
+mirror that does not exist, so the check refuses to count rather than reporting a fault in the data
+that is really a fault in the mirror. The line says so (`UNVERIFIABLE=10`), and the next tick after
+a successful `snapshot_full` turns them into real verdicts. `GET /v1/admin/integrity/references`
+reads the findings, with the references nothing can check listed beside them.
+
+An `ORPHANS=` on that line means one of exactly two things, and both want a person: the ERP deleted
+a record and nothing told us, or a write got past the validation that should have refused it. The
+administrators are notified once per reference — not once a night — and the notice closes itself
+when a later check comes back clean.
+
 ## Notifications
 
 Two channels. **In-app** needs no configuration: a notification is a row, written by

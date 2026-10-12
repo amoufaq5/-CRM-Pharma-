@@ -870,6 +870,37 @@ drift guard cannot see a column with no reference, so `composite-fk.contract.tes
 asserts both replacements live instead, and asserts the absence itself — this is the one
 table in `crm.*` with no foreign key at all, which is a choice rather than an oversight.
 
+**And the ERP references, which no key can cover, are checked nightly at last.** The composite
+keys above govern references *inside* `crm`. The ones that point at the ERP — `visit.erp_account_id`,
+`sample_lot.erp_item_id`, nine others — have no key available to them at all, which is what ADR-0001
+Q1 chose with its eyes open: "**3-degraded.** No FKs; ACL-enforced integrity **plus a nightly orphan
+check**". `crm.referential_check_run` has existed since migration 0005 to hold that check's results
+and **nothing wrote a row for sixty-one migrations** (0066 builds it).
+
+The reason it stayed unbuilt was a real objection and it only killed the obvious design: checking
+the *snapshots* against the ERP would report an orphan count that is always non-zero, because the
+ERP keeps no per-record tombstone and mirror drift is reconciled by a full sweep, not by a report.
+The check that earns its place runs the other way round — **the CRM's own rows against the CRM's own
+mirror**, which the ACL validated against when the row was written. So a row its own snapshot cannot
+resolve is not a steady state; it is an ERP deletion nobody told us about, or a write that got past
+validation, which is what 0005's header said and both of which want a human.
+
+```
+referential_check  references=10 clean=10
+referential_check  ORPHANS=3 UNVERIFIABLE=1 references=10 clean=8 in=visit.erp_account_id:3 unchecked=sample_lot.erp_item_id
+```
+
+Two things make it honest rather than noisy. It **fails closed**: a reference whose mirror has never
+synced, or is stale past the tenant's own `block_after_seconds`, is recorded `unverifiable` and
+counts *nothing*, because "we could not look" must not read like "there is nothing there" — and a
+CHECK constraint enforces that pairing. And its population comes from the **database**, never from a
+list: `crm.erp_reference_register` declares all 23 columns of the `crm.erp_record_id` domain and
+`crm.unregistered_erp_references()` derives the gap from `pg_catalog`, so a migration that adds one
+and forgets to declare it fails a test the same day. Seven of the 23 have no mirror and are declared
+**with the question** each is waiting on — should the CRM mirror ERP Contacts, or is a contact id
+carried through without the CRM ever resolving it? — because "we cannot check this one" belongs in
+the register rather than in the silence that looks like completeness.
+
 **The pre-flight those migrations open with has now been seen to work.** A composite key's
 bulk `VALIDATE` is an ordinary query, so as `crm_app` with no tenant context it validates
 against **zero visible rows** and marks itself valid over a table holding a violation. The
@@ -1182,7 +1213,7 @@ PGUSER=… PGHOST=… ./scripts/verify-live-erp.sh
 ```
 
 Boots a real `operate-server` over a real Postgres, points it at the CRM's own JWKS, and
-runs **141 checks**: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
+runs **141 driver checks** plus the shell's own: 90 through the shipped `dist` of `@crm/acl`, `@crm/credential` and
 `@crm/relay` as a library, and 51 through the CRM's own `api` and `scheduler` **binaries**,
 started as processes exactly as `deploy/docker-compose.yml` starts them. One of those is a real
 **SMTP server in a process of its own**, demanding AUTH, so the gate reads the bytes the deployed

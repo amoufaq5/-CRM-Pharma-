@@ -10,6 +10,7 @@ import { sweepExpiredStock } from "@crm/sample";
 import { summariseExpensePostSweep, sweepApprovedExpenseClaims } from "@crm/expense";
 import {
   summariseTenantDeletionWatch,
+  runReferentialCheck,
   watchTenantDeletion,
   type SnapshotRefresher,
 } from "@crm/sync";
@@ -416,6 +417,31 @@ export class Scheduler {
             `pending=${r.pending} overdue=${r.overdue} ` +
             `notified=${r.notified} alreadyKnown=${r.alreadyKnown}`
           );
+        } finally {
+          client.release();
+        }
+      }
+      case "referential_check": {
+        // ADR-0001 Q1'S OTHER HALF, ten migrations after the table that was built to hold it.
+        // One transaction, like the sweeps above: the rows of a sweep belong together, and a
+        // partial one that committed half its findings would be indistinguishable from a
+        // complete one.
+        //
+        // The counters are the whole value of the line, and two of the three are capitalised
+        // because they are the ones that mean somebody has to act. `ORPHANS=` is a CRM row
+        // naming a record its own mirror does not hold — 0005's two cases, an ERP deletion
+        // nobody told us about or a write that got past validation. `UNVERIFIABLE=` is the
+        // fail-closed arm: a mirror too stale to call anything an orphan, so nothing was
+        // counted. A line of zeroes is the claim this job exists to be able to make.
+        const client = await this.options.pool.connect();
+        try {
+          const r = await withTenantContext(client, tenantId, (tx) =>
+            // `this.now()`, like every job above: one clock per tick, and a check whose idea
+            // of "too stale" came from somewhere the scheduler cannot control is a check no
+            // test can pin.
+            runReferentialCheck(tx, tenantId, this.now()),
+          );
+          return `${r.summary}${r.notified > 0 ? ` notified=${String(r.notified)}` : ""}`;
         } finally {
           client.release();
         }

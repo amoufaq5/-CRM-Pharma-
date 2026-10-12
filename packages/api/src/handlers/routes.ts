@@ -59,6 +59,7 @@ import {
   unreadCount,
   updateEndpoint,
 } from "@crm/notify";
+import { latestReferentialFindings, unverifiableReferences } from "@crm/sync";
 import {
   ROLES,
   grantRole,
@@ -3007,6 +3008,42 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       requireRole(ctx.principal, "administrator");
       const data = await inTenant(deps, ctx.principal, (tx) => listEndpoints(tx, ctx.principal.tenantId));
       return { status: 200, body: { data } };
+    },
+  });
+
+  /**
+   * The nightly integrity check's findings (0066) — ADR-0001 Q1's other half, over HTTP.
+   *
+   * Q1's answer was "no FKs; ACL-enforced integrity plus a nightly orphan check", and
+   * `crm.referential_check_run` held the results of a job that did not exist for sixty-one
+   * migrations. The job exists now, and a finding nobody can read is the same gap one layer up —
+   * the defect this repository has shipped five times, which README rule 29 names.
+   *
+   * THE NEWEST FINDING PER REFERENCE, not a log. The question an administrator asks is "where
+   * does this schema stand", and a reference whose last run was `unverifiable` must read as
+   * unverifiable rather than falling back to the clean run before it: the most recent answer is
+   * the only one that is still a claim.
+   *
+   * `unverifiable` CARRIES THE REGISTER'S QUESTIONS BESIDE IT, because the two are different
+   * kinds of "we did not check". A run is `unverifiable` when the mirror was too stale to trust
+   * — which fixes itself on the next successful refresh. A reference in
+   * `crm.unverifiable_erp_references()` has no mirror at all, and the question is for a human:
+   * should the CRM mirror ERP Contacts, or is a contact id carried through without the CRM ever
+   * resolving it? Showing only the first would make the schema look fully covered.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/integrity/references",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const body = await inTenant(deps, ctx.principal, async (tx) => ({
+        findings: await latestReferentialFindings(tx, ctx.principal.tenantId),
+        // Platform-wide — the register describes the SCHEMA, not this tenant's rows — so it is
+        // the same list for every tenant, and that is the honest shape: "nothing can check this
+        // reference" is a fact about the deployment.
+        unmirrored: await unverifiableReferences(tx),
+      }));
+      return { status: 200, body };
     },
   });
 

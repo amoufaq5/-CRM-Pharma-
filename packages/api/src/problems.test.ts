@@ -14,6 +14,7 @@ import * as relay from "@crm/relay";
 import * as role from "@crm/role";
 import * as sample from "@crm/sample";
 import * as storage from "@crm/storage";
+import * as sync from "@crm/sync";
 import * as territory from "@crm/territory";
 import * as visit from "@crm/visit";
 
@@ -59,6 +60,12 @@ describe("toProblem covers every domain error", () => {
     ["@crm/role", role as unknown as Record<string, unknown>],
     ["@crm/sample", sample as unknown as Record<string, unknown>],
     ["@crm/storage", storage as unknown as Record<string, unknown>],
+    // AUDITED SINCE 0066, and it moved here because the structure said so. It was EXCLUDED on
+    // the grounded claim "not a dependency of @crm/api" — and the route reading the nightly
+    // integrity check's findings made it one, which is exactly the move this audit's grounding
+    // is for: the exclusion stopped being true and the test failed the same day rather than
+    // leaving a package's errors unmapped behind a sentence that had gone stale.
+    ["@crm/sync", sync as unknown as Record<string, unknown>],
     ["@crm/territory", territory as unknown as Record<string, unknown>],
     ["@crm/visit", visit as unknown as Record<string, unknown>],
   ];
@@ -81,10 +88,6 @@ describe("toProblem covers every domain error", () => {
       "the background process, which drives the relay, the refresher and the sweeps. Not a " +
       "dependency of @crm/api, so nothing it raises can reach a request — and it declares " +
       "no error class of its own",
-    "@crm/sync":
-      "snapshot refresh, run by the scheduler. Not a dependency of @crm/api. Its one error, " +
-      "`CoercionError`, rejects a record whose ERP value will not coerce into a typed column " +
-      "(rule 4) and is reported as a `RejectedRecord` in the refresh result, never to a caller",
     "@crm/client":
       "the field client's pure layer, which runs in a BROWSER. It is the other end of this " +
       "file: it CONSUMES the problem kinds toProblem produces, and classifies each one as " +
@@ -116,6 +119,22 @@ describe("toProblem covers every domain error", () => {
   const DELIBERATELY_INTERNAL: Readonly<Record<string, string>> = {
     // The email channel. These three happen inside the SCHEDULER while it talks to an SMTP
     // relay, where the sender converts them into a `SendOutcome` and the dispatcher logs them.
+    // 0066. `@crm/sync` joined AUDITED when a route started reading the integrity check's
+    // findings, and this is its one error class. It happens inside the SCHEDULER, mid-refresh,
+    // where a record whose ERP value will not coerce into a typed column (rule 4) is reported as
+    // a `RejectedRecord` in the refresh result rather than thrown at anybody. No route can reach
+    // it: the two functions the API imports are reads of `crm.referential_check_run` and the
+    // register, and neither coerces anything.
+    CoercionError:
+      "a snapshot refresh rejecting one ERP record; reported as a RejectedRecord in the refresh result, never to a caller",
+    // The other one, and its 500 is the point rather than an omission: it means the ERP has a
+    // tenant_deletion tombstone for a tenant `crm.tenant` does not list, so the signal arrived
+    // and the consequence could not be applied. It is raised by the `tenant_deletion_watch` JOB,
+    // which fails loudly so the tick is retried and an operator sees it — and it is the open row
+    // "a tenant the registry does not list cannot be stopped at all" in ADR-0001's own words. A
+    // 4xx would be a status for a caller who is not there.
+    TenantNotRegisteredError:
+      "the scheduler's tenant-deletion watch finding a tombstone for an unregistered tenant; the job must fail, and no request can reach it",
     InvalidSmtpRelayError: "boot-time relay configuration; the scheduler must fail to start, not answer a request",
     SmtpProtocolError: "the relay spoke something that is not SMTP; becomes a dead SendOutcome",
     SmtpTimeoutError: "a relay stopped answering; becomes a retry SendOutcome",

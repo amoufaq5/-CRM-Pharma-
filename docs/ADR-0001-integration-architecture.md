@@ -2323,6 +2323,105 @@ Concretely, and these specifics are the decision, not commentary on it:
       query can group by: `last_error` carries the relay's sentence as text. A bounce taxonomy
       is the suppression work above, not this.
 
+39. **The orphan check Q1's answer promised, ten migrations after the table built to hold it.**
+
+    Q1 chose "3-degraded" over migrating the ERP to typed columns, and the answer was not "no
+    foreign keys". It was "no FKs; ACL-enforced integrity **plus a nightly orphan check**".
+    `crm.referential_check_run` has existed since migration 0005 — with a partial index on
+    `orphan_count > 0` and a header naming the only two things an orphan can be — and nothing
+    wrote a row for sixty-one migrations. The scheduler registered nine jobs and none was this
+    one, so the half of Q1 meant to catch what the absent foreign keys cannot was never
+    delivered.
+
+    **The objection that kept it unbuilt was right about the obvious design and wrong about the
+    useful one.** The open row said: "a snapshot row naming an ERP record that no longer exists
+    is the obvious case and is also the expected steady state of a full sweep against a system
+    that keeps no per-record tombstone, so an orphan count that is always non-zero teaches
+    nobody anything." That kills checking the SNAPSHOTS against the ERP — and the snapshots are
+    a mirror of somebody else's master data, which drifts by design and is reconciled by
+    `deleteStale`, not by a report. The check that earns its place runs the other way: the CRM's
+    **own operational rows** against the CRM's **own mirror**. `crm.visit.erp_account_id` is NOT
+    NULL and the ACL validated it against `crm.account_snapshot` when the visit was recorded;
+    `crm.sample_lot.erp_item_id` was validated against `crm.product_snapshot`. A CRM row its own
+    snapshot cannot resolve is therefore not a steady state — it is an ERP deletion nobody told
+    us about, or an ACL bug, which is exactly what 0005's header said and both of which want a
+    human.
+
+    **Fail closed, which is what separates this from a liar.** Every row would read as an orphan
+    against a mirror that has never synced, and most would against one a week behind. So a
+    reference whose mirror is `never_synced`, or stale past the tenant's own
+    `block_after_seconds`, is recorded `unverifiable` and counts NOTHING — a database CHECK
+    enforces that pairing. "We could not look" must not read like "there is nothing there", the
+    distinction `ChannelCoverageReport.unreadable` draws and the one item 28's register draws
+    between `undecided` and no row at all. A merely *stale* mirror is still counted, with its age
+    recorded: a check that refused past the warn threshold would be unverifiable on most real
+    deployments most of the time, which is a check nobody reads.
+
+    **And a register, because the check is only as good as its completeness.** A runner driven by
+    a list in TypeScript is a list that goes stale the first time somebody adds a column — which
+    is how the table came to be empty for sixty-one migrations in the first place. Item 28 solved
+    this shape already, so this is that solution for a different population:
+    `crm.erp_reference_register` declares every column of the `crm.erp_record_id` domain,
+    `crm.unregistered_erp_references()` derives the gap from `pg_catalog`, and the contract suite
+    asserts it empty. 23 columns: 10 checkable references, 7 references with no mirror that carry
+    the QUESTION each is waiting on (should the CRM mirror ERP Contacts, or is a contact id
+    carried through without the CRM ever resolving it?), 4 mirror keys and 2 of the CRM's own
+    deterministic ids. A reference with no mirror is declared with its question rather than
+    omitted, so "we cannot check this one" is in the register instead of being the silence that
+    looks like completeness.
+
+    **Three kinds, because not every column of that domain is a reference.**
+    `account_snapshot.erp_account_id` IS the mirror's key — the thing references are checked
+    against. `crm.outbox.target_record_id` is the CRM's own id for a record it is about to create
+    at the ERP, so before the write lands there is deliberately nothing there. Calling either an
+    "unverifiable reference" would be false, and a register that said so would train whoever
+    reads it to ignore the real ones.
+
+    Item 36's lesson applied without being asked: the finding raises
+    `referential_orphans_found` to the administrators, `warning` rather than `urgent`, with no
+    period in the dedup key — and `notification_subject_open` reads the newest run, so a later
+    clean check closes the notice rather than a human having to. `GET
+    /v1/admin/integrity/references` is the read side, carrying the unmirrored references and
+    their questions beside the findings, because showing only the findings would make the schema
+    look fully covered.
+
+    **Verified live.** The deployed scheduler's tenth job ran against the real ERP and reported
+    `references=10 clean=10`, writing the first rows that table has ever held — and the assertion
+    is deliberately non-vacuous, which cost a correction: the first version asserted `clean` on
+    `visit.erp_account_id` on the strength of a comment claiming the gate seeded a visit. It does
+    not; it records a sample receipt. The assertion passed with `checked=0`, which is a claim
+    about nothing. It now asserts `sample_lot.erp_item_id` with `checked=1` against a
+    `crm.product_snapshot` the live ERP filled, plus a non-zero total across the sweep. 23 new
+    contract tests, 101 files / 2,610 tests, migration runner green on a fresh database with 66
+    migrations.
+
+    **One defect of my own**, and it is the one an offline fake cannot catch: `array_agg` over the
+    `crm.erp_record_id` DOMAIN comes back from node-postgres as the literal string
+    `{acct-1,acct-2}`, because the driver has no parser registered for a domain's array type. The
+    row shape is declared rather than inferred, so TypeScript was happy and `.slice()` threw at
+    runtime. A `::text` cast fixes it; running it is what found it.
+
+    **Still open.**
+
+    * **Seven references have no mirror and the questions are not mine to answer.** Three are
+      contacts (`visit`, `call_plan_target`, `sample_transaction`), and the third matters most: a
+      sample disbursed to a contact the ERP cannot identify is a custody record with a gap in it.
+      Two are ids the ERP ASSIGNED to records the CRM created (`expense_claim.erp_expense_id`,
+      `erp_journal_entry_id`), which need an ERP read per claim — a different mechanism, and the
+      question is whether this check grows an ERP-reading mode or the relay re-verifies on
+      settle. Two are projected and unread (`rep_snapshot.position_id`, `department_id`): mirror
+      them or stop projecting them.
+    * **The check reports and never heals**, which is 0005's own rule and stays deliberate — but
+      nothing yet helps an operator act on a finding. The sample gives them an id to look up by
+      hand.
+    * **A reference with no rows reads `clean`**, and that is a true statement about an empty
+      table rather than a claim about the schema. `checked_count` is recorded so a reader can
+      tell the two apart; nothing makes them look different at a glance.
+    * **The cadence is forced rather than chosen.** Daily, because the only thing that observes
+      an ERP deletion is `snapshot_full`, which is daily because the ERP keeps no tombstones. The
+      webhook producer Q9 is waiting on would make both of them a fallback rather than the
+      signal.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -2720,7 +2819,7 @@ commit.
 | **An endpoint can be created and disabled but never removed, and nothing bounds either the endpoints or their dead deliveries.** 0048 argued against a DELETE route (the cascade would erase the record of everything ever sent there) and 0049 froze the destination, so "disable the old endpoint, create a new one" is now the only way to move one — which is right, and leaves `crm.notification_endpoint` with no horizon and no cap while every replacement adds a row. Two things follow that nobody decided. `notification_endpoint_probe_endpoint_id_fkey` is `ON DELETE CASCADE`, and 0045's budget and 0034's cooldown are both counted from those probe rows, so if a DELETE route is ever added, deleting and recreating an endpoint **refunds its share of the hourly budget and clears its cooldown** — the same bypass 0045 found in the retention ring, by a different route. And `crm.notification_delivery`'s prune keys on `unsettled = (state <> 'delivered')`, which is true of the terminal `dead`, so **a delivery settled `dead` is never pruned at any horizon** and pins its notification too. For a real failed push that is arguably correct — it is evidence of a disclosure that did not happen — but `settleOrphanedDeliveries` mints them deliberately, so the set grows without bound and the retention policy quietly does not apply to it. | us | _set a date_ |
 | **0049 left two things in TypeScript that the database still does not say, and one key nothing uses.** `normaliseKinds` dedups and sorts an endpoint's allow-list; `notification_endpoint_kinds_known` only checks containment, so `ARRAY['x','x']` is legal from SQL and two spellings of one allow-list store as two different arrays — which matters only for comparing endpoints, which nothing does yet, so it is recorded rather than fixed. Normalising in a trigger would be the move if anything ever needs to. Separately, `crm.notification` still carries `UNIQUE (tenant_id, id)` and, since 0046 dropped the delivery foreign key, **nothing references it at all** — verified against the live catalog. Harmless but not free: it is a second index on every inbox write. It stays because dropping a unique key is the kind of change that wants its own migration and its own reason, not a line in one about something else. | us | _set a date_ |
 | **An ERP tenant deletion now really erases that tenant, and as of migration 0050 this CRM stops when it does.** Found by reading `origin/main` on 2026-10-06, 11 commits ahead of the checkout this repo builds against. The ERP's ADR-0316 to ADR-0320 give a tenant serving its own activated manifest a Postgres schema of its own, drop it on a GDPR Article 17 deletion, compose a tombstone from attestations and anchor it — closing, in that ADR's own words, a flow that issued a signed `TombstoneRecord` while "every row of the tenant's actual business data survived": the tombstone "was not incomplete. It was false, and it was cryptographically signed." The CRM holds that tenant's `product_snapshot`, `rep_snapshot`, `account_snapshot`, its `crm.outbox` rows, its `crm.expense_claim` rows carrying `erp_ledger_account_code`, and its `crm.erp_service_principal`. Nothing listened, no route and no job knew the concept, and the scheduler kept polling a tenant that no longer existed — so the ERP's proof was true about the ERP and false about the system holding copies of the same personal data. This is the identical defect ADR-0316 describes, one system over, and it is not something the ERP can close for us: it needs a deletion signal we can receive (the webhook producer Q9 is waiting on is the obvious carrier) and a decision about what a CRM tenant-erasure proof commits to. `tenant-lifecycle` is an ERP package; `crm.tenant` is a registry nothing references. WHAT CLOSED IT: `tenant_deletion_watch` reads `GET /v1/platform/tenants/{id}/tombstones` daily and gets one of three answers — `deleted` (a `tenant_deletion` tombstone in hand), `live` (200 and no such tombstone, an AFFIRMATIVE not-deleted) or `unknown` (403, 404, 503, a timeout, an unparseable body). Nothing infers a deletion from an empty list, a 401 or a vanished schema, and nothing reads a refusal as a clean bill of health: every check lands in `crm.tenant_deletion_check` with its reason, because a fail-closed signal that silently never fires is worse than none. The read is possible at all because of a property of the ERP worth recording — the tenant row is retired AFTER the deletion pipeline commits, and the request path never consults `meta.tenants` to authenticate, so a per-tenant token still works after its tenant is gone. A confirmed tombstone sets `crm.tenant.status = 'erp_deleted'`, which the scheduler's own `WHERE status = 'active'` turns into "every job stops" at one point rather than seven; the API refuses in `resolvePrincipal` with its own `tenant-deleted` problem type, so an offline client stops retrying instead of reading it as transient permissions. A CHECK pairs the status with the receipt so no prompt can quarantine a field force with one word, a second CHECK refuses a `data_subject_erasure` tombstone in that column (it is ONE person, in a tenant otherwise alive — reacting to it would stop a working tenant the first time an employee asked to be forgotten), and a trigger makes the mark terminal with the evidence write-once. | us | **closed 2026-10-06** |
-| **Q1's answer is half-built: there is no nightly orphan check.** The answer was "3-degraded. No FKs; ACL-enforced integrity **plus a nightly orphan check**", and `crm.referential_check_run` has existed since migration 0005 to hold its results. Nothing writes it. The scheduler registers nine jobs — `relay_drain`, `snapshot_incremental`, `snapshot_full`, `expiry_sweep`, `notify_dispatch`, `notify_prune`, `expense_post`, `tenant_deletion_watch`, `notify_approvals` — and none of them is this one, so the table is empty in every deployment and the half of Q1 that was supposed to catch what the missing foreign keys cannot was never delivered. Recorded as a gap and not fixed in the same breath because what it should CHECK is a real question: a snapshot row naming an ERP record that no longer exists is the obvious case and is also the expected steady state of a full sweep against a system that keeps no per-record tombstone, so an orphan count that is always non-zero teaches nobody anything. | us | _set a date_ |
+| **Q1's answer is half-built: there is no nightly orphan check — BUILT by decision item 39.** The answer was "3-degraded. No FKs; ACL-enforced integrity **plus a nightly orphan check**", and `crm.referential_check_run` had existed since migration 0005 to hold its results with nothing writing it for sixty-one migrations. This row recorded the reason honestly and it was right about the design it was objecting to: checking the SNAPSHOTS against the ERP would report an orphan count that is always non-zero, because the ERP keeps no per-record tombstone and snapshot drift is reconciled by `deleteStale`. It was wrong that there was nothing worth checking. The check that earns its place runs the other way round — the CRM's own operational rows against the CRM's own mirror, which the ACL validated against on write — so a row its own snapshot cannot resolve is exactly 0005's two cases and neither is expected. 0066 adds the register that makes it complete (`crm.erp_reference_register`, 23 columns, completeness derived from `pg_catalog`), the fail-closed rule that makes it honest (`unverifiable` counts nothing against a mirror too stale to trust), the scheduler's tenth job, the notification, and the route. The live gate ran it against the real ERP: `references=10 clean=10`, with `sample_lot.erp_item_id` resolving `checked=1` against a mirror the live ERP filled. What remains is seven references with no mirror, each carrying the question it is waiting on — which is item 39's open list, not this row's. | us | **closed 2026-10-12** |
 | **Migration 0001 says the CRM reads ERP master data over SQL. It does not, and the grant it takes is unused.** The precondition refuses to run without `meta.operate_entity_records` and errors with "the CRM reads ERP master data over SQL and grants itself SELECT on that table", then issues `GRANT SELECT ON meta.operate_entity_records TO crm_app`. No CRM code selects from it: the only occurrences of that name in `packages/` are two test fixtures quoting an ERP unique-constraint message. Every read goes over HTTP through `ErpClient`, which is what Q5's "entity names, not tables" (R17) decided and what the live gate exercises. The ERP's ADR-0314 retires the premise permanently: a tenant serving an activated manifest is now served from its OWN schema, so the SQL path would read zero rows for them — silently, under a fail-closed rule that reads an empty set as "no products". Because we read over HTTP this is transparent to us and 0314 costs us nothing; the hazard is the grant and the sentence, which invite exactly the thing ADR-0001 forbids. Removing both is small, and the one question worth answering first is whether the precondition should check something else instead — "is an ERP in this database at all" is still a thing worth refusing to boot without. | us | _set a date_ |
 | **The live gate verifies against whatever ERP commit the checkout happens to hold, and records which one nowhere.** `scripts/verify-live-erp.sh` builds and boots the real ERP out of `/home/user/CrossEngin` and runs 125 checks against it, which is the strongest evidence in this repository — and on 2026-10-06 that checkout was 11 commits behind `origin/main` (at #185 against #196), so every "verified live" claim was made against an ERP two days stale and nothing said so. Nothing in the gate reads, pins or prints the ERP's `git rev-parse HEAD`. The claims themselves survived — the six ERP-side facts this ADR depends on (no filterable `updated_at`, the empty `WhtCertificate` access lists, the conditional tenant cross-check, the bodiless idempotent replay, the lenient `decimal` validator, the array in `invalid_settings.detail`) were each re-read on `origin/main` and are unchanged — but that was luck, confirmed afterwards, not a property of the gate. Printing the ERP's commit in the gate's output costs one line; deciding whether a stale checkout should FAIL it is the actual question, and it turns on whether this repo wants to track the ERP's main or a pinned revision. | us | _set a date_ |
 | **The CRM has the vocabulary as of migration 0051, and 19 of its 39 tenant-scoped tables are now VISIBLY undecided rather than silently so.** 0050's own header says why: `crm.expense_claim` may be a statutory accounting record, so a deletion that destroys it is as wrong as one that keeps everything, and the CRM cannot decide that for itself. The ERP solved the same shape with `retentionObligation` on a `DeletionAttestation` — "we did not delete this, and here is the law that says so" — and ADR-0316 is worth quoting on what it costs to lack it: the contracts were already right and "there was nothing that could PRODUCE the truth to put in it". The CRM is in that exact position one layer out. What is owed is a per-table decision (erase, retain-with-obligation, or anonymise) and something that composes those into a proof a data subject could be shown. Until then a stopped tenant's rows sit indefinitely, which is a lawful holding position and not an answer. WHAT CLOSED IT: `crm.data_disposition`, one row per tenant-scoped table saying `erase`, `retain` with a lawful basis, or `undecided` with the question — built on ADR-0317's rule verbatim, and complete by construction rather than by diligence. `crm.undeclared_tenant_tables()` is derived from `pg_catalog`, the migration refuses to apply while it is non-empty, and a test fails the day a new tenant-scoped table arrives without a decision. `undecided` is first-class for the reason that makes the whole design work: a table with no row is silence and refuses with "nobody looked at this", where a declared `undecided` refuses with the QUESTION, which is the difference between a bug and an agenda item. The five overlapping obligation codes are the ERP's own spellings and `verify-live-erp.sh` greps the ERP's source to keep them that way; `drug_sample_custody` carries no period because the period is jurisdictional and lives in the row's note. `crm-erasure plan` produces a plan and NEVER a tombstone — composing one before anything is erased would be ADR-0317's "correct proof of a false claim" — and it is a CLI rather than a route because 0050 makes the tenant's own API refuse every request for it, which is correct and leaves no HTTP surface that may answer. WHAT IS STILL OPEN is now two separable things, below: the 19 answers, and the execution that earns a tombstone. | us + Compliance | **closed 2026-10-06** |

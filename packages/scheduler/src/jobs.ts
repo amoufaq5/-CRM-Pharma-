@@ -18,6 +18,7 @@ export const JOB_NAMES = [
   "expense_post",
   "tenant_deletion_watch",
   "notify_approvals",
+  "referential_check",
 ] as const;
 export type JobName = (typeof JOB_NAMES)[number];
 
@@ -75,6 +76,13 @@ export type JobName = (typeof JOB_NAMES)[number];
  *   snapshots for a tenant whose controller has ended the relationship. If that window ever
  *   needs to be minutes, the answer is not a tighter poll — it is the webhook producer the
  *   ADR's Q9 is waiting on, which would make this job the fallback rather than the signal.
+ * - **referential_check (24h).** ADR-0001 Q1's answer was "no FKs; ACL-enforced integrity plus a
+ *   NIGHTLY orphan check", and this is it — the table has held its results since migration 0005
+ *   with nothing writing them. The cadence is forced rather than chosen: the check reads the
+ *   snapshots, and the only thing that ever observes an ERP deletion is `snapshot_full`, which
+ *   runs daily because the ERP keeps no tombstones. A tighter interval could not find anything
+ *   sooner; it would re-report yesterday's finding against yesterday's mirror. The pass is one
+ *   anti-join per checkable reference — ten queries, zero rows on a healthy tenant.
  */
 export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   relay_drain: 30_000,
@@ -86,6 +94,7 @@ export const DEFAULT_INTERVALS_MS: Readonly<Record<JobName, number>> = {
   expense_post: 5 * 60_000,
   tenant_deletion_watch: 24 * 60 * 60_000,
   notify_approvals: 15 * 60_000,
+  referential_check: 24 * 60 * 60_000,
 };
 
 /**

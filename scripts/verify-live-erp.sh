@@ -734,6 +734,64 @@ SCHED_PID=""
 grep -q '"type":"shutdown"' "$WORK/sched.out" || fail "the scheduler exited without logging its shutdown"
 ok "and stopped cleanly on SIGTERM, draining the tick in flight first"
 
+# 0066. ADR-0001 Q1'S OTHER HALF, in the deployed binary.
+#
+# THE VERDICT HAS TO BE NON-VACUOUS, which is the point of asserting it HERE rather than only in
+# the contract suite. `clean` over zero rows is not a claim about anything, and the first version
+# of this section asserted it against `visit.erp_account_id` on the strength of a comment saying
+# the gate had seeded a visit. It had not — this gate records a sample RECEIPT — so the assertion
+# passed with `checked=0`, which is the fixture-kinder-than-reality failure in its purest form.
+# What the gate really makes is `crm.sample_lot` of `itm-1`, and the scheduler filled
+# `crm.product_snapshot` from the LIVE ERP on its own first tick, so that reference resolves
+# against a mirror nothing in this repository wrote.
+wait_for_line "$WORK/sched.out" '"type":"job_ok".*"job":"referential_check"' "$SCHED_PID" 120 \
+  "the scheduler's referential_check tick"
+REF_LINE="$(grep '"type":"job_ok".*"job":"referential_check"' "$WORK/sched.out" | head -1)"
+case "$REF_LINE" in
+  *ORPHANS=*) fail "the orphan check found orphans against the live ERP's own data: $REF_LINE" ;;
+  *'references='*) ok "referential_check ran and found nothing wrong — $REF_LINE" ;;
+  *) fail "referential_check reported no reference count at all: $REF_LINE" ;;
+esac
+# And the rows, which is the half a log line cannot prove: the table 0005 built has been empty in
+# every deployment for sixty-one migrations, and this is the first run that writes it.
+REF_ROWS="$(psql -d "$CRM_DB" -At -c "
+  SELECT count(*) || ' ' || count(DISTINCT verdict) || ' ' ||
+         coalesce(string_agg(DISTINCT verdict, ',' ORDER BY verdict), 'none')
+    FROM crm.referential_check_run WHERE tenant_id = '$TENANT'")"
+case "$REF_ROWS" in
+  0\ *) fail "referential_check reported a sweep and wrote no rows: $REF_ROWS" ;;
+  *) ok "and crm.referential_check_run holds its findings at last — $REF_ROWS" ;;
+esac
+# The lot's product reference specifically — the one with rows — with the mirror's age recorded
+# beside it so an operator could tell an ERP deletion from a lag.
+LOT_VERDICT="$(psql -d "$CRM_DB" -At -c "
+  SELECT verdict || ' checked=' || checked_count || ' age=' || coalesce(snapshot_age_seconds::text, 'null')
+    FROM crm.referential_check_run
+   WHERE tenant_id = '$TENANT' AND source_table = 'sample_lot' AND source_column = 'erp_item_id'
+   ORDER BY seq DESC LIMIT 1")"
+case "$LOT_VERDICT" in
+  clean\ checked=0*) fail "sample_lot.erp_item_id came back clean over NO rows, which claims nothing: $LOT_VERDICT" ;;
+  clean*age=[0-9]*) ok "sample_lot.erp_item_id resolves against the mirror the live ERP filled — $LOT_VERDICT" ;;
+  "") fail "no finding was recorded for sample_lot.erp_item_id at all" ;;
+  *) fail "sample_lot.erp_item_id did not come back clean with an age: $LOT_VERDICT" ;;
+esac
+# And the sweep as a whole looked at something. A run of ten vacuous `clean` verdicts would
+# satisfy every assertion above except this one.
+TOTAL_CHECKED="$(psql -d "$CRM_DB" -At -c "
+  SELECT coalesce(sum(checked_count), 0) FROM crm.referential_check_run WHERE tenant_id = '$TENANT'")"
+[ "$TOTAL_CHECKED" -gt 0 ] \
+  || fail "the whole sweep checked $TOTAL_CHECKED rows, so every clean verdict in it is vacuous"
+ok "and the sweep examined $TOTAL_CHECKED row(s) in total, so its verdicts are about something"
+# THE REGISTER'S COMPLETENESS, asserted against the database the gate actually built rather than
+# against `crm_test`. 0051's guard for a different population: a column of the
+# `crm.erp_record_id` domain that nobody declared is a reference the check does not know about.
+UNREGISTERED="$(psql -d "$CRM_DB" -At -c "
+  SELECT coalesce(string_agg(source_table || '.' || source_column, ','), 'none')
+    FROM crm.unregistered_erp_references()")"
+[ "$UNREGISTERED" = "none" ] \
+  || fail "these crm.erp_record_id columns are in no register row: $UNREGISTERED"
+ok "and every crm.erp_record_id column in the schema is declared in crm.erp_reference_register"
+
 # The sink writes what it received on SIGTERM, so it is stopped after the scheduler and read
 # afterwards — reading it while a tick was still in flight is how a gate reports a timing
 # accident as a failure.

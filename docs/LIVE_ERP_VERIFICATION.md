@@ -2497,3 +2497,118 @@ character classes are not JavaScript's and no string comparison of the two means
 - **A `dead` delivery does not say the address was wrong** in any way a query can group by:
   `last_error` carries the relay's sentence as text. A bounce taxonomy is the suppression work
   above, not this.
+
+## The orphan check Q1 promised
+
+*2026-10-12, `./scripts/verify-live-erp.sh` (141 driver checks plus the shell's own),
+`pnpm client:verify` (329 checks) and `npx vitest run` (101 files / 2,610 tests). The migration
+runner is green on a fresh database with 66 migrations.*
+
+ADR-0001 Q1 chose "3-degraded" over migrating the ERP to typed columns, and the answer was not
+"no foreign keys":
+
+> **3-degraded.** No FKs; ACL-enforced integrity **plus a nightly orphan check**.
+
+`crm.referential_check_run` has existed since migration 0005 to hold the results — with a partial
+index on `orphan_count > 0` and a header naming the only two things an orphan can be — and
+nothing wrote a row for sixty-one migrations.
+
+### The objection that kept it unbuilt, and why it only killed the obvious design
+
+The open row was honest about why:
+
+> what it should CHECK is a real question: a snapshot row naming an ERP record that no longer
+> exists is the obvious case and is also the expected steady state of a full sweep against a
+> system that keeps no per-record tombstone, so an orphan count that is always non-zero teaches
+> nobody anything.
+
+That is correct, and it is an argument against checking the **snapshots** against the ERP. The
+snapshots are a mirror of somebody else's master data; drift is the design, and `deleteStale` is
+what reconciles it. The check that earns its place runs the other way round — the CRM's **own
+rows** against the CRM's **own mirror**, which the ACL validated against when the row was
+written. `crm.visit.erp_account_id` is NOT NULL and was checked against `crm.account_snapshot`;
+`crm.sample_lot.erp_item_id` against `crm.product_snapshot`. So a row its own snapshot cannot
+resolve is not a steady state. It is 0005's two cases exactly, and both want a human.
+
+### In the deployed binary, against a mirror the live ERP filled
+
+```
+ok: referential_check ran and found nothing wrong
+    {"job":"referential_check","durationMs":23,"detail":"references=10 clean=10"}
+ok: and crm.referential_check_run holds its findings at last            (10 rows, 1 verdict: clean)
+ok: sample_lot.erp_item_id resolves against the mirror the live ERP filled
+                                                           (clean checked=1 age=0)
+ok: and the sweep examined 3 row(s) in total, so its verdicts are about something
+ok: and every crm.erp_record_id column in the schema is declared in crm.erp_reference_register
+```
+
+The scheduler's tenth job, booted as `deploy/docker-compose.yml` boots it, writing the first rows
+that table has ever held — and the mirror it resolved against was filled by the same process from
+the live ERP on an earlier tick, which is the part the contract suite cannot reach.
+
+### The correction that cost the most, because it is the oldest mistake in this file
+
+The first version of this section asserted `clean` on `visit.erp_account_id`, on the strength of a
+comment of mine saying the gate had seeded a visit against an account the ERP serves. **It had
+not** — this gate records a sample *receipt*. The assertion passed, with `checked=0`: a clean
+verdict over zero rows, which is not a claim about anything. It is the same shape as the
+`updated_at` fixture that made six tests green against code that always threw, and as the
+`work_email_hint` provenance 0065 corrected: a fact attributed to something that could not have
+supplied it.
+
+It now asserts the reference that really has rows, demands a non-zero `checked_count` by name, and
+adds a second assertion that the whole sweep examined something — because ten vacuous `clean`
+verdicts would have satisfied every other line above.
+
+### The fail-closed rule, which is what separates this from a liar
+
+Every row would read as an orphan against a mirror that has never synced, and most would against
+one a week behind. So a reference whose mirror is `never_synced`, or stale past the tenant's own
+`block_after_seconds`, is recorded `unverifiable` and counts **nothing** — a CHECK constraint
+enforces the pairing, so a run cannot claim a count it did not take.
+
+A merely **stale** mirror is still counted, with its age recorded. A check that refused past the
+*warn* threshold would be unverifiable on most real deployments most of the time, which is a check
+nobody reads; the age is what lets an operator tell "the ERP deleted it" from "our mirror is
+behind", and that is the first question anybody asks about an orphan.
+
+### The register, because a check is only as good as its completeness
+
+A runner driven by a list in TypeScript is a list that goes stale the first time somebody adds a
+column — which is how this table came to be empty in the first place. 0051 solved this shape
+already, so 0066 is that solution for a different population: every column of the
+`crm.erp_record_id` domain needs a row in `crm.erp_reference_register`, and
+`crm.unregistered_erp_references()` derives the gap from `pg_catalog`.
+
+| | count | |
+| --- | --- | --- |
+| checkable references | 10 | a mirror can answer for them |
+| references with no mirror | 7 | declared **with the question** each waits on |
+| mirror keys | 4 | what the others are checked against |
+| the CRM's own ids | 2 | nothing is there until the write lands |
+
+The seven are the interesting number. A reference with no mirror is declared with its question
+rather than omitted, so "we cannot check this one" is in the register instead of being the silence
+that looks like completeness — and three of them are contacts, where the third matters most: a
+sample disbursed to a contact the ERP cannot identify is a custody record with a gap in it.
+
+### One defect, of the kind only running it finds
+
+`array_agg` over the `crm.erp_record_id` **domain** comes back from node-postgres as the literal
+string `{acct-1,acct-2}` — the driver has no parser registered for a domain's array type. The row
+shape is declared rather than inferred, so TypeScript was perfectly happy and `.slice()` threw at
+runtime. A `::text` cast fixes it. This is the third time in this file that a type-inference
+difference between what the SQL says and what the driver does has been invisible to every offline
+assertion.
+
+### What is still not built
+
+- **Seven questions that are not an engineer's to answer**, listed above and in the register with
+  their own text.
+- **The check reports and never heals**, which is 0005's rule and stays deliberate — but nothing
+  yet helps an operator act on a finding beyond the sample of ids.
+- **A reference with no rows reads `clean`**, which is true of an empty table and is not a claim
+  about the schema. `checked_count` tells them apart; nothing makes them *look* different.
+- **The cadence is forced rather than chosen.** Daily, because the only thing that observes an ERP
+  deletion is `snapshot_full`, which is daily because the ERP keeps no tombstones. Q9's webhook
+  producer would make both a fallback rather than the signal.

@@ -204,6 +204,20 @@ describe("CRM schema invariants", () => {
         "which configuration changes require two different people (0062): table, column, " +
         "direction and the grant both actors must hold. Platform-wide so a tenant cannot " +
         "relax its own, and holding no tenant's data for a policy to confine",
+      // 0066, and the same two arguments as the two rows above it. Which columns name an ERP
+      // record is a property of the SCHEMA — `crm.visit.erp_account_id` is a reference to an
+      // Account in every tenant — so a per-tenant copy would be 23 rows multiplied by every
+      // tenant, identical by construction, and the first time two disagreed one tenant's
+      // integrity check would silently stop covering a column. And a tenant that could edit
+      // which of its references get checked would be a tenant whose references are not checked,
+      // which is `four_eyes_rule`'s argument in a different subsystem. The FINDINGS are
+      // tenant-scoped and under RLS (`crm.referential_check_run`); the register of what to look
+      // at is not anybody's data.
+      erp_reference_register:
+        "every crm.erp_record_id column in the schema and whether an orphan check can verify " +
+        "it (0066): the entity, the mirror or the question it waits on. A statement about the " +
+        "schema, identical for every tenant by construction, and not relaxable by the tenants " +
+        "it describes",
     };
     const { rows } = await client.query<{ relname: string }>(`
       SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

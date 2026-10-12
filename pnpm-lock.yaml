@@ -79,6 +79,9 @@ importers:
       '@crm/storage':
         specifier: workspace:*
         version: link:../storage
+      '@crm/sync':
+        specifier: workspace:*
+        version: link:../sync
       '@crm/territory':
         specifier: workspace:*
         version: link:../territory
@@ -253,6 +256,9 @@ importers:
       '@crm/db':
         specifier: workspace:*
         version: link:../db
+      '@crm/notify':
+        specifier: workspace:*
+        version: link:../notify
       pg:
         specifier: ^8.13.0
         version: 8.23.0
