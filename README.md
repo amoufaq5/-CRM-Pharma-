@@ -901,6 +901,35 @@ and forgets to declare it fails a test the same day. Seven of the 23 have no mir
 carried through without the CRM ever resolving it? — because "we cannot check this one" belongs in
 the register rather than in the silence that looks like completeness.
 
+**And the receipts are re-checked on a timer, by work that belongs to nobody.** 0052 writes a
+cryptographic receipt when a tenant is erased and 0054 versioned its format so one stays checkable
+for as long as it is kept — and nothing ever recomputed a hash except an operator typing
+`crm-erasure receipts`. What blocked the job was a real question: a receipt that no longer
+recomputes is either a bug in our own canonicalisation or evidence that somebody with database
+access rewrote a deletion record, and those want very different responses.
+
+A **known-answer self-test** settles it (0067). Before a single stored receipt is read, the sweep
+hashes a committed vector — one expected digest per manifest version — and compares. A hashing bug
+cannot hide from a known-answer test, and no tampering with stored rows can make one fail:
+
+| | verdict |
+| --- | --- |
+| the self-test fails | `self_test_failed` — this build cannot hash, so **nothing is read** |
+| every receipt of a version fails | `unreproducible` — a format change shipped under an existing version |
+| some fail, their siblings pass | `tampered` — a row was rewritten after it was written |
+
+The third arm rests on the cohort: *one of forty failed* is not a shape a bug can produce, because
+a bug does not pick rows.
+
+It also needed a concept that did not exist. A receipt belongs to a tenant that has been **erased**,
+and the scheduler's tenant list is `status = 'active'` — so no per-tenant job can ever reach one,
+and the alternative was putting a deleted tenant back into the loop 0050 took it out of.
+`crm.platform_job` is `crm.scheduled_job` with the tenant taken out: work about the deployment
+rather than about anybody's data. And nobody is notified, which is not an oversight —
+`crm.notification` is addressed to a rep, a deleted tenant has no reps, and telling every other
+tenant's administrators would be the cross-tenant disclosure the erasure exists to prevent. The
+process's own log line carries `TAMPERED=` in capitals for a shipper to alert on.
+
 **The pre-flight those migrations open with has now been seen to work.** A composite key's
 bulk `VALIDATE` is an ordinary query, so as `crm_app` with no tenant context it validates
 against **zero visible rows** and marks itself valid over a table holding a violation. The

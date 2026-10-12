@@ -61,6 +61,9 @@ importers:
       '@crm/db':
         specifier: workspace:*
         version: link:../db
+      '@crm/erasure':
+        specifier: workspace:*
+        version: link:../erasure
       '@crm/expense':
         specifier: workspace:*
         version: link:../expense
@@ -220,6 +223,9 @@ importers:
       '@crm/db':
         specifier: workspace:*
         version: link:../db
+      '@crm/erasure':
+        specifier: workspace:*
+        version: link:../erasure
       '@crm/expense':
         specifier: workspace:*
         version: link:../expense

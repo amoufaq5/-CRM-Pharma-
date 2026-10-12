@@ -1,5 +1,11 @@
 import type { PoolClient } from "pg";
-import { DEFAULT_INTERVALS_MS, JOB_NAMES, nextRunAt, type JobName } from "./jobs.js";
+import {
+  DEFAULT_INTERVALS_MS,
+  JOB_NAMES,
+  nextRunAt,
+  type JobName,
+  type PlatformJobName,
+} from "./jobs.js";
 
 export interface TenantRow {
   readonly tenant_id: string;
@@ -70,6 +76,15 @@ export interface JobResult {
   readonly ok: boolean;
   readonly durationMs: number;
   readonly error?: string;
+  /**
+   * The job's summary line, kept on the row for a PLATFORM job (0067).
+   *
+   * Ignored by `recordResult` below, which governs the per-tenant table — a tenant's last job
+   * line is one of thousands and the log is where it belongs. For the deployment's own jobs there
+   * is exactly one row, and its most recent answer about the erasure evidence is worth being able
+   * to read without finding the log.
+   */
+  readonly detail?: string;
 }
 
 /**
@@ -159,4 +174,99 @@ export async function jobHealth(tx: PoolClient, tenantId: string): Promise<reado
     [tenantId],
   );
   return rows;
+}
+
+/**
+ * Work that belongs to the DEPLOYMENT rather than to a tenant (0067).
+ *
+ * WHY THIS EXISTS AT ALL, because a second scheduling table needs a reason. An erasure receipt
+ * belongs to a tenant that has been ERASED, and `activeTenants` above is `status = 'active'` —
+ * deliberately, since 0050's whole point is that a deleted tenant's background work stops. So
+ * there is no per-tenant job that can ever reach a receipt, and the alternative was putting a
+ * deleted tenant back into the loop 0050 took it out of.
+ *
+ * `crm.platform_job` is `crm.scheduled_job` with the tenant taken out and the same semantics
+ * everywhere else, so an operator who knows one knows the other. These two functions are the
+ * tenant-free twins of `claimDueJobs` and `recordResult`, and the one thing they do NOT share is
+ * `ensureJobs`: there is exactly one row per job for the whole deployment, so 0067 seeds it and
+ * nothing has to discover it per tenant.
+ */
+export interface DuePlatformJob {
+  readonly job: PlatformJobName;
+  readonly interval_ms: number;
+  readonly consecutive_failures: number;
+}
+
+/**
+ * Claims the platform jobs that are due, advancing `next_run_at` in the same statement.
+ *
+ * The same concurrency story as `claimDueJobs`, and it matters more here: there is one row per
+ * job for the whole deployment, so every instance of the scheduler contends for the SAME row
+ * rather than for a per-tenant one. Advancing at claim time under `FOR UPDATE SKIP LOCKED` means
+ * a second instance arriving in the same window finds nothing due and does not wait.
+ */
+export async function claimDuePlatformJobs(
+  tx: PoolClient,
+  now: Date,
+  random: () => number = Math.random,
+): Promise<readonly DuePlatformJob[]> {
+  const { rows } = await tx.query<DuePlatformJob>(
+    `WITH due AS (
+       SELECT job FROM crm.platform_job
+        WHERE enabled AND next_run_at <= $1
+        ORDER BY next_run_at
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE crm.platform_job p
+        SET last_run_at = $1,
+            next_run_at = $2
+      WHERE p.job IN (SELECT job FROM due)
+      RETURNING p.job, p.interval_ms, p.consecutive_failures`,
+    // The provisional advance uses the CURRENT failure count, like the per-tenant claim;
+    // `recordPlatformResult` sets the real next run once the outcome is known.
+    [now, nextRunAt(now, 60_000, 0, random)],
+  );
+  return rows;
+}
+
+export async function recordPlatformResult(
+  tx: PoolClient,
+  job: PlatformJobName,
+  result: JobResult,
+  now: Date,
+  random: () => number = Math.random,
+): Promise<void> {
+  const { rows } = await tx.query<{ interval_ms: number; consecutive_failures: number }>(
+    "SELECT interval_ms, consecutive_failures FROM crm.platform_job WHERE job = $1",
+    [job],
+  );
+  const row = rows[0];
+  if (row === undefined) return;
+
+  const failures = result.ok ? 0 : row.consecutive_failures + 1;
+  await tx.query(
+    `UPDATE crm.platform_job SET
+       last_success_at      = CASE WHEN $2 THEN $5 ELSE last_success_at END,
+       last_status          = CASE WHEN $2 THEN 'ok' ELSE 'error' END,
+       last_error           = $3,
+       last_detail          = $6,
+       last_duration_ms     = $4,
+       consecutive_failures = $7,
+       next_run_at          = $8
+     WHERE job = $1`,
+    [
+      job,
+      result.ok,
+      result.error ?? null,
+      Math.round(result.durationMs),
+      now,
+      // `last_detail` is the summary line, kept on the row as well as logged. The per-tenant
+      // table has no such column and does not need one: a tenant's last job line is one of
+      // thousands, where this is the deployment's single most recent answer about its own
+      // erasure evidence, and an operator reading the row should not have to find the log.
+      result.detail ?? null,
+      failures,
+      nextRunAt(now, row.interval_ms, failures, random),
+    ],
+  );
 }

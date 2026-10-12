@@ -14,6 +14,7 @@ import * as relay from "@crm/relay";
 import * as role from "@crm/role";
 import * as sample from "@crm/sample";
 import * as storage from "@crm/storage";
+import * as erasure from "@crm/erasure";
 import * as sync from "@crm/sync";
 import * as territory from "@crm/territory";
 import * as visit from "@crm/visit";
@@ -60,6 +61,16 @@ describe("toProblem covers every domain error", () => {
     ["@crm/role", role as unknown as Record<string, unknown>],
     ["@crm/sample", sample as unknown as Record<string, unknown>],
     ["@crm/storage", storage as unknown as Record<string, unknown>],
+    // AUDITED SINCE 0067, and the exclusion it replaces was right about the thing that still
+    // matters. It said this package was "deliberately not reachable over HTTP at all: 0050 makes
+    // the API refuse every request for an `erp_deleted` tenant, so the tenant's own API is
+    // precisely the surface that must not answer questions about its data". That is still true
+    // OF THE DATA, and the route that made this a dependency keeps it: it reads the VERDICT of a
+    // receipt verification — a count, a version cohort, a receipt id — and carries no
+    // attestation, no table name and nothing else from inside a receipt. What changed is the
+    // grounding, so the exclusion had to go: a package the API imports cannot be excluded on
+    // "no request can reach it", whatever any request actually asks for.
+    ["@crm/erasure", erasure as unknown as Record<string, unknown>],
     // AUDITED SINCE 0066, and it moved here because the structure said so. It was EXCLUDED on
     // the grounded claim "not a dependency of @crm/api" — and the route reading the nightly
     // integrity check's findings made it one, which is exactly the move this audit's grounding
@@ -94,14 +105,6 @@ describe("toProblem covers every domain error", () => {
       "retry, permanent, reauthenticate or stop (`classifyRowOutcome`). It is not a " +
       "dependency of @crm/api — the arrow points the other way — and it declares no error " +
       "class, because a client that threw on a refusal could not queue it",
-    "@crm/erasure":
-      "the retention disposition register and the erasure plan (0051), reached only by the " +
-      "`crm-erasure` CLI. Not a dependency of @crm/api, and deliberately not reachable over " +
-      "HTTP at all: 0050 makes the API refuse every request for an `erp_deleted` tenant, so " +
-      "the tenant's own API is precisely the surface that must not answer questions about its " +
-      "data. It exports no error class — a plan reports its refusals as data, in a typed " +
-      "`PlanRefusal` list, because \"what stands between us and being able to do this\" is an " +
-      "answer and not an exception",
   };
 
   /**
@@ -117,14 +120,12 @@ describe("toProblem covers every domain error", () => {
    * remedy for a class the probe cannot construct — see `PROBE_ARGS`.
    */
   const DELIBERATELY_INTERNAL: Readonly<Record<string, string>> = {
-    // The email channel. These three happen inside the SCHEDULER while it talks to an SMTP
-    // relay, where the sender converts them into a `SendOutcome` and the dispatcher logs them.
     // 0066. `@crm/sync` joined AUDITED when a route started reading the integrity check's
-    // findings, and this is its one error class. It happens inside the SCHEDULER, mid-refresh,
-    // where a record whose ERP value will not coerce into a typed column (rule 4) is reported as
-    // a `RejectedRecord` in the refresh result rather than thrown at anybody. No route can reach
-    // it: the two functions the API imports are reads of `crm.referential_check_run` and the
-    // register, and neither coerces anything.
+    // findings. `CoercionError` happens inside the SCHEDULER, mid-refresh, where a record whose
+    // ERP value will not coerce into a typed column (rule 4) is reported as a `RejectedRecord` in
+    // the refresh result rather than thrown at anybody. No route can reach it: the two functions
+    // the API imports are reads of `crm.referential_check_run` and the register, and neither
+    // coerces anything.
     CoercionError:
       "a snapshot refresh rejecting one ERP record; reported as a RejectedRecord in the refresh result, never to a caller",
     // The other one, and its 500 is the point rather than an omission: it means the ERP has a
@@ -135,6 +136,21 @@ describe("toProblem covers every domain error", () => {
     // 4xx would be a status for a caller who is not there.
     TenantNotRegisteredError:
       "the scheduler's tenant-deletion watch finding a tombstone for an unregistered tenant; the job must fail, and no request can reach it",
+    // 0067, @crm/erasure's three. All of them happen while PLANNING or EXECUTING an erasure,
+    // which only the `crm-erasure` CLI does — the API imports two read functions
+    // (`latestReceiptVerification`, `runSelfTest`) and neither plans, assembles nor attests.
+    // `NoTenantContextError` and `TombstoneInvalidError` are both "this deployment has a bug":
+    // a plan built with no tenant context would read nothing, and a malformed attestation is
+    // caught before a transaction has deleted anything. `ErasureRefusedError` is a refusal a
+    // human reads at a terminal, with the plan's typed `PlanRefusal` list behind it.
+    NoTenantContextError:
+      "a plan built outside a tenant context; the CLI's own bug, and a plan that reported nothing would be worse",
+    TombstoneInvalidError:
+      "an attestation that is not well-formed, caught before the erasure transaction deletes anything",
+    ErasureRefusedError:
+      "the erasure refusing to proceed, read by an operator at a terminal — no route executes one",
+    // The email channel. These three happen inside the SCHEDULER while it talks to an SMTP
+    // relay, where the sender converts them into a `SendOutcome` and the dispatcher logs them.
     InvalidSmtpRelayError: "boot-time relay configuration; the scheduler must fail to start, not answer a request",
     SmtpProtocolError: "the relay spoke something that is not SMTP; becomes a dead SendOutcome",
     SmtpTimeoutError: "a relay stopped answering; becomes a retry SendOutcome",
@@ -287,6 +303,11 @@ describe("toProblem covers every domain error", () => {
   const PROBE_ARGS: Readonly<Record<string, readonly unknown[]>> = {
     InvalidTransitionError: [visit.VISIT_STATUSES[0], visit.VISIT_STATUSES[1]],
     InvalidExpenseClaimTransitionError: [expense.EXPENSE_CLAIM_STATES[0], expense.EXPENSE_CLAIM_STATES[1]],
+    // 0067. Its constructor takes an `ErasurePlan` and reads `plan.refusals.length` to build the
+    // message, so a string probe throws before the class exists. Read off the constructor, as the
+    // probe's own refusal instructs — the minimum an `ErasurePlan` needs for the message to
+    // render, and nothing more, because this is a probe and not a fixture.
+    ErasureRefusedError: [{ tenantId: "probe", refusals: [], tables: [], excludedTables: [] }],
   };
 
   type ErrorClass = new (...args: readonly unknown[]) => Error;

@@ -2612,3 +2612,110 @@ assertion.
 - **The cadence is forced rather than chosen.** Daily, because the only thing that observes an ERP
   deletion is `snapshot_full`, which is daily because the ERP keeps no tombstones. Q9's webhook
   producer would make both a fallback rather than the signal.
+
+## A receipt nobody re-checks
+
+*2026-10-12, `./scripts/verify-live-erp.sh`, `pnpm client:verify` (329 checks) and
+`npx vitest run` (102 files / 2,637 tests). The migration runner is green on a fresh database
+with 67 migrations.*
+
+0052 writes a cryptographic receipt when a tenant is erased. 0054 versioned the manifest format
+so one stays checkable for as long as it is kept. Both tables are append-only. `verifyTombstone`
+recomputes both hashes and is pure. **Nothing ever called it** except an operator typing
+`crm-erasure receipts <tenant>`.
+
+### The decision that was missing, and why it is answerable
+
+ADR-0001 recorded the blocker instead of guessing:
+
+> a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence
+> that somebody with database access rewrote a deletion record, and those want very different
+> responses… a job that cried wolf about its own hashing bug would be worse than no job.
+
+A **known-answer self-test** settles it. Before a single stored receipt is read, the sweep hashes
+a committed vector — one expected digest per entry in `MANIFEST_VERSIONS` — and compares. A
+hashing bug cannot hide from a known-answer test, and no amount of tampering with stored rows can
+make one fail.
+
+| | verdict | |
+| --- | --- | --- |
+| self-test fails | `self_test_failed` | this build cannot hash. **Nothing is read** |
+| all of a version fail | `unreproducible` | a format change shipped under an existing version |
+| some fail, siblings pass | `tampered` | a row was rewritten after it was written |
+| nothing fails | `verified` | |
+
+The cohort carries the third arm: *one of forty failed* is not a shape a bug can produce, because
+a bug does not pick rows. The one arguable boundary — a version holding a single receipt, where
+there is no sibling to compare against — is decided towards `unreproducible`, because accusing
+somebody of rewriting a record on that evidence is the wolf-crying the row refused.
+
+### The structural problem, which is why this increment is two things
+
+A receipt belongs to a tenant that has been **erased**, and `activeTenants` is
+`status = 'active'` — deliberately, because 0050's whole point is that a deleted tenant's
+background work stops. **So no per-tenant job can ever reach a receipt.** The alternative was
+putting a deleted tenant back into the loop 0050 took it out of.
+
+So 0067 adds the concept that was missing: `crm.platform_job`, which is `crm.scheduled_job` with
+the tenant taken out — work about the deployment rather than about anybody's data. Where the
+per-tenant claim races on a row per tenant, this one races on one row for the whole deployment,
+which is why the claim-time advance under `FOR UPDATE SKIP LOCKED` is doing more work here.
+
+### In the deployed binary
+
+```
+ok: receipt_verify ran as platform work and its self-test passed
+    {"type":"platform_job_ok","job":"receipt_verify","durationMs":5,
+     "detail":"verdict=verified tenants=1 receipts=0"}
+ok: and the stored run records the self-test this build actually passed
+                                                      (verified selftest=ok,ok)
+ok: and crm.platform_job carries the answer on the row
+                                   (ok failures=0 detail=verdict=verified ten…)
+```
+
+**`receipts=0` is vacuous and is said so.** The gate's tenant has never been erased, so there is
+nothing to verify — the lesson from the previous chapter, applied before it could be repeated.
+What is **not** vacuous is the rest of the line: a deployed binary really reproduced the committed
+digests before looking at anything, which is the entire mechanism that lets a rewritten row be
+told from our own bug. And `last_detail` on the job row is a column the per-tenant table
+deliberately does not have: one row for the whole deployment, whose most recent answer about the
+erasure evidence should be readable without finding the log.
+
+The tampering itself is proven in the contract suite, where it can be *done*: a receipt is written
+with correct hashes, a second one beside it, and then the first is rewritten with its append-only
+triggers explicitly disabled — which is the honest shape rather than a workaround, since the
+threat this job exists for is precisely somebody who is not the application role. The verdict
+comes back `tampered` and names the sibling that passed.
+
+### Nobody is notified, and that is not an oversight
+
+`crm.notification` is addressed to a rep and endpoints are per tenant. A deleted tenant has no
+reps, and telling every live tenant's administrators about another tenant's erasure receipt would
+be the cross-tenant disclosure the erasure exists to prevent. So the channel for a platform
+finding is the process's own log line — `TAMPERED=` in capitals, first on the line, for a shipper
+to alert on — plus the row and `GET /v1/admin/integrity/receipts`, which carries a receipt id and
+a tenant id and **nothing from inside a receipt**. The exclusion this package used to have was
+right about the thing that still matters: "the tenant's own API is precisely the surface that must
+not answer questions about its data."
+
+### The audit caught its own case, twice
+
+`@crm/erasure` and `@crm/sync` were both excluded from the error-mapping audit on the **grounded**
+claim "not a dependency of @crm/api". The routes in these two chapters made them both
+dependencies, so the test failed the same day rather than leaving two packages' errors unmapped
+behind sentences that had gone stale. Five error classes now carry explicit decisions, and
+`ErasureRefusedError` needed a `PROBE_ARGS` entry because its constructor reads
+`plan.refusals.length` — which the audit refuses to let anybody paper over with a
+`DELIBERATELY_INTERNAL` line, in those words.
+
+### What is still not built
+
+- **No platform notification channel at all.** A `tampered` finding reaches a log line, a row and
+  a route. Giving the CRM one means deciding who the deployment's *operator* is in a multi-tenant
+  product, which is a real question and not this increment's.
+- **The window is a day**, and what that costs is a day in which evidence of a rewritten deletion
+  record sits unreported. The real answer is an append-only guarantee the application role cannot
+  defeat.
+- **The self-test covers the manifest and not the proof.** The proof commits to who did it, for
+  whom, under what authority, and there is nothing to pin that against without a stored receipt —
+  a vector would have to invent a tenant, suggesting a coverage it does not have.

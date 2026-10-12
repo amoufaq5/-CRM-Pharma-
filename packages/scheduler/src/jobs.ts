@@ -23,6 +23,30 @@ export const JOB_NAMES = [
 export type JobName = (typeof JOB_NAMES)[number];
 
 /**
+ * Jobs that belong to the DEPLOYMENT rather than to a tenant (0067).
+ *
+ * The same two-copies arrangement as `JOB_NAMES` and `crm.scheduled_jobs()`, mirrored by
+ * `crm.platform_jobs()` and asserted equal by a test. The reason this list exists at all is
+ * narrower than it looks: an erasure receipt belongs to a tenant that has been ERASED, and
+ * `activeTenants` is `status = 'active'` — so nothing in `JOB_NAMES` can ever reach one, and the
+ * alternative was putting a deleted tenant back into the loop 0050 took it out of.
+ */
+export const PLATFORM_JOB_NAMES = ["receipt_verify"] as const;
+export type PlatformJobName = (typeof PLATFORM_JOB_NAMES)[number];
+
+/**
+ * - **receipt_verify (24h).** Re-verifies every stored erasure receipt against a known-answer
+ *   self-test, so a bug in our own canonicalisation can be told from a rewritten row. Daily
+ *   because the receipts are append-only and a rewrite is a deliberate act by somebody with
+ *   database access, not an event that arrives in bursts — and a sweep reads every receipt in the
+ *   deployment. What a day costs is worth stating rather than hiding: a day in which evidence of
+ *   a rewritten deletion record sits unreported.
+ */
+export const DEFAULT_PLATFORM_INTERVALS_MS: Readonly<Record<PlatformJobName, number>> = {
+  receipt_verify: 24 * 60 * 60_000,
+};
+
+/**
  * Default cadences, and why each is what it is.
  *
  * - **relay_drain (30s).** This is a rep's write waiting to reach the ERP. The

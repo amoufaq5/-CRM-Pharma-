@@ -59,6 +59,7 @@ import {
   unreadCount,
   updateEndpoint,
 } from "@crm/notify";
+import { latestReceiptVerification, runSelfTest } from "@crm/erasure";
 import { latestReferentialFindings, unverifiableReferences } from "@crm/sync";
 import {
   ROLES,
@@ -3044,6 +3045,52 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
         unmirrored: await unverifiableReferences(tx),
       }));
       return { status: 200, body };
+    },
+  });
+
+  /**
+   * The newest erasure-receipt verification (0067).
+   *
+   * THE READ SIDE OF A FINDING NOBODY CAN BE NOTIFIED ABOUT, which is why it matters more than
+   * most. `crm.notification` is addressed to a rep and endpoints are per tenant; a receipt belongs
+   * to a tenant that has been ERASED, so there is nobody in it to tell, and telling every other
+   * tenant's administrators about it would be the cross-tenant disclosure the erasure exists to
+   * prevent. The scheduler's log line is the alerting channel and this is the one place a human
+   * can ask the question deliberately.
+   *
+   * PLATFORM DATA BEHIND A TENANT'S ADMINISTRATOR, and the asymmetry is deliberate rather than
+   * sloppy: the verdict is about the deployment's evidence as a whole, so every administrator sees
+   * the same answer. What it deliberately does NOT carry is anything from inside a receipt — no
+   * attestation, no table name, no tenant display name. A receipt id and a tenant id are what an
+   * operator needs to go and look with `crm-erasure receipts`, and this route must not become a
+   * way to read what the erasure destroyed.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/integrity/receipts",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      // NOT `inTenant`: the table is platform-wide and has no policy to satisfy. Opening a tenant
+      // context would be harmless and misleading — a reader of this handler would infer the row
+      // is somebody's, and it is not.
+      const client = await deps.pool.connect();
+      try {
+        const latest = await latestReceiptVerification(client);
+        return {
+          status: 200,
+          body: {
+            // Null before the first sweep, which is a real answer and the one an operator needs
+            // on a fresh deployment: nothing has verified the receipts yet.
+            latest,
+            // What this build can hash RIGHT NOW, computed per request rather than read from the
+            // row. The stored verdict is as old as the last sweep; a self-test is three hashes
+            // and answers "can this process verify anything at all" at the moment of asking.
+            selfTest: runSelfTest(),
+          },
+        };
+      } finally {
+        client.release();
+      }
     },
   });
 

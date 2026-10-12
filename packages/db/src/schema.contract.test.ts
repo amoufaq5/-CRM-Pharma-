@@ -218,6 +218,22 @@ describe("CRM schema invariants", () => {
         "it (0066): the entity, the mirror or the question it waits on. A statement about the " +
         "schema, identical for every tenant by construction, and not relaxable by the tenants " +
         "it describes",
+      // 0067, and this pair's argument is different from the four above it — they are
+      // statements about the schema, and these are about the DEPLOYMENT. `platform_job`
+      // schedules work that is nobody's: an erasure receipt belongs to a tenant that has been
+      // erased, and `crm.scheduled_job` is only ever claimed for a tenant whose status is
+      // `active`, so there is no tenant left to key the row on. `receipt_verification_run`
+      // holds that work's verdict, and a tenant_id would be a lie in both directions — the
+      // sweep spans every tenant, and a `tampered` finding visible only from inside the tenant
+      // it concerns would be a finding nobody can see, since that tenant is gone.
+      platform_job:
+        "crm.scheduled_job with the tenant taken out (0067): work about the deployment rather " +
+        "than about anybody's data. One row per job for the whole deployment, so there is no " +
+        "tenant to key it on",
+      receipt_verification_run:
+        "the verdict of an erasure-receipt verification sweep (0067), which spans every tenant " +
+        "and is read when the tenants it concerns no longer exist. Holds counts, version " +
+        "cohorts and receipt ids — deliberately nothing from inside a receipt",
     };
     const { rows } = await client.query<{ relname: string }>(`
       SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

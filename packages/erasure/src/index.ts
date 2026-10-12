@@ -46,3 +46,23 @@ export {
 } from "./tombstone.js";
 
 export { eraseDeleteOrder } from "./plan.js";
+
+export {
+  FAILURE_SAMPLE_LIMIT,
+  RECEIPT_VERDICTS,
+  SELF_TEST_ATTESTATIONS,
+  SELF_TEST_EXCLUSIONS,
+  SELF_TEST_VECTORS,
+  decideReceiptVerdict,
+  latestReceiptVerification,
+  recordReceiptVerification,
+  runSelfTest,
+  sweepReceipts,
+  verifyStoredReceipts,
+  type ReceiptFailure,
+  type ReceiptVerdict,
+  type ReceiptVerificationResult,
+  type ReceiptVerificationRow,
+  type SelfTestResult,
+  type VersionCohort,
+} from "./verify-receipts.js";

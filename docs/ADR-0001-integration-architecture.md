@@ -2422,6 +2422,97 @@ Concretely, and these specifics are the decision, not commentary on it:
       webhook producer Q9 is waiting on would make both of them a fallback rather than the
       signal.
 
+40. **A receipt nobody re-checks, and the work that belongs to the deployment rather than to a
+    tenant.**
+
+    0052 writes a cryptographic receipt when a tenant is erased, 0054 versioned the manifest
+    format so one stays checkable for as long as it is kept, both tables are append-only, and
+    `verifyTombstone` recomputes both hashes and is pure. **Nothing ever called it** except an
+    operator typing `crm-erasure receipts <tenant>`. The ERP solved the same shape with a
+    scheduled integrity proof; this CRM had every piece of the cheap version and no decision.
+
+    **The decision the open row said was missing, and it is answerable rather than a judgement
+    call.** The row put it exactly: "a receipt that no longer recomputes is either a bug in our
+    own canonicalisation or evidence that somebody with database access rewrote a deletion
+    record, and those want very different responses… a job that cried wolf about its own hashing
+    bug would be worse than no job." The two can be told apart decisively, by a **known-answer
+    self-test**. Before a single stored receipt is read, the sweep hashes a fixed vector — a
+    committed set of attestations with a hard-coded digest, one per entry in `MANIFEST_VERSIONS` —
+    and compares. A hashing bug cannot hide from a known-answer test, and no amount of tampering
+    with stored rows can make one fail. From there:
+
+    | | verdict | what it means |
+    | --- | --- | --- |
+    | self-test fails | `self_test_failed` | this build cannot hash. **Nothing is read**, nothing is called tampered |
+    | all of a version fail | `unreproducible` | a format change shipped under an existing version number. Our bug |
+    | some fail, siblings pass | `tampered` | a row was rewritten after it was written |
+    | nothing fails | `verified` | |
+
+    The cohort is what makes the third arm sound — "one of forty failed" is not a shape a
+    canonicalisation bug can produce, because a bug does not pick rows. The one genuinely arguable
+    boundary is a version with a single receipt, where there is no sibling to compare against:
+    that is decided towards `unreproducible`, because accusing somebody of rewriting a record on
+    that evidence would be exactly the wolf-crying the row refused. The vector exercises all three
+    attestation outcomes and is deliberately unsorted, so a removed sort cannot pass it, and v1
+    and v2 have separate expected digests — if they were equal the version field would be
+    decoration.
+
+    **And the structural problem the job ran into, which is why this is two things.** A receipt
+    belongs to a tenant that has been **erased**, and `activeTenants` is `status = 'active'` —
+    deliberately, since 0050's whole point is that a deleted tenant's background work stops. So
+    there is no per-tenant job that can ever reach a receipt, and the alternative was putting a
+    deleted tenant back into the loop 0050 took it out of. 0067 therefore adds the concept that
+    was missing: **platform work**. `crm.platform_job` is `crm.scheduled_job` with the tenant taken
+    out, same columns and same semantics, and receipt verification is its first instance. Where
+    the per-tenant claim races on a row per tenant, this one races on one row for the whole
+    deployment, so the claim-time advance under `FOR UPDATE SKIP LOCKED` is doing more work here
+    than there.
+
+    **Nobody is notified, and that is not an oversight.** `crm.notification` is addressed to a rep
+    and endpoints are per tenant; a deleted tenant has no reps, and telling every live tenant's
+    administrators about another tenant's erasure receipt would be the cross-tenant disclosure the
+    erasure exists to prevent. So the channel for a platform finding is the process's own log line,
+    with `TAMPERED=` capitalised for a shipper to alert on, plus the row and
+    `GET /v1/admin/integrity/receipts` — which carries a receipt id and a tenant id and **nothing
+    from inside a receipt**, because the exclusion this package used to have was right about the
+    thing that still matters: "the tenant's own API is precisely the surface that must not answer
+    questions about its data."
+
+    **The audit caught its own case, twice.** `@crm/erasure` and `@crm/sync` were both EXCLUDED
+    from the error-mapping audit on the **grounded** claim "not a dependency of @crm/api", and the
+    routes in items 39 and 40 made them both dependencies — so the test failed the same day rather
+    than leaving two packages' errors unmapped behind sentences that had gone stale. Five error
+    classes now have explicit decisions, and `ErasureRefusedError` needed a `PROBE_ARGS` entry
+    because its constructor reads `plan.refusals.length`, which the audit refuses to let anybody
+    paper over with a `DELIBERATELY_INTERNAL` line.
+
+    **Verified live.** The deployed scheduler ran its first platform tick against the real ERP:
+    `verdict=verified tenants=1 receipts=0`, with the self-test recorded as `ok,ok` in the stored
+    run and the answer on the `crm.platform_job` row itself. The vacuousness is stated rather than
+    hidden — the gate's tenant has never been erased, so there are no receipts; what is **not**
+    vacuous is that a deployed binary really reproduced the committed digests before looking at
+    anything, which is the whole thing that lets a rewritten row be told from our own bug. 19 new
+    contract tests, 4 new API tests, 2 new scheduler tests, 102 files / 2,637 tests, migration
+    runner green on a fresh database with 67 migrations.
+
+    **Still open.**
+
+    * **There is no platform notification channel at all.** A `tampered` finding reaches a log
+      line, a row and a route, and nothing else. Giving the CRM one means deciding who the
+      deployment's operator *is* in a multi-tenant product, which is a real question and not this
+      increment's.
+    * **The window is a day**, and what that costs is a day in which evidence of a rewritten
+      deletion record sits unreported. The real answer is an append-only guarantee the application
+      role cannot defeat, which is what the open row on the registry's authority is about.
+    * **The self-test covers the manifest and not the proof.** The proof commits to who did it,
+      for whom, under what authority, and there is nothing to pin that against without a stored
+      receipt — so a vector for it would have to invent a tenant, which would suggest a coverage
+      it does not have.
+    * **A sweep that cannot read a tenant reports it and carries on**, which is right, but
+      `unreadable` rides in the `failures` column rather than having one of its own: there is no
+      honest count to pair it with, and a verdict for it would be a fifth value nobody could act
+      on differently.
+
 ## Alternatives considered
 
 - **Option (a): extend the CrossEngin repo directly as new modules.**
@@ -2835,7 +2926,7 @@ commit.
 | **A DELETE undid the whole deletion chain, and 0053 closed it.** Found by reading 0050 to 0052 back together rather than by a failing test — every suite was green. 0050's terminal trigger was `BEFORE UPDATE`, so `DELETE FROM crm.tenant WHERE tenant_id = …` succeeded as `crm_app` and did three things, all measured before the fix was written: the API SERVED THE TENANT AGAIN, because `resolvePrincipal` LEFT-joins the registry and treats a missing row as "serve normally" — the fail-open argued at length in 0050 and pinned by a test, which is sound and is exactly what makes removing the row an UN-stop rather than a nuisance; the 0052 receipt was ORPHANED, since its trigger checks the registry at INSERT and nothing after and the catalog had ZERO constraints pointing at `crm.tenant`, so the chain "a CRM tombstone implies a stopped tenant implies an ERP tombstone" became false retroactively with the proof still verifying; and `TRUNCATE crm.tenant` did it to every tenant at once, because a statement-level truncation fires no row trigger. THREE LAYERS, because the three holes differ and any one left open re-opens the bypass: the trigger fires on DELETE too (a live tenant's row stays deletable — not a blanket append-only); a BEFORE TRUNCATE statement trigger refuses truncation, and the reachable path for it is CASCADE, since plain TRUNCATE is already refused by the new key; and `crm.tenant_tombstone.tenant_id` references the registry ON DELETE RESTRICT — the first foreign key into `crm.tenant` in this schema's history, RESTRICT rather than CASCADE because cascade would make the delete succeed and take the receipts with it. The trigger is the layer doing the work today: the key pins only an ERASED tenant, where the trigger pins a STOPPED one, which is every deleted tenant until somebody runs the erasure. Four test suites' cleanups broke, correctly, and each now turns the guarantee off by name through one shared helper rather than finding a statement that happens to work. | us | **closed 2026-10-07** |
 | **The registry is still not authoritative, and the application role cannot make it so.** 0053 stops a stopped tenant's row being removed, which closes the bypass — it does NOT make a tenant with data and no registry row impossible, and such a tenant is still watched by nothing and served by the API. The obvious fix is to derive the tenant set from the data rather than from a list, which is the principle that makes 0051's completeness guard trustworthy, and it is unavailable: measured on 2026-10-07, `crm_app` OWNS these tables, RLS is on, and FORCE ROW LEVEL SECURITY is on — so the owner is confined too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0 where the admin answers 2. Enumeration across tenants is a privileged act. A `SECURITY DEFINER` enumerator is doubly blocked: `schema.contract.test.ts` forbids one in `crm` by design, and migrations 0003+ run as `crm_app`, so a function a migration creates would be owned by `crm_app` and FORCE would apply to it anyway. That leaves either an FK from every tenant-scoped table to the registry (the large change ADR-0001 already named) or a reconciliation run with admin credentials from `scripts/`, outside the product. Recorded with the measurement so the next person does not re-derive the obstacle. | us | _set a date_ |
 | **The receipt attested about the table it was written into, and 0054 took it out of its own scope.** Found by reading 0052 adversarially a day after shipping it; every test passed. Measured, both halves: the first erasure's receipt said `tenant_tombstone: nothing_to_erase` from inside the transaction that INSERTS a row into it — false by the time it committed, with the content hash committing to it — and said the same about `tenant_tombstone_attestation`, into which that transaction writes 41 rows. Run it twice and those two tables attested `retained` with counts of 1 and 41, counting the FIRST receipt, the second figure wrong the moment it landed because there were then two. So two signed receipts about one tenant disagreed about one table for purely structural reasons. This is the subsystem's own failure mode turned inward: ADR-0317's "a correct proof of a false claim", except self-falsifying, which is worse because the hashes verify and nothing looks wrong. THE FIX IS NOT A NEW DISPOSITION — `retain` under `deletion_evidence` is right for those tables and 0052 got that part right; it is the SCOPE, and `is_receipt_store` marks them in the register while a receipt neither counts them nor speaks about them. Faithful to the mirror rather than a deviation: the ERP's six subsystems do not include its own tombstone store either. A receipt store cannot be dispositioned `erase` by CHECK, because an erasure would destroy the proof of itself — the one row in this register that is arithmetic rather than a jurisdictional judgement a deployment may amend. THE EXCLUSION IS DECLARED ON THE RECEIPT AND INSIDE ITS HASH, which is 0051's insight one level in: a declared "deliberately silent about this" is not silence, and without it a reader comparing 41 register rows to 39 attestations finds a discrepancy with no explanation. AND THE MANIFEST FORMAT IS NOW VERSIONED, STORED AND VERIFIED BY: adding the list changed the format, and a receipt whose stored hash no longer recomputes is indistinguishable from a tampered one, so `v1` receipts stay verifiable under the rules they were made with, the version sits inside the hashed bytes as well as beside them, and there is no backfill — re-hashing a stored receipt under a new format would produce one that verifies and was never signed by the people it names. | us | **closed 2026-10-07** |
-| **Nothing re-verifies a stored receipt except somebody running `crm-erasure receipts`.** 0054 made the format versioned so a receipt stays checkable for as long as it is kept, and 0052 made both tables append-only so neither can be rewritten through the application role — but the only thing that ever recomputes a hash is an operator typing a command. The ERP solved the same shape with a scheduled integrity proof (its ADR-0287/0288: row-against-anchor and chain link verification per tenant, on a timer, recording the verdict and declaring an incident on a compromised finding), and this CRM has the pieces for the cheap version — `verifyTombstone` is pure, the scheduler already runs per-tenant jobs, and `crm.notification` can raise. What it does not have is a decision about what a failed verification MEANS here: a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses. Recorded rather than guessed at, because a job that cried wolf about its own hashing bug would be worse than no job. | us | _set a date_ |
+| **Nothing re-verifies a stored receipt — ANSWERED by decision item 40.** This row named the blocker rather than guessing at it: "a receipt that no longer recomputes is either a bug in our own canonicalisation or evidence that somebody with database access rewrote a deletion record, and those want very different responses… a job that cried wolf about its own hashing bug would be worse than no job." The two are told apart by a KNOWN-ANSWER SELF-TEST — a committed vector per manifest version, hashed before any stored row is read — plus the cohort: a self-test failure means this build cannot hash and NOTHING is called tampered; a whole version failing is a format change shipped under an existing version number; some failing while their siblings pass is a rewritten row, which no hashing bug can produce. 0067 adds the four verdicts, the sweep, the route, and the thing the job could not exist without: `crm.platform_job`, because a receipt belongs to a tenant that has been ERASED and `activeTenants` is `status = 'active'`, so no per-tenant job could ever reach one. The deployed binary ran it against the real ERP with its self-test recorded `ok,ok`. What remains is that the CRM has no platform NOTIFICATION channel — a `tampered` finding reaches a log line, a row and a route, and giving it one means deciding who the deployment's operator is in a multi-tenant product. | us | **closed 2026-10-12** |
 | **THERE IS A CLIENT, AND IT IS A FIRST SLICE.** This row said THERE IS NO CLIENT for most of the project's life, in capitals, because a great deal of the system existed to serve a consumer that did not exist — device-minted ids (0012/0017), the per-row sync batch, the signature capture, the staleness question. `apps/field` now consumes them: sign in, see my accounts, record a visit with no network, watch it sync, read a refusal. Verified by `pnpm client:verify` — 315 checks across SIX browser profiles, taken offline mid-session, against the real API binary, counting rows in Postgres. Disbursements and their signatures landed next (item 26), then rep-to-rep transfers and the two shared-device defects they exposed (item 27), then the cycle count and the three schema changes it needed (item 28), then write-offs and the date a disposal was recorded on (item 29), then the return to a warehouse and the first write the ERP must hear about (item 30), then the warehouse list that made a return possible for stock a colleague handed over (item 31), and then the disposal policy — the first administrative screen, and the record of who changed it that 0023 left unbuilt (item 32) — and the configuration history beside it, which is 0061's generic attribution log on screen for an administrator (item 34), and the approval queue for the two changes that take two people (item 35). **What is NOT built is still most of the product**: call plans and their approval, expenses and receipts, notifications, the manager's team views, and every admin surface but those three — roughly 70 of the 113 routes have no screen. Capacitor packaging, iOS Safari and push are untouched. The shape question the row used to pose is answered: a PWA, framework-free, wrappable. | Product | _set a date_ |
 
 | **ACME is tested nowhere, and the first deploy is the first certificate.** The edge IS exercised now — CI brings Caddy up and it serves `/healthz` over TLS (`ok: caddy serves the api over TLS`, run 37655061713) — but against `DOMAIN=localhost` with Caddy's internal CA. Issuance over ACME against a real domain has never happened, and it is the last part of the stack where that is true. In this sandbox even the container could not start: Docker Hub answered 429 to every anonymous pull of `caddy:2`, so `CRM_SMOKE_SKIP_CADDY=1` exists and prints that it was used. | Platform | _set a date_ |

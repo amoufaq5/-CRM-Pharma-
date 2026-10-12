@@ -2497,6 +2497,94 @@ describe("the API, end to end", () => {
   });
 
   /**
+   * The erasure-receipt verification (0067), over HTTP.
+   *
+   * THE READ SIDE OF A FINDING NOBODY CAN BE NOTIFIED ABOUT, which is why it matters more than
+   * most. A receipt belongs to a tenant that has been ERASED, so there is nobody in it to tell —
+   * and telling every other tenant's administrators about it would be the cross-tenant disclosure
+   * the erasure exists to prevent.
+   */
+  describe("the erasure-receipt verification", () => {
+    const asAdmin = (): string => token({ sub: "idp|rep2", tenant: TENANT });
+    const grantAdmin = (): Promise<unknown> =>
+      withTenantContext(admin, TENANT, (tx) =>
+        tx.query(
+          `INSERT INTO crm.rep_role (tenant_id, rep_profile_id, role, granted_by, valid_from)
+           VALUES ($1,$2,'administrator',$3,CURRENT_DATE)`,
+          [TENANT, otherRep, manager],
+        ),
+      );
+
+    it("is administrator only", async () => {
+      expect((await call("GET", "/v1/admin/integrity/receipts")).status).toBe(403);
+    });
+
+    it("answers before any sweep has run, and still says whether this build can hash", async () => {
+      await grantAdmin();
+      await admin.query("DELETE FROM crm.receipt_verification_run");
+      const res = await call("GET", "/v1/admin/integrity/receipts", { auth: asAdmin() });
+      expect(res.status).toBe(200);
+      // Null is a real answer and the one an operator needs on a fresh deployment: nothing has
+      // verified the receipts yet, which is different from "they verify".
+      expect(res.body.latest).toBeNull();
+      // THE SELF-TEST IS COMPUTED PER REQUEST, not read from the row — the stored verdict is as
+      // old as the last sweep, and this answers "can this process verify anything at all" at the
+      // moment of asking.
+      expect(res.body.selfTest).toEqual({ v1: "ok", v2: "ok" });
+    });
+
+    it("shows the newest sweep with the evidence its verdict rested on", async () => {
+      await grantAdmin();
+      await admin.query("DELETE FROM crm.receipt_verification_run");
+      // Written directly: the sweep runs in the SCHEDULER, and a test that drove it through HTTP
+      // would be testing @crm/erasure's contract suite a second time.
+      for (const [verdict, failed] of [
+        ["verified", 0],
+        ["tampered", 1],
+      ] as const) {
+        await admin.query(
+          `INSERT INTO crm.receipt_verification_run
+             (verdict, receipts_checked, receipts_failed, tenants_checked, by_version, self_test, failures)
+           VALUES ($1, 40, $2, 3, '{"v2":{"checked":40,"failed":1}}'::jsonb,
+                   '{"v1":"ok","v2":"ok"}'::jsonb,
+                   '[{"tenantId":"gone","receiptId":"crmtomb_x","problems":["proof hash"]}]'::jsonb)`,
+          [verdict, failed],
+        );
+      }
+      const res = await call("GET", "/v1/admin/integrity/receipts", { auth: asAdmin() });
+      const latest = res.body.latest as Record<string, unknown>;
+      // The newest by `seq`: both rows share `ran_at` to the microsecond, which is exactly why
+      // 0067 gave the table a sequence.
+      expect(latest["verdict"]).toBe("tampered");
+      expect(latest["receipts_failed"]).toBe(1);
+      // The cohort, because the verdict is an inference and a reader must be able to see what it
+      // rested on: 1 of 40 failed under one format, which no hashing bug can produce.
+      expect(latest["by_version"]).toEqual({ v2: { checked: 40, failed: 1 } });
+    });
+
+    it("carries nothing from inside a receipt", async () => {
+      await grantAdmin();
+      await admin.query("DELETE FROM crm.receipt_verification_run");
+      await admin.query(
+        `INSERT INTO crm.receipt_verification_run
+           (verdict, receipts_checked, receipts_failed, tenants_checked, failures)
+         VALUES ('tampered', 1, 1, 1,
+                 '[{"tenantId":"gone","receiptId":"crmtomb_x","problems":["content manifest hash is a but recomputes to b"]}]'::jsonb)`,
+      );
+      const res = await call("GET", "/v1/admin/integrity/receipts", { auth: asAdmin() });
+      // THE RULE THE EXCLUSION THIS PACKAGE USED TO HAVE WAS RIGHT ABOUT: "the tenant's own API
+      // is precisely the surface that must not answer questions about its data". A receipt id and
+      // a tenant id are what an operator needs to go and look with `crm-erasure receipts`; an
+      // attestation would be a way to read what the erasure destroyed.
+      const body = JSON.stringify(res.body);
+      expect(body).toContain("crmtomb_x");
+      expect(body).not.toContain("rows_erased");
+      expect(body).not.toContain("attestation");
+      expect(body).not.toContain("table_name");
+    });
+  });
+
+  /**
    * The nightly integrity check's findings (0066), over HTTP.
    *
    * ADR-0001 Q1's answer was "no FKs; ACL-enforced integrity plus a nightly orphan check", and

@@ -7,7 +7,7 @@ import type { SnapshotRefresher } from "@crm/sync";
 
 import { Scheduler, type SchedulerEvent } from "./scheduler.js";
 import { claimDueJobs, ensureJobs, jobHealth, recordResult } from "./store.js";
-import { JOB_NAMES } from "./jobs.js";
+import { DEFAULT_PLATFORM_INTERVALS_MS, JOB_NAMES, PLATFORM_JOB_NAMES } from "./jobs.js";
 
 // A distinct tenant per suite, from the shared registry in @crm/db/testing.
 // Sharing fixture rows couples suites to vitest's hook interleaving and to each
@@ -604,6 +604,83 @@ describe("scheduler against a real database", () => {
     });
     expect(leaked).toBe(0);
   });
+
+  /**
+   * And the same arrangement for PLATFORM jobs (0067), which are a second list and therefore a
+   * second chance to drift.
+   *
+   * The reason there are two lists is narrow: an erasure receipt belongs to a tenant that has
+   * been ERASED, and `activeTenants` is `status = 'active'`, so nothing in `JOB_NAMES` can ever
+   * reach one. `crm.platform_job` is `crm.scheduled_job` with the tenant taken out, and its CHECK
+   * calls `crm.platform_jobs()` exactly as the other calls `crm.scheduled_jobs()`.
+   */
+  it("every platform job the code runs is a platform job the database accepts", async () => {
+    const { rows: declared } = await admin.query<{ jobs: string[] }>(
+      "SELECT crm.platform_jobs() AS jobs",
+    );
+    expect([...declared[0]!.jobs].sort()).toEqual([...PLATFORM_JOB_NAMES].sort());
+
+    // And every one of them has an interval declared in TypeScript, since the row is SEEDED by
+    // the migration rather than created on first tick: a job in the list with no default would be
+    // a job nothing could ever schedule.
+    for (const job of PLATFORM_JOB_NAMES) {
+      expect(DEFAULT_PLATFORM_INTERVALS_MS[job], `${job} needs a default interval`).toBeGreaterThan(
+        0,
+      );
+    }
+
+    // The seeded row, which is the one thing the per-tenant table gets from `ensureJobs` and this
+    // one gets from the migration. A list entry with no row would never run.
+    const { rows: seeded } = await admin.query<{ job: string }>("SELECT job FROM crm.platform_job");
+    expect(seeded.map((r) => r.job).sort()).toEqual([...PLATFORM_JOB_NAMES].sort());
+  });
+
+  /**
+   * The platform tick claims, runs and records — against a real database, because the claim is a
+   * single row every instance of the scheduler contends for.
+   *
+   * Where the per-tenant claim races on a row per tenant, this one races on ONE row for the whole
+   * deployment, so `FOR UPDATE SKIP LOCKED` and the claim-time advance are doing more work here
+   * than there. The second tick finding nothing due is the assertion that says so.
+   */
+  it("runs a due platform job once and advances it past the next tick", async () => {
+    await admin.query("UPDATE crm.platform_job SET next_run_at = now() - interval '1 hour'");
+    const seen: string[] = [];
+    const sched = scheduler({
+      onEvent: (e) => {
+        if (e.type === "platform_job_ok") seen.push(`${e.job}:${e.detail.slice(0, 60)}`);
+        if (e.type === "platform_job_error") seen.push(`${e.job}:ERROR:${e.error.slice(0, 120)}`);
+      },
+    });
+
+    await sched.tick();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("receipt_verify:");
+    // The verdict, not just that it ran: this deployment's receipts verify, which is the claim
+    // the job exists to be able to make.
+    expect(seen[0]).toContain("verdict=verified");
+
+    // The row carries the answer as well as the log, which the per-tenant table deliberately does
+    // not: one row for the whole deployment, and its most recent answer about the erasure evidence
+    // is worth reading without finding the log.
+    const { rows } = await admin.query<{
+      last_status: string;
+      last_detail: string;
+      consecutive_failures: number;
+      next_run_at: Date;
+    }>("SELECT last_status, last_detail, consecutive_failures, next_run_at FROM crm.platform_job WHERE job = 'receipt_verify'");
+    expect(rows[0]!.last_status).toBe("ok");
+    expect(rows[0]!.last_detail).toContain("verdict=verified");
+    expect(rows[0]!.consecutive_failures).toBe(0);
+    expect(rows[0]!.next_run_at.getTime()).toBeGreaterThan(Date.now());
+
+    // THE SECOND TICK, which must find nothing. The claim advanced `next_run_at` in the same
+    // statement that read it, so a second instance arriving in the same window does no work and
+    // waits on no lock.
+    seen.length = 0;
+    await sched.tick();
+    expect(seen).toEqual([]);
+  });
 });
 
 describe("the loop itself", () => {
@@ -808,5 +885,4 @@ describe("recordResult", () => {
       "jobs the database admits that no code runs",
     ).toEqual([]);
   });
-
 });

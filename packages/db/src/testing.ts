@@ -345,6 +345,19 @@ export const TENANT_REFERENTIAL = "f0660000-0000-4000-8000-00000000002f";
 export const TENANT_REFERENTIAL_OTHER = "f1660000-0000-4000-8000-000000000030";
 
 /**
+ * packages/erasure — verify-receipts.contract (migration 0067).
+ *
+ * Its own pair, and the sweep is the reason both are needed rather than one: the verification is
+ * PLATFORM-WIDE — it enumerates `crm.tenant` and reads every tenant's receipts — so it sees
+ * whatever any other suite left behind, and the cohort arithmetic that tells a hashing bug from a
+ * rewritten row is exactly what a stray receipt would corrupt. The suite therefore counts its own
+ * two tenants' receipts out of the sweep's totals rather than asserting on the totals, and the
+ * second tenant is what makes "some failed and their siblings passed" expressible at all.
+ */
+export const TENANT_RECEIPT_VERIFY = "f0670000-0000-4000-8000-000000000031";
+export const TENANT_RECEIPT_VERIFY_OTHER = "f1670000-0000-4000-8000-000000000032";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding

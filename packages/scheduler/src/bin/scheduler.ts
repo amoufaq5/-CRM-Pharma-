@@ -83,7 +83,10 @@ function log(event: SchedulerEvent): void {
   // the CRM grows one. The ERP has no structured logger at all (report R11), so
   // this is ours to provide.
   const line = { ts: new Date().toISOString(), ...event };
-  const stream = event.type === "job_error" || event.type === "tick_error" ? console.error : console.log;
+  const stream =
+    event.type === "job_error" || event.type === "tick_error" || event.type === "platform_job_error"
+      ? console.error
+      : console.log;
   stream(JSON.stringify(line));
 }
 

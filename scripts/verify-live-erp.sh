@@ -792,6 +792,43 @@ UNREGISTERED="$(psql -d "$CRM_DB" -At -c "
   || fail "these crm.erp_record_id columns are in no register row: $UNREGISTERED"
 ok "and every crm.erp_record_id column in the schema is declared in crm.erp_reference_register"
 
+# 0067. PLATFORM WORK, in the deployed binary — the first job this process runs that belongs to
+# nobody. An erasure receipt belongs to a tenant that has been ERASED, and `activeTenants` is
+# `status = 'active'`, so no per-tenant job could ever reach one; this is the tick that can.
+#
+# The gate's own tenant has never been erased, so there are no receipts and `verdict=verified` is
+# the honest vacuous answer. What is NOT vacuous and is the whole contribution: the known-answer
+# self-test, which this process really ran against the committed digests before it looked at
+# anything. That is the thing that lets a tampered receipt be told from our own hashing bug, and
+# a deployed binary failing it would mean the CRM cannot verify its own deletion evidence.
+wait_for_line "$WORK/sched.out" '"type":"platform_job_ok".*"job":"receipt_verify"' "$SCHED_PID" 120 \
+  "the scheduler's receipt_verify platform tick"
+RECEIPT_LINE="$(grep '"type":"platform_job_ok".*"job":"receipt_verify"' "$WORK/sched.out" | head -1)"
+case "$RECEIPT_LINE" in
+  *TAMPERED=*)         fail "the deployed binary says an erasure receipt has been rewritten: $RECEIPT_LINE" ;;
+  *SELF_TEST_FAILED=*) fail "the deployed binary cannot reproduce its own manifest format: $RECEIPT_LINE" ;;
+  *UNREPRODUCIBLE=*)   fail "stored receipts do not recompute under this build's canonicalisation: $RECEIPT_LINE" ;;
+  *verdict=verified*)  ok "receipt_verify ran as platform work and its self-test passed — $RECEIPT_LINE" ;;
+  *) fail "receipt_verify reached no verdict at all: $RECEIPT_LINE" ;;
+esac
+# The row, which is the half a log line cannot prove — and `last_detail` on the job itself, which
+# the per-tenant table deliberately has no column for: one row for the whole deployment, and its
+# most recent answer about the erasure evidence is worth reading without finding the log.
+RECEIPT_ROW="$(psql -d "$CRM_DB" -At -c "
+  SELECT verdict || ' selftest=' || (self_test->>'v1') || ',' || (self_test->>'v2')
+    FROM crm.receipt_verification_run ORDER BY seq DESC LIMIT 1")"
+[ "$RECEIPT_ROW" = "verified selftest=ok,ok" ] \
+  || fail "the stored verification does not record a passing self-test: $RECEIPT_ROW"
+ok "and the stored run records the self-test this build actually passed — $RECEIPT_ROW"
+PLATFORM_ROW="$(psql -d "$CRM_DB" -At -c "
+  SELECT last_status || ' failures=' || consecutive_failures || ' detail=' ||
+         left(coalesce(last_detail, 'none'), 20)
+    FROM crm.platform_job WHERE job = 'receipt_verify'")"
+case "$PLATFORM_ROW" in
+  "ok failures=0 detail=verdict=verified"*) ok "and crm.platform_job carries the answer on the row — $PLATFORM_ROW" ;;
+  *) fail "crm.platform_job did not record a clean run with its detail: $PLATFORM_ROW" ;;
+esac
+
 # The sink writes what it received on SIGTERM, so it is stopped after the scheduler and read
 # afterwards — reading it while a tick was still in flight is how a gate reports a timing
 # accident as a failure.

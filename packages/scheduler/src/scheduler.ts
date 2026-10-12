@@ -14,11 +14,19 @@ import {
   watchTenantDeletion,
   type SnapshotRefresher,
 } from "@crm/sync";
+import { sweepReceipts } from "@crm/erasure";
 import type { TombstoneReader } from "@crm/acl";
 import type { Pool, PoolClient } from "pg";
 
-import type { JobName } from "./jobs.js";
-import { activeTenants, claimDueJobs, ensureJobs, recordResult } from "./store.js";
+import type { JobName, PlatformJobName } from "./jobs.js";
+import {
+  activeTenants,
+  claimDueJobs,
+  claimDuePlatformJobs,
+  ensureJobs,
+  recordPlatformResult,
+  recordResult,
+} from "./store.js";
 
 export interface SchedulerOptions {
   readonly pool: Pool;
@@ -113,6 +121,22 @@ export type SchedulerEvent =
       readonly type: "job_error";
       readonly tenantId: string;
       readonly job: JobName;
+      readonly durationMs: number;
+      readonly error: string;
+    }
+  // 0067. The deployment's own jobs, kept as their own event types rather than reusing the three
+  // above with a sentinel tenant: every line this process writes carries `tenantId` when it has
+  // one, and a `job_ok` with a made-up tenant would be a line nobody could filter correctly.
+  | { readonly type: "platform_job_start"; readonly job: PlatformJobName }
+  | {
+      readonly type: "platform_job_ok";
+      readonly job: PlatformJobName;
+      readonly durationMs: number;
+      readonly detail: string;
+    }
+  | {
+      readonly type: "platform_job_error";
+      readonly job: PlatformJobName;
       readonly durationMs: number;
       readonly error: string;
     }
@@ -224,6 +248,94 @@ export class Scheduler {
       } catch (err) {
         // Isolated on purpose: one tenant's problem is not everyone's.
         this.options.onEvent?.({ type: "tick_error", error: `${tenant.tenant_id}: ${String(err).slice(0, 300)}` });
+      }
+    }
+
+    // AFTER the tenants, and isolated the same way (0067). Platform work is about the deployment
+    // rather than about anybody's data, and it goes last for the same reason it exists: nothing
+    // in it is a rep waiting on a write, so it must not delay the loop above. A failure here is
+    // one more `tick_error` and not a dead tick — the per-tenant work has already been done.
+    try {
+      await this.tickPlatform();
+    } catch (err) {
+      this.options.onEvent?.({ type: "tick_error", error: `platform: ${String(err).slice(0, 300)}` });
+    }
+  }
+
+  /**
+   * The deployment's own jobs, claimed from `crm.platform_job`.
+   *
+   * NO TENANT CONTEXT ANYWHERE IN HERE, which is the whole point and also the hazard. The table
+   * is platform-wide and the claim must run outside a tenant — but the WORK may enter one (the
+   * receipt sweep enters each tenant's context in turn to read rows that are RLS-forced), so the
+   * claim and the work deliberately use different connections: a claim that handed its own client
+   * to a job which then opened a tenant context would be opening a nested transaction, which
+   * `withTenantContext` refuses outright.
+   */
+  private async tickPlatform(): Promise<void> {
+    const client = await this.options.pool.connect();
+    let due: readonly { job: PlatformJobName }[] = [];
+    try {
+      due = await claimDuePlatformJobs(client, this.now(), this.random);
+    } finally {
+      client.release();
+    }
+
+    for (const { job } of due) {
+      this.options.onEvent?.({ type: "platform_job_start", job });
+      const started = Date.now();
+      let outcome: { ok: boolean; detail?: string; error?: string };
+      let detail = "";
+      try {
+        detail = await this.executePlatform(job);
+        outcome = { ok: true, detail };
+      } catch (err) {
+        outcome = { ok: false, error: String(err).slice(0, 2000) };
+      }
+      const durationMs = Date.now() - started;
+      const recorder = await this.options.pool.connect();
+      try {
+        await recordPlatformResult(
+          recorder,
+          job,
+          {
+            ok: outcome.ok,
+            durationMs,
+            ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+            ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
+          },
+          this.now(),
+          this.random,
+        );
+      } catch {
+        // Swallowed like `runJob`'s, and for the same reason: a job that DID its work and could
+        // not write down that it had must not look like a job that failed. The next tick re-runs
+        // it, which is safe because every platform job here is idempotent.
+      } finally {
+        recorder.release();
+      }
+      if (outcome.ok) {
+        this.options.onEvent?.({ type: "platform_job_ok", job, durationMs, detail });
+      } else {
+        this.options.onEvent?.({ type: "platform_job_error", job, durationMs, error: outcome.error ?? "" });
+      }
+    }
+  }
+
+  private async executePlatform(job: PlatformJobName): Promise<string> {
+    switch (job) {
+      case "receipt_verify": {
+        // 0067. THE VERDICT IS THE LINE, because there is nobody to notify: `crm.notification` is
+        // addressed to a rep and endpoints are per tenant, a deleted tenant has no reps, and
+        // telling every live tenant's administrators about another tenant's erasure receipt would
+        // be the cross-tenant disclosure the erasure exists to prevent. So this process's own log
+        // is the channel, `TAMPERED=` is capitalised for a shipper to alert on, and the row in
+        // `crm.receipt_verification_run` is what an operator reads afterwards.
+        //
+        // The pool, not a client: the sweep opens one short transaction per tenant to read rows
+        // that are RLS-forced, which it cannot do on a connection already inside one.
+        const r = await sweepReceipts(this.options.pool, this.now());
+        return r.summary;
       }
     }
   }
