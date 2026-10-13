@@ -47,10 +47,30 @@ export interface DeliveryRecord {
   readonly recipient_rep_profile_id: string;
   /** Resolved by LEFT JOIN, so a removed profile reads as a recorded uuid and a null name. */
   readonly recipient_display_name: string | null;
-  readonly state: "pending" | "in_flight" | "delivered" | "dead";
+  /**
+   * All five of `crm.notification_delivery.state`'s values, `abandoned` included.
+   *
+   * It is reachable here, which is the difference from the relay's copy of this union: 0069
+   * settles an orphaned push as `abandoned`, so a history read back from a tenant whose
+   * notification or endpoint was deleted really does return one.
+   */
+  readonly state: "pending" | "in_flight" | "delivered" | "dead" | "abandoned";
   readonly attempts: number;
   readonly last_status: number | null;
   readonly last_error: string | null;
+  /**
+   * When this push was settled as unsendable, and why — null unless `state` is `abandoned`.
+   *
+   * SEPARATE FROM `last_error` BY DESIGN (0069). That column means "what the DESTINATION
+   * said", and an abandoned push never reached one: its notification was deleted so the
+   * payload cannot be rebuilt, or its endpoint was so the secret it names cannot be read. A
+   * reader seeing `abandoned` beside two nulls would learn nothing, which is why these two
+   * come back from the same function rather than being a column somebody has to go and look
+   * up. The reason carries a greppable prefix — `tenant-deleted:`, `orphaned-notification:`
+   * or `orphaned-endpoint:` — so one query groups a deployment's abandonments by cause.
+   */
+  readonly abandoned_at: Date | null;
+  readonly abandoned_reason: string | null;
   readonly delivered_at: Date | null;
   readonly created_at: Date;
   /**

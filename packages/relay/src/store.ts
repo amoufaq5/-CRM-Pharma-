@@ -1,7 +1,15 @@
 import type { PoolClient } from "pg";
 
-/** The four states `crm.outbox.state`'s CHECK constraint admits. */
-export type OutboxState = "pending" | "in_flight" | "delivered" | "dead";
+/**
+ * The five states `crm.outbox.state`'s CHECK constraint admits.
+ *
+ * `abandoned` arrived with 0068 and this union did not, because nothing in the relay can write
+ * or reach one: a row is abandoned only when its tenant has been deleted, and a deleted tenant
+ * is out of `activeTenants`, so the relay never asks for its work. It is here because a type
+ * that enumerates a column's values has to enumerate them — a reader widening a query one day
+ * would otherwise get a union that silently excludes a state the database can return.
+ */
+export type OutboxState = "pending" | "in_flight" | "delivered" | "dead" | "abandoned";
 
 export interface OutboxRow {
   readonly id: string;

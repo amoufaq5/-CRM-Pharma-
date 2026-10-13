@@ -218,7 +218,7 @@ ok "operate-server and crossengin-pg are built ($(wc -l < "$WORK/erp-before.txt"
 #   * DIRTY — uncommitted changes under the ERP checkout. REFUSED. The gate's output would name a
 #     commit that is not what it ran, so the evidence is unreproducible by anybody, including us.
 #     This is also the one state that can be caused by a previous run of this gate going wrong,
-#     and §16 only checks it afterwards.
+#     and §17 only checks it afterwards.
 #   * BEHIND its own `origin/main`, if that ref exists locally. WARNED, not refused: freshness
 #     needs a network the gate must not require, and a CI runner or an offline laptop would fail
 #     for a reason unrelated to anything it was testing. The warning names the distance.
@@ -1017,7 +1017,123 @@ ok "every process this gate started — ERP, 2 key sets, API, 3 schedulers — i
 
 # ---------------------------------------------------------------------------
 echo
-echo "--- 15. the retention vocabulary still matches the ERP's own source ---"
+echo "--- 15. a push nobody refused is abandoned, not dead ---"
+# 0069, AFTER EVERY PROCESS IS GONE, deliberately. The dispatcher calls this function on every
+# tick, so a seeded orphan left in front of a running scheduler would be settled by the binary
+# somewhere between two assertions — which is the right behaviour and an unreadable test. §14
+# has just proved nothing is running, so what follows is this gate's own transaction against the
+# live CRM database, on real rows beside a run's worth of real ones.
+#
+# WHAT IT HAS TO SHOW, which is two things and not one: that an unsendable push lands in a state
+# retention can reach, AND that a push a destination really refused is left exactly as it was.
+# The second is the control, and without it the first is satisfied by a function that abandons
+# everything.
+#
+# The endpoints are seeded DISABLED. They exist only to be deleted, and an enabled one would
+# have been a live destination for every signal this tenant raised while the gate was still
+# running — a fan-out the gate never asked for, to a url nothing is listening on.
+ORPHAN_SEED="$(psql -d "$CRM_DB" -At -v ON_ERROR_STOP=1 <<SQL 2>&1
+BEGIN;
+WITH author AS (SELECT id FROM crm.rep_profile WHERE tenant_id = '$TENANT' AND subject = 'rep-ada'),
+     eps AS (
+       INSERT INTO crm.notification_endpoint
+         (tenant_id, channel, url, secret_env, enabled, created_by, created_reason)
+       SELECT '$TENANT', 'webhook', u.url, 'CRM_WEBHOOK_SECRET', false, a.id,
+              'the live gate proving an orphaned push is abandoned and a refused one is not'
+         FROM author a, (VALUES ('https://sink.invalid/abandoned'),
+                                ('https://sink.invalid/refused')) AS u(url)
+       RETURNING id, url
+     ),
+     notes AS (
+       INSERT INTO crm.notification
+         (tenant_id, recipient_rep_profile_id, kind, severity, subject, body, dedup_key)
+       SELECT '$TENANT', a.id, 'erp_write_failed', 'urgent', k.subject, 'the live gate', k.dedup
+         FROM author a, (VALUES ('an orphaned push', 'live-gate-0069-orphan'),
+                                ('a refused push',  'live-gate-0069-refused')) AS k(subject, dedup)
+       RETURNING id, dedup_key
+     )
+INSERT INTO crm.notification_delivery
+  (tenant_id, notification_id, endpoint_id, state, last_status, last_error)
+SELECT '$TENANT', n.id, e.id,
+       CASE WHEN n.dedup_key LIKE '%refused' THEN 'dead' ELSE 'pending' END,
+       CASE WHEN n.dedup_key LIKE '%refused' THEN 410 END,
+       CASE WHEN n.dedup_key LIKE '%refused' THEN '410 Gone' END
+  FROM notes n
+  JOIN eps e ON (e.url LIKE '%refused') = (n.dedup_key LIKE '%refused');
+-- And now the destination is gone, which is the only way to reach either state: 0048 dropped
+-- the cascade, so the rows survive their endpoint and nothing in the product can delete one.
+DELETE FROM crm.notification_endpoint
+ WHERE tenant_id = '$TENANT' AND url LIKE 'https://sink.invalid/%';
+COMMIT;
+SELECT 'seeded';
+SQL
+)"
+case "$ORPHAN_SEED" in
+  *seeded*) ok "two pushes seeded whose endpoint has been deleted — one pending, one refused 410" ;;
+  *) fail "could not seed the orphaned pushes: $ORPHAN_SEED" ;;
+esac
+
+SETTLED="$(psql -d "$CRM_DB" -At -c "SELECT crm.abandon_orphaned_deliveries('$TENANT')")"
+[ "$SETTLED" = "1" ]   || fail "the settle claimed $SETTLED rows; it must take the pending push and leave the refused one"
+ok "crm.abandon_orphaned_deliveries settled exactly one of the two"
+
+# THE TENANT GUC IS SET EVEN THOUGH THIS CONNECTION IS A SUPERUSER, and the reason is worth
+# recording because it looks redundant: a superuser bypasses RLS on a TABLE, but these two
+# prune-candidate views are plain views owned by `crm_app`, so they are evaluated as `crm_app` —
+# which is subject to FORCE ROW LEVEL SECURITY like anybody else. Without the setting the policy
+# yields nothing and every assertion below would pass by reading an empty result. Found by
+# writing it the obvious way first and getting silence.
+ORPHAN_STATE="$(psql -d "$CRM_DB" -qAt -F'|' -c "SET app.current_tenant_id = '$TENANT'" -c "
+  SELECT d.state,
+         left(coalesce(d.abandoned_reason, '-'), 24),
+         coalesce(d.last_error, '-'),
+         coalesce(d.last_status::text, '-'),
+         c.unsettled
+    FROM crm.notification_delivery d
+    JOIN crm.notification_delivery_prune_candidates c ON c.id = d.id
+    JOIN crm.notification n ON n.id = d.notification_id
+   WHERE d.tenant_id = '$TENANT' AND n.dedup_key LIKE 'live-gate-0069-%'
+   ORDER BY n.dedup_key")"
+# dedup_key sorts `…-orphan` before `…-refused`, so the first line is the one that was settled.
+EXPECTED_ORPHAN="abandoned|orphaned-endpoint: the e|-|-|f"
+EXPECTED_REFUSED="dead|-|410 Gone|410|t"
+case "$ORPHAN_STATE" in
+  "$EXPECTED_ORPHAN
+$EXPECTED_REFUSED") ok "the unsendable one is abandoned with its reason and is PRUNABLE; the refused one is untouched and still held" ;;
+  *) printf '%s
+' "$ORPHAN_STATE" >&2
+     fail "the two pushes did not end as 0069 requires (wanted $EXPECTED_ORPHAN then $EXPECTED_REFUSED)" ;;
+esac
+
+# AND THE INBOX IS RELEASED, which is the clause of the open row that was about the other table:
+# a dead delivery holds its notification back from the prune forever (0046), so an orphan settled
+# `dead` pinned an inbox row nobody could ever act on. The two notifications differ only in the
+# state of their one delivery.
+HELD="$(psql -d "$CRM_DB" -qAt -F'|' -c "SET app.current_tenant_id = '$TENANT'" -c "
+  SELECT n.dedup_key, c.delivery_unsettled
+    FROM crm.notification_prune_candidates c
+    JOIN crm.notification n ON n.id = c.id
+   WHERE c.tenant_id = '$TENANT' AND n.dedup_key LIKE 'live-gate-0069-%'
+   ORDER BY n.dedup_key")"
+case "$HELD" in
+  "live-gate-0069-orphan|f
+live-gate-0069-refused|t") ok "and its notification is no longer held back, where the refused one's still is" ;;
+  *) printf '%s
+' "$HELD" >&2; fail "the inbox hold is not what 0069 requires" ;;
+esac
+
+# The terminality, on a row this run really abandoned rather than on a fixture's.
+TERMINAL="$(psql -d "$CRM_DB" -At -c "
+  UPDATE crm.notification_delivery d SET state = 'pending'
+   WHERE d.tenant_id = '$TENANT' AND d.state = 'abandoned'" 2>&1 || true)"
+case "$TERMINAL" in
+  *abandoned-is-terminal*orphaned-endpoint*) ok "and it cannot be moved out of abandoned, in a refusal that quotes its own reason" ;;
+  *) fail "an abandoned push was not frozen, or the refusal does not say why: $TERMINAL" ;;
+esac
+
+# ---------------------------------------------------------------------------
+echo
+echo "--- 16. the retention vocabulary still matches the ERP's own source ---"
 # Migration 0051 takes five obligation codes verbatim from the ERP's RETENTION_OBLIGATIONS so
 # that a deletion recorded on both sides of the boundary reads as one record rather than two
 # dialects. The whole value of that is lost the first time one side renames a code, and a
@@ -1060,7 +1176,7 @@ ok "and crm.retention_obligations() carries every one of them — $db_codes"
 
 # ---------------------------------------------------------------------------
 echo
-echo "--- 16. the ERP checkout is exactly as it was found ---"
+echo "--- 17. the ERP checkout is exactly as it was found ---"
 erp_manifest > "$WORK/erp-after.txt"
 if diff -q "$WORK/erp-before.txt" "$WORK/erp-after.txt" >/dev/null; then
   ok "not one file under $ERP_DIR changed (CrossEngin $(echo "$ERP_HEAD" | cut -c1-12), dirty=$ERP_DIRTY)"

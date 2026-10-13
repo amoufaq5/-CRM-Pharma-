@@ -3073,3 +3073,111 @@ it.
   that needs a Docker daemon and an unintercepted registry, and this environment has neither
   together. CI does not run it either. A gate that nothing runs is a gate that rots — this
   increment found one broken assertion in it by hand, and the next one will not be found that way.
+
+## A push nobody refused is not dead
+
+*2026-10-13, `./scripts/verify-live-erp.sh` (now 201 ok lines, five of them new),
+`pnpm client:verify` (329 checks) and `npx vitest run` (104 files / 2,661 tests). The migration
+runner is green on a fresh database with 69 migrations.*
+
+Migration 0069, and the state it uses was built two increments ago for a different cause.
+`crm.notification_delivery`'s prune keyed on `unsettled = (state <> 'delivered')`, so a delivery
+settled `dead` was never pruned at any horizon and held its notification back with it. For a push
+a **destination refused** that is right — it is the evidence of a disclosure that did not happen,
+and nothing here changes it. But `settleOrphanedDeliveries` wrote `dead` for a push **nobody ever
+answered**: the notification has been deleted so the payload cannot be rebuilt, or the endpoint
+has so the `secret_env` it names cannot be read. No byte was sent. The one state retention could
+not reach was the one the dispatcher mints on its own schedule.
+
+`abandoned` is 0068's state for "settled, definitively, by the thing it was for ceasing to exist",
+and 0068 built it on this very table. Using it released the inbox hold with **no edit at all** —
+`crm.notification_prune_candidates.delivery_unsettled` is already an allow-list that omits
+`abandoned` — which is what a state earning its keep looks like.
+
+### In the live gate, after §14 has proved nothing is running
+
+The gate's new §15 is deliberately placed after "both processes are gone". The dispatcher calls
+this settle on every tick, so a seeded orphan left in front of a running scheduler would be
+settled by the binary somewhere between two assertions — the right behaviour and an unreadable
+test.
+
+```
+--- 15. a push nobody refused is abandoned, not dead ---
+ok: two pushes seeded whose endpoint has been deleted — one pending, one refused 410
+ok: crm.abandon_orphaned_deliveries settled exactly one of the two
+ok: the unsendable one is abandoned with its reason and is PRUNABLE; the refused one is untouched and still held
+ok: and its notification is no longer held back, where the refused one's still is
+ok: and it cannot be moved out of abandoned, in a refusal that quotes its own reason
+```
+
+**The second push is the control and it is the half that matters.** It is settled `dead` with
+`last_status = 410` and `last_error = '410 Gone'`, and its endpoint is deleted in the same
+transaction as the first one's — so the two rows differ only in whether anybody ever replied.
+Without it, every assertion above is satisfied by a function that abandons everything. The gate
+asserts both rows as one two-line comparison:
+
+```
+abandoned|orphaned-endpoint: the e|-|-|f      ← reason recorded, no destination claimed, prunable
+dead|-|410 Gone|410|t                          ← untouched, and still held back forever
+```
+
+**Two endpoints, seeded disabled.** They exist only to be deleted. An enabled one would have been
+a live destination for every signal this tenant raised while the gate was still running — a
+fan-out nobody asked for, to a url nothing is listening on.
+
+### The mistake that would have made §15 pass by reading nothing
+
+The first version of those assertions returned silence, and the reason is worth keeping because it
+looks redundant on the page: the gate's psql session is a **superuser**, which bypasses RLS on a
+table — but `crm.notification_delivery_prune_candidates` and `crm.notification_prune_candidates`
+are plain views owned by `crm_app`, so they are evaluated **as `crm_app`**, which is subject to
+`FORCE ROW LEVEL SECURITY` like anybody else. With no `app.current_tenant_id` the policy yields
+nothing and every comparison would have been against an empty result. One `SET` fixes it; the
+comment beside it records why a superuser needs a tenant context to read a view.
+
+That is the same class of error as 0066's vacuous `clean` and 0032's zero-row clamp, found for the
+third time in a different disguise.
+
+### Not a trigger, and the reason is a row worth keeping
+
+The instinct in this repository is to make a rule a property of the row: refuse `dead` when the
+delivery is an orphan. It would be wrong here. A row can become an orphan **after** a genuine
+refusal — claimed, answered 410, endpoint deleted by hand in the meantime — and the trigger would
+then refuse `markDead`, losing the destination's own answer and leaving the row to be abandoned on
+the next tick as though nobody had ever replied. The guard would protect a rule by destroying the
+evidence the rule exists for.
+
+So the invariant is carried by there being exactly **one statement** that settles an orphan, in
+the database, beside the two CHECKs that bind the state to its evidence — and by a contract test
+that seeds a real 410 and proves it is left alone.
+
+### Two things 0068 left, which only this increment could find
+
+**Its terminality trigger asserted a cause.** "was abandoned because the ERP deleted its tenant …
+there is no retry for a write to a schema that no longer exists" was true of every abandoned row
+in existence when it was written. It now quotes the row's own `abandoned_reason` instead — the
+column 0068 added for exactly this and made NOT NULL for an abandoned row — and the gate asserts
+the refusal still names `orphaned-endpoint`.
+
+**Two TypeScript unions still enumerated four states.** `OutboxState` and the delivery-history row
+type were written before the fifth existed, and were harmless while nothing could write it. The
+moment a code path could, they were types that lie. Both are widened; the relay's carries a note
+saying why its copy is unreachable and still has to be complete.
+
+### What is still not built
+
+- **An abandoned row is bounded by `retain_delivery_days`, which defaults to 730 days.** That is
+  the policy applying rather than a number anybody chose for this case. A tenant that wants its
+  orphans gone sooner has to shorten the horizon for every delivery record it holds.
+- **The backfill names a timestamp it cannot know.** Rows the old code already settled are
+  relabelled with `abandoned_at = now()` and a reason that says so, because nothing on the row
+  records when it was settled. Expected to be zero rows on any real database — the orphan path
+  needs a hand-written DELETE of a live parent to reach.
+- **Nothing reads `dead` deliveries over HTTP.** `idx_notification_delivery_dead` has been a
+  partial index since 0021 with no consumer; it is now exactly the right index for the listing
+  that still does not exist, because `dead` finally means one thing.
+- **The rest of its open row stands.** `crm.notification_endpoint` still has no horizon and no
+  cap, and the probe cascade still refunds an hourly budget if a DELETE route is ever added. What
+  changed is that 0048's argument against that route has partly expired: a delivery record now
+  survives its endpoint with the destination copied onto it, so the only thing a cascade still
+  destroys is the probe history — the one leg 0046 and 0048 have each already shown how to detach.

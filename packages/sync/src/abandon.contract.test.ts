@@ -294,6 +294,25 @@ describe("abandoning a stopped tenant's queued work (0068)", () => {
       ).toContain("abandoned-is-terminal");
     });
 
+    /**
+     * And the refusal QUOTES THE ROW rather than asserting a cause, which 0069 had to change:
+     * 0068 wrote "was abandoned because the ERP deleted its tenant", true of every abandoned
+     * row then in existence and no longer true of all of them — an orphaned push is abandoned
+     * too. The rule did not change; the sentence stopped guessing why.
+     */
+    it("names the row's own reason in the refusal", async () => {
+      await queueOutbox(STOPPED, "crm-sm-abandon-quotes");
+      await withTenantContext(client, STOPPED, (tx) => abandonStoppedTenantWork(tx, STOPPED));
+      const message = await refusalOf(() =>
+        withTenantContext(client, STOPPED, (tx) =>
+          tx.query("UPDATE crm.outbox SET state = 'pending' WHERE tenant_id = $1", [STOPPED]),
+        ),
+      );
+      expect(message).toContain("abandoned-is-terminal");
+      expect(message).toContain("tenant-deleted:");
+      expect(message).toContain(TOMB);
+    });
+
     it("pairs the state with its evidence in both directions, in two constraints", async () => {
       await queueOutbox(STOPPED, "crm-sm-abandon-pairing");
       const refuse = (sql: string): Promise<string> =>

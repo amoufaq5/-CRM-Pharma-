@@ -61,7 +61,7 @@ export interface ClaimedDelivery {
 }
 
 /**
- * Settles deliveries whose notification no longer exists.
+ * Settles deliveries that can never be sent: the ones whose notification or endpoint is gone.
  *
  * NEW WITH 0046, AND ONLY BECAUSE OF IT. While `crm.notification_delivery` cascaded from
  * `crm.notification` this state could not arise; with the reference dropped it can, and it
@@ -71,51 +71,41 @@ export interface ClaimedDelivery {
  * be consumed on every tick without ever being delivered, dead-lettered or counted. Silent
  * and unbounded.
  *
- * DEAD, not deleted and not left pending. The payload cannot be rebuilt from anything this
- * row carries (0046 deliberately copies no `subject`, `body` or `payload` — see its header),
- * so this is a permanent refusal and `dead` is the state for one. Deleting it would throw
- * away the record of a push that was enqueued, which is the opposite of what 0046 is for;
- * leaving it pending would leave it invisible.
+ * ABANDONED SINCE 0069, WHERE THIS WROTE `dead` FOR THREE MIGRATIONS. `dead` means A
+ * DESTINATION REFUSED US — it is the state `last_error` and `last_status` account for, and
+ * the state 0046 holds back from every horizon because it is the evidence of a disclosure
+ * that did not happen. Nothing refused these: the notification's payload cannot be rebuilt
+ * (0046 deliberately copies no `subject`, `body` or `payload`) or the endpoint's `secret_env`
+ * cannot be read (0048 deliberately does not copy it), so no byte was ever sent. Calling that
+ * `dead` put rows the system mints on its own schedule into the one state retention cannot
+ * reach, which is ADR-0001's open row; `abandoned` is 0068's state for "settled by the thing
+ * it was for ceasing to exist" and it prunes at `retain_delivery_days` like any other settled
+ * row. Deleting them instead would throw away the record of a push that was enqueued, which
+ * is the opposite of what 0046 is for; leaving them pending would leave them invisible.
  *
- * It takes a prune's hold with it: a `dead` delivery is never pruned at any horizon, so an
- * orphan settled this way is retained indefinitely. That is acceptable because the only way
- * to reach it is a hand-written DELETE of a parent with a live delivery — the prune itself
- * cannot, since an unsettled delivery holds its notification back (0024).
+ * THE STATEMENT ITSELF IS IN SQL (`crm.abandon_orphaned_deliveries`), because `abandoned` is
+ * three columns bound by two CHECKs and a length floor, and because the predicate that defines
+ * an orphan was already written in SQL twice — `claimDue`'s two EXISTS terms and the prune
+ * view's `orphaned`. A third copy here was the drift waiting to happen. 0068 moved
+ * `abandon_stopped_tenant_work` into the database for the same reason; this is the second
+ * instance of that shape, and it also makes the settle reachable from `psql` for a tenant
+ * whose dispatcher is not running.
  *
- * TWO PARENTS SINCE 0048, which dropped the endpoint's cascade for the same reasons. A
- * missing ENDPOINT is the same hazard and not quite the same story, so the two are reported
- * separately: the notification's payload cannot be rebuilt, where a deleted endpoint's
- * `secret_env` cannot be read — and `secret_env` is deliberately not copied, because it
- * names an environment variable and rotating which one an endpoint reads is a legitimate
- * change that must not be frozen per delivery. Either way the push cannot be made, and
- * either way the row keeps saying what it was for: 0048 copies the channel and the url, so
- * an orphan of this second kind still records where it was going.
+ * TWO PARENTS SINCE 0048, which dropped the endpoint's cascade for the same reasons, and the
+ * two are reported separately in the reason the function writes: the notification's payload
+ * cannot be rebuilt, where a deleted endpoint's secret cannot be read. Either way the push
+ * cannot be made, and either way the row keeps saying what it was for — 0048 copies the
+ * channel and the url, so an orphan of the second kind still records where it was going.
  */
 export async function settleOrphanedDeliveries(
   tx: PoolClient,
   tenantId: string,
 ): Promise<number> {
-  const { rowCount } = await tx.query(
-    `UPDATE crm.notification_delivery d
-        SET state = 'dead',
-            last_error = left(
-              CASE
-                WHEN NOT EXISTS (SELECT 1 FROM crm.notification n
-                                  WHERE n.tenant_id = d.tenant_id AND n.id = d.notification_id)
-                THEN 'the notification this push describes no longer exists, so its '
-                     || 'payload cannot be rebuilt — recorded as undeliverable'
-                ELSE 'the endpoint this push was addressed to no longer exists, so the '
-                     || 'secret it names cannot be read — recorded as undeliverable'
-              END, 2000)
-      WHERE d.tenant_id = $1
-        AND d.state IN ('pending', 'in_flight')
-        AND (NOT EXISTS (SELECT 1 FROM crm.notification n
-                          WHERE n.tenant_id = d.tenant_id AND n.id = d.notification_id)
-             OR NOT EXISTS (SELECT 1 FROM crm.notification_endpoint e
-                             WHERE e.tenant_id = d.tenant_id AND e.id = d.endpoint_id))`,
+  const { rows } = await tx.query<{ n: string }>(
+    `SELECT crm.abandon_orphaned_deliveries($1) AS n`,
     [tenantId],
   );
-  return rowCount ?? 0;
+  return Number(rows[0]!.n);
 }
 
 /**

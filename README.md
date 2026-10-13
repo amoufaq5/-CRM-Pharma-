@@ -417,7 +417,8 @@ notification about something **unfinished** is not old news, however old it is:
 - an ERP write still `dead`
 - material still in transit (a `transfer_out` with no acceptance against it)
 - a call plan still `submitted`, waiting on an approver
-- …or any notification whose webhook push is still pending, in flight or dead
+- …or any notification whose webhook push is still pending, in flight or dead — but **not**
+  one whose push was `abandoned`, because that one is settled and nobody can act on it (0069)
 
 `crm.notification_subject_open` is the one place that decides, with a branch per producing
 table. A table it has no branch for reads as **not** open and prunes normally — the
@@ -532,8 +533,19 @@ CONSTRAINT` as all three widenings did, and the scan names the rows.
 transaction, same ceiling, same floor, same break-glass override — but measured against its
 own table, because a share *of the inbox* says nothing about a delete from the delivery
 table. The two phases refuse independently, so one mistyped inbox horizon cannot suspend the
-other table's retention. Only a `delivered` push is prunable; a `dead` one is kept forever,
-because a webhook that permanently failed is the most valuable row in the table.
+other table's retention. A `delivered` push prunes at its horizon and a `dead` one is kept
+forever, because a webhook that permanently failed is the most valuable row in the table.
+
+**And an `abandoned` one prunes too, which is newer than it looks** (0069). A push whose
+notification or endpoint has been deleted can never be made — the payload cannot be rebuilt,
+or the secret it names cannot be read — and nothing refused it, so it is not `dead`: it is
+0068's `abandoned`, settled by the thing it was for ceasing to exist. It used to be written
+`dead`, which put the one rows the dispatcher mints on its own schedule into the one state no
+horizon could reach, and held their notifications back forever with them. The settle lives in
+`crm.abandon_orphaned_deliveries` rather than in TypeScript, because the state is three
+columns bound by two CHECKs — and deliberately **not** in a trigger refusing `dead` for an
+orphan: a row can become an orphan after a genuine refusal, and that guard would destroy the
+destination's own answer to protect the rule the answer is evidence for.
 
 The table also got `seq`, for the reason `crm.outbox.seq` exists: `created_at` *and*
 `next_attempt_at` are both the transaction clock, and `raiseNotification` fans one signal to

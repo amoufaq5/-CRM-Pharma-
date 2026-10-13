@@ -115,9 +115,12 @@ describe("delivery retention", () => {
       // `next_attempt_at` is supplied rather than defaulted: its default is `now()`, the
       // REAL clock, where every horizon here is measured against the fixed `NOW` below —
       // so a defaulted row is never due and `claimDue` would silently find nothing.
+      // `abandoned` carries its own two columns, bound to the state by two CHECKs (0068), so a
+      // fixture that set the state alone would be refused by name rather than build the row.
       `INSERT INTO crm.notification_delivery
-         (tenant_id, notification_id, endpoint_id, state, created_at, delivered_at, next_attempt_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$5) RETURNING id`,
+         (tenant_id, notification_id, endpoint_id, state, created_at, delivered_at, next_attempt_at,
+          abandoned_at, abandoned_reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$5,$7,$8) RETURNING id`,
       [
         tenant,
         notificationId,
@@ -125,6 +128,8 @@ describe("delivery retention", () => {
         opts.state ?? "delivered",
         daysAgo(opts.createdDaysAgo ?? 0),
         (opts.state ?? "delivered") === "delivered" ? daysAgo(opts.createdDaysAgo ?? 0) : null,
+        opts.state === "abandoned" ? daysAgo(opts.createdDaysAgo ?? 0) : null,
+        opts.state === "abandoned" ? "a fixture abandoned this row" : null,
       ],
     );
     return rows[0]!.id;
@@ -529,7 +534,14 @@ describe("delivery retention", () => {
       expect({ attempts, state }).toEqual({ attempts: 0, state: "pending" });
     });
 
-    it("is recorded as undeliverable, with a reason that names why", async () => {
+    /**
+     * ABANDONED, NOT DEAD, since 0069 — and the reason is the whole of ADR-0001's open row.
+     * `dead` means a destination refused us, which is what `last_error` and `last_status`
+     * account for and what 0046 holds back from every horizon. Nothing refused this: no byte
+     * was ever sent, because the payload cannot be rebuilt. Calling it `dead` put a row the
+     * dispatcher mints on its own schedule into the one state retention cannot reach.
+     */
+    it("is abandoned, with a reason that names why, and nothing is said about a destination", async () => {
       await inTenant(async (c) => {
         const ep = await endpoint(c, TENANT);
         const n = await notify(c, TENANT, REP);
@@ -538,14 +550,60 @@ describe("delivery retention", () => {
       });
       expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(1);
       const row = await inTenant(async (c) => {
-        const { rows } = await c.query<{ state: string; last_error: string }>(
-          "SELECT state, last_error FROM crm.notification_delivery WHERE tenant_id = $1",
+        const { rows } = await c.query<{
+          state: string;
+          last_error: string | null;
+          last_status: number | null;
+          abandoned_at: Date | null;
+          abandoned_reason: string | null;
+        }>(
+          `SELECT state, last_error, last_status, abandoned_at, abandoned_reason
+             FROM crm.notification_delivery WHERE tenant_id = $1`,
           [TENANT],
         );
         return rows[0]!;
       });
-      expect(row.state).toBe("dead");
-      expect(row.last_error).toContain("no longer exists");
+      expect(row.state).toBe("abandoned");
+      expect(row.abandoned_reason).toContain("orphaned-notification:");
+      expect(row.abandoned_reason).toContain("payload cannot be rebuilt");
+      expect(row.abandoned_at).toBeInstanceOf(Date);
+      // The two columns that mean "what the destination said" stay empty, because there was
+      // no destination in this story. A `dead` row with a null `last_error` is exactly the
+      // ambiguity this state removes.
+      expect(row.last_error).toBeNull();
+      expect(row.last_status).toBeNull();
+    });
+
+    /**
+     * The closing of the row's second clause. A dead delivery holds its notification back
+     * forever (0046), so an orphan settled `dead` pinned an inbox row nobody could ever read
+     * — and a notification already deleted by hand had its delivery hold a hold over nothing.
+     * `crm.notification_prune_candidates.delivery_unsettled` omits `abandoned` (0068 §5), so
+     * this needed no edit: it is what a state earning its keep looks like.
+     */
+    it("stops holding the inbox back, where a dead push would not", async () => {
+      const held = async (): Promise<boolean> =>
+        inTenant(async (c) => {
+          const { rows } = await c.query<{ delivery_unsettled: boolean }>(
+            `SELECT delivery_unsettled FROM crm.notification_prune_candidates
+              WHERE tenant_id = $1`,
+            [TENANT],
+          );
+          return rows[0]!.delivery_unsettled;
+        });
+
+      const nid = await inTenant(async (c) => {
+        const ep = await endpoint(c, TENANT);
+        const n = await notify(c, TENANT, REP);
+        await deliver(c, TENANT, n, ep, { state: "pending" });
+        // Delete the ENDPOINT, so the notification survives and can be asked about.
+        await c.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [ep]);
+        return n;
+      });
+      expect(nid).toBeDefined();
+      expect(await held()).toBe(true);
+      expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(1);
+      expect(await held()).toBe(false);
     });
 
     it("leaves a settled delivery alone", async () => {
@@ -555,6 +613,80 @@ describe("delivery retention", () => {
         await deliver(c, TENANT, n, ep, { state: "delivered" });
         await c.query("DELETE FROM crm.notification WHERE id = $1", [n]);
       });
+      expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(0);
+    });
+
+    /**
+     * THE ONE THING THIS MUST NEVER DO, and the reason the invariant is carried by there being
+     * exactly one statement that settles an orphan rather than by a trigger refusing `dead`.
+     * A row can become an orphan AFTER a genuine refusal — claimed, answered 4xx, endpoint
+     * deleted by hand afterwards — and relabelling that as "nobody refused this" would erase
+     * the destination's own answer, which is the most valuable thing in the table.
+     */
+    it("never relabels a push a destination really did refuse", async () => {
+      await inTenant(async (c) => {
+        const ep = await endpoint(c, TENANT);
+        const n = await notify(c, TENANT, REP);
+        const d = await deliver(c, TENANT, n, ep, { state: "dead" });
+        await c.query(
+          "UPDATE crm.notification_delivery SET last_error = $2, last_status = 410 WHERE id = $1",
+          [d, "410 Gone"],
+        );
+        await c.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [ep]);
+      });
+      expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(0);
+      const row = await inTenant(async (c) => {
+        const { rows } = await c.query<{ state: string; last_status: number; last_error: string }>(
+          "SELECT state, last_status, last_error FROM crm.notification_delivery WHERE tenant_id = $1",
+          [TENANT],
+        );
+        return rows[0]!;
+      });
+      expect(row).toEqual({ state: "dead", last_status: 410, last_error: "410 Gone" });
+    });
+
+    /**
+     * And the history says what happened, which the state alone does not.
+     *
+     * `abandoned` arrives with a null `last_error` and a null `last_status` — nothing spoke to
+     * a destination — and those two columns are the whole of what both history functions used
+     * to return about a push that did not arrive. A row that reads "abandoned" beside two
+     * blanks is the defect this increment is about, one table over.
+     */
+    it("reads back through the history with its reason, not as a blank", async () => {
+      const nid = await inTenant(async (c) => {
+        const ep = await endpoint(c, TENANT);
+        const n = await notify(c, TENANT, REP);
+        await deliver(c, TENANT, n, ep, { state: "pending" });
+        await c.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [ep]);
+        return n;
+      });
+      await inTenant((c) => settleOrphanedDeliveries(c, TENANT));
+      const [row] = await inTenant((c) => deliveryHistory(c, nid));
+      expect(row?.state).toBe("abandoned");
+      expect(row?.abandoned_reason).toContain("orphaned-endpoint:");
+      expect(row?.abandoned_at).toBeInstanceOf(Date);
+      expect(row?.last_error).toBeNull();
+      // And through the tenant-wide listing too, which is the other function 0069 had to
+      // re-create: a return type cannot be amended in place, so forgetting one is silent.
+      const [recent] = await inTenant((c) => recentDeliveries(c, { limit: 10 }));
+      expect(recent?.abandoned_reason).toContain("orphaned-endpoint:");
+    });
+
+    /**
+     * Idempotent, so the dispatcher can run it on every tick without coordinating with
+     * anything — and so the terminality trigger is never the thing that stops a second pass.
+     * A second call must be ZERO rather than a refusal: the statement touches only `pending`
+     * and `in_flight`, so there is nothing for it to do and nothing for it to overwrite.
+     */
+    it("settles once and then finds nothing, rather than refusing", async () => {
+      await inTenant(async (c) => {
+        const ep = await endpoint(c, TENANT);
+        const n = await notify(c, TENANT, REP);
+        await deliver(c, TENANT, n, ep, { state: "pending" });
+        await c.query("DELETE FROM crm.notification WHERE id = $1", [n]);
+      });
+      expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(1);
       expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(0);
     });
   });
@@ -605,22 +737,25 @@ describe("delivery retention", () => {
       expect({ attempts, state }).toEqual({ attempts: 0, state: "pending" });
     });
 
-    it("is recorded as undeliverable, naming the ENDPOINT and not the notification", async () => {
+    it("is abandoned naming the ENDPOINT and not the notification", async () => {
       await orphanByEndpoint();
       expect(await inTenant((c) => settleOrphanedDeliveries(c, TENANT))).toBe(1);
       const row = await inTenant(async (c) => {
-        const { rows } = await c.query<{ state: string; last_error: string }>(
-          "SELECT state, last_error FROM crm.notification_delivery WHERE tenant_id = $1",
+        const { rows } = await c.query<{ state: string; abandoned_reason: string }>(
+          "SELECT state, abandoned_reason FROM crm.notification_delivery WHERE tenant_id = $1",
           [TENANT],
         );
         return rows[0]!;
       });
-      expect(row.state).toBe("dead");
+      expect(row.state).toBe("abandoned");
       // The two orphan kinds are different stories and the reason has to say which: a
       // missing notification means the payload cannot be rebuilt, a missing endpoint means
-      // the secret it names cannot be read.
-      expect(row.last_error).toContain("endpoint this push was addressed to");
-      expect(row.last_error).not.toContain("payload cannot be rebuilt");
+      // the secret it names cannot be read. Both prefixes are greppable across tables, which
+      // is 0068's `tenant-deleted:` convention — one query answers "what did this deployment
+      // abandon, and why".
+      expect(row.abandoned_reason).toContain("orphaned-endpoint:");
+      expect(row.abandoned_reason).toContain("secret it names cannot be read");
+      expect(row.abandoned_reason).not.toContain("payload cannot be rebuilt");
     });
 
     it("refuses a delivery row naming an endpoint this tenant cannot see", async () => {
@@ -727,6 +862,50 @@ describe("delivery retention", () => {
       expect(r.delivery.deleted).toBe(0);
       expect(r.delivery.keptUnsettled).toBe(2);
       expect(await countDeliveries()).toBe(2);
+    });
+
+    /**
+     * AND IT DOES TAKE AN ABANDONED ONE, which is the row ADR-0001 left open: the prune's
+     * `unsettled` was `state <> 'delivered'`, so the one state the dispatcher mints by itself
+     * was the one state no horizon could reach. The dead row beside it is the control — the
+     * two differ only in state, so this cannot pass by the horizon being wrong.
+     */
+    it("takes an abandoned push at its horizon, and still never the dead one", async () => {
+      await inTenant(async (c) => {
+        const ep1 = await endpoint(c, TENANT);
+        const ep2 = await endpoint(c, TENANT);
+        const n = await notify(c, TENANT, REP, { createdDaysAgo: 2000, read: true });
+        await deliver(c, TENANT, n, ep1, { state: "abandoned", createdDaysAgo: 2000 });
+        await deliver(c, TENANT, n, ep2, { state: "dead", createdDaysAgo: 2000 });
+      });
+      const r = await prune();
+      expect(r.delivery.deleted).toBe(1);
+      expect(r.delivery.keptUnsettled).toBe(1);
+      const left = await inTenant(async (c) => {
+        const { rows } = await c.query<{ state: string }>(
+          "SELECT state FROM crm.notification_delivery WHERE tenant_id = $1",
+          [TENANT],
+        );
+        return rows.map((x) => x.state);
+      });
+      expect(left).toEqual(["dead"]);
+    });
+
+    /**
+     * And it is the HORIZON that takes it, not the state. An abandoned row inside its horizon
+     * is retained like any other settled row — otherwise "abandoned prunes" would be
+     * "abandoned is deleted", which is a different and much worse promise: a tenant would
+     * lose the record of a push within days of the parent going away.
+     */
+    it("keeps an abandoned push that is inside its horizon", async () => {
+      await inTenant(async (c) => {
+        const ep = await endpoint(c, TENANT);
+        const n = await notify(c, TENANT, REP, { createdDaysAgo: 400, read: true });
+        await deliver(c, TENANT, n, ep, { state: "abandoned", createdDaysAgo: 400 });
+      });
+      const r = await prune();
+      expect(r.delivery.deleted).toBe(0);
+      expect(await countDeliveries()).toBe(1);
     });
 
     /**
