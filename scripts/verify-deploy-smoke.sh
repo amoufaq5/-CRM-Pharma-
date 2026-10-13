@@ -304,8 +304,24 @@ else
   done
   # Through the edge, over TLS, with Caddy's internal CA — so this checks the proxy and
   # the certificate path, not just that the container is up.
-  dc exec -T caddy sh -c 'wget -q -O - --no-check-certificate https://localhost/healthz' > "$WORK/edge.log" 2>&1 \
-    || { dc logs caddy | tail -10 >&2; fail "the edge did not serve /healthz over TLS"; }
+  #
+  # RETRIED, AND THAT IS A CORRECTION. This was one attempt, fired the instant the container
+  # reported Running — and "running" is not "listening on TLS": Caddy's internal CA has to be
+  # created or loaded and a certificate issued for localhost before the first handshake can
+  # succeed. On a cold runner that takes longer than the gap between those two lines, which is
+  # how this job went red on a commit that touched a browser driver and three documents, with
+  # "the edge did not serve /healthz over TLS" and a Caddy log that showed it coming up fine.
+  # Twenty seconds of patience, and the failure path still dumps the log.
+  edge_ok=""
+  for _ in $(seq 1 20); do
+    if dc exec -T caddy sh -c 'wget -q -O - --no-check-certificate https://localhost/healthz' \
+         > "$WORK/edge.log" 2>&1; then
+      edge_ok="yes"
+      break
+    fi
+    sleep 1
+  done
+  [ -n "$edge_ok" ] || { dc logs caddy | tail -20 >&2; fail "the edge did not serve /healthz over TLS, after 20 attempts"; }
   grep -q '"status":"ok"' "$WORK/edge.log" || fail "the edge answered, but not with the api's health"
   ok "caddy serves the api over TLS"
 
