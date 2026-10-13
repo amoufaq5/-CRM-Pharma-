@@ -34,7 +34,7 @@ cannot do (20 recorded risks; §13 is the important part).
 | `packages/client/` | The field client's pure layer: the wire schemas, the outbox state machine, the backoff, device-minted ids, and the classifier that decides what a refusal MEANS for a queue. No DOM, no `fetch`, no clock. |
 | `apps/field/` | The app a rep uses. A framework-free PWA: IndexedDB outbox, PKCE sign-in, a canvas signature pad, a service worker for the offline shell. Visits and sample disbursements, offline, with the signature the ledger commits to. |
 | `deploy/` | Dockerfile, Compose stack, Caddy. One image, three entrypoints, plus a `web` target that serves the app from the same origin — which is why nothing here has CORS. See [`deploy/README.md`](deploy/README.md). |
-| `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres), `verify-client-live.sh` (the app, in a real Chromium, taken offline). |
+| `scripts/` | `erp-fixture.sh` (ERP stand-in), `setup-test-db.sh` (contract-test database), `verify-migration-runner.sh` (the runner, against a real Postgres), `verify-client-live.sh` (the app, in a real Chromium, taken offline), `verify-tenant-registry.sh` (every tenant with data has a registry row — needs the admin credential, because enumeration across tenants is a privileged act). |
 
 ## Running it
 

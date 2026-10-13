@@ -3524,3 +3524,88 @@ Two things make the next failure legible rather than a guess:
 
 This is the same lesson as the `field-client` job's missing annotations, one layer down: a red
 square that cannot say why costs more than the bug.
+
+## A tenant is what the data says
+
+*2026-10-13, `./scripts/verify-live-erp.sh` (209 ok lines), `pnpm client:verify` (329 checks) and
+`npx vitest run` (105 files / 2,689 tests). The migration runner is green on a fresh database with
+73 migrations.*
+
+Migration 0073 and `scripts/verify-tenant-registry.sh`. Nothing in `crm.*` references `crm.tenant`,
+so a tenant can have rows everywhere and no registry row — and every per-tenant job walks the
+registry, so that tenant is served by the API (deliberately: the join is fail-open, and a test pins
+it) while being watched by **nothing**. No relay, no expiry sweep, no deletion watch.
+
+ADR-0001 carried this with a measurement rather than a fix, because the obvious detection is a
+privileged act: the tables are owned by `crm_app` with RLS **forced**, so the owner is confined
+too, and `SELECT count(DISTINCT tenant_id) FROM crm.rep_profile` with no tenant context answers 0
+where an admin answers 2.
+
+### The migration's contribution is a refusal
+
+```
+ERROR:  tenant-enumeration-confined: crm_app is subject to row-level security, so this question
+        can only be answered as zero tenants — which is not an answer. Run it as the migration
+        admin (a role with BYPASSRLS or SUPERUSER); scripts/verify-tenant-registry.sh is the
+        supported caller.
+```
+
+That is 0066's `unverifiable` and 0067's `self_test_failed` in a third place. A reconciliation that
+answered **zero** under the application role would print a clean verdict on every deployment
+forever, about a database with thousands of rows.
+
+### On the deployment this gate builds
+
+```
+ok: every tenant with data in crm_live1 is registered, and the check proved it can say otherwise
+ok: and the application role is refused by name, not answered with zero
+```
+
+The second clause of the first line is the one that matters. The script **plants** a tenant with
+data and no registry row, inside a transaction it rolls back, and confirms the check sees it — so
+"every tenant is registered" cannot be a derivation that quietly stopped working. The gate asserts
+both halves of the script's output, not just its exit code, for the same reason.
+
+Nothing in CI gates on it: a test database legitimately holds 31 unregistered tenants, because
+every suite invents a tenant id and writes rows under it without provisioning anything. That is
+also the measurement that makes the open half of this row concrete.
+
+### It reports and does not fix
+
+Provisioning a tenant means deciding a `display_name` and a status, and 0050 makes `erp_deleted`
+terminal — so a reconciliation that inserted a registry row would be inventing the one fact the
+row exists to carry. The script prints the tenants, says what each one is missing out on (no relay,
+no expiry sweep, no deletion watch), and exits 1.
+
+### Two corrections, both found by a test rather than by reading
+
+**The register contains the registry.** `crm.tenant` is in `crm.data_disposition` like any other
+tenant-scoped table, so the first version counted a registry row as data — which makes the whole
+check **circular**: every registered tenant then has data by virtue of being registered, and
+`registered_tenants_without_data()` could never return a row on any database. It failed the first
+time its test ran, as `Cannot read properties of undefined (reading 'status')`. The one table the
+derivation excludes is now the list being checked against, and a test asserts both halves: a
+tenant whose only row is its registry row has no data, *and* `crm.tenant` really is in the register,
+so the exclusion is a deliberate subtraction rather than a table the register happens not to list.
+
+**A `${var:?word}` message cannot contain an apostrophe.** The word is expanded, so the quote in
+"one deployment's database" opened a quoted string and bash failed to parse the entire script:
+
+```
+scripts/verify-tenant-registry.sh: line 84: unexpected EOF while looking for matching `''
+```
+
+Line 84 was the last line of the file, which is what that class of error always points at.
+
+### What is still not built
+
+- **Detection, not prevention.** A foreign key from every tenant-scoped table to `crm.tenant` is
+  what would make an unregistered tenant impossible. It is a change to forty-odd tables plus every
+  fixture in the suite — each of which invents a tenant id and writes under it without provisioning
+  anything, which is exactly why the test database reports 31. It is the right end state and it is
+  not a line in a migration about detection.
+- **Nothing runs the script on a schedule.** It is a deploy-time or on-call tool; a cron would need
+  the admin credential in a process that currently never holds one, which is a property of the
+  deployment rather than an oversight.
+- **The count is "tables with rows", not rows.** Enough to tell one stray write from a populated
+  tenant; not enough to decide what to do about either.

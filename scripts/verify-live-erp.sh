@@ -1288,6 +1288,38 @@ case "$CAP_RAISED" in
   *) fail "raising the cap did not admit the endpoint: $CAP_RAISED" ;;
 esac
 
+# 0073. IS EVERY TENANT WITH DATA ACTUALLY REGISTERED, asked of the deployment this run built.
+# Nothing in `crm.*` references `crm.tenant`, so a tenant can have rows everywhere and no registry
+# row — and every per-tenant job walks the registry, so that tenant is served by the API and
+# watched by nothing. This gate's database has exactly one tenant and it was provisioned with a
+# registry row in §4, so the expected answer is clean; the script's own control (it plants an
+# unregistered tenant in a transaction it rolls back) is what stops that clean verdict from being
+# a query that found nothing.
+#
+# RUN AS THE ADMIN, which is this gate's own connection: enumeration across tenants is a
+# privileged act, `crm.tenants_with_data()` REFUSES a role row-level security confines rather than
+# answering zero, and that refusal is asserted separately below.
+REGISTRY_OUT="$(PGDATABASE="$CRM_DB" "$ROOT/scripts/verify-tenant-registry.sh" 2>&1)" || {
+  printf '%s\n' "$REGISTRY_OUT" >&2
+  fail "the tenant registry does not account for every tenant with data in $CRM_DB"
+}
+case "$REGISTRY_OUT" in
+  *"detects a planted unregistered tenant"*"is registered"*)
+    ok "every tenant with data in $CRM_DB is registered, and the check proved it can say otherwise" ;;
+  *) printf '%s\n' "$REGISTRY_OUT" >&2
+     fail "the registry check passed without its control, which makes the verdict meaningless" ;;
+esac
+
+# AND THE REFUSAL, on the identity the product actually runs as. A reconciliation that answered
+# zero under `crm_app` would report every deployment clean forever.
+CONFINED="$(PGPASSWORD="${CRM_PGPASSWORD:-crm_app}" psql -h "$PGHOST" -U "${CRM_PGUSER:-crm_app}" \
+  -d "$CRM_DB" -At -c "SELECT count(*) FROM crm.tenants_with_data()" 2>&1 || true)"
+case "$CONFINED" in
+  *tenant-enumeration-confined*BYPASSRLS*)
+    ok "and the application role is refused by name, not answered with zero" ;;
+  *) fail "crm_app was not refused the tenant enumeration: $CONFINED" ;;
+esac
+
 # ---------------------------------------------------------------------------
 echo
 echo "--- 16. the retention vocabulary still matches the ERP's own source ---"
