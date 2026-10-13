@@ -3656,6 +3656,34 @@ that script has dozens of those lines. Two changes make the next one legible:
   without saying anything. The first version of that step had the grep alone — and its annotations
   were the five "command not found" lines above and no cause at all.
 
+### Every job, not just the one that failed
+
+The same treatment went onto `migration-runner`, `deploy-stack` and `build-and-test`, and the
+deploy gate is the one that makes the point. ADR-0001 carries a row about it going red once at the
+scheduler's key check, on a commit whose whole diff was a comment and three documents; the gate's
+failure path was then rebuilt to print the expected kid, every credential line, the generator's
+published line and the last twenty log lines, and the row's deadline column reads "recurrence will
+now carry its evidence". That promise was **false in CI**, where all of that evidence went to a job
+log served from a host the API cannot reach. A recurrence would still have been a red square.
+
+Both halves of each step were checked against a deliberately failing script before being committed,
+because a snippet that annotates nothing is exactly as useful as no snippet:
+
+```
+# a script that fails loudly
+::error::FAIL: the thing failed
+::error::--- the last 20 lines before it stopped ---
+::error::step one ok
+::error::FAIL: the thing failed
+
+# a script that just exits 9
+::error::--- the last 20 lines before it stopped ---
+::error::step one ok
+::error::step two ok
+```
+
+The second case is the one the grep alone cannot serve, and it is the case that actually happened.
+
 ### What this does not explain
 
 **I still do not know why those two runs failed.** Both greens since (CI on the following commits)

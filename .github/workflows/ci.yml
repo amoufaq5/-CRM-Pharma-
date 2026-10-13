@@ -169,8 +169,28 @@ jobs:
       # Asserts: every crm table owned by crm_app, the schema invariants hold on a
       # runner-built database, a second run is a no-op, and an edited
       # already-applied migration is refused.
+      # ANNOTATED ON FAILURE, like every other gate in this workflow since the field-client job
+      # went red twice with nothing recoverable but a red square. A job's log is served from a
+      # blob host the API cannot reach; annotations have their own endpoint.
       - name: Verify the migration runner
-        run: ./scripts/verify-migration-runner.sh
+        shell: bash
+        run: |
+          set +e
+          ./scripts/verify-migration-runner.sh > "$RUNNER_TEMP/migrate.log" 2>&1
+          code=$?
+          set -e
+          tail -60 "$RUNNER_TEMP/migrate.log"
+          if [ "$code" -ne 0 ]; then
+            # Both the matching lines and the tail: a migration that fails says so loudly, and a script that dies unchecked says nothing at all.
+            sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/migrate.log" \
+              | grep -E "^(FAIL|fail:)|AssertionError|ERROR|error:|Timeout|refused|exited [0-9]+" \
+              | head -30 > "$RUNNER_TEMP/migrate-failures.txt" || true
+            while IFS= read -r line; do printf '::error::%s\n' "$line"; done < "$RUNNER_TEMP/migrate-failures.txt"
+            printf '::error::--- the last 20 lines before it stopped ---\n'
+            sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/migrate.log" | tail -20 \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+          fi
+          exit "$code"
 
   # The field client, driven in a real browser against the real API binary.
   #
@@ -300,5 +320,28 @@ jobs:
       # No CRM_SMOKE_CA_FILE and no CRM_SMOKE_PIN_BASE here: a runner has no TLS
       # interception and no anonymous-pull limit to dodge, so this builds deploy/Dockerfile
       # byte for byte.
+      # ANNOTATED ON FAILURE, and this job is the reason ADR-0001 carries a row saying a
+      # recurrence "will now carry its evidence": the smoke gate went red once at the
+      # scheduler's key check, on a commit whose whole diff was a comment and three documents,
+      # and the gate printed its verdict and no evidence. Its failure path prints plenty now —
+      # which was worth nothing in CI, where the log is served from a host the API cannot reach.
+      # This is the other half of that promise.
       - name: Build and run the stack
-        run: ./scripts/verify-deploy-smoke.sh
+        shell: bash
+        run: |
+          set +e
+          ./scripts/verify-deploy-smoke.sh > "$RUNNER_TEMP/smoke.log" 2>&1
+          code=$?
+          set -e
+          tail -60 "$RUNNER_TEMP/smoke.log"
+          if [ "$code" -ne 0 ]; then
+            # The kid, the credential lines and the container logs the gate prints on failure are in the tail; the grep catches the verdict line itself.
+            sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/smoke.log" \
+              | grep -E "^(FAIL|fail:)|AssertionError|ERROR|error:|Timeout|refused|exited [0-9]+" \
+              | head -30 > "$RUNNER_TEMP/smoke-failures.txt" || true
+            while IFS= read -r line; do printf '::error::%s\n' "$line"; done < "$RUNNER_TEMP/smoke-failures.txt"
+            printf '::error::--- the last 20 lines before it stopped ---\n'
+            sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/smoke.log" | tail -20 \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+          fi
+          exit "$code"
