@@ -1472,7 +1472,7 @@ inherited the host's own `dist/` because there was no `.dockerignore`.
 
 What runs now, on every push (`pnpm deploy:smoke`, and `deploy-stack` in CI): the image
 builds from a clean context; `migrate` refuses a database with no ERP in it, naming the
-cause; all 54 migrations apply and a second run is a no-op; the api comes up healthy as
+cause; every migration applies and a second run is a no-op; the api comes up healthy as
 `crm_app`; `/healthz`, the JWKS fail-closed rule and the 401 problem documents answer
 correctly; and the scheduler refuses to start without an ERP credential, starts with one,
 and signs with exactly the key the api publishes out of the database. `pnpm deploy:image`
