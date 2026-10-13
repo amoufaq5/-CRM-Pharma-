@@ -46,6 +46,12 @@
     },
     {
       "path": "../storage"
+    },
+    {
+      "path": "../sync"
+    },
+    {
+      "path": "../erasure"
     }
   ]
 }

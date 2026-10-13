@@ -2738,6 +2738,31 @@ halving this process's connection peak per tenant tick. And the helper captures 
 `tick_error` as well as `job_ok`, and asserts one line per tick with the array in the message —
 so the next recurrence names itself instead of reporting an assertion's type confusion.
 
+### And then it went red again, for a reason only a clean checkout can see
+
+`Cannot find module '@crm/erasure' or its corresponding type declarations.` — all four CI jobs,
+on code that typechecked clean locally three times over. Nothing was wrong with the code. Two
+lists had drifted:
+
+- `pnpm -r build` and `npx tsc -p packages/api` build in the order the **PNPM** graph gives, so a
+  dependency's `dist/` is already there by the time anything needs it. That is why this is
+  invisible locally.
+- `pnpm typecheck` is `tsc --build --force`, which orders by **`references`** in `tsconfig.json`
+  and knows nothing about `package.json`. An unreferenced dependency has no `dist/`, and a package
+  whose `types` points into `dist/` then resolves to nothing.
+
+Three tsconfigs were missing a reference. But the instance is the smaller half: this is the
+**third** pair of lists in this repository that has to agree — `JOB_NAMES`/`crm.scheduled_jobs()`
+and `NOTIFICATION_KINDS`/`crm.notification_kinds()` are the others — and both of those have a test
+that fails the day they part. This one had nothing. It does now
+(`project-references.contract.test.ts`), derived from the files rather than restating either side,
+and it found a real undeclared exclusion the moment it was written: `apps/field` depends on
+`@crm/client` with no reference and is in no root build, because `composite: false` means it
+*cannot be* a project reference and `moduleResolution: Bundler` means it does not need one. That
+was true and nowhere written down, so it is now a `NOT_IN_THE_BUILD` entry with its reason — and
+the exclusion list itself is checked for naming something real, which is the rule
+`crm.data_disposition`'s trigger applies to its own register.
+
 ### What is still not built
 
 - **No platform notification channel at all.** A `tampered` finding reaches a log line, a row and
