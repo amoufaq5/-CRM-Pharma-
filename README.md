@@ -537,6 +537,24 @@ migration says so where someone will read it: replacing the function does not re
 constraints that call it, so removing a kind goes through `DROP CONSTRAINT` + `ADD
 CONSTRAINT` as all three widenings did, and the scan names the rows.
 
+**And the database normalises the list too, since 0072** — it checked only containment, so
+`ARRAY['x','x']` was legal from SQL and two spellings of one allow-list stored as two different
+arrays. That was recorded and deferred because nothing compared endpoints; 0071's cap then told an
+administrator to re-enable a disabled endpoint that already points where they want, which is an
+instruction to compare. `crm.normalise_notification_kinds` sorts and de-duplicates (preserving
+NULL, which means *every* kind, and leaving an empty array empty so the not-empty CHECK still
+answers), a trigger applies it on insert and update, and a validated CHECK behind it means a
+denormal row cannot exist. **The amendment log normalises too**, which is the part worth knowing:
+the endpoint row is a projection of that log, so without it, re-submitting the same kinds in a
+different order would have passed the "changes nothing" comparison and written a log row claiming
+an amendment that never happened.
+
+The same migration dropped `crm.notification`'s `UNIQUE (tenant_id, id)`: nothing had referenced
+it since 0046 detached the delivery table, and it cost an index on every inbox write. The
+direction of travel settled it — 0046, 0048 and 0070 each detached a child so its record could
+outlive its parent, so a new composite reference *into* the inbox would be against the grain of
+three migrations.
+
 `notify_prune` gained a second **phase** rather than a second job: same pass, same
 transaction, same ceiling, same floor, same break-glass override — but measured against its
 own table, because a share *of the inbox* says nothing about a delete from the delivery

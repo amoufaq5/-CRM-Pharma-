@@ -1424,12 +1424,20 @@ describe("no reference in crm escapes its tenant", () => {
     // name columns covered by a unique index. These are redundant as uniqueness claims —
     // `id` is already a primary key — and exist solely to be referenced.
     //
-    // `crm.notification` is named separately because nothing references it any more: 0046
-    // dropped the one reference there was, deliberately, and the key is KEPT rather than
-    // dropped with it. It is one index on a growing table and it is what any future
-    // composite reference into the inbox would need — dropping and re-adding it would be a
-    // second migration over a large table to get back where this one already is.
-    const UNREFERENCED_TARGETS = ["notification"];
+    // THE LIST IS NOW EMPTY, AND IT USED TO NAME `crm.notification`. This test argued that
+    // its key should be KEPT although 0046 had dropped the only reference to it: "one index
+    // on a growing table, and what any future composite reference into the inbox would need
+    // — dropping and re-adding it would be a second migration over a large table". 0072
+    // dropped it, and the argument that settled it is the DIRECTION OF TRAVEL: 0046, 0048 and
+    // 0070 each detached a child from its parent so the child's record could outlive it, so a
+    // NEW composite reference into the inbox would be against the grain of three migrations.
+    // Weighed against that, a second index maintained on every inbox write — and an expiry
+    // sweep writes thousands in one transaction — is a real cost paid for a hypothetical.
+    //
+    // The list stays as a list rather than being deleted, so the next unreferenced target is
+    // a declared exception with a reason attached instead of a silent one. Empty is the
+    // stronger assertion: every `(tenant_id, id)` unique constraint in `crm` is referenced.
+    const UNREFERENCED_TARGETS: readonly string[] = [];
     const parents = [
       ...new Set([...Object.values(HARDENED).map((h) => h.parent), ...UNREFERENCED_TARGETS]),
     ].sort();

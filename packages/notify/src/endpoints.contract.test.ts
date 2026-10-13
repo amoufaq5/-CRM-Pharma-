@@ -236,6 +236,90 @@ describe("notification endpoints", () => {
     });
   });
 
+  /**
+   * AND THE DATABASE DOES IT TOO SINCE 0072, which is the half ADR-0001 recorded and deferred:
+   * `normaliseKinds` sorted and de-duplicated in TypeScript while
+   * `notification_endpoint_kinds_known` only checked containment, so `ARRAY['x','x']` was legal
+   * from SQL and two spellings of one allow-list stored as two different arrays. The premise
+   * that deferred it — "which matters only for comparing endpoints, which nothing does yet" —
+   * expired with 0071, whose cap tells an administrator to re-enable a disabled endpoint that
+   * already points where they want. That is an instruction to compare.
+   *
+   * Written through raw SQL on purpose: the store's normaliser is not what is under test.
+   */
+  it("normalises an allow-list written straight to SQL, and refuses one that is not normal", async () => {
+    const id = await inTenant(async (tx) => {
+      const { rows } = await tx.query<{ id: string; kinds: string[] }>(
+        `INSERT INTO crm.notification_endpoint
+           (tenant_id, channel, url, secret_env, kinds, created_by, created_reason)
+         VALUES ($1,'webhook','https://hooks.example.test/raw','CRM_TEST_WEBHOOK_SECRET',
+                 ARRAY['erp_write_failed','call_plan_approved','erp_write_failed'], $2,
+                 'a row written without the store, which used to keep whatever it was given')
+         RETURNING id, kinds`,
+        [TENANT, AUTHOR],
+      );
+      expect(rows[0]!.kinds).toEqual(["call_plan_approved", "erp_write_failed"]);
+      return rows[0]!.id;
+    });
+
+    // AND AN EMPTY ALLOW-LIST IS STILL EMPTY, which is the mistake the first version of the
+    // normaliser made: `array_agg` over an empty set returns NULL, so `ARRAY[]::text[]` came
+    // back as NULL — promoting "receives nothing", the thing `kinds_not_empty` exists to
+    // refuse, into EVERY KIND. 0049's own suite caught it; this asserts it from the other side.
+    await inTenant(async (tx) => {
+      const { rows } = await tx.query<{ empty: string | null }>(
+        `SELECT crm.normalise_notification_kinds(ARRAY[]::text[])::text AS empty`,
+      );
+      expect(rows[0]!.empty).toBe("{}");
+    });
+
+    // And the CHECK behind the trigger, which is the guard on the guard.
+    //
+    // EVERY USER TRIGGER COMES OFF, not just the normaliser, which is the shape
+    // `composite-fk.contract.test.ts` uses and for its reason: 0060 refuses a direct UPDATE of
+    // this table in a trigger of its own, so with only the normaliser disabled the refusal
+    // would be that one and this test would pass while asserting nothing about the CHECK.
+    // Inside a transaction that always rolls back, so the schema is unchanged afterwards.
+    await inTenant(async (tx) => {
+      await tx.query("SAVEPOINT raw");
+      await tx.query("ALTER TABLE crm.notification_endpoint DISABLE TRIGGER USER");
+      const err = await tx
+        .query(
+          "UPDATE crm.notification_endpoint SET kinds = ARRAY['erp_write_failed','call_plan_approved'] WHERE id = $1",
+          [id],
+        )
+        .then(() => null, (e: unknown) => e as { constraint?: string; message?: string });
+      await tx.query("ROLLBACK TO SAVEPOINT raw");
+      await tx.query("ALTER TABLE crm.notification_endpoint ENABLE TRIGGER USER");
+      expect(err?.constraint).toBe("notification_endpoint_kinds_normal");
+    });
+  });
+
+  /**
+   * THE AMENDMENT LOG HAD TO NORMALISE TOO, and this is the row that explains why. The endpoint
+   * is a projection of the log (0060): the apply trigger reads the live row into `kinds_from`,
+   * compares, refuses an amendment that changes nothing, and then applies it. With the endpoint
+   * normalised and the log not, re-submitting the same three kinds in a different order would
+   * have passed that comparison, written a log row claiming a change, and then normalised to
+   * exactly what was already there — a history asserting an amendment that never happened.
+   */
+  it("refuses a reordering of the same allow-list as the no-op it is", async () => {
+    await inTenant(async (tx) => {
+      const ep = await create(tx, { kinds: ["call_plan_approved", "erp_write_failed"] });
+      const err = await refuses(tx, () =>
+        amend(tx, ep.id, { kinds: ["erp_write_failed", "call_plan_approved"] }),
+      );
+      expect(err.message).toContain("changes nothing");
+      // And the log holds one row — the creation left none, so an amendment that was refused
+      // must have left none either.
+      const { rows } = await tx.query<{ n: string }>(
+        "SELECT count(*) AS n FROM crm.notification_endpoint_change WHERE endpoint_id = $1",
+        [ep.id],
+      );
+      expect(rows[0]!.n).toBe("0");
+    });
+  });
+
   describe("updating", () => {
     it("changes the thresholds and leaves the rest alone", async () => {
       await inTenant(async (tx) => {

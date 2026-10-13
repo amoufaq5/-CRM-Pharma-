@@ -3380,3 +3380,97 @@ asserts that adding is still refused — the cap governs the act, not the state.
 - **A `psql` prompt can still raise the cap to 500** without the configuration log, like every
   other number in this schema — which is what `crm.config_change` exists to make visible rather
   than impossible.
+
+## The database says it too
+
+*2026-10-13, `npx vitest run` (105 files / 2,683 tests), the migration runner on a fresh database
+with 72 migrations, **the upgrade path run by hand**, `./scripts/verify-live-erp.sh` (207 ok lines)
+and `pnpm client:verify` (329 checks).*
+
+Migration 0072 — two things 0049 left in TypeScript and one index nothing referenced. The row that
+recorded them deferred both, on the grounds that the allow-list spelling "matters only for
+comparing endpoints, which nothing does yet". That premise expired one migration ago: 0071's cap
+tells an administrator who hits it to re-enable a disabled endpoint that already points where they
+want, which is an instruction to compare.
+
+No live-gate section was added, and that is a judgement rather than an omission: the rule is a
+trigger and a validated CHECK, and the contract suite exercises both against a real Postgres,
+which is what the gate would do. What the gate *cannot* reach is the path that mattered here.
+
+### The verification that found both defects was the upgrade path
+
+A fresh database runs this migration's backfill against **no rows**. So the two things wrong with
+it were invisible to every green suite, and both turned up in ten minutes of doing what a deploy
+does: build a database at 0071, put one denormal endpoint in it, hand it the file.
+
+**1. The normaliser promoted an empty allow-list to "every kind".**
+
+```
+SELECT crm.normalise_notification_kinds(ARRAY[]::text[])   →   NULL
+```
+
+`array_agg` over an empty set returns NULL. `kinds IS NULL` means **every** kind; an empty array
+means none, and `notification_endpoint_kinds_not_empty` exists to refuse it so that "receives
+nothing" cannot be written by accident. So the function inverted the meaning of the one value the
+schema is careful about — and the migration's own header claimed, two paragraphs above the bug,
+that this must not happen in either direction. 0049's suite caught it, in the test named "leaves
+emptiness to the constraint that was already asking", which is exactly what that test is for.
+
+**2. The backfill could not run on a database that had endpoints.**
+
+```
+ERROR:  crm.notification_endpoint's severity, kinds, enabled and description are derived from
+        crm.notification_endpoint_change and cannot be updated directly. Insert a change row
+        with an author and a reason.
+CONTEXT:  PL/pgSQL function crm.notification_endpoint_guard() line 14 at RAISE
+```
+
+0060's guard, doing its job. The migration now stands it down **by name**, for one statement, and
+puts it back — with the reason written where it happens: normalising storage is not an amendment,
+nothing about any endpoint's meaning changes, so there is no author to name and no reason to give,
+and writing a change row would be precisely the false history the rest of this migration exists to
+prevent.
+
+With both fixed, the upgrade path reads as it should:
+
+```
+before:  {erp_write_failed,call_plan_approved,erp_write_failed}
+after:   {call_plan_approved,erp_write_failed}
+validated=true
+unique keys on crm.notification: 1        ← the dedup key; the orphaned (tenant_id,id) is gone
+guard enabled=O                           ← 0060's guard is live again
+```
+
+### The log had to normalise, not just the row
+
+`crm.notification_endpoint` is a projection of its amendment log. The apply trigger reads the live
+row into the `_from` columns, compares, refuses an amendment that changes nothing, then applies it.
+With the endpoint normalised and the log not, re-submitting the same three kinds in a different
+order would have passed that comparison, written a log row claiming a change, and then normalised
+to exactly what was already there — a history asserting an amendment that never happened. A test
+submits a reordering and takes the "changes nothing" refusal, then checks the log is still empty.
+
+### An index dropped on the strength of a direction of travel
+
+Exactly one of the fourteen `(tenant_id, id)` unique constraints in `crm` had no foreign key
+pointing at it — read out of `pg_constraint`, not out of the migrations.
+`composite-fk.contract.test.ts` carried it as a declared exception with an argument for keeping it:
+"what any future composite reference into the inbox would need", and re-adding it later would be a
+second migration over a large table.
+
+What settled it was that 0046, 0048 and 0070 each detached a child from its parent so the child's
+record could outlive it. A **new** composite reference into the inbox would be against the grain of
+three migrations — so the index was a cost paid on every inbox write, with an expiry sweep writing
+thousands in one transaction, for a hypothetical pointing the other way. The exception list stays,
+now empty, which is the stronger assertion: every `(tenant_id, id)` unique constraint in `crm` is
+referenced.
+
+### What is still not built
+
+- **`normaliseKinds` stays in TypeScript and now duplicates the database.** Kept for the two things
+  the SQL cannot do: name every unknown kind at once, where the CHECK can only say the array
+  failed, and refuse an empty list before a round trip. The duplication is the price of a readable
+  422.
+- **Nothing compares endpoints yet, still.** The cap's refusal sends an administrator looking for a
+  reusable destination by hand; a route answering "which disabled endpoints point where I want" is
+  what normalisation makes possible, and nobody has asked for it.
