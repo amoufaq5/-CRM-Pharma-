@@ -27,6 +27,17 @@ import {
  * them as a superuser, which bypasses row-level security even under `FORCE` — so a
  * missing tenant predicate would be invisible to this whole suite. One was.
  * See the comment on `appPool` in `@crm/db/testing`.
+ *
+ * EVERY `next_run_at` A TEST WRITES IS A MINUTE IN THE PAST, not `now()`, and that is a
+ * correction. `claimDueJobs` compares `next_run_at` against the instant the SCHEDULER supplies
+ * (`this.now()`, Node's clock) where these fixtures wrote Postgres's `now()` — two clocks, in two
+ * processes, compared for "is this due yet". A Node clock a few milliseconds behind the server's
+ * makes the job not due, the tick skips it, and a test counting one line per tick comes back one
+ * short. That is what CI reported once, in "channel coverage, per tick": three lines for four
+ * ticks, with the third carrying the transition the test was about, so the assertion was right and
+ * the fixture was the problem. The same shape had just been corrected in
+ * `packages/relay/src/sequence.contract.test.ts`; a minute of slack costs nothing and ends the
+ * class.
  */
 
 /** Stand-ins that record what they were asked to do. */
@@ -373,7 +384,7 @@ describe("scheduler against a real database", () => {
     await new Scheduler({ pool: p, relay: failing.relay, refresher, random: () => 0.5 }).tick();
 
     await withTenantContext(admin, TENANT, (tx) =>
-      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [TENANT]),
+      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id = $1", [TENANT]),
     );
     const healthy = stubRelay();
     await new Scheduler({ pool: p, relay: healthy.relay, refresher, random: () => 0.5 }).tick();
@@ -413,7 +424,7 @@ describe("scheduler against a real database", () => {
     expect(lostLine.detail).toContain("LOST=2");
 
     await withTenantContext(admin, TENANT, (tx) =>
-      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [TENANT]),
+      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id = $1", [TENANT]),
     );
     const clean: SchedulerEvent[] = [];
     await new Scheduler({ pool: p, relay: result(0), refresher, random: () => 0.5, onEvent: (e) => clean.push(e) }).tick();
@@ -483,7 +494,7 @@ describe("scheduler against a real database", () => {
       });
       for (const _ of answers) {
         await withTenantContext(admin, TENANT, (tx) =>
-          tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [TENANT]),
+          tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id = $1", [TENANT]),
         );
         await scheduler.tick();
       }
@@ -526,7 +537,7 @@ describe("scheduler against a real database", () => {
       const { refresher } = stubRefresher();
       const events: SchedulerEvent[] = [];
       await withTenantContext(admin, TENANT, (tx) =>
-        tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [TENANT]),
+        tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id = $1", [TENANT]),
       );
       await new Scheduler({
         pool: p,
@@ -575,10 +586,10 @@ describe("scheduler against a real database", () => {
   it("skips a disabled JOB while still running the tenant's others", async () => {
     await scheduler().tick();
     await withTenantContext(admin, TENANT, (tx) =>
-      tx.query("UPDATE crm.scheduled_job SET enabled = false, next_run_at = now() WHERE tenant_id=$1 AND job='relay_drain'", [TENANT]),
+      tx.query("UPDATE crm.scheduled_job SET enabled = false, next_run_at = now() - interval '1 minute' WHERE tenant_id=$1 AND job='relay_drain'", [TENANT]),
     );
     await withTenantContext(admin, TENANT, (tx) =>
-      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id=$1 AND job<>'relay_drain'", [TENANT]),
+      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id=$1 AND job<>'relay_drain'", [TENANT]),
     );
     const { relay, calls } = stubRelay();
     const { refresher, calls: rc } = stubRefresher();
@@ -593,7 +604,7 @@ describe("scheduler against a real database", () => {
     // no lock, lease or heartbeat is needed.
     await scheduler().tick();
     await withTenantContext(admin, TENANT, (tx) =>
-      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [TENANT]),
+      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id = $1", [TENANT]),
     );
 
     const [a, b] = await Promise.all([p.connect(), p.connect()]);
@@ -778,7 +789,7 @@ describe("the loop itself", () => {
     const { refresher } = stubRefresher();
 
     await withTenantContext(admin, LOOP_TENANT, (tx) =>
-      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = $1", [LOOP_TENANT]),
+      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id = $1", [LOOP_TENANT]),
     );
 
     const s = new Scheduler({ pool: p, relay, refresher, tickIntervalMs: 5, random: () => 0.5 });
@@ -802,7 +813,7 @@ describe("the loop itself", () => {
     const { refresher } = stubRefresher();
 
     await withTenantContext(admin, LOOP_TENANT, (tx) =>
-      tx.query("UPDATE crm.scheduled_job SET next_run_at = now(), interval_ms = 1000 WHERE tenant_id = $1", [LOOP_TENANT]),
+      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute', interval_ms = 1000 WHERE tenant_id = $1", [LOOP_TENANT]),
     );
 
     const s = new Scheduler({ pool: p, relay, refresher, tickIntervalMs: 5, random: () => 0.5, onEvent: (e) => events.push(e) });

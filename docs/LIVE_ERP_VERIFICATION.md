@@ -3684,6 +3684,32 @@ because a snippet that annotates nothing is exactly as useful as no snippet:
 
 The second case is the one the grep alone cannot serve, and it is the case that actually happened.
 
+### A third instance of the two clocks, and the guard catching its author
+
+CI then reported the same clock defect in a third place, and this time the test said so itself:
+
+```
+AssertionError: expected one notify_dispatch line per tick; got
+  ["claimed=0 … pending=0",
+   "claimed=0 … pending=0",
+   "claimed=0 … pending=0 | coverage covered -> unsendable: no sender register…"]
+```
+
+Three lines for four ticks, with the third carrying the transition the test was about — so the
+assertion was right and the FIXTURE was wrong. `claimDueJobs` compares `next_run_at` against the
+instant the *scheduler* supplies (`this.now()`, Node's clock) and the fixtures wrote Postgres's
+`now()`: a Node clock a few milliseconds behind leaves the job not due, the tick skips it, and the
+count comes back one short. Every `next_run_at` a test writes is now a minute in the past, which
+is what those fixtures meant, and the live gate's one instance of the same line went with them.
+
+That array in the message exists because an earlier CI failure in this same test reported
+`expect(undefined).toContain(string)` and the test was taught to capture what it had. It paid for
+itself here: the diagnosis took one read instead of a reproduction.
+
+And `shell-heredoc.contract.test.ts` — written an hour earlier — failed on the comment explaining
+the fix, because that comment went into an unquoted heredoc with backticks in it. The guard caught
+its own author, which is the only real evidence a guard like that works.
+
 ### What this does not explain
 
 **I still do not know why those two runs failed.** Both greens since (CI on the following commits)

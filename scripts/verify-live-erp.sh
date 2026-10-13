@@ -928,7 +928,11 @@ PGPASSWORD="$CRM_PGPASSWORD" psql -h "$PGHOST" -U "$CRM_PGUSER" -d "$CRM_DB" \
 BEGIN;
 SELECT set_config('app.current_tenant_id', '$TENANT', true);
 UPDATE crm.erp_service_principal SET erp_role = 'erp_viewer' WHERE tenant_id = '$TENANT';
-UPDATE crm.scheduled_job SET next_run_at = now() WHERE tenant_id = '$TENANT' AND job = 'relay_drain';
+-- A MINUTE IN THE PAST, not now(): claimDueJobs compares this against the instant the
+-- SCHEDULER supplies (Node's clock, in another process), so a clock a hair behind the server's
+-- leaves the job not-due and this gate waits out the full 30-second cadence for no reason. The
+-- scheduler suite was corrected for the same thing after CI reported three lines for four ticks.
+UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id = '$TENANT' AND job = 'relay_drain';
 COMMIT;
 SQL
 node "$ROOT/scripts/live-erp/drive-binaries.mjs" role-setup "$WORK" || fail "could not queue the erp_viewer row"
