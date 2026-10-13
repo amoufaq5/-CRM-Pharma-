@@ -2508,6 +2508,16 @@ Concretely, and these specifics are the decision, not commentary on it:
       for whom, under what authority, and there is nothing to pin that against without a stored
       receipt — so a vector for it would have to invent a tenant, which would suggest a coverage
       it does not have.
+    * **A CI failure in a test neither increment touched**, which turned out to be a real
+      defect in the scheduler and not a flake. `expect(undefined).toContain(string)` meant a
+      tick's `notify_dispatch` had errored and the helper collected only successes. It did not
+      reproduce (three full runs on a fresh database, eight of the file alone) — and the
+      mechanism was there to find: `tickTenant` holds a pool connection for the whole tenant and
+      **six job cases opened a second one on top of it**, for nothing, since the held client is
+      not inside a transaction between jobs. A hundred test files in parallel against one server
+      reach `too many clients`, and a job that dies that way disappears from the line an
+      assertion is counting. `execute` now takes the tick's own client; the helper captures
+      `job_error` and `tick_error` and asserts one line per tick with the array in the message.
     * **A sweep that cannot read a tenant reports it and carries on**, which is right, but
       `unreadable` rides in the `failures` column rather than having one of its own: there is no
       honest count to pair it with, and a verdict for it would be a fifth value nobody could act

@@ -361,7 +361,14 @@ export class Scheduler {
     this.options.onEvent?.({ type: "job_start", tenantId, job });
     const started = Date.now();
     try {
-      const detail = await this.execute(tenantId, job);
+      // THE TICK'S OWN CLIENT, not a second one (0067). `tickTenant` holds a connection for the
+      // whole tenant and every job used to connect ANOTHER from the same pool on top of it —
+      // doubling this process's connection peak for no gain, because the held client is not
+      // inside a transaction between jobs and is therefore perfectly usable. It cost a CI run
+      // to notice: with a hundred test files in parallel against one server, the second
+      // connection is what makes `too many clients` reachable, and a job that fails that way
+      // disappears from the line an assertion is counting.
+      const detail = await this.execute(client, tenantId, job);
       const durationMs = Date.now() - started;
       await withTenantContext(client, tenantId, (tx) =>
         recordResult(tx, tenantId, job, { ok: true, durationMs }, this.now(), this.random),
@@ -411,7 +418,22 @@ export class Scheduler {
   }
 
   /** Dispatches to the thing that actually does the work. Returns a one-line summary. */
-  private async execute(tenantId: string, job: JobName): Promise<string> {
+  /**
+   * One job, on the connection `tickTenant` already holds.
+   *
+   * THE CLIENT IS PASSED IN rather than taken from the pool, and the comment is here because
+   * the opposite is the obvious thing to write. `tickTenant` holds a connection for the whole
+   * tenant; a job that opened a second one doubled the peak for nothing, since the held client
+   * sits between `withTenantContext` blocks and is not inside a transaction. What it bought was a
+   * way to fail: a hundred test files in parallel against one server reach `too many clients`,
+   * and a job that dies that way vanishes from the log line an operator — or an assertion — is
+   * reading.
+   *
+   * It does mean every case here must leave the client as it found it: outside a transaction and
+   * outside a tenant context. `withTenantContext` enforces the first by refusing to nest, which
+   * is what makes this safe rather than merely tidy.
+   */
+  private async execute(client: PoolClient, tenantId: string, job: JobName): Promise<string> {
     switch (job) {
       case "relay_drain": {
         const r = await this.options.relay.drainTenant(tenantId);
@@ -435,67 +457,57 @@ export class Scheduler {
         // The only job that works purely inside the CRM's own tables — no ERP call — so
         // it runs in one transaction and either the whole night's sweep lands or none of
         // it does. That is the right granularity for something that runs again tomorrow.
-        const client = await this.options.pool.connect();
-        try {
-          const r = await withTenantContext(client, tenantId, (tx) =>
-            sweepExpiredStock(tx, tenantId, { asOf: this.now() }),
-          );
-          return (
-            `expired=${r.expiredHoldings} opened=${r.opened} resolved=${r.resolved} ` +
-            `overdue=${r.markedOverdue} autoWrittenOff=${r.autoWrittenOff} ` +
-            `unattributed=${r.unattributed} graceDays=${r.policy.grace_days}`
-          );
-        } finally {
-          client.release();
-        }
+        const r = await withTenantContext(client, tenantId, (tx) =>
+          sweepExpiredStock(tx, tenantId, { asOf: this.now() }),
+        );
+        return (
+          `expired=${r.expiredHoldings} opened=${r.opened} resolved=${r.resolved} ` +
+          `overdue=${r.markedOverdue} autoWrittenOff=${r.autoWrittenOff} ` +
+          `unattributed=${r.unattributed} graceDays=${r.policy.grace_days}`
+        );
       }
       case "notify_prune": {
         // In the CRM's own tables only, like the expiry sweep, so it runs in one
         // transaction: either tonight's prune lands or none of it does.
-        const client = await this.options.pool.connect();
-        try {
-          const r = await withTenantContext(client, tenantId, (tx) =>
-            pruneNotifications(tx, tenantId, { asOf: this.now() }),
-          );
-          return (
-            `deletedRead=${r.deletedRead} deletedUnread=${r.deletedUnread} ` +
-            `keptSubjectOpen=${r.keptSubjectOpen} keptDeliveryUnsettled=${r.keptDeliveryUnsettled} ` +
-            `unknownSubjects=${r.unknownSubjects} more=${r.moreRemaining} ` +
-            `retainRead=${r.policy.retain_read_days}d retainUnread=${r.policy.retain_unread_days}d ` +
-            // The guard's numbers go in every line, not only on a refusal: a share that
-            // has been creeping towards the ceiling is the warning, and it is only
-            // visible if the ordinary line carries it.
-            `share=${r.sharePercent}%/${r.guard.prune_max_share_percent}% ` +
-            `prunable=${r.prunableTotal} inbox=${r.inboxTotal}` +
-            (r.overridden ? " overridden=true" : "") +
-            // A pass the FLOOR let through over the ceiling used to read like a pass that
-            // was within it — `overridden` is only ever true when the guard tripped, and
-            // the floor stops it tripping. Named here so the log says which knob did it.
-            (r.floorWaived ? ` FLOOR-WAIVED: ${r.floorWaivedReason ?? "under the row floor"}` : "") +
-            // A refusal deleted NOTHING, so it must not read like a quiet zero.
-            (r.refused ? ` REFUSED: ${r.refusalReason ?? "over the ceiling"}` : "") +
-            // Phase two: `crm.notification_delivery`, under its own horizon and its own
-            // share of its own table (0046). Its numbers go in the same line because it is
-            // the same pass and the same transaction — a second line would read like a
-            // second job, which is the thing it deliberately is not. A share OF THE INBOX
-            // says nothing about a delete from the delivery table, which is why the two
-            // phases measure separately and refuse independently.
-            ` | deliveries deleted=${r.delivery.deleted} keptUnsettled=${r.delivery.keptUnsettled} ` +
-            `orphaned=${r.delivery.orphaned} more=${r.delivery.moreRemaining} ` +
-            `retainDelivery=${r.delivery.retainDeliveryDays}d ` +
-            `share=${r.delivery.sharePercent}%/${r.guard.prune_max_share_percent}% ` +
-            `prunable=${r.delivery.prunableTotal} pushes=${r.delivery.deliveryTotal}` +
-            (r.delivery.overridden ? " overridden=true" : "") +
-            (r.delivery.floorWaived
-              ? ` FLOOR-WAIVED: ${r.delivery.floorWaivedReason ?? "under the row floor"}`
-              : "") +
-            (r.delivery.refused
-              ? ` REFUSED: ${r.delivery.refusalReason ?? "over the ceiling"}`
-              : "")
-          );
-        } finally {
-          client.release();
-        }
+        const r = await withTenantContext(client, tenantId, (tx) =>
+          pruneNotifications(tx, tenantId, { asOf: this.now() }),
+        );
+        return (
+          `deletedRead=${r.deletedRead} deletedUnread=${r.deletedUnread} ` +
+          `keptSubjectOpen=${r.keptSubjectOpen} keptDeliveryUnsettled=${r.keptDeliveryUnsettled} ` +
+          `unknownSubjects=${r.unknownSubjects} more=${r.moreRemaining} ` +
+          `retainRead=${r.policy.retain_read_days}d retainUnread=${r.policy.retain_unread_days}d ` +
+          // The guard's numbers go in every line, not only on a refusal: a share that
+          // has been creeping towards the ceiling is the warning, and it is only
+          // visible if the ordinary line carries it.
+          `share=${r.sharePercent}%/${r.guard.prune_max_share_percent}% ` +
+          `prunable=${r.prunableTotal} inbox=${r.inboxTotal}` +
+          (r.overridden ? " overridden=true" : "") +
+          // A pass the FLOOR let through over the ceiling used to read like a pass that
+          // was within it — `overridden` is only ever true when the guard tripped, and
+          // the floor stops it tripping. Named here so the log says which knob did it.
+          (r.floorWaived ? ` FLOOR-WAIVED: ${r.floorWaivedReason ?? "under the row floor"}` : "") +
+          // A refusal deleted NOTHING, so it must not read like a quiet zero.
+          (r.refused ? ` REFUSED: ${r.refusalReason ?? "over the ceiling"}` : "") +
+          // Phase two: `crm.notification_delivery`, under its own horizon and its own
+          // share of its own table (0046). Its numbers go in the same line because it is
+          // the same pass and the same transaction — a second line would read like a
+          // second job, which is the thing it deliberately is not. A share OF THE INBOX
+          // says nothing about a delete from the delivery table, which is why the two
+          // phases measure separately and refuse independently.
+          ` | deliveries deleted=${r.delivery.deleted} keptUnsettled=${r.delivery.keptUnsettled} ` +
+          `orphaned=${r.delivery.orphaned} more=${r.delivery.moreRemaining} ` +
+          `retainDelivery=${r.delivery.retainDeliveryDays}d ` +
+          `share=${r.delivery.sharePercent}%/${r.guard.prune_max_share_percent}% ` +
+          `prunable=${r.delivery.prunableTotal} pushes=${r.delivery.deliveryTotal}` +
+          (r.delivery.overridden ? " overridden=true" : "") +
+          (r.delivery.floorWaived
+            ? ` FLOOR-WAIVED: ${r.delivery.floorWaivedReason ?? "under the row floor"}`
+            : "") +
+          (r.delivery.refused
+            ? ` REFUSED: ${r.delivery.refusalReason ?? "over the ceiling"}`
+            : "")
+        );
       }
       case "notify_approvals": {
         // In the CRM's own tables only, like the two sweeps above, so it runs in one
@@ -508,30 +520,25 @@ export class Scheduler {
         // decide, waiting on an administrator to appoint a second holder of the grant. It is
         // prefixed rather than folded in, like the relay's `LOST=`, so a non-zero value is
         // legible at a glance in a line that is otherwise all zeroes.
-        const client = await this.options.pool.connect();
-        try {
-          const r = await withTenantContext(client, tenantId, (tx) =>
-            // `this.now()` rather than the function's own default, like both sweeps above:
-            // one clock per tick, and a job whose idea of "late" came from somewhere the
-            // scheduler cannot control is a job no test can pin.
-            notifyPendingApprovals(tx, tenantId, { asOf: this.now() }),
-          );
-          return (
-            // 0064. An escalation is the loudest thing this job can report and the rarest:
-            // it means a proposal passed its deadline undecided and everybody who could have
-            // acted has now been told once, at `urgent`. First in the line for that reason.
-            `${r.escalated > 0 ? `ESCALATED=${r.escalated} ` : ""}` +
-            `${r.blocked > 0 ? `BLOCKED=${r.blocked} ` : ""}` +
-            // A blocked proposal with nobody to tell is the end of the chain: the only
-            // administrator is the person waiting. Named separately because it is the one
-            // case where a non-zero `blocked` produced no notification and never will.
-            `${r.unreportable > 0 ? `UNREPORTABLE=${r.unreportable} ` : ""}` +
-            `pending=${r.pending} overdue=${r.overdue} ` +
-            `notified=${r.notified} alreadyKnown=${r.alreadyKnown}`
-          );
-        } finally {
-          client.release();
-        }
+        const r = await withTenantContext(client, tenantId, (tx) =>
+          // `this.now()` rather than the function's own default, like both sweeps above:
+          // one clock per tick, and a job whose idea of "late" came from somewhere the
+          // scheduler cannot control is a job no test can pin.
+          notifyPendingApprovals(tx, tenantId, { asOf: this.now() }),
+        );
+        return (
+          // 0064. An escalation is the loudest thing this job can report and the rarest:
+          // it means a proposal passed its deadline undecided and everybody who could have
+          // acted has now been told once, at `urgent`. First in the line for that reason.
+          `${r.escalated > 0 ? `ESCALATED=${r.escalated} ` : ""}` +
+          `${r.blocked > 0 ? `BLOCKED=${r.blocked} ` : ""}` +
+          // A blocked proposal with nobody to tell is the end of the chain: the only
+          // administrator is the person waiting. Named separately because it is the one
+          // case where a non-zero `blocked` produced no notification and never will.
+          `${r.unreportable > 0 ? `UNREPORTABLE=${r.unreportable} ` : ""}` +
+          `pending=${r.pending} overdue=${r.overdue} ` +
+          `notified=${r.notified} alreadyKnown=${r.alreadyKnown}`
+        );
       }
       case "referential_check": {
         // ADR-0001 Q1'S OTHER HALF, ten migrations after the table that was built to hold it.
@@ -545,18 +552,13 @@ export class Scheduler {
         // nobody told us about or a write that got past validation. `UNVERIFIABLE=` is the
         // fail-closed arm: a mirror too stale to call anything an orphan, so nothing was
         // counted. A line of zeroes is the claim this job exists to be able to make.
-        const client = await this.options.pool.connect();
-        try {
-          const r = await withTenantContext(client, tenantId, (tx) =>
-            // `this.now()`, like every job above: one clock per tick, and a check whose idea
-            // of "too stale" came from somewhere the scheduler cannot control is a check no
-            // test can pin.
-            runReferentialCheck(tx, tenantId, this.now()),
-          );
-          return `${r.summary}${r.notified > 0 ? ` notified=${String(r.notified)}` : ""}`;
-        } finally {
-          client.release();
-        }
+        const r = await withTenantContext(client, tenantId, (tx) =>
+          // `this.now()`, like every job above: one clock per tick, and a check whose idea
+          // of "too stale" came from somewhere the scheduler cannot control is a check no
+          // test can pin.
+          runReferentialCheck(tx, tenantId, this.now()),
+        );
+        return `${r.summary}${r.notified > 0 ? ` notified=${String(r.notified)}` : ""}`;
       }
       case "tenant_deletion_watch": {
         const tombstones = this.options.tombstones;
@@ -566,29 +568,20 @@ export class Scheduler {
           // it would bury the tenants that CAN be watched.
           return "unconfigured: no tombstone reader (the ERP needs --tenant-deletion-routes and a --tenant-tombstone-read-role this credential holds)";
         }
-        // A plain pool client: `watchTenantDeletion` opens its own tenant context, and the
-        // registry read it may do afterwards is of the RLS-exempt `crm.tenant` and must not
-        // be inside one.
-        const client = await this.options.pool.connect();
-        try {
-          return summariseTenantDeletionWatch(await watchTenantDeletion(client, tombstones, tenantId));
-        } finally {
-          client.release();
-        }
+        // The tick's client, UNWRAPPED: `watchTenantDeletion` opens its own tenant context, and
+        // the registry read it may do afterwards is of the RLS-exempt `crm.tenant` and must not
+        // be inside one. That is exactly the state `execute` promises to hand every case —
+        // outside a transaction and outside a context — which is why this works on a shared
+        // connection rather than needing one of its own.
+        return summariseTenantDeletionWatch(await watchTenantDeletion(client, tombstones, tenantId));
       }
       case "expense_post": {
-        // A PLAIN pool client, deliberately not wrapped: the sweep opens one transaction
-        // per claim, so one claim that cannot post must not roll back the ones that
-        // already did. It refuses a client that is already in a tenant context rather than
+        // The tick's client, deliberately NOT wrapped: the sweep opens one transaction per
+        // claim, so one claim that cannot post must not roll back the ones that already did. It refuses a client that is already in a tenant context rather than
         // nesting a BEGIN inside one, which is why the wrapper is its job and not ours.
-        const client = await this.options.pool.connect();
-        try {
-          return summariseExpensePostSweep(
-            await sweepApprovedExpenseClaims(client, tenantId, { asOf: this.now() }),
-          );
-        } finally {
-          client.release();
-        }
+        return summariseExpensePostSweep(
+          await sweepApprovedExpenseClaims(client, tenantId, { asOf: this.now() }),
+        );
       }
       case "notify_dispatch": {
         // Asked FIRST, and outside the dispatcher guard, because the answer is about this

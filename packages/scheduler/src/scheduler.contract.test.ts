@@ -467,6 +467,18 @@ describe("scheduler against a real database", () => {
           if (e.type === "job_ok" && e.job === "notify_dispatch" && e.tenantId === TENANT) {
             details.push(e.detail);
           }
+          // THE FAILING CASE IS CAPTURED, not just the passing one, and it cost a CI run to
+          // learn why. A tick whose `notify_dispatch` ERRORED pushed nothing, so `details` came
+          // back short and the assertion read `expect(undefined).toContain(string)` — which
+          // vitest reports as "the given combination of arguments (undefined and string) is
+          // invalid for this assertion". That is a true sentence about the assertion and says
+          // nothing about the scheduler, so 33 runs' worth of precedent applies: the gate printed
+          // its verdict and no evidence. Now the error lands in the array and the next
+          // recurrence names itself.
+          if (e.type === "job_error" && e.job === "notify_dispatch" && e.tenantId === TENANT) {
+            details.push(`JOB_ERROR: ${e.error}`);
+          }
+          if (e.type === "tick_error") details.push(`TICK_ERROR: ${e.error}`);
         },
       });
       for (const _ of answers) {
@@ -475,6 +487,12 @@ describe("scheduler against a real database", () => {
         );
         await scheduler.tick();
       }
+      // One line per tick, or the test below is asserting against a hole. Checked here rather
+      // than in each caller so every one of them inherits the diagnosis.
+      expect(
+        details.length,
+        `expected one notify_dispatch line per tick; got ${JSON.stringify(details)}`,
+      ).toBe(answers.length);
       return details;
     };
 

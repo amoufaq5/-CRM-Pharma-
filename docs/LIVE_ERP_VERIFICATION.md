@@ -2708,6 +2708,36 @@ behind sentences that had gone stale. Five error classes now carry explicit deci
 `plan.refusals.length` — which the audit refuses to let anybody paper over with a
 `DELIBERATELY_INTERNAL` line, in those words.
 
+### And the CI failure that followed, which was not a flake
+
+0066's commit went red on `build-and-test` with one failure, in a test it had not touched:
+
+```
+× channel coverage, per tick > reports a recovery too, because that is also news
+  → the given combination of arguments (undefined and string) is invalid for this assertion
+```
+
+That sentence is true about the assertion and says **nothing** about the scheduler, which is
+this file's oldest lesson — the deploy gate "printed its verdict and no evidence" and stayed red
+for 33 runs. `expect(undefined).toContain(string)` means the array the test indexed was short:
+a tick whose `notify_dispatch` job ERRORED pushed no line, and the helper collected only
+successes.
+
+It did not reproduce — three full runs on a freshly provisioned database, eight runs of the file
+alone, all green — so the honest move was to find the mechanism rather than re-run until it
+passed. The mechanism is real and it is in the code 0066 added to: **`tickTenant` already holds a
+pool connection for the whole tenant, and every job case opened a second one on top of it.** Six
+of them did. The held client sits between `withTenantContext` blocks and is not inside a
+transaction, so the second connection bought nothing — and what it cost is reachable: a hundred
+test files in parallel against one server hit `too many clients`, the job dies that way, and it
+vanishes from the line an assertion is counting. The CI log for that run contains two
+connection-level `FATAL`s of its own.
+
+So `execute` now takes the client the tick already holds and the six extra connections are gone,
+halving this process's connection peak per tenant tick. And the helper captures `job_error` and
+`tick_error` as well as `job_ok`, and asserts one line per tick with the array in the message —
+so the next recurrence names itself instead of reporting an assertion's type confusion.
+
 ### What is still not built
 
 - **No platform notification channel at all.** A `tampered` finding reaches a log line, a row and
