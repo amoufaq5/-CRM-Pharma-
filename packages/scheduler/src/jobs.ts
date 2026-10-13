@@ -31,7 +31,7 @@ export type JobName = (typeof JOB_NAMES)[number];
  * `activeTenants` is `status = 'active'` — so nothing in `JOB_NAMES` can ever reach one, and the
  * alternative was putting a deleted tenant back into the loop 0050 took it out of.
  */
-export const PLATFORM_JOB_NAMES = ["receipt_verify"] as const;
+export const PLATFORM_JOB_NAMES = ["receipt_verify", "abandon_stopped_work"] as const;
 export type PlatformJobName = (typeof PLATFORM_JOB_NAMES)[number];
 
 /**
@@ -41,9 +41,16 @@ export type PlatformJobName = (typeof PLATFORM_JOB_NAMES)[number];
  *   database access, not an event that arrives in bursts — and a sweep reads every receipt in the
  *   deployment. What a day costs is worth stating rather than hiding: a day in which evidence of
  *   a rewritten deletion record sits unreported.
+ * - **abandon_stopped_work (24h).** Settles the queued work of a tenant the ERP deleted (0068),
+ *   which no per-tenant job can reach for the same reason: `activeTenants` is `status = 'active'`.
+ *   THE BACKSTOP AND NOT THE MECHANISM — `watchTenantDeletion` settles in the same transaction
+ *   that stops the tenant, so there is never an instant in which a deleted tenant has live pending
+ *   work. This exists for rows stopped before 0068 shipped, or stopped by hand in SQL. Daily, and
+ *   on a healthy deployment it settles nothing every night and says so.
  */
 export const DEFAULT_PLATFORM_INTERVALS_MS: Readonly<Record<PlatformJobName, number>> = {
   receipt_verify: 24 * 60 * 60_000,
+  abandon_stopped_work: 24 * 60 * 60_000,
 };
 
 /**

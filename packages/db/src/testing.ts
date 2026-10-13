@@ -358,6 +358,18 @@ export const TENANT_RECEIPT_VERIFY = "f0670000-0000-4000-8000-000000000031";
 export const TENANT_RECEIPT_VERIFY_OTHER = "f1670000-0000-4000-8000-000000000032";
 
 /**
+ * packages/sync — abandon.contract (migration 0068).
+ *
+ * Two, and neither is a spare. The first is STOPPED — `erp_deleted`, which 0050 makes terminal,
+ * so it can never be reused by a later test in the same database — and the second stays alive to
+ * prove the settle is per tenant and, more importantly, that it REFUSES a live one: a function
+ * whose job is to make queued work unsendable must not be callable against a tenant that is still
+ * being served, and the only way to assert that is to have one.
+ */
+export const TENANT_ABANDON_STOPPED = "f0680000-0000-4000-8000-000000000033";
+export const TENANT_ABANDON_LIVE = "f1680000-0000-4000-8000-000000000034";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding

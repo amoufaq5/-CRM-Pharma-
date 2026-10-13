@@ -829,6 +829,28 @@ case "$PLATFORM_ROW" in
   *) fail "crm.platform_job did not record a clean run with its detail: $PLATFORM_ROW" ;;
 esac
 
+# 0068. THE SECOND PLATFORM JOB, which exists for the same wall: a tenant the ERP deleted is out
+# of `activeTenants`, so no per-tenant job can ever settle the rows it left queued. This gate's
+# tenant is alive, so the backstop settles nothing — which is the line a healthy deployment shows
+# and the one that proves the job runs at all.
+wait_for_line "$WORK/sched.out" '"type":"platform_job_ok".*"job":"abandon_stopped_work"' "$SCHED_PID" 120 \
+  "the scheduler's abandon_stopped_work platform tick"
+ABANDON_LINE="$(grep '"type":"platform_job_ok".*"job":"abandon_stopped_work"' "$WORK/sched.out" | head -1)"
+case "$ABANDON_LINE" in
+  *SETTLED=*) fail "the backstop settled work for a tenant this gate never deleted: $ABANDON_LINE" ;;
+  *'stopped=0 tenants=0 outbox=0 deliveries=0'*) ok "abandon_stopped_work ran and had nothing to settle — $ABANDON_LINE" ;;
+  *) fail "abandon_stopped_work reported something unexpected: $ABANDON_LINE" ;;
+esac
+# AND THE REFUSAL, which is the guard that matters: this function makes queued work unsendable, so
+# it must not be callable against a tenant that is still being served. Asserted against the live
+# tenant the gate has spent the whole run writing to — a real queue, not a fixture's.
+LIVE_REFUSAL="$(psql -d "$CRM_DB" -At -c "
+  SELECT * FROM crm.abandon_stopped_tenant_work('$TENANT')" 2>&1 || true)"
+case "$LIVE_REFUSAL" in
+  *abandon-live-tenant*) ok "and refuses to abandon a tenant that is still active, by name" ;;
+  *) fail "abandoning a LIVE tenant's queue was not refused: $LIVE_REFUSAL" ;;
+esac
+
 # The sink writes what it received on SIGTERM, so it is stopped after the scheduler and read
 # afterwards — reading it while a tick was still in flight is how a gate reports a timing
 # accident as a failure.

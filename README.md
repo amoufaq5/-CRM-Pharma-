@@ -930,6 +930,25 @@ rather than about anybody's data. And nobody is notified, which is not an oversi
 tenant's administrators would be the cross-tenant disclosure the erasure exists to prevent. The
 process's own log line carries `TAMPERED=` in capitals for a shipper to alert on.
 
+**And a stopped tenant's queue is settled rather than stranded** (0068). 0050's mark removes a
+tenant from every job at once — which is the intent, because pushing a deleted tenant's rep names
+to a third party after the controller ended the relationship is the disclosure the deletion exists
+to stop. But its `pending` rows in `crm.outbox` and `crm.notification_delivery` then sat forever:
+never sent, never dead-lettered, never pruned, because the delivery prune keys on `delivered` and
+a row that never ran will never reach it.
+
+`abandoned` is a **fifth state**, not a `dead_reason`, and the distinction is the whole of it.
+`dead` means a destination refused us: it is the state the dead-letter history keeps, the state the
+listing offers an operator to **retry**, and the state the alarm counts — and that alarm raises
+`erp_write_failed` *at a rep*. Marking these `dead` would put writes nobody will ever make in front
+of somebody to retry, and notify the reps of a tenant that no longer exists. It is settled in the
+**same transaction that stops the tenant**, so there is no window, with a platform job as the
+backstop for rows stopped earlier or by hand; a trigger makes the state terminal rather than
+leaving it terminal by reachability, because the relay's own settle predicates would overwrite it
+if ever handed the id. Whether those rows are then destroyed or retained is **still undecided**,
+and stays that way in `crm.data_disposition` with its question — a settlement is a state, not a
+retention decision.
+
 **The pre-flight those migrations open with has now been seen to work.** A composite key's
 bulk `VALIDATE` is an ordinary query, so as `crm_app` with no tenant context it validates
 against **zero visible rows** and marks itself valid over a table holding a violation. The

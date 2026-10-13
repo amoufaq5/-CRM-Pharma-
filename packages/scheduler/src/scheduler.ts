@@ -11,6 +11,7 @@ import { summariseExpensePostSweep, sweepApprovedExpenseClaims } from "@crm/expe
 import {
   summariseTenantDeletionWatch,
   runReferentialCheck,
+  sweepAbandonStoppedWork,
   watchTenantDeletion,
   type SnapshotRefresher,
 } from "@crm/sync";
@@ -335,6 +336,16 @@ export class Scheduler {
         // The pool, not a client: the sweep opens one short transaction per tenant to read rows
         // that are RLS-forced, which it cannot do on a connection already inside one.
         const r = await sweepReceipts(this.options.pool, this.now());
+        return r.summary;
+      }
+      case "abandon_stopped_work": {
+        // 0068, and the SECOND instance of the platform work 0067 added — which its own header
+        // predicted, for this exact reason: a tenant the ERP deleted is removed from
+        // `activeTenants`, so no per-tenant job can ever reach the rows it left queued.
+        //
+        // The backstop, not the mechanism: `watchTenantDeletion` settles in the same transaction
+        // that stops the tenant. On a healthy deployment this line is zeroes.
+        const r = await sweepAbandonStoppedWork(this.options.pool);
         return r.summary;
       }
     }

@@ -2774,3 +2774,98 @@ the exclusion list itself is checked for naming something real, which is the rul
 - **The self-test covers the manifest and not the proof.** The proof commits to who did it, for
   whom, under what authority, and there is nothing to pin that against without a stored receipt —
   a vector would have to invent a tenant, suggesting a coverage it does not have.
+
+## `abandoned` is not `dead`
+
+*2026-10-13, `./scripts/verify-live-erp.sh`, `pnpm client:verify` (329 checks) and
+`npx vitest run` (104 files / 2,653 tests). The migration runner is green on a fresh database
+with 68 migrations.*
+
+0050's mark removes a tenant from `activeTenants`, which is the intent: pushing a deleted tenant's
+rep names and account ids to a third party after the controller ended the relationship is the
+disclosure the deletion exists to stop. But its `pending` rows in `crm.outbox` and
+`crm.notification_delivery` then sat **forever** — never sent, never dead-lettered, never pruned,
+because the delivery prune keys on `delivered` and a row that never ran will never reach it.
+
+### Why a fifth state, and not a `dead_reason`
+
+`dead_reason = 'tenant-deleted: …'` is the cheapest possible change and it is wrong two files
+away. `dead` means **a destination refused us**:
+
+- it is the state `crm.outbox_dead_letter` keeps a history for;
+- it is the state the dead-letter listing offers an operator to **retry**;
+- it is the state the alarm counts — and that alarm raises `erp_write_failed` **at a rep**.
+
+So marking these `dead` would put writes nobody will ever make in front of somebody to retry, and
+notify the reps of a tenant that no longer exists. That is the disclosure 0050 stopped, arriving
+one tick later by a different door.
+
+### In the deployed binary: the second platform job, and a refusal
+
+```
+ok: abandon_stopped_work ran and had nothing to settle
+    {"type":"platform_job_ok","job":"abandon_stopped_work","durationMs":1,
+     "detail":"stopped=0 tenants=0 outbox=0 deliveries=0"}
+ok: and refuses to abandon a tenant that is still active, by name
+```
+
+The first line is what a healthy deployment shows, and it is the only thing that says the backstop
+runs at all. The second is the guard that matters: this function's job is to make queued work
+unsendable, so the gate asked the database to abandon the queue of the **live** tenant it had spent
+the whole run writing to — a real queue with a real mirrored StockMovement in it — and was refused
+by name (`abandon-live-tenant`). It is checked against `crm.tenant` rather than against an
+argument, because a caller that could assert "this tenant is deleted" would be a caller that could
+be wrong about it.
+
+The settle itself is the *mechanism* and not the backstop: `watchTenantDeletion` abandons the queue
+**in the same transaction that stops the tenant**, so there is never an instant in which a deleted
+tenant has live pending work. The platform job — 0067's concept, second instance, as its header
+predicted — is for rows of a tenant stopped before 0068 shipped or stopped by hand in SQL.
+
+### Terminal in the database, rather than terminal by reachability
+
+`abandoned` is unreachable from every live code path today, and that is an **argument**, not a
+guarantee: the relay's `markDead` guards on `state <> 'delivered'` and its `releaseForRetry` on
+`state <> 'dead'`, so either would overwrite an abandoned row if ever handed its id. The only thing
+stopping them is that the tenant is not in `activeTenants` — a fact two files away about a
+different table. A trigger makes it a property of the row, which is 0052's append-only shape
+applied to a state.
+
+### Two mistakes of mine, both caught by writing it down
+
+**`SECURITY DEFINER` would not have worked, and the guard said so first.** I wrote
+`crm.stopped_tenants_with_unsent_work()` as `SECURITY DEFINER` so a platform sweep could count
+pending rows with no tenant context. `schema.contract.test.ts` refuses one in `crm` in so many
+words — "adding one has to be a conscious act that fails this test and makes someone argue for
+it" — and the argument does not survive the schema: such a function runs as its **owner**, the
+owner is `crm_app`, and every table it would count is RLS-**FORCED**. With no context the policy
+yields nothing, so the counts would all be zero and the function would report every deployment
+clean. It is now a plain tenant list the caller enters each context from, which is
+`checkChannelCoverage`'s shape and 0067's.
+
+**One constraint where it needed two.** The evidence pairing started as
+`(state = 'abandoned') = (abandoned_at IS NOT NULL AND abandoned_reason IS NOT NULL)`, which
+**accepts a reason alone** on a pending row: both sides are false, so it balances. The row would
+then carry an explanation for a settlement that never happened. Split into two, each half refuses
+by name and the conjunction is airtight — abandoned ⟺ a timestamp ⟺ a reason — and the suite now
+asserts all three corners.
+
+### The thing it deliberately does not do
+
+`crm.notification_prune_candidates.delivery_unsettled` is an allow-list — `pending`, `in_flight`,
+`dead` — so `abandoned` is absent and an abandoned delivery does **not** hold its notification back
+from the prune. That is the opposite of what the same view does for `dead`, deliberately: a dead
+delivery is an unresolved disclosure attempt somebody may act on, where an abandoned one is
+resolved, definitively, by the tenant ceasing to exist. Holding its notification back would make a
+deleted tenant's inbox unprunable forever — this migration's own unboundedness, moved one table
+over. Asserted by a test, because an omission that is correct looks exactly like one that is a bug.
+
+### What is still not built
+
+- **Whether these rows are destroyed or retained is still undecided**, which is the half the open
+  row said was not cheap. It stays in `crm.data_disposition` with its question. An `abandoned` row
+  is now prunable in principle — it is settled — and nothing prunes it.
+- **A re-registered tenant id would find abandoned rows waiting.** 0050 makes `erp_deleted`
+  terminal so this cannot happen through the application, and nothing stops a DBA.
+- **The dry run is not reachable over HTTP.** `sweepAbandonStoppedWork(pool, { settle: false })` is
+  a function call; an operator wanting to see what tonight will settle needs a route or the CLI.

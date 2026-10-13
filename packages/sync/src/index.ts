@@ -58,7 +58,12 @@ export {
 } from "./referential.js";
 export {
   TenantNotRegisteredError,
+  abandonStoppedTenantWork,
   recordTenantDeletionCheck,
+  sweepAbandonStoppedWork,
+  type AbandonResult,
+  type AbandonSweepResult,
+  type StoppedTenantWork,
   summariseTenantDeletionWatch,
   tenantRegistryStatus,
   watchTenantDeletion,

@@ -672,25 +672,38 @@ describe("scheduler against a real database", () => {
     });
 
     await sched.tick();
-    expect(seen).toHaveLength(1);
-    expect(seen[0]).toContain("receipt_verify:");
+    // EVERY platform job, not a fixed number: the list grows, and a test asserting "one" would
+    // have to be edited by whoever adds the next one — which is how a count stops meaning
+    // anything. Asserted by NAME instead, so a job that silently stopped running is caught and a
+    // job that was added is not a failure.
+    expect(seen.map((l) => l.split(":")[0]).sort()).toEqual([...PLATFORM_JOB_NAMES].sort());
+
+    const verify = seen.find((l) => l.startsWith("receipt_verify:"));
     // The verdict, not just that it ran: this deployment's receipts verify, which is the claim
     // the job exists to be able to make.
-    expect(seen[0]).toContain("verdict=verified");
+    expect(verify).toContain("verdict=verified");
+    // And 0068's, which on a healthy deployment settles nothing and says so rather than being
+    // silent — the line is how an operator knows the backstop is running at all.
+    expect(seen.find((l) => l.startsWith("abandon_stopped_work:"))).toContain("stopped=");
 
     // The row carries the answer as well as the log, which the per-tenant table deliberately does
     // not: one row for the whole deployment, and its most recent answer about the erasure evidence
     // is worth reading without finding the log.
     const { rows } = await admin.query<{
+      job: string;
       last_status: string;
       last_detail: string;
       consecutive_failures: number;
       next_run_at: Date;
-    }>("SELECT last_status, last_detail, consecutive_failures, next_run_at FROM crm.platform_job WHERE job = 'receipt_verify'");
-    expect(rows[0]!.last_status).toBe("ok");
-    expect(rows[0]!.last_detail).toContain("verdict=verified");
-    expect(rows[0]!.consecutive_failures).toBe(0);
-    expect(rows[0]!.next_run_at.getTime()).toBeGreaterThan(Date.now());
+    }>("SELECT job, last_status, last_detail, consecutive_failures, next_run_at FROM crm.platform_job ORDER BY job");
+    expect(rows).toHaveLength(PLATFORM_JOB_NAMES.length);
+    for (const row of rows) {
+      expect(row.last_status, row.job).toBe("ok");
+      expect(row.last_detail, row.job).not.toBe("");
+      expect(row.consecutive_failures, row.job).toBe(0);
+      expect(row.next_run_at.getTime(), row.job).toBeGreaterThan(Date.now());
+    }
+    expect(rows.find((r) => r.job === "receipt_verify")?.last_detail).toContain("verdict=verified");
 
     // THE SECOND TICK, which must find nothing. The claim advanced `next_run_at` in the same
     // statement that read it, so a second instance arriving in the same window does no work and
