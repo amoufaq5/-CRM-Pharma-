@@ -32,6 +32,17 @@ cd "$ROOT"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "ok: $*"; }
 
+# EVERY `set -e` DEATH SAYS WHERE IT HAPPENED, which this script needed and did not have.
+#
+# It went red once on CI and the only recoverable evidence was the last `ok:` line before it
+# stopped — no `FAIL:`, because nothing called `fail`. That is the signature of an UNCHECKED
+# command under `set -e`: `VAR="$(psql …)"` takes the failure's exit status as the assignment's,
+# so the shell exits silently, and there are dozens of those lines below. An ERR trap turns every
+# one of them into a sentence naming the line, which is the difference between a diagnosis and a
+# guess. `set -E` so it also fires inside functions and subshells.
+set -E
+trap 'code=$?; echo "FAIL: ${BASH_SOURCE[0]}:$LINENO exited $code — the command there failed and nothing checked it" >&2' ERR
+
 WORK="$(mktemp -d)"
 API_PID=""
 IDP_PID=""
@@ -112,12 +123,20 @@ echo "--- 4. the rows a rep needs to exist at all ---"
 # Seeded as crm_app INSIDE a tenant context, for the reason ADR-0001 item 14 records: a
 # privileged insert with no context is the blind spot that let a fixture pass where the
 # app could not.
+# AN UNQUOTED HEREDOC, SO NO BACKTICKS IN THE BODY — not even in a comment. `$TENANT` has to
+# expand, which means the whole body is expanded, which means a backtick is COMMAND SUBSTITUTION:
+# the prose below used to quote four identifiers that way, and every run of this gate was really
+# executing `work_email_hint`, `Warehouse`, `SnapshotRefresher` and two script names. Harmless
+# because each failed to nothing, invisible because the stderr went where nobody read it, and
+# found only when the CI job started re-emitting its own output as annotations. A comment that
+# runs a command is a comment that could run any command.
 psql -v ON_ERROR_STOP=1 -q -o /dev/null <<SQL || fail "could not seed the rep, territory and accounts"
 BEGIN;
 SET ROLE crm_app;
 SELECT set_config('app.current_tenant_id', '$TENANT', true);
 
--- `work_email_hint` ON ADA AND NOWHERE ELSE, because chapter 23 needs both branches of the
+-- work_email_hint ON ADA AND NOWHERE ELSE (no backticks: this heredoc is UNQUOTED so $TENANT
+-- expands, which means a backtick here is command substitution — see the note at the seed), because chapter 23 needs both branches of the
 -- to-do list. 0003 carries this column as a RECONCILIATION HINT the ERP reconciler writes from
 -- whatever the Employee record happens to say, and forbids it being load-bearing — so the
 -- chapter's job is to show it reaching a box a human presses, and the second rep (who has no
@@ -170,11 +189,11 @@ VALUES ('$TENANT', 'acc-live-1', 'St Mary''s Hospital', 'active', 'GB', now(), n
        ('$TENANT', 'acc-live-2', 'Riverside Clinic', 'active', 'GB', now(), now());
 
 -- THE DEPOTS, and this one is a stand-in that says so. Everything else in this file is
--- seeded because a rep cannot create it; this is a MIRROR of the ERP's `Warehouse` entity
--- that `SnapshotRefresher` fills in production, and there is no ERP in this gate — the
+-- seeded because a rep cannot create it; this is a MIRROR of the ERP's Warehouse entity
+-- that SnapshotRefresher fills in production, and there is no ERP in this gate — the
 -- fixture is the three rows a refresh would have written. The refresh itself, against a
--- real operate-server serving pack-erp-core, is §7 of `verify-client-live.sh`'s sibling
--- `verify-live-erp.sh`, which now syncs these from the live server and asserts on them.
+-- real operate-server serving pack-erp-core, is §7 of this script's sibling
+-- verify-live-erp.sh, which now syncs these from the live server and asserts on them.
 --
 -- The closed one is not decoration: since 0058 only an ACTIVE depot is offered or accepted,
 -- and a list with nothing closed in it cannot show that the filter does anything.

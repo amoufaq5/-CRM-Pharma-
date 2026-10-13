@@ -239,10 +239,19 @@ jobs:
           set -e
           tail -120 "$RUNNER_TEMP/client.log"
           if [ "$code" -ne 0 ]; then
+            # TWO CAPTURES, and the second one is why. The grep finds the lines that LOOK like a
+            # cause; the tail reports where the script actually stopped, which is the only thing
+            # that helps when it stopped without saying anything — an unchecked command under
+            # `set -e` exits silently, and this job went red exactly that way. The first attempt
+            # at this step had the grep alone and the annotations showed five harmless
+            # "command not found" lines and no cause.
             sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/client.log" \
-              | grep -E "^(FAIL|fail:)|^ *(×|✗)|AssertionError|^ *→ |Timeout|uncaught|not found|refus|checks, [0-9]+ failure" \
-              | head -40 > "$RUNNER_TEMP/client-failures.txt" || true
+              | grep -E "^(FAIL|fail:)|^ *(×|✗)|AssertionError|^ *→ |Timeout|uncaught|checks, [0-9]+ failure" \
+              | head -30 > "$RUNNER_TEMP/client-failures.txt" || true
             while IFS= read -r line; do printf '::error::%s\n' "$line"; done < "$RUNNER_TEMP/client-failures.txt"
+            printf '::error::--- the last 20 lines before it stopped ---\n'
+            sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/client.log" | tail -20 \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
           fi
           exit "$code"
 

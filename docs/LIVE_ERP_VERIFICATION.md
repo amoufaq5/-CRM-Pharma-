@@ -3609,3 +3609,57 @@ Line 84 was the last line of the file, which is what that class of error always 
   deployment rather than an oversight.
 - **The count is "tables with rows", not rows.** Enough to tell one stray write from a populated
   tenant; not enough to decide what to do about either.
+
+## A comment that runs a command
+
+*2026-10-13, `pnpm client:verify` (329 checks, and five fewer lines of stderr than before),
+`npx vitest run` (105 files / 2,692 tests) and `./scripts/verify-live-erp.sh`.*
+
+The `field-client` job went red twice on commits that touched nothing in its path, and the second
+time it could say something, because the job had just been taught to re-emit its output as
+annotations. What it said was not the failure:
+
+```
+./scripts/verify-client-live.sh: line 115: verify-live-erp.sh: command not found
+./scripts/verify-client-live.sh: line 115: SnapshotRefresher: command not found
+./scripts/verify-client-live.sh: line 115: Warehouse: command not found
+./scripts/verify-client-live.sh: line 115: work_email_hint: command not found
+```
+
+Line 115 is `psql … <<SQL`, an **unquoted** heredoc — unquoted because `$TENANT` has to expand,
+which means the whole body is expanded, which means a backtick in it is **command substitution**.
+Four identifiers were quoted that way in SQL *comments*, so every run of that gate really did
+execute `work_email_hint`, `Warehouse`, `SnapshotRefresher` and two script names. Harmless,
+because each failed to nothing. Invisible, because the stderr went where nobody read it. Present
+in every local run I had called green, five lines at a time.
+
+A comment that runs a command is a comment that could run any command, and the next person writing
+prose into one of those heredocs has no reason to know it. So the rule is now a test
+(`shell-heredoc.contract.test.ts`): it tracks heredoc openers across every script in `scripts/`,
+reports a backtick in any unquoted body, and — because a scanner that matched nothing would also
+report an empty list — asserts that it finds the shape in a sample that has one. It found one more
+pair in `verify-live-erp.sh` the moment it was written.
+
+### And the job that dies without saying so
+
+The first red run said less than that: the last `ok:` line and nothing else. No `FAIL:`, because
+nothing called `fail`. That is the signature of an **unchecked command under `set -e`** —
+`VAR="$(psql …)"` takes the failure's status as the assignment's, so the shell exits silently, and
+that script has dozens of those lines. Two changes make the next one legible:
+
+- **An ERR trap in the script**, with `set -E` so it fires inside functions and subshells too. Every
+  silent death now prints `FAIL: scripts/verify-client-live.sh:<line> exited <code> — the command
+  there failed and nothing checked it`. Verified not to misfire: a `cmd || fail "…"` list is a
+  *checked* command and does not trigger it, so a full green run prints no FAIL lines at all.
+- **The CI step annotates the log's tail as well as its matches.** The grep finds lines that look
+  like a cause; the tail says where it stopped, which is the only thing that helps when it stopped
+  without saying anything. The first version of that step had the grep alone — and its annotations
+  were the five "command not found" lines above and no cause at all.
+
+### What this does not explain
+
+**I still do not know why those two runs failed.** Both greens since (CI on the following commits)
+and every local run, over a socket and CI-shaped, pass 329 checks. The two defects found here are
+real and were fixed; neither is a plausible cause of an exit on its own, and I am not going to
+dress either up as the diagnosis. What changed is that the next occurrence arrives with a line
+number and twenty lines of context instead of a red square.

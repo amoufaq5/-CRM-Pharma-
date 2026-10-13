@@ -532,7 +532,7 @@ SELECT '$TENANT', a.id, 'administrator', g.id, CURRENT_DATE - 1,
 -- about the query behind it.
 --
 -- Inserted directly rather than through the route, because the API binary is not up yet and
--- the claim being measured is the SCHEDULER's. `four_eyes_columns` and `role` are written out
+-- the claim being measured is the SCHEDULER's. four_eyes_columns and role are written out
 -- for the same reason: the store stamps them from crm.four_eyes_rule, and a fixture going
 -- through the store would be testing that here instead of where it belongs.
 --
@@ -602,7 +602,9 @@ SELECT '$TENANT', 'email_recipient', 'mailto:*', 'CRM_SMTP_PASSWORD', 'urgent', 
    AND NOT EXISTS (SELECT 1 FROM crm.notification_endpoint e
                     WHERE e.tenant_id = '$TENANT' AND e.channel = 'email_recipient');
 -- A DO block rather than a bare SELECT, which printed its two return values as a table
--- into the gate's own output. `PERFORM` is how plpgsql calls a function for its effect.
+-- into the gate's own output. PERFORM is how plpgsql calls a function for its effect.
+-- (No backticks anywhere in these heredocs: they are UNQUOTED so $TENANT expands, which makes a
+-- backtick command substitution. verify-client-live.sh was executing four identifiers that way.)
 DO \$\$
 BEGIN
   PERFORM set_config('app.change_actor',
