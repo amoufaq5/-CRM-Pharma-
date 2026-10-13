@@ -3717,3 +3717,59 @@ and every local run, over a socket and CI-shaped, pass 329 checks. The two defec
 real and were fixed; neither is a plausible cause of an exit on its own, and I am not going to
 dress either up as the diagnosis. What changed is that the next occurrence arrives with a line
 number and twenty lines of context instead of a red square.
+
+## What was typed, and the form the draft forgot
+
+*2026-10-13, `pnpm client:verify` (331 checks — two more than before, and both of them new),
+`npx vitest run` (105 files / 2,692 tests).*
+
+The annotations earned their keep on the run after they were added. `field-client` went red with a
+sentence instead of a red square:
+
+```
+FAIL: the destination is a row, and it is what she typed rather than what the ERP guessed —
+      expected "[{"who":"Ada Lovelace","address":"ada.lovelace@field.example.test"}]",
+      got      "[{"who":"Ada Lovelace","address":"ada@erp.example.test"}]"
+```
+
+A real defect in the app, not in the gate. `ada@erp.example.test` is `work_email_hint` — the
+value 0003 carries as a **reconciliation hint** and forbids being load-bearing, and the exact
+thing chapter 23 exists to show an administrator can overrule. The write went out carrying the
+guess.
+
+### The cause: one form, where the screen has two
+
+`render()` snapshots what has been typed before it rewrites the DOM and puts it back afterwards,
+and the comment on that mechanism promises "a typed address and a typed reason must survive a
+re-render". It captured `document.querySelector("form[id]")` — **the first** form with an id. The
+administrator's screen renders the approvals list before the notification addresses, so the
+approvals form's typing survived and the address form's did not.
+
+So: a background re-render between typing an address and pressing **Set** restored nothing, the
+input was re-rendered with `value="<the ERP's hint>"`, and the click read the hint out of the DOM
+and sent it. On this machine the window never opened; on a slower runner it did.
+
+### Reproduced deliberately, because a race nobody can assert against is a race that comes back
+
+The app re-renders on an `online` event — a phone regaining signal mid-round — so the driver now
+fires one between the typing and the press, and asserts the box before clicking. With the old
+`main.ts` restored, the new assertions fail exactly as CI did:
+
+```
+FAIL: a re-render between typing and pressing Set keeps what was typed, not the ERP's guess
+      — expected "ada.lovelace@field.example.test", got "ada@erp.example.test"
+FAIL: and keeps the reason with it, which the database will not take the write without
+      — expected true, got false
+```
+
+With the fix — the draft keyed per form id, every `form[id]` on screen captured and restored —
+331 checks, 0 failures.
+
+### The two details that keep the fix honest
+
+- **Restored by id, never by position.** A screen that renders its forms in a different order
+  must not have one form's typing pasted into another, which is the failure a positional restore
+  would produce.
+- **An empty capture does not replace a draft.** `render()` captures before it rewrites, and its
+  booting and fatal branches return before any form exists — so a capture that found nothing has
+  to leave the previous draft alone rather than clear it.

@@ -1979,6 +1979,28 @@ async function main() {
     await page.fill(`input[name="address-${adaRepId}"]`, "ada.lovelace@field.example.test");
     await page.fill(`input[name="address-reason-${adaRepId}"]`,
       "confirmed the mailbox with her in person, the ERP has an old domain");
+
+    // A RE-RENDER BETWEEN TYPING AND PRESSING SET, which is the state CI found and this run
+    // never did. The app re-renders on an `online` event (a phone regaining signal mid-round),
+    // and the input is re-rendered carrying the ERP's hint as its value — so unless the draft
+    // is restored, what goes out is the GUESS. It was not restored: `captureFormDraft` took
+    // `document.querySelector("form[id]")`, the FIRST form with an id, and this screen has the
+    // approvals list before the addresses. One form's typing survived and this one's did not.
+    //
+    // Fired deliberately rather than waited for, because a race that only shows up on a slower
+    // machine is a race nobody can assert against. The assertions below are unchanged.
+    await page.evaluate(`window.dispatchEvent(new Event("online")); return true;`);
+    await page.waitFor(`document.querySelector("input[name='address-${adaRepId}']") !== null`,
+      { label: "the address form after a re-render" });
+    const afterRerender = await page.evaluate(`
+      const box = document.querySelector("input[name='address-${adaRepId}']");
+      const why = document.querySelector("input[name='address-reason-${adaRepId}']");
+      return { address: box?.value ?? null, reason: why?.value ?? null };`);
+    is(afterRerender.address, "ada.lovelace@field.example.test",
+      "a re-render between typing and pressing Set keeps what was typed, not the ERP's guess");
+    is(/confirmed the mailbox with her in person/.test(String(afterRerender.reason)), true,
+      "and keeps the reason with it, which the database will not take the write without");
+
     await page.click(`button[data-set-address="${adaRepId}"]`);
     await page.waitFor(`/Signals your tenant sends by email now reach that person/.test(document.body.textContent ?? "")`,
       { label: "the device's confirmation that the address was set" });

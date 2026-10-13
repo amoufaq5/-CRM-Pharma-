@@ -239,36 +239,63 @@ let signatureInProgress: ImageData | null = null;
  * form is opened or closed — a fresh form starts blank, which is a rule two earlier
  * increments wrote down and this would otherwise break.
  */
-let formDraft: { readonly formId: string; readonly values: Readonly<Record<string, string>> } | null = null;
+/**
+ * What was typed into every form on screen, kept across a re-render.
+ *
+ * ONE ENTRY PER FORM, and that is a correction. This used to hold a single
+ * `{ formId, values }` captured from `document.querySelector("form[id]")` — THE FIRST form with
+ * an id — so on a screen with two of them (the approvals list and the notification addresses are
+ * both on the administrator's page) only the first one's typing survived. The browser gate caught
+ * it in CI and nowhere else: a background refresh landed between typing an address and pressing
+ * Set, the input was re-rendered with the ERP's hint as its value, nothing restored what had been
+ * typed, and the write went out carrying the GUESS — which is the one value 0003 forbids being
+ * load-bearing, and the thing that chapter exists to show the box is a box for.
+ */
+let formDraft: { readonly values: Readonly<Record<string, Readonly<Record<string, string>>>> } | null = null;
 
 /** Read the open form, if there is one. Synchronous, immediately before the DOM goes. */
 function captureFormDraft(): void {
-  const form = document.querySelector("form[id]");
-  if (!(form instanceof HTMLFormElement)) return;
-  const values: Record<string, string> = {};
-  for (const el of form.querySelectorAll("input[name], select[name], textarea[name]")) {
-    if (el instanceof HTMLInputElement) {
-      values[el.name] = el.type === "checkbox" ? (el.checked ? "1" : "") : el.value;
-    } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
-      values[el.name] = el.value;
+  const forms: Record<string, Record<string, string>> = {};
+  // EVERY form with an id, not the first: see the note on `formDraft`.
+  for (const form of document.querySelectorAll("form[id]")) {
+    if (!(form instanceof HTMLFormElement)) continue;
+    const values: Record<string, string> = {};
+    for (const el of form.querySelectorAll("input[name], select[name], textarea[name]")) {
+      if (el instanceof HTMLInputElement) {
+        values[el.name] = el.type === "checkbox" ? (el.checked ? "1" : "") : el.value;
+      } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+        values[el.name] = el.value;
+      }
     }
+    forms[form.id] = values;
   }
-  formDraft = { formId: form.id, values };
+  // An empty capture must not REPLACE a draft: `render()` captures before it rewrites the DOM,
+  // and the booting and fatal branches return before any form exists.
+  if (Object.keys(forms).length === 0) return;
+  formDraft = { values: forms };
 }
 
-/** Put it back, into the same form. A different form on screen means the draft is not its. */
+/**
+ * Put it back, form by form. A form that is no longer on screen means that draft is not its.
+ *
+ * Matched by id rather than by position, so a screen that renders its forms in a different order
+ * cannot paste one form's typing into another — which is the failure a positional restore would
+ * produce and the reason the capture is keyed this way.
+ */
 function restoreFormDraft(): void {
   const draft = formDraft;
   if (draft === null) return;
-  const form = document.getElementById(draft.formId);
-  if (!(form instanceof HTMLFormElement)) return;
-  for (const [name, value] of Object.entries(draft.values)) {
-    const el = form.querySelector(`[name="${CSS.escape(name)}"]`);
-    if (el instanceof HTMLInputElement) {
-      if (el.type === "checkbox") el.checked = value === "1";
-      else el.value = value;
-    } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
-      el.value = value;
+  for (const [formId, values] of Object.entries(draft.values)) {
+    const form = document.getElementById(formId);
+    if (!(form instanceof HTMLFormElement)) continue;
+    for (const [name, value] of Object.entries(values)) {
+      const el = form.querySelector(`[name="${CSS.escape(name)}"]`);
+      if (el instanceof HTMLInputElement) {
+        if (el.type === "checkbox") el.checked = value === "1";
+        else el.value = value;
+      } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+        el.value = value;
+      }
     }
   }
 }
