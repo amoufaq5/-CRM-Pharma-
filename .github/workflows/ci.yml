@@ -67,8 +67,13 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # `typecheck:packages` and not `typecheck`, which since this commit runs both halves:
+      # the two stay separate STEPS here so a failure says which half failed, where one
+      # command is what a developer should be able to type without having to remember the
+      # second. The day that convenience did not exist, a test with a type error in it
+      # reached CI from a working tree where `pnpm typecheck` was green.
       - name: Typecheck
-        run: pnpm typecheck
+        run: pnpm typecheck:packages
 
       # Test files are excluded from `tsc` so they are not emitted into dist, and vitest
       # transpiles without checking types — so for most of this project's life not one of
@@ -218,8 +223,28 @@ jobs:
 
       # A runner has Chrome; the harness finds it, or fails saying so rather than
       # skipping. A browser check that skips when there is no browser is not a check.
+      #
+      # AND IT RE-EMITS ITS FAILURES AS ANNOTATIONS, which `build-and-test` has done since
+      # the deploy gate "printed its verdict and no evidence" and stayed red for 33 runs. The
+      # reason it has to: a job's log is served from a blob host that the API cannot reach, so
+      # a failure here was a red square with no readable cause — and this job went red once on
+      # a commit that was green locally and the only way to find out why was to guess. An
+      # annotation is the one channel the API does serve.
       - name: Drive the field client in a real browser
-        run: ./scripts/verify-client-live.sh
+        shell: bash
+        run: |
+          set +e
+          ./scripts/verify-client-live.sh > "$RUNNER_TEMP/client.log" 2>&1
+          code=$?
+          set -e
+          tail -120 "$RUNNER_TEMP/client.log"
+          if [ "$code" -ne 0 ]; then
+            sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/client.log" \
+              | grep -E "^(FAIL|fail:)|^ *(×|✗)|AssertionError|^ *→ |Timeout|uncaught|not found|refus|checks, [0-9]+ failure" \
+              | head -40 > "$RUNNER_TEMP/client-failures.txt" || true
+            while IFS= read -r line; do printf '::error::%s\n' "$line"; done < "$RUNNER_TEMP/client-failures.txt"
+          fi
+          exit "$code"
 
   # The deployment stack, in three layers of increasing cost.
   #

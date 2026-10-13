@@ -261,7 +261,11 @@ describe("the endpoint cap", () => {
           reason: "complying with a cap this tenant has just lowered",
         }),
       );
-      expect(amended.enabled).toBe(false);
+      // `updateEndpoint` returns `EndpointRow | null` — null when the id is not this tenant's —
+      // so the null is asserted away rather than assumed. `pnpm typecheck` cannot see this,
+      // because `tsc --build` excludes `*.test.ts`; `pnpm typecheck:tests` is what does, and
+      // skipping it is what sent this file to CI with a type error in it.
+      expect(amended?.enabled).toBe(false);
       // But adding is still refused, because the act is what the cap governs.
       expect(await refusal(() => inTenant((tx) => add(tx)))).toBeInstanceOf(EndpointCapExceededError);
     });

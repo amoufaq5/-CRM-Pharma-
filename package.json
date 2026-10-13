@@ -10,7 +10,8 @@
   },
   "scripts": {
     "build": "tsc --build",
-    "typecheck": "tsc --build --force && pnpm --filter @crm/field typecheck",
+    "typecheck": "pnpm typecheck:packages && pnpm typecheck:tests",
+    "typecheck:packages": "tsc --build --force && pnpm --filter @crm/field typecheck",
     "test": "vitest run",
     "test:watch": "vitest",
     "db:migrate": "pnpm --filter @crm/db build && node packages/db/dist/bin/migrate.js",

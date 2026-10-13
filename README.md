@@ -40,7 +40,7 @@ cannot do (20 recorded risks; §13 is the important part).
 
 ```bash
 pnpm install
-pnpm typecheck
+pnpm typecheck               # the packages AND the test files; see below for why that is two things
 
 # Contract tests need a real Postgres — that is the point of them.
 export PGHOST=/var/run/postgresql PGUSER=postgres PGDATABASE=crm_test
@@ -49,6 +49,13 @@ pnpm test
 ```
 
 CI runs exactly this against a `postgres:16` service container on every push.
+
+`pnpm typecheck` is two commands, because `tsc --build` **excludes `*.test.ts`** — test files are
+not emitted into `dist/`, and vitest transpiles without checking types, so for most of this
+project's life not one of its tests was typechecked. `typecheck:packages` does the projects and
+`typecheck:tests` does the test files through their own config; the single command runs both, and
+CI keeps them as separate steps so a failure says which half. Running only the first is how a test
+with a type error in it reaches CI from a tree that looked green.
 
 The app, and the checks that drive it:
 
