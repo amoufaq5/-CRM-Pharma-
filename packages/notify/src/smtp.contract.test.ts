@@ -301,8 +301,12 @@ describe("the SMTP channel, against a real server", () => {
         env: { CRM_SMTP_PASSWORD: "pa55" },
       });
       expect(outcome.kind).toBe("dead");
+      // THE FACT FROM THE CONVERSATION, and the CONSEQUENCE from the sender (ADR-0001 item 42). The
+      // conversation is shared with `SmtpProber`, where nothing was ever going to be sent, so its
+      // refusals state what the relay did and stop — and each caller appends what it will do.
       expect(outcome.error).toMatch(/offers no AUTH mechanism/);
-      expect(outcome.error).toMatch(/Refusing to send unauthenticated/);
+      expect(outcome.error).toMatch(/cannot be authenticated as relay-user/);
+      expect(outcome.error).toMatch(/Refusing to send\.$/);
       expect(live.messages).toHaveLength(0);
     });
 

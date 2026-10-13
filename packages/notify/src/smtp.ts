@@ -654,11 +654,15 @@ export class SmtpConversation {
       if (!caps.startTls) {
         // Fail closed. The alternative is to carry the rep's name and the account id in
         // clear text to another host, which is the thing the transport rule exists to stop.
+        // THE SENTENCE STATES THE FACT AND STOPS THERE (ADR-0001 item 42). It used to end "Refusing to
+        // send." — and this conversation is shared with `SmtpProber`, where nothing was ever
+        // going to be sent, so a probe row read as though a message had been held back. The
+        // CALLER appends what it will do about the fact, because only the caller knows.
         return {
           kind: "dead",
           error:
             `${relay.host}:${String(relay.port)} does not offer STARTTLS, so anything sent to it would ` +
-            `cross the network in clear text. Refusing to send.`,
+            `cross the network in clear text.`,
         };
       }
       this.send("STARTTLS");
@@ -694,7 +698,7 @@ export class SmtpConversation {
         error:
           `${relay.host} offers no AUTH mechanism this client supports ` +
           `(${caps.authMechanisms.length === 0 ? "it advertised none" : caps.authMechanisms.join(", ")}), ` +
-          `but a username is configured. Refusing to send unauthenticated as ${username}.`,
+          `but a username is configured, so it cannot be authenticated as ${username}.`,
       };
     }
     const refusal = await this.authenticate(mechanism, username, password);
@@ -912,6 +916,23 @@ export class SmtpConversation {
   }
 }
 
+/**
+ * Appends what the caller will do to a fact the conversation reported (ADR-0001 item 42).
+ *
+ * `SmtpConversation` is shared by `SmtpSender` and `SmtpProber`, so its refusals say what the
+ * relay did — "does not offer STARTTLS, so anything sent to it would cross the network in clear
+ * text" — and nothing about the consequence. A probe row that ended "Refusing to send" described
+ * a message being held back when there was never a message, which is the sentence an operator
+ * reads to decide whether their relay is usable.
+ *
+ * Only `dead` and `retry` outcomes carry an error to append to; a `delivered` one is returned
+ * unchanged, which is why this takes the outcome rather than the string.
+ */
+export function withConsequence(outcome: SendOutcome, consequence: string): SendOutcome {
+  if (outcome.error === undefined || outcome.error === "") return outcome;
+  return { ...outcome, error: `${outcome.error} ${consequence}` };
+}
+
 export class SmtpSender implements ChannelSender {
   readonly channel: string;
   private readonly relay: SmtpRelayConfig;
@@ -983,7 +1004,11 @@ export class SmtpSender implements ChannelSender {
       });
 
       const session = await conn.negotiate(password);
-      if ("kind" in session) return session;
+      // ADR-0001 item 42. The conversation's refusals state the FACT about the relay and stop there, because
+      // `SmtpProber` shares them and nothing is ever sent in a probe. What this process will do
+      // about the fact is this class's to say, so it says it here — and `SmtpProber` says its own
+      // ("nothing was sent") rather than inheriting a sentence that would be false there.
+      if ("kind" in session) return withConsequence(session, "Refusing to send.");
 
       // The composed body, not `payload.body`: the footer appends the recipient's own
       // name, so the text that actually goes down the wire can be non-ASCII when the

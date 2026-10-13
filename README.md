@@ -779,6 +779,12 @@ rule cannot drift apart — and that last one matters more for a probe, because 
 *authenticates*, so plaintext to a remote host would put the password on the wire purely to
 find out whether it was right.
 
+What one conversation must **not** share is its consequence. Its refusals used to end
+"Refusing to send", which in a probe row is false — nothing was going to be sent — and sends
+an operator looking for a lost notification. The conversation now states the fact about the
+relay and stops; the sender appends "Refusing to send." and the probe "Nothing was sent — this
+was a test." One test asserts both, because the property is that they differ.
+
 Four rules sit in the schema rather than the route, so the offline path cannot skip them:
 **one outstanding probe per endpoint** (a partial unique index, because a trigger cannot see
 another transaction's uncommitted row), a **cooldown per endpoint, of the tenant's chosen
@@ -1275,7 +1281,11 @@ that is how a check came to fail with `column "seq" does not exist` against a da
 migrations behind. Everything the integration assumes had previously been read out of the ERP's
 source and a captured schema; this is the first time a socket answered. The gate
 fingerprints every file in the ERP checkout before the run and diffs after — that repo is
-read-only this phase and the check proves it.
+read-only this phase and the check proves it — and **records which ERP each run was evidence
+about**: the head commit and its subject, refusing outright on a dirty checkout (the output
+would name a commit that is not what ran) and warning when the checkout is behind its own local
+`origin/main` (freshness needs a fetch this gate must not require). It is currently eleven
+commits behind, which it now says out loud every run.
 
 What it pins, beyond the handshake: all 51 declared slugs route and the naive pluraliser
 really is naive (`/v1/opportunitys` serves, `/v1/opportunities` 404s); an unknown filter is
@@ -1330,9 +1340,12 @@ compromised. `deploy/README.md` has the rotation procedure.
 [`deploy/README.md`](deploy/README.md) is the operator's copy. The three things worth
 knowing before reading it:
 
-**The ERP goes first.** One database (ADR-0001 option b), and the CRM grants itself
-`SELECT` on `meta.operate_entity_records`, so that table has to exist before the CRM's
-first migration. `0001` checks and fails with a message naming the real cause.
+**The ERP goes first.** One database (ADR-0001 option b), so the ERP's `meta` schema has to
+exist before the CRM's first migration — not because the CRM reads it (it does not; `0001`
+**revokes** every privilege it once granted itself there, and a test asserts `crm_app` holds
+nothing in `meta`, not even `SELECT`), but because a CRM migrated beside the wrong database
+would come up, serve reps and queue writes over HTTP to an ERP whose data is somewhere else,
+with nothing downstream saying so. `0001` checks and fails with a message naming that cause.
 
 **The migration runner switches roles, and that is load-bearing.** It connects as the
 admin for the two DBA files — `CREATE ROLE`, `CREATE EXTENSION` — then `SET ROLE crm_app`
@@ -1672,9 +1685,15 @@ transaction" and answers before any work with a better-aimed sentence; this asks
 whether there is *any* open transaction, which catches a caller's own `BEGIN` that no GUC
 reveals.
 
-**2. Never write an ERP table over SQL.** Writes go through the ERP's HTTP API via the
-outbox, so its RBAC, write-guards, period locks, sequences, audit and double-entry GL
-effects all still run. The database permits a direct write; the design does not.
+**2. Never touch an ERP table over SQL, in either direction.** Writes go through the ERP's
+HTTP API via the outbox, so its RBAC, write-guards, period locks, sequences, audit and
+double-entry GL effects all still run. Reads go the same way, through `ErpClient`. For writes
+the database permits it and the design does not; for reads it is no longer even permitted —
+`0001` revokes `crm_app`'s privileges on `meta` and `schema.contract.test.ts` asserts it holds
+nothing there. The grant it used to hold was never used, and the ERP's ADR-0314 made that path
+actively wrong: a tenant serving an activated manifest is served from its own schema, so a SQL
+read of the shared table would return zero rows for them under a rule that reads an empty set
+as "no products".
 
 Retries are safe because the relay mints the ERP record id itself and the ERP is unique on
 `(tenant_id, entity, record_id)` — a durable constraint. Not because of the

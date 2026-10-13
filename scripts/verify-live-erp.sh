@@ -204,6 +204,56 @@ erp_manifest() {
 erp_manifest > "$WORK/erp-before.txt"
 ok "operate-server and crossengin-pg are built ($(wc -l < "$WORK/erp-before.txt") ERP files fingerprinted)"
 
+# WHICH ERP THIS RUN ACTUALLY VERIFIED AGAINST (ADR-0001 item 42).
+#
+# This gate is the strongest evidence in the repository and for most of its life it recorded
+# nowhere which ERP it was evidence about. On 2026-10-06 the checkout was eleven commits behind
+# `origin/main` and every "verified live" claim was made against an ERP two days stale — the claims
+# survived, because the six ERP-side facts ADR-0001 depends on were re-read afterwards and were
+# unchanged, but that was luck confirmed after the fact rather than a property of the gate.
+#
+# WHAT IS PRINTED AND WHAT IS REFUSED, which is the question the open row said had to be answered
+# before the line could be added. Three different states, three different answers:
+#
+#   * DIRTY — uncommitted changes under the ERP checkout. REFUSED. The gate's output would name a
+#     commit that is not what it ran, so the evidence is unreproducible by anybody, including us.
+#     This is also the one state that can be caused by a previous run of this gate going wrong,
+#     and §16 only checks it afterwards.
+#   * BEHIND its own `origin/main`, if that ref exists locally. WARNED, not refused: freshness
+#     needs a network the gate must not require, and a CI runner or an offline laptop would fail
+#     for a reason unrelated to anything it was testing. The warning names the distance.
+#   * no git at all, or not a repository. Reported as unknown rather than skipped silently — a
+#     gate whose provenance line is absent reads exactly like one that was never added.
+ERP_HEAD="unknown"
+ERP_DIRTY="unknown"
+if command -v git >/dev/null && git -C "$ERP_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  ERP_HEAD="$(git -C "$ERP_DIR" rev-parse HEAD)"
+  ERP_SUBJECT="$(git -C "$ERP_DIR" log -1 --format=%s | cut -c1-60)"
+  if [ -n "$(git -C "$ERP_DIR" status --porcelain)" ]; then
+    ERP_DIRTY="yes"
+    git -C "$ERP_DIR" status --porcelain | head -10 >&2
+    fail "the ERP checkout at $ERP_DIR has uncommitted changes, so this run could not say which ERP it verified against. Commit or stash them."
+  fi
+  ERP_DIRTY="no"
+  ok "verifying against CrossEngin $(echo "$ERP_HEAD" | cut -c1-12) — "$ERP_SUBJECT", clean checkout"
+  # BEHIND is a warning, and only askable when the ref is already here: `git fetch` would make
+  # this gate need the network and somebody's credentials.
+  if git -C "$ERP_DIR" rev-parse --verify --quiet origin/main >/dev/null; then
+    BEHIND="$(git -C "$ERP_DIR" rev-list --count "HEAD..origin/main" 2>/dev/null || echo 0)"
+    if [ "${BEHIND:-0}" -gt 0 ]; then
+      echo "    WARNING: this checkout is $BEHIND commit(s) behind its own origin/main, so every" >&2
+      echo "    claim below is about an ERP that is $BEHIND commit(s) old. Not a failure — freshness" >&2
+      echo "    needs a fetch this gate must not require — but date the evidence accordingly." >&2
+    else
+      ok "and it is level with its own origin/main, so the evidence is about the current ERP"
+    fi
+  else
+    echo "    note: no local origin/main under $ERP_DIR, so this run cannot say how fresh it is." >&2
+  fi
+else
+  echo "    note: $ERP_DIR is not a git checkout, so this run cannot record which ERP it verified." >&2
+fi
+
 # ---------------------------------------------------------------------------
 echo "--- 3. a throwaway ERP database, migrated by the ERP's own applier ---"
 psql -lqtA -F'|' | cut -d'|' -f1 | grep -qx "$ERP_DB" || createdb "$ERP_DB" || fail "createdb $ERP_DB failed"
@@ -1013,7 +1063,7 @@ echo
 echo "--- 16. the ERP checkout is exactly as it was found ---"
 erp_manifest > "$WORK/erp-after.txt"
 if diff -q "$WORK/erp-before.txt" "$WORK/erp-after.txt" >/dev/null; then
-  ok "not one file under $ERP_DIR changed"
+  ok "not one file under $ERP_DIR changed (CrossEngin $(echo "$ERP_HEAD" | cut -c1-12), dirty=$ERP_DIRTY)"
 else
   diff -u "$WORK/erp-before.txt" "$WORK/erp-after.txt" | head -20 >&2
   fail "this run MODIFIED the ERP checkout — it is read-only; see the diff above"

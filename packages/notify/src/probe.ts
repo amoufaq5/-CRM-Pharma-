@@ -786,10 +786,24 @@ export interface SmtpProberOptions {
  * `classifySmtpReply` or from `negotiate`, so a probe and the dead letter it predicts read
  * the same.
  */
+/**
+ * A probe's verdict from one of the conversation's refusals.
+ *
+ * SAYS WHAT A PROBE DOES, which the shared sentence deliberately no longer does (ADR-0001 item 42). Those
+ * refusals used to end "Refusing to send", because `SmtpSender` and `SmtpProber` drive the same
+ * `SmtpConversation` — so a probe row described a message being held back when there was never a
+ * message to hold. The conversation now states the fact about the relay and stops; the caller
+ * appends its own consequence, and a probe's is that nothing was ever going to be sent.
+ *
+ * That matters more here than in the sender. A probe row IS the sentence an operator reads to
+ * decide whether a relay is usable, and one that implies a notification was lost sends them
+ * looking for it.
+ */
 function refusalVerdict(outcome: SendOutcome): ProbeOutcome {
+  const fact = outcome.error ?? "the relay refused, without saying where";
   return {
     verdict: verdictOf(outcome, "reachable"),
-    detail: outcome.error ?? "the relay refused, without saying where",
+    detail: `${fact} Nothing was sent — this was a test.`,
     ...(outcome.status === undefined ? {} : { status: outcome.status }),
   };
 }

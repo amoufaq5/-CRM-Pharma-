@@ -2869,3 +2869,207 @@ over. Asserted by a test, because an omission that is correct looks exactly like
   terminal so this cannot happen through the application, and nothing stops a DBA.
 - **The dry run is not reachable over HTTP.** `sweepAbandonStoppedWork(pool, { settle: false })` is
   a function call; an operator wanting to see what tonight will settle needs a route or the CLI.
+
+## Three reports that said less than they knew
+
+*2026-10-13, `./scripts/verify-live-erp.sh`, `pnpm client:verify` (329 checks) and
+`npx vitest run` (104 files / 2,654 tests). The migration runner is green on a fresh database with
+68 migrations and the corrected 0001, and the REVOKE is verified on the upgrade path as well as the
+fresh one. The Docker stack could not be built in this container — see the note at the end — so the
+one step of `verify-deploy-smoke.sh` this increment changed was run directly instead, which is how
+its new assertion turned out to be broken.*
+
+No migration and no new table. Three open rows, each one a sentence or a privilege that was not
+quite true, closed together because they are one kind of defect: a report that knew more than it
+said, or said more than it knew.
+
+### (a) A privilege nobody used, deleted rather than left standing
+
+Migration 0001 required `meta.operate_entity_records` to exist, gave the reason as "the CRM reads
+ERP master data over SQL and grants itself SELECT on that table", and then granted exactly that.
+The CRM does not read ERP master data over SQL and never did — every read goes over HTTP through
+`ErpClient`, which is Q5's answer ("entity names, not tables"). The only occurrences of that
+table's name anywhere in `packages/` are two tests quoting an ERP unique-constraint message.
+
+An unused grant is not neutral. It is an invitation to the thing item 5 forbids, and the ERP's own
+ADR-0314 made the path actively wrong in the meantime: a tenant serving an activated manifest is
+served from **its own schema**, so a SQL read of the shared table returns zero rows for that
+tenant — silently, under a fail-closed rule that reads an empty set as "this tenant has no
+products".
+
+**Revoked, not merely deleted from the file,** and that distinction is the whole of the change:
+
+```sql
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables
+              WHERE table_schema = 'meta' AND table_name = 'operate_entity_records') THEN
+    EXECUTE 'REVOKE ALL ON meta.operate_entity_records FROM crm_app';
+  END IF;
+END
+$$;
+REVOKE ALL ON SCHEMA meta FROM crm_app;
+```
+
+0001 declares `-- @requires: dba` and those files are **not** hash-ledgered: `bin/migrate.ts` runs
+every one of them on every deploy, ahead of the ledgered app migrations. Deleting the two GRANT
+lines would therefore have removed the privilege from databases created *afterwards* and left it
+standing on every database that already exists, with nothing to take it away. A REVOKE in the file
+that runs every time is the only form of this change that reaches a deployed database. The
+existence guard is there because the first statement names a table that the ERP creates and a
+CRM-only database legitimately does not have — and `REVOKE` on a missing object is an error, not a
+no-op.
+
+What is asserted now, in `schema.contract.test.ts`, is a property of the privileges rather than a
+convention:
+
+```
+✓ crm_app holds NOTHING on the ERP, not even SELECT
+```
+
+It checks both halves — `has_schema_privilege` for `USAGE` and `CREATE` on `meta`, and
+`has_table_privilege` for all seven on `meta.operate_entity_records` where it exists — because a
+table privilege with no schema `USAGE` is unusable but still *granted*, and the row in
+`information_schema` is what a future reader would copy.
+
+The precondition stays, with its subject narrowed from the one table to the schema and the reason
+that survives: ADR-0001 deploys the two side by side, and a CRM migrated beside the wrong database
+would come up, serve reps, and queue writes over HTTP to an ERP whose data is somewhere else, with
+nothing downstream saying so. **The upgrade path is the whole point, so it was run.** A database carrying the old grants —
+`GRANT USAGE ON SCHEMA meta` and `GRANT SELECT` on the table, applied by hand to reproduce a
+pre-item-42 deployment — then had 0001 re-run over it exactly as a deploy would:
+
+```
+before: schema usage=true  table select=true
+after:  schema usage=false create=false table select=false / crm schema usage=true
+```
+
+The last field is the control: `crm_app` keeps everything it needs in its own schema, so this is a
+revoke of the ERP reach and not a role that can no longer work.
+
+**And the deploy-smoke gate's new assertion was broken, which only running it showed.** The gate
+greps the migrate container's log for the refusal, and the sentence was updated to the new one:
+
+```sh
+grep -q 'schema "meta" was not found' "$WORK/refuse.log"
+```
+
+That cannot match. The refusal reaches that log inside the runner's own **JSON** line, where the
+quoted identifier is written `schema \"meta\" was not found` — so the gate would have failed with
+"migrate refused, but not for the documented reason", about a refusal that was perfectly correct.
+The old pattern (`operate_entity_records was not found`) had no quote characters in it and that is
+the only reason it ever worked. Both patterns are now quote-free — `there is no CrossEngin ERP in
+this database` and `every CRM read of the ERP goes over HTTP` — and both were checked against the
+real log of a real refusal:
+
+```json
+{"type":"failed","error":"DBA migration 0001_roles_and_grants.sql failed. … Cause: error: schema
+ \"meta\" was not found, so there is no CrossEngin ERP in this database. ADR-0001 deploys the two
+ side by side, and a CRM migrated beside the wrong database would come up, serve reps and queue
+ writes to an ERP whose own data is somewhere else — with nothing downstream saying so, because
+ every CRM read of the ERP goes over HTTP. …"}
+```
+
+The second pattern is the one that stops this from being re-explained wrongly in a year: a grep for
+a refusal is only as good as what it insists the refusal *says*.
+
+### (b) The gate now records which ERP it was evidence about
+
+This file is the strongest evidence in the repository, and for most of its life it recorded
+nowhere which ERP each run verified against. On 2026-10-06 the CrossEngin checkout was **eleven
+commits behind its own `origin/main`**, so every "verified live" claim in the chapters above that
+date was made against an ERP two days stale. The claims survived — the six ERP-side facts ADR-0001
+depends on were re-read afterwards and were unchanged — but that is luck confirmed after the fact,
+not a property of the gate.
+
+The open row said the real question was whether a stale checkout should **fail**. Three states,
+three different answers, and the difference between them is the point:
+
+- **Dirty** — uncommitted changes under the ERP checkout — is **refused**. The output would name a
+  commit that is not what ran, so the evidence is unreproducible by anybody, us included. This is
+  also the one state a previous bad run of this gate could itself have caused, and §16 only
+  notices that afterwards.
+- **Behind** its own local `origin/main` is **warned**. Freshness needs a fetch, a network and
+  somebody's credentials, and a gate that required them would fail on a CI runner or an offline
+  laptop for a reason unrelated to anything it tests. The warning names the distance so the
+  evidence can be dated.
+- **No git at all** is reported as *unknown*, not skipped silently — a provenance line that is
+  absent reads exactly like one that was never added.
+
+The first run under this rule said both halves out loud:
+
+```
+ok: verifying against CrossEngin 92cfc09e288a — Compare index and policy definitions by letting Postgres dep, clean checkout
+    WARNING: this checkout is 11 commit(s) behind its own origin/main, so every
+    claim below is about an ERP that is 11 commit(s) old. Not a failure — freshness
+    needs a fetch this gate must not require — but date the evidence accordingly.
+```
+
+So the row's own observation is now made by the gate instead of by somebody reading it two days
+later. §16's closing line carries the same commit, which is what ties "not one file under the ERP
+changed" to a particular ERP:
+
+```
+ok: not one file under /home/user/CrossEngin changed (CrossEngin 92cfc09e288a, dirty=no)
+```
+
+### (c) A probe that no longer says a message was refused
+
+`SmtpSender` and `SmtpProber` drive the same `SmtpConversation`, which is deliberate — a probe
+that negotiated differently from the sender would be testing something else. But the shared
+refusals ended "Refusing to send", and in a **probe row** nothing was ever going to be sent. A
+probe row *is* the sentence an operator reads to decide whether a relay is usable; one that
+implies a notification was lost sends them looking for a notification that does not exist.
+
+The conversation now states the fact about the relay and stops, and each caller appends its own
+consequence through one helper:
+
+```
+sender: relay does not advertise STARTTLS and require_starttls is set. Refusing to send.
+probe:  relay does not advertise STARTTLS and require_starttls is set. Nothing was sent —
+        this was a test.
+```
+
+One test asserts both sides, because the property is that they **differ** — a reworded sentence
+duplicated into two call sites would pass a test that only read one — and it checks the sink
+received nothing, so the probe's claim is true rather than merely better phrased.
+
+### A number that did not exist
+
+Every comment in this increment first cited itself as "0069", which is not a migration: there
+isn't one, and 0069 is a file a reader would go looking for and not find. They now cite ADR-0001
+item 42. Worth recording because the habit that produced it is a good one — the repository's
+comments cite the decision that made them, and almost every decision here has been a migration —
+and because an invented cross-reference is the one kind of comment that is worse than no comment.
+
+### The Docker stack could not be built in this container
+
+`dockerd` starts — the lesson from the four image defects holds — but `pnpm install` inside the
+build fails:
+
+```
+#32 0.282   code: 'SELF_SIGNED_CERT_IN_CHAIN'
+ERROR: process "/bin/sh -c pnpm install --frozen-lockfile" did not complete successfully
+```
+
+This container's outbound HTTPS goes through a TLS-intercepting proxy, and the build context
+carries neither its CA bundle nor a reason to. Nothing about `deploy/` is wrong and the fix would
+be an environment-specific `ARG`/`NODE_EXTRA_CA_CERTS` in the Dockerfile that no deployment wants
+— so the gate is **not claimed to have run**, which is the whole of the rule this chapter is
+about. The one step it changed was run directly against a real empty database instead, and that is
+what found the grep defect above; the rest of the gate is unchanged from the run that last proved
+it.
+
+### What is still not built
+
+- **The ERP checkout is eleven commits behind**, which the gate now says out loud every run.
+  Making it current is a decision about this environment, not a code change.
+- **`origin/main` is only askable when it is already local.** A deployment with no ERP remote
+  configured gets "cannot say how fresh it is" — honest, and not freshness.
+- **The precondition is weaker than it was, deliberately.** It asserts an ERP is in this database,
+  not that it is a *compatible* one. Compatibility is what the captured-baseline drift check
+  (`erp:codegen:check`) answers, and that runs in CI rather than at migration time.
+- **`verify-deploy-smoke.sh` has no home that can run it.** It is the only gate in the repository
+  that needs a Docker daemon and an unintercepted registry, and this environment has neither
+  together. CI does not run it either. A gate that nothing runs is a gate that rots — this
+  increment found one broken assertion in it by hand, and the next one will not be found that way.

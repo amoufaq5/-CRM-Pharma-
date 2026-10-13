@@ -137,8 +137,18 @@ ok "database healthy"
 if dc run --rm migrate > "$WORK/refuse.log" 2>&1; then
   fail "migrate succeeded against a database with no ERP in it; the 0001 precondition is not holding"
 fi
-grep -q "operate_entity_records was not found" "$WORK/refuse.log" \
+# ADR-0001 item 42 narrowed the precondition's SUBJECT from one table to the schema, because the reason it
+# used to give — "the CRM reads ERP master data over SQL" — was never true. The reason it gives now
+# is the one that survives: a CRM deployed beside the wrong database would come up, serve reps and
+# queue writes over HTTP to an ERP whose own data is somewhere else, with nothing saying so.
+# NO QUOTE CHARACTERS IN EITHER PATTERN. The refusal reaches this log inside the runner's own
+# JSON line, where `schema "meta" was not found` is written `schema \"meta\" was not found` — so a
+# grep for the raw sentence does not match, and this gate would have gone red on first use saying
+# the refusal was undocumented. Caught by running the step directly rather than trusting it.
+grep -q 'there is no CrossEngin ERP in this database' "$WORK/refuse.log" \
   || { tail -5 "$WORK/refuse.log" >&2; fail "migrate refused, but not for the documented reason"; }
+grep -q "every CRM read of the ERP goes over HTTP" "$WORK/refuse.log" \
+  || fail "the refusal no longer says WHY a database with no ERP in it is the wrong one"
 ok "migrate refuses without the ERP, naming the cause"
 
 # ---------------------------------------------------------------------------

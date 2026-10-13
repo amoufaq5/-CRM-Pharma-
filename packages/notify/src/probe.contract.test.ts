@@ -1274,6 +1274,34 @@ describe("the endpoint probe", () => {
       expect(live.transcript.at(-1)).toBe("QUIT");
     });
 
+    /**
+     * The sentence a probe row carries, which is the whole of ADR-0001's open note, closed by its item 42.
+     *
+     * `SmtpProber` and `SmtpSender` drive the same `SmtpConversation`, so a refusal used to end
+     * "Refusing to send" even here — where nothing was ever going to be sent. A probe row IS the
+     * sentence an operator reads to decide whether a relay is usable, and one that implies a
+     * notification was lost sends them looking for it.
+     *
+     * The conversation now states the FACT about the relay and stops; each caller appends its own
+     * consequence. Asserted from BOTH sides in one test, because the property is that they differ.
+     */
+    it("says nothing was sent, where the sender says it is refusing to send", async () => {
+      const live = await open({ advertiseAuth: [] });
+      const probed = await probeVia(live, {
+        relay: { username: "relay-user" },
+        env: { [SECRET_ENV]: SECRET },
+      });
+      // The shared fact.
+      expect(probed.detail).toContain("offers no AUTH mechanism");
+      expect(probed.detail).toContain("cannot be authenticated as relay-user");
+      // The probe's own consequence — and NOT the sender's, which would be false here.
+      expect(probed.detail).toContain("Nothing was sent — this was a test.");
+      expect(probed.detail).not.toContain("Refusing to send");
+      // And the relay really did receive nothing, so the sentence is true rather than merely
+      // reworded.
+      expect(live.messages).toEqual([]);
+    });
+
     it("earns `reachable` with no AUTH at all when the relay wants none", async () => {
       const live = await open();
       const outcome = await probeVia(live);

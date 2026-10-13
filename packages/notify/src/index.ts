@@ -188,6 +188,7 @@ export {
   SmtpSender,
   SmtpTimeoutError,
   classifySmtpReply,
+  withConsequence,
   type SmtpRelayConfig,
   type SmtpSenderOptions,
   type SmtpStage,

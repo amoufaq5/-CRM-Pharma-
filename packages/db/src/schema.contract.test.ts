@@ -270,11 +270,38 @@ describe("CRM schema invariants", () => {
     expect(rows.map((r) => r.relname)).toEqual([]);
   });
 
-  it("crm_app holds SELECT and nothing else on the ERP", async () => {
-    const { rows } = await client.query<{ privilege_type: string }>(`
-      SELECT DISTINCT privilege_type FROM information_schema.table_privileges
-       WHERE grantee = 'crm_app' AND table_schema = 'meta' ORDER BY 1`);
-    expect(rows.map((r) => r.privilege_type)).toEqual(["SELECT"]);
+  /**
+   * `crm_app` holds NOTHING on the ERP, as of ADR-0001 item 42 — this test used to assert `["SELECT"]`.
+   *
+   * 0001 granted `USAGE ON SCHEMA meta` and `SELECT ON meta.operate_entity_records` for an SQL
+   * read path that was designed and never built: every CRM read of the ERP goes over HTTP through
+   * `ErpClient`, which is what ADR-0001 Q5 decided ("entity names, not tables"). The only
+   * occurrences of that table's name in `packages/` are two tests quoting an ERP
+   * unique-constraint message.
+   *
+   * An unused grant is not neutral. It is an invitation to the thing ADR-0001 item 5 forbids, and
+   * the ERP's own ADR-0314 made the path actively wrong: a tenant serving an activated manifest
+   * is served from its OWN schema, so an SQL read of that table returns zero rows for them —
+   * silently, under a fail-closed rule that reads an empty set as "no products". Reading over HTTP
+   * means 0314 costs the CRM nothing; the hazard was the privilege sitting there.
+   *
+   * So "never over SQL" is now a property of the privileges rather than a convention. Asserted on
+   * the schema as well as on the objects, because `USAGE` alone is enough to resolve a name and an
+   * object grant without it is a privilege waiting for the schema grant to come back.
+   */
+  it("crm_app holds NOTHING on the ERP, not even SELECT", async () => {
+    const { rows } = await client.query<{ privilege_type: string; table_name: string }>(`
+      SELECT DISTINCT privilege_type, table_name FROM information_schema.table_privileges
+       WHERE grantee = 'crm_app' AND table_schema = 'meta' ORDER BY 1, 2`);
+    expect(
+      rows.map((r) => `${r.table_name}:${r.privilege_type}`),
+      "ADR-0001 item 42 revoked the CRM's SQL reach into the ERP; nothing should grant one back",
+    ).toEqual([]);
+
+    const { rows: schema } = await client.query<{ usage: boolean; create: boolean }>(`
+      SELECT has_schema_privilege('crm_app', 'meta', 'USAGE')  AS usage,
+             has_schema_privilege('crm_app', 'meta', 'CREATE') AS create`);
+    expect(schema[0]).toEqual({ usage: false, create: false });
   });
 
   it("crm_app cannot escalate past RLS", async () => {
