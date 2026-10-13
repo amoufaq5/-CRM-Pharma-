@@ -2915,6 +2915,55 @@ describe("the API, end to end", () => {
       expect(list.body.summary).toContain("their signals go nowhere");
     });
 
+    /**
+     * THE TEST HISTORY OUTLIVES THE ENDPOINT, over HTTP and not only in the table (0070).
+     *
+     * The probe rows stopped cascading away with the endpoint, which is the point of that
+     * migration — they record that a destination was tested and the hourly budget counts
+     * them. This route used to 404 on a missing parent, so the moment those rows became the
+     * only copy they became unreadable: built and unreachable, the trap this repository has
+     * fallen into five times. An empty list is now the answer for an id with no probes,
+     * which is also the honest answer for an id that never existed.
+     */
+    it("still serves an endpoint's test history after the endpoint is deleted", async () => {
+      await grantAdmin();
+      const made = await call("POST", "/v1/admin/notification-endpoints", {
+        auth: asAdmin(),
+        body: {
+          channel: "webhook",
+          url: "https://hooks.example.test/outlives-its-endpoint",
+          secretEnv: "CRM_WEBHOOK_SECRET",
+          reason: "an endpoint whose test history has to survive it",
+        },
+      });
+      expect(made.status).toBe(201);
+      const id = made.body.id as string;
+      expect((await call("POST", `/v1/admin/notification-endpoints/${id}/test`, { auth: asAdmin() })).status)
+        .toBe(202);
+
+      await withTenantContext(admin, TENANT, async (tx) => {
+        await tx.query("DELETE FROM crm.notification_endpoint_change WHERE endpoint_id = $1", [id]);
+        await tx.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [id]);
+      });
+
+      const history = await call("GET", `/v1/admin/notification-endpoints/${id}/tests`, { auth: asAdmin() });
+      expect(history.status).toBe(200);
+      const rows = history.body.data as readonly Record<string, unknown>[];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.endpoint_url).toBe("https://hooks.example.test/outlives-its-endpoint");
+      expect(rows[0]?.endpoint_present).toBe(false);
+
+      // And an id that never existed reads the same way, which is why this is not a 404: the
+      // two answers must be indistinguishable or the route is an existence oracle.
+      const unknown = await call(
+        "GET",
+        "/v1/admin/notification-endpoints/00000000-0000-4000-8000-00000000dead/tests",
+        { auth: asAdmin() },
+      );
+      expect(unknown.status).toBe(200);
+      expect(unknown.body.data).toEqual([]);
+    });
+
     it("refuses an email_recipient endpoint with a mailbox of its own, and says what the channel is for", async () => {
       await grantAdmin();
       const res = await call("POST", "/v1/admin/notification-endpoints", {

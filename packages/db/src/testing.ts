@@ -548,14 +548,21 @@ export async function wipeProposals(tx: PoolClient, tenantId: string): Promise<v
 }
 
 /**
- * Wipes a tenant's notification endpoints, and the amendment log that pins them.
+ * Wipes a tenant's notification endpoints, the amendment log that pins them, and their probes.
  *
- * Two statements and a disabled trigger, which is the shape of a fixture undoing a
+ * Three statements and a disabled trigger, which is the shape of a fixture undoing a
  * guarantee rather than working around one. 0060's log references the endpoint `ON DELETE
  * RESTRICT` — the convention for an audit child in this schema — and refuses a DELETE on
  * itself, so wiping endpoints means retiring the history first and saying so. A tenant
  * erasure does not need this: `eraseOrder` derives children-before-parents from the live
  * foreign-key graph, so it removes the log and then the endpoints with the triggers on.
+ *
+ * THE PROBES ARE DELETED EXPLICITLY SINCE 0070, and the day that migration landed this
+ * function was the only thing in the repository that noticed. They used to go with the
+ * endpoint by `ON DELETE CASCADE`; 0070 drops that key so a probe outlives the destination it
+ * tested, which is the whole point of it — and the hourly probe budget counts rows in that
+ * table, so a fixture leaving them behind made every budget assertion in the next test read
+ * `used = 78` against a ceiling of three. A borrowed tenant has to be handed back empty.
  *
  * Shared because seven suites wipe endpoints and seven copies of a trigger-disable is how
  * one of them ends up missing the re-enable.
@@ -567,6 +574,7 @@ export async function wipeEndpoints(tx: PoolClient, tenantId: string): Promise<v
   } finally {
     await tx.query("ALTER TABLE crm.notification_endpoint_change ENABLE TRIGGER USER");
   }
+  await tx.query("DELETE FROM crm.notification_endpoint_probe WHERE tenant_id = $1", [tenantId]);
   await tx.query("DELETE FROM crm.notification_endpoint WHERE tenant_id = $1", [tenantId]);
 }
 

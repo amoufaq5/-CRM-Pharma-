@@ -222,6 +222,23 @@ export interface ProbeRow {
   readonly seq: string;
   readonly endpoint_id: string;
   readonly channel: string;
+  /**
+   * Where this probe went, copied onto the row at request time (0070).
+   *
+   * The destination rather than the endpoint's current one, for 0048's reason on the delivery
+   * table: this row outlives the endpoint, so a joined url would vanish with it — and 0049
+   * freezes a live endpoint's url precisely because a repointed one would re-attribute its
+   * history. A copy taken at request time cannot be re-attributed by anything.
+   */
+  readonly endpoint_url: string;
+  /**
+   * Whether the endpoint this was addressed to still exists (0070).
+   *
+   * False means this probe row is the only record that the destination was ever tested, which
+   * is the whole reason the cascade is gone. A reader should say so rather than offering a
+   * re-test of something that is not there.
+   */
+  readonly endpoint_present: boolean;
   readonly requested_by: string;
   readonly requested_at: string;
   readonly state: ProbeState;
@@ -233,16 +250,21 @@ export interface ProbeRow {
 }
 
 /**
- * `channel` and `enabled` are joined in rather than left to the reader.
+ * The channel and the url come off the PROBE ROW, not off the endpoint (0070).
  *
  * A verdict is unreadable without the channel — `reachable` means a relay accepted us and
- * `delivered` means a receiver did, and which one a probe could even have earned depends
- * on the channel. `enabled` is here because a `delivered` verdict on a disabled endpoint is
- * true and misleading on its own.
+ * `delivered` means a receiver did, and which one a probe could even have earned depends on the
+ * channel. It used to be joined, with 0048's own expired argument: the endpoint is readable from
+ * a live row. That stopped being true the moment this row could outlive it, and an INNER JOIN
+ * would then have made the whole history of a removed destination DISAPPEAR — which is the defect
+ * dropping the cascade exists to prevent, reintroduced one layer up.
  */
-const PROBE_COLUMNS = `p.id, p.seq::text AS seq, p.endpoint_id, e.channel, p.requested_by,
+const PROBE_COLUMNS = `p.id, p.seq::text AS seq, p.endpoint_id,
+       p.endpoint_channel AS channel, p.endpoint_url, p.requested_by,
        to_char(p.requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS requested_at,
        p.state, p.attempts, p.verdict, p.detail, p.status,
+       EXISTS (SELECT 1 FROM crm.notification_endpoint e
+                WHERE e.tenant_id = p.tenant_id AND e.id = p.endpoint_id) AS endpoint_present,
        CASE WHEN p.completed_at IS NULL THEN NULL
             ELSE to_char(p.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') END AS completed_at`;
 
@@ -285,7 +307,6 @@ export async function probeById(tx: PoolClient, id: string): Promise<ProbeRow | 
   const { rows } = await tx.query<ProbeRow>(
     `SELECT ${PROBE_COLUMNS}
        FROM crm.notification_endpoint_probe p
-       JOIN crm.notification_endpoint e ON e.id = p.endpoint_id
       WHERE p.id = $1`,
     [id],
   );
@@ -312,7 +333,6 @@ export async function listProbes(
   const { rows } = await tx.query<ProbeRow>(
     `SELECT ${PROBE_COLUMNS}
        FROM crm.notification_endpoint_probe p
-       JOIN crm.notification_endpoint e ON e.id = p.endpoint_id
       WHERE p.endpoint_id = $1
       ORDER BY p.seq DESC
       LIMIT $2`,
@@ -326,10 +346,22 @@ export interface ClaimedProbe {
   readonly seq: string;
   readonly tenant_id: string;
   readonly endpoint_id: string;
+  /** From the probe row's own copy since 0070, so it is here even when the endpoint is not. */
   readonly channel: string;
   readonly url: string;
-  readonly secret_env: string;
-  readonly enabled: boolean;
+  /**
+   * The environment variable holding the secret — NULL when the endpoint is gone (0070).
+   *
+   * Deliberately not copied onto the probe: it names a variable rather than holding a value,
+   * and rotating which one an endpoint reads must not be frozen per probe. So this is the one
+   * field that can only come from the live row, and its absence is what tells the runner there
+   * is nothing left to ask.
+   */
+  readonly secret_env: string | null;
+  /** Null for the same reason, and for the same one row. */
+  readonly enabled: boolean | null;
+  /** False when the endpoint was deleted between the request and this claim (0070). */
+  readonly endpoint_present: boolean;
   readonly attempts: number;
   readonly requested_at: string;
 }
@@ -375,13 +407,29 @@ export async function claimDueProbes(
               claimed_at = $2,
               claimed_by = left($4, 200)
         WHERE p.id IN (SELECT id FROM due)
-        RETURNING p.id, p.seq, p.tenant_id, p.endpoint_id, p.attempts, p.requested_at
+        RETURNING p.id, p.seq, p.tenant_id, p.endpoint_id, p.attempts, p.requested_at,
+                  -- 0070: the destination, off the claimed row rather than off a join, for the
+                  -- reason the SELECT below gives.
+                  p.endpoint_channel, p.endpoint_url
      )
      SELECT c.id, c.seq::text AS seq, c.tenant_id, c.endpoint_id, c.attempts,
             to_char(c.requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS requested_at,
-            e.channel, e.url, e.secret_env, e.enabled
+            -- 0070: THE DESTINATION COMES OFF THE PROBE ROW and the live endpoint contributes
+            -- only what the WORK needs. The two parted company when the cascade was dropped:
+            -- the record of where a probe went is the probe's, where the secret to make it with
+            -- is the endpoint's and must never be frozen (rotating which variable an endpoint
+            -- reads is a legitimate change).
+            c.endpoint_channel AS channel, c.endpoint_url AS url,
+            -- LEFT, not inner. An inner join here would claim an orphan in the CTE above and
+            -- then drop it from the result: consumed every pass, never answered, never counted
+            -- — 0046's hazard on the delivery table, one subsystem over. A LEFT JOIN hands the
+            -- row to the runner with no secret, and the runner answers it unknown, which keeps
+            -- the rule notification_endpoint_probe_settle_once enforces: an answer comes from
+            -- a claim. (No backticks here: template literal.)
+            e.secret_env, e.enabled, (e.id IS NOT NULL) AS endpoint_present
        FROM claimed c
-       JOIN crm.notification_endpoint e ON e.id = c.endpoint_id
+       LEFT JOIN crm.notification_endpoint e
+              ON e.tenant_id = c.tenant_id AND e.id = c.endpoint_id
       ORDER BY c.seq`,
     [tenantId, now, limit, workerId, leaseMs],
   );
@@ -925,6 +973,14 @@ export class SmtpProber implements ChannelProber {
 export interface ProbeRunResult {
   readonly claimed: number;
   readonly abandoned: number;
+  /**
+   * Probes answered `unknown` because the endpoint they were addressed to is gone (0070).
+   *
+   * Reported separately from `byVerdict` even though they land in it, for the reason
+   * `DispatchResult.orphaned` is: a number that is normally zero and suddenly is not says
+   * somebody is deleting endpoints with probes in flight, which no route does.
+   */
+  readonly orphaned: number;
   readonly byVerdict: Readonly<Record<ProbeVerdict, number>>;
 }
 
@@ -959,6 +1015,7 @@ export class EndpointProbeRunner {
     const byVerdict: Record<ProbeVerdict, number> = { delivered: 0, reachable: 0, refused: 0, unknown: 0 };
     let abandoned = 0;
 
+    let orphaned = 0;
     try {
       const claimed = await withTenantContext(client, tenantId, (tx) =>
         claimDueProbes(
@@ -974,18 +1031,34 @@ export class EndpointProbeRunner {
       for (const probe of claimed) {
         const outcome = await this.outcomeFor(probe, tenantId);
         if (probe.attempts > MAX_PROBE_ATTEMPTS) abandoned += 1;
+        if (!probe.endpoint_present) orphaned += 1;
         await withTenantContext(client, tenantId, async (tx) => {
           if (await recordProbeVerdict(tx, probe.id, outcome, now())) byVerdict[outcome.verdict] += 1;
         });
       }
 
-      return { claimed: claimed.length, abandoned, byVerdict };
+      return { claimed: claimed.length, abandoned, orphaned, byVerdict };
     } finally {
       client.release();
     }
   }
 
   private async outcomeFor(probe: ClaimedProbe, tenantId: string): Promise<ProbeOutcome> {
+    if (!probe.endpoint_present) {
+      // 0070: THE ENDPOINT IS GONE, so there is nothing left to ask. Checked here rather than
+      // in the claim because `notification_endpoint_probe_settle_once` only admits
+      // `in_flight → complete`: an answer comes from a claim, which is a rule worth keeping, so
+      // the orphan is claimed like any other probe and answered where every other verdict is
+      // decided. `unknown` is 0034's verdict for "we cannot say" — `refused` would be a claim
+      // about a third party that never spoke, the mistake 0069 corrected one table over.
+      return {
+        verdict: "unknown",
+        detail:
+          `the endpoint this probe was addressed to no longer exists, so nothing can be asked ` +
+          `and no answer will arrive. The destination it named was ${probe.channel} ` +
+          `${probe.url}; this row is now the only record that it was ever tested.`,
+      };
+    }
     if (probe.attempts > MAX_PROBE_ATTEMPTS) {
       // Checked before the prober so a probe that somehow kills the process it is claimed
       // by cannot be claimed forever. `unknown`, because nobody ever got an answer.
@@ -1010,6 +1083,18 @@ export class EndpointProbeRunner {
           `${[...this.probers.keys()].join(", ") || "none"}. The endpoint may be fine; this binary ` +
           `cannot find out, and it cannot send to it either.`,
       };
+    }
+
+    if (probe.secret_env === null) {
+      // UNREACHABLE, and a refusal rather than a `?? ""`. `secret_env` is null exactly when
+      // the endpoint is gone, and that case returned `unknown` above — but an empty variable
+      // name would make the prober sign with nothing and report a refusal about the
+      // DESTINATION when the fault is entirely ours, which is the one outcome a probe must
+      // never produce. If this ever throws, the claim's LEFT JOIN and `endpoint_present` have
+      // parted company and the right answer is a crash, not a verdict.
+      throw new Error(
+        `probe ${probe.id} reports a present endpoint and no secret_env, which the claim cannot produce`,
+      );
     }
 
     const outcome = await prober.probe({

@@ -2987,7 +2987,7 @@ three different answers, and the difference between them is the point:
 
 - **Dirty** — uncommitted changes under the ERP checkout — is **refused**. The output would name a
   commit that is not what ran, so the evidence is unreproducible by anybody, us included. This is
-  also the one state a previous bad run of this gate could itself have caused, and §16 only
+  also the one state a previous bad run of this gate could itself have caused, and §17 only
   notices that afterwards.
 - **Behind** its own local `origin/main` is **warned**. Freshness needs a fetch, a network and
   somebody's credentials, and a gate that required them would fail on a CI runner or an offline
@@ -3006,7 +3006,7 @@ ok: verifying against CrossEngin 92cfc09e288a — Compare index and policy defin
 ```
 
 So the row's own observation is now made by the gate instead of by somebody reading it two days
-later. §16's closing line carries the same commit, which is what ties "not one file under the ERP
+later. §17's closing line carries the same commit, which is what ties "not one file under the ERP
 changed" to a particular ERP:
 
 ```
@@ -3181,3 +3181,119 @@ saying why its copy is unreachable and still has to be complete.
   changed is that 0048's argument against that route has partly expired: a delivery record now
   survives its endpoint with the destination copied onto it, so the only thing a cascade still
   destroys is the probe history — the one leg 0046 and 0048 have each already shown how to detach.
+
+## A probe is about a destination
+
+*2026-10-13, `./scripts/verify-live-erp.sh` (204 ok lines, three more than before),
+`pnpm client:verify` (329 checks) and `npx vitest run` (104 files / 2,666 tests). The migration
+runner is green on a fresh database with 70 migrations.*
+
+Migration 0070, and the second clause of the same open row. `notification_endpoint_probe_endpoint_id_fkey`
+was `ON DELETE CASCADE`, and 0045's hourly probe budget counts rows in that table — so deleting
+an endpoint did not only erase the record that a destination had been tested, it **handed the
+tenant back its spend**. ADR-0001's row named that bypass in advance; what it did not say is that
+the comment in `routes.ts` explaining why there is no DELETE route had already expired, because
+the cascade it cites is the one 0048 dropped.
+
+This is 0046 and 0048 a third time, on the third child of one subsystem: copy the channel and the
+url onto the probe at request time, let the guard that makes the copies be the tenant check the
+key used to provide, drop the key. 43 composite references remain of the original 46.
+
+### The rule that moved, and the exemption nobody had noticed
+
+0034's cooldown keyed on `endpoint_id`, so it bounded how often a **row** could be probed. What it
+protects is a third party's server — and since 0049 froze a live endpoint's url, "disable the old
+one and create a new one" is the only way to move a destination, and it already produced a fresh
+row with no cooldown at all. An administrator who wanted to hammer one url twice in a minute never
+needed a DELETE route; they needed a second endpoint.
+
+So the cooldown keys on `(tenant, channel, url)`, which only the copy makes possible. The live gate
+proves it on the running deployment's own tenant, through the live guard rather than through a
+fixture:
+
+```
+ok: one probe requested through the live guard, which copied the destination onto it
+ok: and a second endpoint pointing at the same url is refused by that destination's cooldown
+ok: both endpoints deleted, the probe survived them, and the budget still counts it (1 spent, unchanged)
+```
+
+The third line is the one the open row asked for, and it is a number before and after in one
+statement: `used = 1`, both endpoints deleted, one probe row left, `used = 1`.
+
+### What the schema refused, and was right to
+
+The obvious answer to "a probe can now outlive its endpoint" was 0069's, one increment old: a
+settle function moving an unanswerable probe to `complete` with `unknown`. 0034's
+`notification_endpoint_probe_settle_once` refused it **by name**:
+
+```
+probe-transition: probe 799729e4-… cannot move from requested to complete
+```
+
+It admits `requested → in_flight` and `in_flight → complete` and nothing else, because an answer
+comes from a claim or it is an answer nobody obtained. The trigger caught a design that would have
+put a verdict on a row no process ever ran.
+
+So the claim takes the orphan with a **LEFT JOIN**, hands the runner a probe with no `secret_env`
+and `endpoint_present = false`, and the runner answers it `unknown` beside the two cases already
+there — "no prober registered for this channel" and "claimed too many times and never answered".
+No new SQL function, a rule kept, and the migration's third section is now a comment explaining
+where the answer went, because the next reader will look for a function.
+
+The one place that narrowing could go wrong is the prober call, where `secret_env` is `string |
+null` and the branch above guarantees it is not null. That is a **throw**, not a `?? ""`: an empty
+variable name would make the prober sign with nothing and report a refusal about the *destination*
+when the fault is entirely ours, which is the one outcome a probe must never produce.
+
+### Two fixtures were the only things that noticed
+
+Worth recording, because it is what a dropped cascade actually costs:
+
+- **`wipeEndpoints` relied on it** to hand a borrowed tenant back empty. Without the cascade the
+  probe rows stayed, and because the budget counts them the next test in the file read `used = 78`
+  against a ceiling of three. Nine failures in one suite, all of them about a number nobody had
+  changed.
+- **The fixture that backdates probes** stands the guard down on purpose — 0034 overwrites
+  `requested_at` precisely so no caller can defeat the cooldown — so it now has to supply the
+  destination the guard would have copied, and reads it off the endpoint rather than writing one in.
+
+And the suite had to be **inverted**: `takes its probes with the endpoint when the endpoint is
+deleted` was a test asserting the defect. It is now two tests, one for the rows surviving with
+their destination intact and one for the budget not being refunded, because "the rows survive" and
+"the spend is still counted" are two claims.
+
+### The history is readable after the deletion, which it was not
+
+`GET /v1/admin/notification-endpoints/:id/tests` 404'd on a missing parent, so the probe rows
+became unreachable over HTTP the moment they became the only copy — built and unreachable, the
+trap this repository has fallen into five times. It now answers an empty list for an id with no
+probes, which is also the honest answer for an id that never existed: the delivery-history route's
+existence-oracle rule, arriving here for the same reason it was written there.
+
+### A pattern that failed against a refusal that was right
+
+The gate's twin-endpoint check failed on its first run, and the refusal it failed on was perfect:
+
+```
+FAIL: a twin endpoint was probed inside the destination's cooldown: ERROR:  probe-cooldown:
+https://sink.invalid/probed was probed at … — the cooldown is per DESTINATION, so another
+endpoint pointing at the same url shares it
+```
+
+The shell pattern looked for `per DESTINATION` before the url; the message puts the url first,
+because it is the refusal's first argument. I had rehearsed the SQL against a scratch tenant and
+read the message with my own eyes — and not run the `case` over it. Rehearsing a statement is not
+rehearsing the assertion above it.
+
+### What is still not built
+
+- **The last clause of that row stands: nothing bounds `crm.notification_endpoint`.** No DELETE
+  route and no cap. What changed is that the obstacle is nameable: nothing cascades away any more,
+  and the only reference left is `crm.notification_endpoint_change` — 0060's amendment log, at
+  `ON DELETE RESTRICT`, the audit-child convention. A retire path has to answer that log.
+- **A retired endpoint's last twenty probes are kept forever.** 0034's ring trims on insert, per
+  endpoint, so an endpoint nothing probes again is never trimmed. Bounded and deliberate: they are
+  the record of that destination's last tests.
+- **`uq_notification_endpoint_probe_outstanding` is still per endpoint.** It is about a row's own
+  claim rather than about traffic, and the destination cooldown subsumes it — a just-requested
+  probe on a sibling endpoint is now that destination's `previous`.

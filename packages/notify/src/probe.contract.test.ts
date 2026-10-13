@@ -205,12 +205,19 @@ describe("the endpoint probe", () => {
         const ids: string[] = [];
         for (let i = 0; i < 20; i += 1) {
           // Ages descend as `seq` ascends, so the newest 20 by `seq` are the newest by clock.
+          // THE DESTINATION IS SUPPLIED HERE SINCE 0070, because the guard this fixture has
+          // just stood down is also what copies it — and the columns are NOT NULL. Read off
+          // the endpoint rather than written in, so an aged row says what a real one would.
           const { rows } = await tx.query<{ id: string }>(
             `INSERT INTO crm.notification_endpoint_probe
                (tenant_id, endpoint_id, requested_by, requested_at,
+                endpoint_channel, endpoint_url,
                 state, verdict, detail, completed_at)
-             VALUES ($1, $2, $3, now() - make_interval(secs => 7200 - $4::int),
-                     'complete', 'refused', 'aged fixture', now() - interval '2 hours')
+             SELECT $1, $2, $3, now() - make_interval(secs => 7200 - $4::int),
+                    e.channel, e.url,
+                    'complete', 'refused', 'aged fixture', now() - interval '2 hours'
+               FROM crm.notification_endpoint e
+              WHERE e.tenant_id = $1 AND e.id = $2
              RETURNING id`,
             [TENANT, endpoint, ADMIN, i],
           );
@@ -304,6 +311,53 @@ describe("the endpoint probe", () => {
       );
       expect(second.id).not.toBe(first.id);
       expect(BigInt(second.seq)).toBeGreaterThan(BigInt(first.seq));
+    });
+
+    /**
+     * THE COOLDOWN IS ABOUT A DESTINATION, NOT A ROW (0070), and this is the case that was
+     * silently exempt before it. 0049 freezes a live endpoint's url, so "disable the old one
+     * and create a new one" is the only way to move a destination — and that produced a fresh
+     * `endpoint_id` with no cooldown at all. An administrator who wanted to hammer one url
+     * twice in a minute never needed a DELETE route; they needed a second endpoint.
+     */
+    it("refuses a probe of a url another endpoint has just probed", async () => {
+      const shared = "https://hooks.example.com/one-and-the-same";
+      const original = await addEndpoint({ url: shared });
+      const first = await inTenant(TENANT, (tx) =>
+        requestProbe(tx, TENANT, { endpointId: original, requestedBy: ADMIN }),
+      );
+      expect(await settle(first.id, { verdict: "delivered", detail: "ok" })).toBe(true);
+
+      const twin = await addEndpoint({ url: shared });
+      const err = await inTenant(TENANT, (tx) =>
+        requestProbe(tx, TENANT, { endpointId: twin, requestedBy: ADMIN }),
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ProbeCooldownError);
+      // The refusal has to name the url and say WHY a different endpoint is being refused,
+      // or it reads as a bug: the administrator is looking at a row that has never been
+      // probed. 0030's rule — a refusal that names the wrong noun sends the reader looking
+      // for a problem they do not have.
+      expect((err as Error).message).toContain(shared);
+      expect((err as Error).message).toContain("per DESTINATION");
+    });
+
+    /**
+     * And one tenant's traffic never explains another's wait. A shared url across tenants is
+     * two cooldowns, because telling tenant A to wait for tenant B's probe would be a
+     * disclosure that tenant B exists — the fail-closed reading in reverse.
+     */
+    it("keeps a destination's cooldown inside the tenant that probed it", async () => {
+      const shared = "https://hooks.example.com/two-tenants-one-url";
+      const ours = await addEndpoint({ url: shared });
+      const mine = await inTenant(TENANT, (tx) =>
+        requestProbe(tx, TENANT, { endpointId: ours, requestedBy: ADMIN }),
+      );
+      expect(mine.endpoint_url).toBe(shared);
+      const theirs = await addEndpoint({ tenant: OTHER_TENANT, url: shared });
+      const ok = await inTenant(OTHER_TENANT, (tx) =>
+        requestProbe(tx, OTHER_TENANT, { endpointId: theirs, requestedBy: OTHER_ADMIN }),
+      );
+      expect(ok.state).toBe("requested");
     });
 
     /** Zero cooldown must still not let a queue form: that is the index's job, not the clock's. */
@@ -469,8 +523,9 @@ describe("the endpoint probe", () => {
       const state = await budget();
       expect(state.nextSlotAt).not.toBeNull();
       expect(Date.parse(state.nextSlotAt!)).toBe(Date.parse(first.requested_at) + 3600 * 1000);
-      // And it is NOT the cooldown's refusal wearing a different message: the two endpoints
-      // are different, so the cooldown has nothing to say about either.
+      // And it is NOT the cooldown's refusal wearing a different message: `addEndpoint`
+      // generates a fresh url per call and the cooldown is per DESTINATION since 0070, so it
+      // has nothing to say about either of these.
       expect(err).not.toBeInstanceOf(ProbeCooldownError);
       expect(err.message).not.toContain("probe-cooldown");
     });
@@ -755,27 +810,70 @@ describe("the endpoint probe", () => {
      * outlive the notification it describes. A probe has no notification and must never
      * acquire one.
      */
-    it("depends on the endpoint and on no notification at all", async () => {
+    /**
+     * ONE REFERENCE LEFT, AND IT IS THE AUTHOR'S (0070).
+     *
+     * The endpoint's was `ON DELETE CASCADE` until 0070 dropped it, which is 0046 and 0048's
+     * move on the third child of this subsystem: the row records that a destination was tested
+     * and must outlive the row that named it. The author's stays `RESTRICT`, which is this
+     * schema's convention for an audit child — a probe whose requester has been deleted is a
+     * probe nobody asked for.
+     */
+    it("depends on its author and on nothing else", async () => {
       const { rows } = await client.query<{ target: string; action: string }>(
         `SELECT confrelid::regclass::text AS target, confdeltype AS action
            FROM pg_constraint
           WHERE conrelid = 'crm.notification_endpoint_probe'::regclass AND contype = 'f'
           ORDER BY 1`,
       );
-      expect(rows.map((r) => r.target).sort()).toEqual(["crm.notification_endpoint", "crm.rep_profile"]);
-      expect(rows.find((r) => r.target === "crm.notification_endpoint")!.action).toBe("c");
+      expect(rows.map((r) => r.target).sort()).toEqual(["crm.rep_profile"]);
+      expect(rows.find((r) => r.target === "crm.rep_profile")!.action).toBe("r");
       expect(rows.map((r) => r.target)).not.toContain("crm.notification");
+      expect(rows.map((r) => r.target)).not.toContain("crm.notification_endpoint");
     });
 
-    it("takes its probes with the endpoint when the endpoint is deleted", async () => {
+    /**
+     * THE CLAIM 0070 EXISTS TO MAKE, and the inverse of what this test asserted before it.
+     *
+     * A probe is evidence that a destination was tested, and the budget that bounds how much
+     * traffic a tenant may send a third party counts these rows — so taking them with the
+     * endpoint both erased the evidence and handed back the spend. The row still says where it
+     * went, because 0070 copies the channel and the url at request time.
+     */
+    it("keeps its probes when the endpoint is deleted, and they still say where they went", async () => {
       const endpoint = await addEndpoint();
       const probe = await inTenant(TENANT, (tx) =>
         requestProbe(tx, TENANT, { endpointId: endpoint, requestedBy: ADMIN }),
       );
+      expect(probe.endpoint_present).toBe(true);
       await inTenant(TENANT, async (tx) => {
         await tx.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [endpoint]);
       });
-      expect(await inTenant(TENANT, (tx) => probeById(tx, probe.id))).toBeNull();
+      const after = await inTenant(TENANT, (tx) => probeById(tx, probe.id));
+      expect(after).not.toBeNull();
+      expect(after?.channel).toBe("webhook");
+      expect(after?.endpoint_url).toMatch(/^https:/);
+      expect(after?.endpoint_present).toBe(false);
+      // And through the per-endpoint listing the admin route reads, which is the query that
+      // would have returned nothing had it kept its inner join.
+      expect(await inTenant(TENANT, (tx) => listProbes(tx, endpoint))).toHaveLength(1);
+    });
+
+    /**
+     * And the spend is not refunded, which is the half ADR-0001's row named as the bypass a
+     * DELETE route would open: 0045's budget counts probe rows per tenant in a window, so a
+     * deletion that took them would hand back the quota. Asserted as a number, before and
+     * after, because "the rows survive" and "the budget still counts them" are two claims.
+     */
+    it("does not refund the tenant's probe budget", async () => {
+      const endpoint = await addEndpoint();
+      await inTenant(TENANT, (tx) => requestProbe(tx, TENANT, { endpointId: endpoint, requestedBy: ADMIN }));
+      const before = await inTenant(TENANT, (tx) => probeBudget(tx, TENANT));
+      expect(before.used).toBe(1);
+      await inTenant(TENANT, async (tx) => {
+        await tx.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [endpoint]);
+      });
+      expect((await inTenant(TENANT, (tx) => probeBudget(tx, TENANT))).used).toBe(1);
     });
 
     it("claims a probe, counts the claim, and names the worker holding it", async () => {
@@ -1534,6 +1632,7 @@ describe("the endpoint probe", () => {
       expect(result).toEqual({
         claimed: 1,
         abandoned: 0,
+        orphaned: 0,
         byVerdict: { delivered: 1, reachable: 0, refused: 0, unknown: 0 },
       });
       const stored = await inTenant(TENANT, (tx) => probeById(tx, probe.id));
@@ -1608,8 +1707,85 @@ describe("the endpoint probe", () => {
       expect(await runner([fakeProber("webhook", { verdict: "delivered", detail: "x" })]).runTenant(TENANT)).toEqual({
         claimed: 0,
         abandoned: 0,
+        orphaned: 0,
         byVerdict: { delivered: 0, reachable: 0, refused: 0, unknown: 0 },
       });
+    });
+
+    /**
+     * THE HAZARD DROPPING A CASCADE ALWAYS BRINGS (0070), and where the answer had to go.
+     *
+     * The claim joins the endpoint because a probe needs the `secret_env` the row deliberately
+     * does not copy, and an INNER join would claim an orphan in the statement's first CTE and
+     * then drop it from the result — consumed every pass, never answered, never counted, which
+     * is 0046's hazard on the delivery table. A settle function like 0069's was the obvious
+     * answer and this schema REFUSED it: `notification_endpoint_probe_settle_once` admits only
+     * `requested → in_flight` and `in_flight → complete`, so moving a requested probe straight
+     * to `complete` is refused by name — and that rule is right. An answer comes from a claim.
+     *
+     * So the claim takes the orphan with a LEFT JOIN, with no secret and `endpoint_present`
+     * false, and the runner answers it where every other verdict is decided.
+     */
+    it("claims a probe whose endpoint is gone, but with no secret to probe it with", async () => {
+      const url = "https://hooks.example.com/deleted-between-request-and-claim";
+      const endpoint = await addEndpoint({ url });
+      await inTenant(TENANT, (tx) => requestProbe(tx, TENANT, { endpointId: endpoint, requestedBy: ADMIN }));
+      await inTenant(TENANT, async (tx) => {
+        await tx.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [endpoint]);
+      });
+      const claimed = await inTenant(TENANT, (tx) => claimDueProbes(tx, TENANT, new Date(), "worker-0070"));
+      expect(claimed).toHaveLength(1);
+      expect(claimed[0]?.endpoint_present).toBe(false);
+      expect(claimed[0]?.secret_env).toBeNull();
+      expect(claimed[0]?.enabled).toBeNull();
+      // And the destination is still there, off the probe's own copy — the row the runner is
+      // about to answer can still say what it was for.
+      expect(claimed[0]?.url).toBe(url);
+      expect(claimed[0]?.channel).toBe("webhook");
+    });
+
+    /**
+     * And the other piece: the row gets an ANSWER rather than sitting unclaimable forever.
+     *
+     * `unknown` is 0034's verdict for every case where we cannot say — a timeout, a refused
+     * connection, no prober for the channel. A deleted endpoint is the purest instance of it:
+     * there is nothing left to ask. `refused` would be a claim about a third party that never
+     * spoke, which is the mistake 0069 corrected on the delivery table.
+     */
+    it("answers an orphaned probe `unknown`, naming the destination it can no longer reach", async () => {
+      const url = "https://hooks.example.com/gone-by-the-time-we-asked";
+      const endpoint = await addEndpoint({ url });
+      const probe = await inTenant(TENANT, (tx) =>
+        requestProbe(tx, TENANT, { endpointId: endpoint, requestedBy: ADMIN }),
+      );
+      await inTenant(TENANT, async (tx) => {
+        await tx.query("DELETE FROM crm.notification_endpoint WHERE id = $1", [endpoint]);
+      });
+
+      const result = await runner([fakeProber("webhook", { verdict: "delivered", detail: "x" })]).runTenant(
+        TENANT,
+      );
+      // Counted separately from the verdicts even though it lands in them: a number that is
+      // normally zero and suddenly is not says somebody is deleting endpoints with probes in
+      // flight, which no route does.
+      expect(result).toEqual({
+        claimed: 1,
+        abandoned: 0,
+        orphaned: 1,
+        byVerdict: { delivered: 0, reachable: 0, refused: 0, unknown: 1 },
+      });
+      const stored = await inTenant(TENANT, (tx) => probeById(tx, probe.id));
+      expect(stored?.state).toBe("complete");
+      expect(stored?.verdict).toBe("unknown");
+      expect(stored?.detail).toContain("no longer exists");
+      expect(stored?.detail).toContain(url);
+      expect(stored?.endpoint_present).toBe(false);
+      // And it is settled, so a second pass has nothing to do — the dispatcher's rule: a
+      // sweep that ran every thirty seconds must not re-settle what it settled.
+      expect(
+        (await runner([fakeProber("webhook", { verdict: "delivered", detail: "x" })]).runTenant(TENANT))
+          .orphaned,
+      ).toBe(0);
     });
 
     it("leaves another tenant's queue alone", async () => {

@@ -3358,10 +3358,16 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
       requireRole(ctx.principal, "administrator");
       const id = parse(UUID, ctx.params["id"]);
       const limit = Number(ctx.query.get("limit") ?? "20");
-      const data = await inTenant(deps, ctx.principal, async (tx) => {
-        if ((await getEndpoint(tx, id)) === null) throw notFound(`no notification endpoint ${id}`);
-        return listProbes(tx, id, Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 20) : 20);
-      });
+      // NO 404 FOR A MISSING ENDPOINT SINCE 0070, which is the delivery-history route's rule
+      // arriving here for the same reason it was written there. The probe rows now OUTLIVE the
+      // endpoint — the cascade is gone, because they are the record that a destination was
+      // tested and the hourly budget counts them — so a 404 on the parent would make the
+      // surviving history unreadable the moment it became the only copy. An empty list is also
+      // the honest answer for an id that never existed, and distinguishing the two would hand
+      // an administrator guessing ids a map of the tenant's endpoints.
+      const data = await inTenant(deps, ctx.principal, (tx) =>
+        listProbes(tx, id, Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 20) : 20),
+      );
       return { status: 200, body: { data } };
     },
   });
@@ -3369,10 +3375,18 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
   /**
    * Change an endpoint's thresholds, or switch it off.
    *
-   * There is no DELETE, and that is not an omission. `crm.notification_delivery`
-   * references the endpoint ON DELETE CASCADE, so removing one would erase the record
-   * of everything ever sent to it — the audit trail of where a tenant's signals went.
-   * `enabled: false` is how an endpoint stops, and the history stays.
+   * There is still no DELETE, and the reason this comment used to give has EXPIRED. It said
+   * `crm.notification_delivery` references the endpoint `ON DELETE CASCADE`, so removing one
+   * would erase the record of everything ever sent to it — true when it was written, and 0048
+   * dropped that key (the delivery row now carries the channel and the url it was sent to) as
+   * 0070 dropped the probe's. So nothing cascades away any more.
+   *
+   * What refuses a DELETE today is `crm.notification_endpoint_change`, 0060's amendment log,
+   * which references the endpoint `ON DELETE RESTRICT` — the audit-child convention in this
+   * schema: an amendment to a destination that no longer exists is still a record of who
+   * changed what. So a DELETE is refused by the database rather than merely absent from this
+   * router, which is the right order. `enabled: false` is how an endpoint stops, and every
+   * history stays.
    */
   router.add({
     method: "PATCH",

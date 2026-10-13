@@ -1017,7 +1017,7 @@ ok "every process this gate started — ERP, 2 key sets, API, 3 schedulers — i
 
 # ---------------------------------------------------------------------------
 echo
-echo "--- 15. a push nobody refused is abandoned, not dead ---"
+echo "--- 15. records that outlive the rows that named them ---"
 # 0069, AFTER EVERY PROCESS IS GONE, deliberately. The dispatcher calls this function on every
 # tick, so a seeded orphan left in front of a running scheduler would be settled by the binary
 # somewhere between two assertions — which is the right behaviour and an unreadable test. §14
@@ -1130,6 +1130,84 @@ case "$TERMINAL" in
   *abandoned-is-terminal*orphaned-endpoint*) ok "and it cannot be moved out of abandoned, in a refusal that quotes its own reason" ;;
   *) fail "an abandoned push was not frozen, or the refusal does not say why: $TERMINAL" ;;
 esac
+
+# 0070. THE THIRD CHILD OF THIS SUBSYSTEM TO OUTLIVE ITS PARENT, and the one that also carried a
+# bypass: 0045's hourly budget counts probe rows, so a cascade that took them with the endpoint
+# handed the tenant back its spend. Two claims here, and the second is the rule change — the
+# cooldown keys on the DESTINATION now, because what it protects is a third party's server and
+# "disable the old endpoint, create a new one" was already producing a fresh row with no cooldown.
+PROBE_SEED="$(psql -d "$CRM_DB" -At -v ON_ERROR_STOP=1 <<SQL 2>&1
+BEGIN;
+INSERT INTO crm.notification_endpoint
+  (tenant_id, channel, url, secret_env, enabled, created_by, created_reason)
+SELECT '$TENANT', 'webhook', u.url, 'CRM_WEBHOOK_SECRET', false, a.id,
+       'the live gate proving a probe outlives its endpoint and the cooldown follows the url'
+  FROM crm.rep_profile a, (VALUES ('https://sink.invalid/probed'),
+                                  ('https://sink.invalid/probed')) AS u(url)
+ WHERE a.tenant_id = '$TENANT' AND a.subject = 'rep-ada';
+-- Through the live guard, so the destination on the row is the one the trigger copied rather
+-- than one this gate wrote: the first probe is accepted.
+INSERT INTO crm.notification_endpoint_probe (tenant_id, endpoint_id, requested_by)
+SELECT '$TENANT', e.id, a.id
+  FROM crm.notification_endpoint e, crm.rep_profile a
+ WHERE e.tenant_id = '$TENANT' AND e.url = 'https://sink.invalid/probed'
+   AND a.tenant_id = '$TENANT' AND a.subject = 'rep-ada'
+ ORDER BY e.id LIMIT 1;
+COMMIT;
+SELECT 'probed ' || (SELECT count(*) FROM crm.notification_endpoint_probe
+                      WHERE tenant_id = '$TENANT'
+                        AND endpoint_url = 'https://sink.invalid/probed');
+SQL
+)"
+case "$PROBE_SEED" in
+  *"probed 1"*) ok "one probe requested through the live guard, which copied the destination onto it" ;;
+  *) fail "could not request the probe: $PROBE_SEED" ;;
+esac
+
+# THE SECOND ENDPOINT, same url, never probed — and refused by the cooldown of the OTHER row's
+# probe. Before 0070 this INSERT succeeded, which is the exemption the open row did not name.
+TWIN_REFUSAL="$(psql -d "$CRM_DB" -At -c "
+  INSERT INTO crm.notification_endpoint_probe (tenant_id, endpoint_id, requested_by)
+  SELECT '$TENANT', e.id, a.id
+    FROM crm.notification_endpoint e, crm.rep_profile a
+   WHERE e.tenant_id = '$TENANT' AND e.url = 'https://sink.invalid/probed'
+     AND a.tenant_id = '$TENANT' AND a.subject = 'rep-ada'
+     AND NOT EXISTS (SELECT 1 FROM crm.notification_endpoint_probe p WHERE p.endpoint_id = e.id)
+   ORDER BY e.id LIMIT 1" 2>&1 || true)"
+# THE ORDER OF THE CLAUSES IS THE MESSAGE'S, not the one that reads best here: the url is the
+# refusal's first argument and the "per DESTINATION" explanation closes the sentence. A pattern
+# written the other way round failed this gate against a refusal that was exactly right — which
+# is what comes of rehearsing the SQL and not the assertion over it.
+case "$TWIN_REFUSAL" in
+  *probe-cooldown*sink.invalid/probed*per\ DESTINATION*)
+    ok "and a second endpoint pointing at the same url is refused by that destination's cooldown" ;;
+  *) fail "a twin endpoint was probed inside the destination's cooldown: $TWIN_REFUSAL" ;;
+esac
+
+# AND THE DELETION, which is what the whole file is for. The budget before and after, as a number.
+PROBE_AFTER="$(psql -d "$CRM_DB" -qAt -F'|' -c "SET app.current_tenant_id = '$TENANT'" -c "
+  WITH spent_before AS (SELECT (SELECT used FROM crm.notification_probe_budget('$TENANT')) AS n),
+       gone AS (
+         DELETE FROM crm.notification_endpoint e
+          WHERE e.tenant_id = '$TENANT' AND e.url = 'https://sink.invalid/probed'
+         RETURNING 1
+       )
+  SELECT (SELECT n FROM spent_before),
+         (SELECT count(*) FROM gone),
+         (SELECT count(*) FROM crm.notification_endpoint_probe p
+           WHERE p.tenant_id = '$TENANT' AND p.endpoint_url = 'https://sink.invalid/probed'),
+         (SELECT used FROM crm.notification_probe_budget('$TENANT'))" 2>&1 || true)"
+case "$PROBE_AFTER" in
+  *probe-cooldown*|*ERROR*) fail "deleting the probed endpoints was refused: $PROBE_AFTER" ;;
+esac
+SPENT_BEFORE="$(printf '%s' "$PROBE_AFTER" | cut -d'|' -f1)"
+DELETED="$(printf '%s' "$PROBE_AFTER" | cut -d'|' -f2)"
+KEPT="$(printf '%s' "$PROBE_AFTER" | cut -d'|' -f3)"
+SPENT_AFTER="$(printf '%s' "$PROBE_AFTER" | cut -d'|' -f4)"
+[ "$DELETED" = "2" ] || fail "expected to delete both twin endpoints, deleted $DELETED ($PROBE_AFTER)"
+[ "$KEPT" = "1" ] || fail "the probe did not outlive its endpoint — $KEPT row(s) left ($PROBE_AFTER)"
+[ "$SPENT_AFTER" = "$SPENT_BEFORE" ]   || fail "deleting the endpoint refunded the probe budget: $SPENT_BEFORE then $SPENT_AFTER"
+ok "both endpoints deleted, the probe survived them, and the budget still counts it ($SPENT_BEFORE spent, unchanged)"
 
 # ---------------------------------------------------------------------------
 echo

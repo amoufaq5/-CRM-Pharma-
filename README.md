@@ -872,21 +872,31 @@ returned `0`, because RLS then hides the damage. That is the shipped bug
 `crm.revoke_rep_role` had — fixed once, in one function, which is exactly the kind of fix the
 next function forgets.
 
-`packages/db/src/composite-fk.contract.test.ts` probes each of the 44 that remain individually, asserting both
+`packages/db/src/composite-fk.contract.test.ts` probes each of the 43 that remain individually, asserting both
 `23503` **and** the constraint name, so a CHECK that fired first or a trigger fails the test
 rather than passing for it. It carries a `pg_constraint` drift guard too: a table added next
 month by someone who does not know this rule fails a test instead of quietly reopening the
 class.
 
-0046 and 0048 dropped two of the original 46 — **both** of `crm.notification_delivery`'s —
-on retention grounds, and did not weaken the rule: a reference that *exists* in `crm.*` is
+0046, 0048 and 0070 dropped three of the original 46 — **both** of
+`crm.notification_delivery`'s and `crm.notification_endpoint_probe`'s endpoint reference — on
+retention grounds, and did not weaken the rule: a reference that *exists* in `crm.*` is
 still composite, and both tenant guards moved into one `BEFORE INSERT` trigger that resolves
 each parent under the caller's own row security. That is **tighter** than the keys it
 replaced, because a referential check runs with row security disabled and would have
 accepted another tenant's parent as existing, where an invisible row reads as absent. The
 drift guard cannot see a column with no reference, so `composite-fk.contract.test.ts`
-asserts both replacements live instead, and asserts the absence itself — this is the one
-table in `crm.*` with no foreign key at all, which is a choice rather than an oversight.
+asserts both replacements live instead, and asserts the absence itself — `crm.notification_delivery`
+is the one table in `crm.*` with no foreign key at all, which is a choice rather than an oversight.
+
+0070's drop is the same move on the probe table, with one addition of its own: the hourly probe
+budget counts rows there, so a cascade did not only erase the record that a destination had been
+tested — it **refunded the spend**, which is the bypass ADR-0001's open row said a DELETE route
+would open. The probe keeps its author's reference (`RESTRICT`, the audit-child convention), the
+guard that reads the endpoint under the caller's own RLS is now the only check on the destination,
+and the cooldown moved with the copy: it keys on the **url** rather than on the endpoint row,
+because what it protects is a third party's server and "disable the old endpoint, create a new
+one" was already producing a fresh row with no cooldown at all.
 
 **And the ERP references, which no key can cover, are checked nightly at last.** The composite
 keys above govern references *inside* `crm`. The ones that point at the ERP — `visit.erp_account_id`,

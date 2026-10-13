@@ -17,7 +17,10 @@ import { withTenantContext } from "./tenant-context.js";
  * dropped two of the 46, BOTH of `crm.notification_delivery`'s, on retention grounds: a
  * delivery record has to outlive the notification it describes and the endpoint it was
  * addressed to, or the evidence of a push to a third party disappears when somebody tidies
- * up either parent. 44 remained, and every reference added since arrives composite — 0056's
+ * up either parent, and 0070 dropped a THIRD on the same grounds: `notification_endpoint_probe`
+ * records that a destination was tested, the hourly probe budget counts those rows, and taking
+ * them with the endpoint both erased the evidence and refunded the spend. 43 remain, and every
+ * reference added since arrives composite — 0056's
  * `sample_transaction.count_id` and 0059's `disposal_policy_change.changed_by` — because the
  * rule is unchanged: a reference that EXISTS is composite, and both dropped guards moved into `crm.notification_delivery_context`, which
  * is tighter than the keys were: a referential check runs with row security disabled and
@@ -52,9 +55,9 @@ import { withTenantContext } from "./tenant-context.js";
  */
 
 /**
- * The 44 references migrations 0035 (38) and 0037 (the last 8) made tenant-scoped and 0046
- * and 0048 left standing, plus the ones added composite since, and what each one must still
- * be.
+ * The 43 references migrations 0035 (38) and 0037 (the last 8) made tenant-scoped and 0046,
+ * 0048 and 0070 left standing, plus the ones added composite since, and what each one must
+ * still be.
  */
 interface Hardened {
   /** The referencing table, unqualified. */
@@ -153,7 +156,6 @@ const HARDENED: Readonly<Record<string, Hardened>> = {
   attachment_access_attachment_id_fkey: { table: "attachment_access", column: "attachment_id", parent: "attachment", onDelete: "RESTRICT" },
   attachment_access_read_by_fkey: { table: "attachment_access", column: "read_by", parent: "rep_profile", onDelete: "RESTRICT" },
 
-  notification_endpoint_probe_endpoint_id_fkey: { table: "notification_endpoint_probe", column: "endpoint_id", parent: "notification_endpoint", onDelete: "CASCADE" },
   // 0060. The amendment log: who narrowed what a third party is told, or turned the signals
   // off. RESTRICT on both, because the log is the audit trail and outlives nothing — unlike
   // `crm.notification_delivery`, whose two keys 0046 and 0048 dropped so the evidence of a
@@ -713,20 +715,14 @@ const PROBES: Readonly<Record<string, Probe>> = {
                   'probing the composite key')`,
     params: [TENANT_FK_B, A.rep1],
   },
-  notification_endpoint_probe_endpoint_id_fkey: {
-    what: "a probe aimed at another tenant's endpoint",
-    // `notification_endpoint_probe_guard` would refuse this first with
-    // `probe-foreign-endpoint:` — it reads the parent under the caller's RLS — and that arm
-    // deliberately stays (0037). Disabling the user triggers is what makes this a test of
-    // the constraint underneath it rather than of the guard on top.
-    sql: `INSERT INTO crm.notification_endpoint_probe (tenant_id, endpoint_id, requested_by)
-          VALUES ($1, $2, $3)`,
-    params: [TENANT_FK_B, A.endp, B.rep1],
-  },
   notification_endpoint_probe_requested_by_fkey: {
     what: "a probe requested by another tenant's rep",
-    sql: `INSERT INTO crm.notification_endpoint_probe (tenant_id, endpoint_id, requested_by)
-          VALUES ($1, $2, $3)`,
+    // THE DESTINATION IS SUPPLIED HERE SINCE 0070, because the guard that copies it off the
+    // endpoint is the guard this probe stands down — and the columns are NOT NULL, so without
+    // them the INSERT fails 23502 and the test reports a missing column as a missing key.
+    sql: `INSERT INTO crm.notification_endpoint_probe
+            (tenant_id, endpoint_id, requested_by, endpoint_channel, endpoint_url)
+          VALUES ($1, $2, $3, 'webhook', 'https://fk-probe.example/hook')`,
     params: [TENANT_FK_B, B.endp, A.rep1],
   },
   rep_notify_address_rep_fkey: {
