@@ -134,11 +134,12 @@ authorisation on its own.
 | `POST /v1/admin/roles/:id/revoke` | end a grant (**administrator**); the grant stays, with an end date |
 | `PUT /v1/admin/samples/disposal-policy` | the grace period and the promo switch (**compliance**); a **reason is required** and the change is an append-only record |
 | `GET\|POST /v1/admin/notification-endpoints` | where signals are pushed (**administrator**); creating one needs a **reason** and records who |
-| `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; a **reason is required** and the change is an append-only record; there is no DELETE |
+| `PATCH /v1/admin/notification-endpoints/:id` | thresholds, or `enabled: false`; a **reason is required** and the change is an append-only record; there is no DELETE, by decision — see the cap below |
 | `GET /v1/admin/notification-endpoints/:id/history` | every amendment to one endpoint, newest first, with both halves of each knob |
 | `POST /v1/admin/notification-endpoints/:id/test` | ask the scheduler to probe it; `202`, because it is queued, not answered |
 | `GET /v1/admin/notification-endpoints/:id/test` | the verdict the scheduler recorded |
-| `GET /v1/admin/notification-endpoints/:id/tests` | the last twenty, newest first |
+| `GET /v1/admin/notification-endpoints/:id/tests` | the last twenty, newest first — and still served after the endpoint is deleted, because the probes outlive it |
+| `GET\|PUT /v1/admin/notifications/endpoint-cap` | how many destinations this tenant may hold, and how many it holds (**administrator**) |
 | `GET\|PUT /v1/admin/notifications/probe-limits` | the probe cooldown and the hourly budget, read and set together (**administrator**) |
 | `GET /v1/admin/notifications/retention` | how long inboxes keep things — readable by every rep |
 | `PUT /v1/admin/notifications/retention` | the two horizons (**administrator**) |
@@ -897,6 +898,19 @@ guard that reads the endpoint under the caller's own RLS is now the only check o
 and the cooldown moved with the copy: it keys on the **url** rather than on the endpoint row,
 because what it protects is a third party's server and "disable the old endpoint, create a new
 one" was already producing a fresh row with no cooldown at all.
+
+**And the table is bounded by a cap rather than a horizon** (0071), which is a decision and not a
+compromise. Growth here comes from REPLACEMENT — an act somebody performs — so it is refused at the
+moment it happens, to the person performing it: `crm.notification_policy.max_endpoints`, 50 by
+default, 500 ceiling, per tenant and raisable through
+`GET|PUT /v1/admin/notifications/endpoint-cap`. A horizon would answer the same complaint with a
+deletion nobody performs, of the one row that explains what a surviving delivery's copied url
+meant — and it would be **unattributed**, because `crm.record_config_change` fires on INSERT OR
+UPDATE and not on DELETE. That is why 0062 made a withdrawal a nullable-column amendment, and it is
+why nothing in this subsystem deletes a destination. The refusal is a 409 (nothing frees on its own,
+so a retry is never the answer) and it names both ways out: re-enable a disabled endpoint that
+already points where you want, or raise the cap. Counted under 0045's advisory lock, because two
+administrators creating an endpoint in the same moment both read `used = max - 1` without it.
 
 **And the ERP references, which no key can cover, are checked nightly at last.** The composite
 keys above govern references *inside* `crm`. The ones that point at the ERP — `visit.erp_account_id`,

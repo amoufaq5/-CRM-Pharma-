@@ -370,6 +370,18 @@ export const TENANT_ABANDON_STOPPED = "f0680000-0000-4000-8000-000000000033";
 export const TENANT_ABANDON_LIVE = "f1680000-0000-4000-8000-000000000034";
 
 /**
+ * packages/notify — the endpoint cap (migration 0071).
+ *
+ * Its own tenant rather than `TENANT_ENDPOINTS`, and the reason is the cap itself: this suite
+ * fills a tenant to its ceiling and then asserts a refusal, so sharing would make one file's
+ * fifty rows another file's unexplained 409 — and the cap counts rows that a `beforeEach` wipe
+ * removes, so the two would also race on anything parallel. The second is the control: a cap is
+ * per tenant, and a ceiling one tenant has reached must say nothing about another's.
+ */
+export const TENANT_ENDPOINT_CAP = "f2710000-0000-4000-8000-000000000035";
+export const TENANT_ENDPOINT_CAP_OTHER = "f3710000-0000-4000-8000-000000000036";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding

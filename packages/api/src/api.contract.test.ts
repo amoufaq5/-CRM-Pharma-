@@ -2389,6 +2389,75 @@ describe("the API, end to end", () => {
     });
 
     /**
+     * THE CAP, which is the bound that replaces a DELETE route (0071).
+     *
+     * Read and set beside the probe limits because it is the same kind of number — a declared
+     * ceiling on how much this tenant may do to third parties — and it answers ADR-0001's
+     * "nothing bounds `crm.notification_endpoint`" with a refusal at the moment of the act
+     * rather than with a sweep that deletes configuration nobody signed for.
+     */
+    it("reads the endpoint cap with the count beside it, and refuses both verbs without the role", async () => {
+      expect((await call("GET", "/v1/admin/notifications/endpoint-cap")).status).toBe(403);
+      expect(
+        (await call("PUT", "/v1/admin/notifications/endpoint-cap", { body: { maxEndpoints: 10 } })).status,
+      ).toBe(403);
+      await grantAdmin();
+      const res = await call("GET", "/v1/admin/notifications/endpoint-cap", { auth: asAdmin() });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ used: 0, maxEndpoints: 50 });
+    });
+
+    it("refuses the endpoint past the cap with a 409 naming both ways out", async () => {
+      await grantAdmin();
+      const set = await call("PUT", "/v1/admin/notifications/endpoint-cap", {
+        auth: asAdmin(),
+        body: { maxEndpoints: 1, reason: WHY },
+      });
+      expect(set.status).toBe(200);
+      expect(set.body).toMatchObject({ used: 0, maxEndpoints: 1 });
+
+      const make = (n: number) =>
+        call("POST", "/v1/admin/notification-endpoints", {
+          auth: asAdmin(),
+          body: {
+            channel: "webhook",
+            url: `https://hooks.example.test/capped-${String(n)}`,
+            secretEnv: "CRM_WEBHOOK_SECRET",
+            reason: "one destination for this tenant's urgent signals",
+          },
+        });
+      expect((await make(1)).status).toBe(201);
+
+      const refused = await make(2);
+      // 409 AND NOT 429: a probe budget is rate limiting and frees on its own, where a cap on
+      // configuration frees only when somebody acts. A retry never succeeds, so an answer that
+      // invites one is the wrong answer.
+      expect(refused.status).toBe(409);
+      expect(refused.body.detail).toContain("1 of 1 permitted notification endpoints");
+      expect(refused.body.detail).toContain("re-enable a disabled endpoint");
+      expect(refused.body.detail).toContain("max_endpoints");
+
+      // And raising it lets the same request through, which is the half that makes the refusal
+      // a bound rather than a wall.
+      await call("PUT", "/v1/admin/notifications/endpoint-cap", {
+        auth: asAdmin(),
+        body: { maxEndpoints: 2, reason: WHY },
+      });
+      expect((await make(2)).status).toBe(201);
+    });
+
+    it("refuses a cap out of range with the sentence the store gives", async () => {
+      await grantAdmin();
+      const zero = await call("PUT", "/v1/admin/notifications/endpoint-cap", {
+        auth: asAdmin(),
+        body: { maxEndpoints: 0, reason: WHY },
+      });
+      expect(zero.status).toBe(422);
+      expect(zero.body.detail).toMatch(/between 1 and 500/);
+      expect(zero.body.detail).toContain("There is no 0");
+    });
+
+    /**
      * The route that writes TWICE under one signature, which is why attribution is scoped to a
      * block rather than consumed by the first write (0061).
      *

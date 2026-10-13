@@ -54,6 +54,29 @@ export class InvalidEndpointError extends Error {
   }
 }
 
+/**
+ * The tenant already holds as many endpoints as its cap allows (0071).
+ *
+ * Its own class, and NOT `ProbeBudgetExceededError`'s 429. A probe budget is rate limiting —
+ * wait and it frees — where this is a quota on CONFIGURATION: nothing frees on its own, and the
+ * answer is an act (re-enable a disabled endpoint, or raise the cap). 409, and the message names
+ * both ways out, because a cap whose refusal has no next step is a cliff rather than a bound.
+ */
+export class EndpointCapExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EndpointCapExceededError";
+  }
+}
+
+/** A cap outside the range the column admits (0071). */
+export class InvalidEndpointCapError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidEndpointCapError";
+  }
+}
+
 export interface EndpointRow {
   readonly id: string;
   readonly channel: string;
@@ -356,6 +379,13 @@ function normaliseKinds(kinds: readonly string[] | null | undefined): string[] |
 function translateEndpointError(err: unknown, channel: string): Error {
   const constraint = (err as { constraint?: string }).constraint;
   const message = (err as { message?: string }).message ?? "";
+  // 0071's cap, raised by a trigger, so it arrives as a message. First, because it is the one
+  // refusal below that is about the TENANT rather than about the row being written — an
+  // operator who reads "a webhook endpoint's url must be https" after hitting the cap goes
+  // looking for a typo in a url that is fine.
+  if (message.includes("endpoint-cap:")) {
+    return new EndpointCapExceededError(message.replace(/^[^:]*endpoint-cap: /, ""));
+  }
   // 0060's own refusals, which arrive as messages rather than constraint names because the
   // triggers raise them. Checked before the constraint arms below: a no-op amendment never
   // reaches a CHECK, because the trigger answers first.
@@ -423,4 +453,85 @@ function translateEndpointError(err: unknown, channel: string): Error {
 
 export function isSeverity(value: string): value is Severity {
   return (SEVERITIES as readonly string[]).includes(value);
+}
+
+// ---------------------------------------------------------------------------
+// The cap (0071).
+// ---------------------------------------------------------------------------
+
+/**
+ * The range the column admits, restated here so a refusal can name it before a round trip.
+ *
+ * 500 is the hard ceiling and it is not arbitrary: `raiseNotification` writes one delivery row
+ * per matching endpoint, so above a few hundred the fan-out per signal is the problem rather than
+ * the size of the configuration table, and a cap is the wrong tool for that.
+ */
+export const MIN_ENDPOINT_CAP = 1;
+export const MAX_ENDPOINT_CAP = 500;
+/** What a tenant with no policy row gets, and what the trigger assumes for one. */
+export const DEFAULT_ENDPOINT_CAP = 50;
+
+export interface EndpointCapState {
+  /** Every endpoint this tenant holds, disabled ones included — the table is what is bounded. */
+  readonly used: number;
+  readonly maxEndpoints: number;
+}
+
+/**
+ * How many destinations this tenant holds, against how many it may.
+ *
+ * Both numbers from one function (`crm.notification_endpoint_cap`) for the reason
+ * `probeBudget` reads that way: a caller that wants to warn before the wall needs the ceiling,
+ * and a refusal that cannot say "50 of 50" is a refusal nobody can act on.
+ */
+export async function endpointCap(tx: PoolClient, tenantId: string): Promise<EndpointCapState> {
+  const { rows } = await tx.query<{ used: string; max_endpoints: number }>(
+    `SELECT used, max_endpoints FROM crm.notification_endpoint_cap($1)`,
+    [tenantId],
+  );
+  const row = rows[0]!;
+  return { used: Number(row.used), maxEndpoints: row.max_endpoints };
+}
+
+/**
+ * Move the cap.
+ *
+ * LOWERING IT BELOW WHAT THE TENANT HOLDS IS PERMITTED, deliberately, and the trigger is BEFORE
+ * INSERT only for the same reason: the cap governs the act of ADDING a destination, not the state
+ * of a table somebody may be in the middle of tidying. A tenant that has decided it wants fewer
+ * destinations sets the number it wants and then disables what it does not need; refusing the
+ * lower cap until the table already complied would make the setting useless exactly when it is
+ * wanted.
+ *
+ * The policy row is defaulted into existence first, as every other notification setter does —
+ * the absence of a policy must never make a write a silent no-op. Written here rather than
+ * through `retention.ts`'s `policyRow`, which is module-private: one `ON CONFLICT DO NOTHING`
+ * is cheaper than coupling two stores.
+ */
+export async function setEndpointCap(
+  tx: PoolClient,
+  tenantId: string,
+  maxEndpoints: number,
+): Promise<EndpointCapState> {
+  if (
+    !Number.isInteger(maxEndpoints) ||
+    maxEndpoints < MIN_ENDPOINT_CAP ||
+    maxEndpoints > MAX_ENDPOINT_CAP
+  ) {
+    throw new InvalidEndpointCapError(
+      `the endpoint cap must be a whole number between ${String(MIN_ENDPOINT_CAP)} and ` +
+        `${String(MAX_ENDPOINT_CAP)}, not ${JSON.stringify(maxEndpoints)}. There is no 0: a tenant ` +
+        `with no endpoints receives no notifications at all, which is a thing to decide by ` +
+        `disabling what it has rather than by a number that forbids having any.`,
+    );
+  }
+  await tx.query(
+    `INSERT INTO crm.notification_policy (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING`,
+    [tenantId],
+  );
+  await tx.query(
+    `UPDATE crm.notification_policy SET max_endpoints = $2, updated_at = now() WHERE tenant_id = $1`,
+    [tenantId, maxEndpoints],
+  );
+  return await endpointCap(tx, tenantId);
 }

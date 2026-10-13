@@ -3297,3 +3297,86 @@ rehearsing the assertion above it.
 - **`uq_notification_endpoint_probe_outstanding` is still per endpoint.** It is about a row's own
   claim rather than about traffic, and the destination cooldown subsumes it — a just-requested
   probe on a sibling endpoint is now that destination's `previous`.
+
+## A bound, not a horizon
+
+*2026-10-13, `./scripts/verify-live-erp.sh` (207 ok lines), `pnpm client:verify` (329 checks) and
+`npx vitest run` (105 files / 2,681 tests). The migration runner is green on a fresh database with
+71 migrations.*
+
+Migration 0071, and the last clause of the endpoint row: "no horizon and no cap while every
+replacement adds a row". The horizon is **refused**, and the refusal is the decision.
+
+Every earlier decision in this subsystem says the same thing. 0048 dropped a cascade so a delivery
+record outlives its endpoint; 0049 froze a live endpoint's destination so its history cannot be
+re-attributed; 0060 made the amendment log the source of truth and refused a direct UPDATE; 0070
+did 0048's move a third time. A horizon would delete the one row that explains what a surviving
+delivery's copied url meant — and it would do it on a schedule, **unattributed**:
+`crm.record_config_change` fires AFTER INSERT OR UPDATE and not on DELETE, which is exactly why
+0062 made a withdrawal a nullable-column amendment rather than a deletion. A sweep that quietly
+removed configuration would be the one write in this schema nobody signed.
+
+A cap also fits the complaint better. Growth comes from **replacement**, which is an act somebody
+performs; a horizon answers it with a deletion nobody performs. A cap refuses the act, at the
+moment it happens, to the person performing it.
+
+### On the running deployment's own tenant
+
+The gate sets the cap to what that tenant already holds — rows this run created through the real
+API — and then tries one more:
+
+```
+ok: the tenant's endpoint cap is set to what it already holds (2 of 2)
+ok: and one more destination is refused by name, with both ways out in the sentence
+ok: and raising the cap by one lets the same destination in (3 of 3)
+```
+
+The third line is what makes the second one mean something: raised by one, the identical statement
+is accepted, so what refused it was the cap and not something else. And the cap is configuration,
+so the gate writes it inside an attribution block — the same `DO` block §11c uses — which is the
+proof that 0061's guard is on rather than worked around.
+
+### What the suite asserts that has no code to point at
+
+The last two tests in the new file assert an **absence**, because an absence that is a decision
+looks exactly like one that is an oversight:
+
+- no scheduled job, no platform job, and no `crm.*` function whose name contains both an endpoint
+  and a retire/delete/prune/purge;
+- and `crm.notification_endpoint` still has exactly one reference pointing at it —
+  `notification_endpoint_change_endpoint_id_fkey`, at `ON DELETE RESTRICT`. 0070 removed the last
+  cascade, so 0060's amendment log is now the only thing that would refuse a hand-written DELETE,
+  and that is the obstacle a retire path would have to answer rather than a cascade.
+
+### The default is proven by reaching it
+
+A cap test that sets the number tests the column, not the default. A tenant has no policy row until
+something writes one, which for most tenants is never — so the test creates **fifty** endpoints
+against no policy row at all, asserts no row appeared, and then takes the fifty-first refusal
+naming `50 of 50`. That also pins `DEFAULT_ENDPOINT_CAP` against the column's own `DEFAULT`, which
+is the pair that would otherwise drift.
+
+### Two things the schema made me get right
+
+**The attribution guard caught the first version.** `crm.notification_policy` is under
+`crm.require_config_attribution`, so the suite's first run failed seven tests with
+`config-change-unattributed` — the cap lives on a configuration row, and writing it needs an author
+and a reason like every other number there. The fixture now signs, through
+`withFixtureAttribution`, exactly as the route signs through `asChange`.
+
+**BEFORE INSERT only, and lowering the cap below the count is permitted.** A guard on UPDATE would
+freeze the configuration of exactly the tenant trying to comply with a cap it has just lowered:
+every amendment is an UPDATE of the endpoint row, so it could not disable the endpoints it had
+decided it no longer wanted. A test lowers the cap to 1 against three endpoints, disables one, and
+asserts that adding is still refused — the cap governs the act, not the state.
+
+### What is still not built
+
+- **The cap counts rows, so two endpoints pointing at one url cost two slots.** Correct — they are
+  two configurations with two filters — but the bound is on configurations rather than on third
+  parties, so a tenant reading "50 of 50" may hold far fewer destinations than that.
+- **Nothing warns before the wall.** Both numbers are readable, and no notification fires at 90%,
+  so the first thing a tenant learns is a 409 in the middle of an administrator's afternoon.
+- **A `psql` prompt can still raise the cap to 500** without the configuration log, like every
+  other number in this schema — which is what `crm.config_change` exists to make visible rather
+  than impossible.

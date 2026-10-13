@@ -322,7 +322,15 @@ export function toProblem(err: unknown): ApiError {
       return new ApiError("too_many_requests", message);
     case "InvalidProbeCooldownError":
     case "InvalidProbeBudgetError":
+    case "InvalidEndpointCapError":
       return new ApiError("validation_failed", message);
+    // 0071's cap, and NOT a 429 like the two above it. A probe budget is rate limiting — wait
+    // and it frees — where this is a quota on CONFIGURATION: nothing frees on its own, no
+    // retry succeeds, and the answer is an act. `conflict` is the reading that carries, and
+    // the message is the trigger's because it names both ways out: re-enable a disabled
+    // endpoint that already points where you want, or raise the cap.
+    case "EndpointCapExceededError":
+      return new ApiError("conflict", message);
     // 0060. A no-op amendment, a direct write to a column that is a projection of the
     // endpoint's change log, a rewrite of who opened the route, an endpoint created with no
     // author: every one of them is a well-formed request the endpoint's own state refuses,

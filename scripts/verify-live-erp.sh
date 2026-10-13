@@ -1032,7 +1032,7 @@ echo "--- 15. records that outlive the rows that named them ---"
 # The endpoints are seeded DISABLED. They exist only to be deleted, and an enabled one would
 # have been a live destination for every signal this tenant raised while the gate was still
 # running — a fan-out the gate never asked for, to a url nothing is listening on.
-ORPHAN_SEED="$(psql -d "$CRM_DB" -At -v ON_ERROR_STOP=1 <<SQL 2>&1
+ORPHAN_SEED="$(psql -d "$CRM_DB" -qAt -v ON_ERROR_STOP=1 <<SQL 2>&1
 BEGIN;
 WITH author AS (SELECT id FROM crm.rep_profile WHERE tenant_id = '$TENANT' AND subject = 'rep-ada'),
      eps AS (
@@ -1136,7 +1136,7 @@ esac
 # handed the tenant back its spend. Two claims here, and the second is the rule change — the
 # cooldown keys on the DESTINATION now, because what it protects is a third party's server and
 # "disable the old endpoint, create a new one" was already producing a fresh row with no cooldown.
-PROBE_SEED="$(psql -d "$CRM_DB" -At -v ON_ERROR_STOP=1 <<SQL 2>&1
+PROBE_SEED="$(psql -d "$CRM_DB" -qAt -v ON_ERROR_STOP=1 <<SQL 2>&1
 BEGIN;
 INSERT INTO crm.notification_endpoint
   (tenant_id, channel, url, secret_env, enabled, created_by, created_reason)
@@ -1208,6 +1208,85 @@ SPENT_AFTER="$(printf '%s' "$PROBE_AFTER" | cut -d'|' -f4)"
 [ "$KEPT" = "1" ] || fail "the probe did not outlive its endpoint — $KEPT row(s) left ($PROBE_AFTER)"
 [ "$SPENT_AFTER" = "$SPENT_BEFORE" ]   || fail "deleting the endpoint refunded the probe budget: $SPENT_BEFORE then $SPENT_AFTER"
 ok "both endpoints deleted, the probe survived them, and the budget still counts it ($SPENT_BEFORE spent, unchanged)"
+
+# 0071. THE BOUND, on the tenant this run has been writing to all along — which has real
+# endpoints in it, created through the real API, so the count the refusal names is a count of
+# rows this gate actually made. Set the cap TO that count and the next destination is refused;
+# raise it by one and the same statement is accepted. The route's 409 is asserted by the API
+# suite; what this proves is the TRIGGER, on live data, which is where the rule lives.
+#
+# THE CAP IS CONFIGURATION, so writing it needs an author and a reason (0061) — the same DO
+# block §11c uses, and the proof that the guard is on rather than a workaround for it.
+# -q, or psql's own BEGIN/DO/INSERT/COMMIT tags land inside the ok: line below and the
+# evidence reads like a transcript instead of a verdict.
+CAP_SET="$(psql -d "$CRM_DB" -qAt -v ON_ERROR_STOP=1 <<SQL 2>&1
+BEGIN;
+DO \$\$
+BEGIN
+  PERFORM set_config('app.change_actor',
+                     (SELECT id::text FROM crm.rep_profile
+                       WHERE tenant_id = '$TENANT' AND subject = 'rep-ada'), true);
+  PERFORM set_config('app.change_reason',
+                     'the live gate pinning this tenant to the destinations it already has', true);
+END
+\$\$;
+INSERT INTO crm.notification_policy (tenant_id, max_endpoints)
+VALUES ('$TENANT', (SELECT count(*) FROM crm.notification_endpoint WHERE tenant_id = '$TENANT'))
+ON CONFLICT (tenant_id) DO UPDATE
+  SET max_endpoints = (SELECT count(*) FROM crm.notification_endpoint WHERE tenant_id = '$TENANT'),
+      updated_at = now();
+COMMIT;
+SELECT used || ' of ' || max_endpoints FROM crm.notification_endpoint_cap('$TENANT');
+SQL
+)"
+case "$CAP_SET" in
+  *"1 of 1"*|*"2 of 2"*|*"3 of 3"*)
+    ok "the tenant's endpoint cap is set to what it already holds ($CAP_SET)" ;;
+  *) fail "could not set the endpoint cap: $CAP_SET" ;;
+esac
+
+CAP_REFUSAL="$(psql -d "$CRM_DB" -At -c "
+  INSERT INTO crm.notification_endpoint
+    (tenant_id, channel, url, secret_env, created_by, created_reason)
+  SELECT '$TENANT', 'webhook', 'https://sink.invalid/one-too-many', 'CRM_WEBHOOK_SECRET', a.id,
+         'the destination this tenant is not allowed to add'
+    FROM crm.rep_profile a WHERE a.tenant_id = '$TENANT' AND a.subject = 'rep-ada'" 2>&1 || true)"
+case "$CAP_REFUSAL" in
+  *endpoint-cap*permitted\ notification\ endpoints*re-enable\ a\ disabled\ endpoint*max_endpoints*)
+    ok "and one more destination is refused by name, with both ways out in the sentence" ;;
+  *) fail "an endpoint past the cap was accepted, or the refusal says too little: $CAP_REFUSAL" ;;
+esac
+
+# AND THE WAY OUT WORKS, which is what separates a bound from a wall. Raised by one, the same
+# statement is accepted — so the refusal above was the cap and not something else.
+CAP_RAISED="$(psql -d "$CRM_DB" -qAt -v ON_ERROR_STOP=1 <<SQL 2>&1
+BEGIN;
+DO \$\$
+BEGIN
+  PERFORM set_config('app.change_actor',
+                     (SELECT id::text FROM crm.rep_profile
+                       WHERE tenant_id = '$TENANT' AND subject = 'rep-ada'), true);
+  PERFORM set_config('app.change_reason',
+                     'the live gate raising the cap it had just set, to prove the way out', true);
+END
+\$\$;
+UPDATE crm.notification_policy
+   SET max_endpoints = max_endpoints + 1, updated_at = now()
+ WHERE tenant_id = '$TENANT';
+INSERT INTO crm.notification_endpoint
+  (tenant_id, channel, url, secret_env, enabled, created_by, created_reason)
+SELECT '$TENANT', 'webhook', 'https://sink.invalid/one-too-many', 'CRM_WEBHOOK_SECRET', false, a.id,
+       'the destination this tenant is now allowed to add'
+  FROM crm.rep_profile a WHERE a.tenant_id = '$TENANT' AND a.subject = 'rep-ada';
+COMMIT;
+SELECT used || ' of ' || max_endpoints FROM crm.notification_endpoint_cap('$TENANT');
+SQL
+)"
+case "$CAP_RAISED" in
+  *"2 of 2"*|*"3 of 3"*|*"4 of 4"*)
+    ok "and raising the cap by one lets the same destination in ($CAP_RAISED)" ;;
+  *) fail "raising the cap did not admit the endpoint: $CAP_RAISED" ;;
+esac
 
 # ---------------------------------------------------------------------------
 echo

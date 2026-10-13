@@ -42,6 +42,8 @@ import {
   repNotifyAddress,
   setRepNotifyAddress,
   deliveryHistory,
+  endpointCap,
+  setEndpointCap,
   notificationDeliveryRetention,
   probeBudget,
   probeCooldownSeconds,
@@ -3617,6 +3619,56 @@ export function buildRouter(deps: HandlerDeps): Router<Principal> {
           budget: await probeBudget(tx, ctx.principal.tenantId),
         };
       });
+      return { status: 200, body };
+    },
+  });
+
+  /**
+   * How many destinations this tenant may hold, and how many it holds (0071).
+   *
+   * BOTH NUMBERS TOGETHER, like the probe limits above: an administrator deciding whether to
+   * raise a cap needs the count, and one about to add an endpoint wants to know how close the
+   * wall is before the 409 rather than after it.
+   *
+   * There is no DELETE anywhere in this subsystem and this route is what replaces one. The
+   * complaint the cap answers is unbounded growth from REPLACEMENT — "disable the old endpoint,
+   * create a new one" is the only way to move a destination (0049) — and a cap refuses that act,
+   * at the moment it happens, to the person performing it, where a horizon would answer it with
+   * a deletion nobody performs and nobody signed.
+   */
+  router.add({
+    method: "GET",
+    pattern: "/v1/admin/notifications/endpoint-cap",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      const body = await inTenant(deps, ctx.principal, (tx) => endpointCap(tx, ctx.principal.tenantId));
+      return { status: 200, body };
+    },
+  });
+
+  router.add({
+    method: "PUT",
+    pattern: "/v1/admin/notifications/endpoint-cap",
+    handler: async (ctx: Ctx): Promise<HandlerResult> => {
+      requireRole(ctx.principal, "administrator");
+      // THE RANGE IS THE NOTIFY MODULE'S and is deliberately not restated: `setEndpointCap`
+      // refuses out of range with a sentence naming the bound and why it exists, and a zod
+      // schema with its own numbers would be a second opinion that drifts. What is parsed
+      // here is the shape.
+      const input = parse(
+        z
+          .object({
+            maxEndpoints: z.number().int(),
+            // REQUIRED (0061). This number decides how many third parties a tenant's records
+            // may be disclosed to, which is the kind of number somebody has to answer for.
+            reason: z.string().min(10).max(1000),
+          })
+          .strict(),
+        ctx.body,
+      );
+      const body = await asChange(deps, ctx.principal, input.reason, (tx) =>
+        setEndpointCap(tx, ctx.principal.tenantId, input.maxEndpoints),
+      );
       return { status: 200, body };
     },
   });
