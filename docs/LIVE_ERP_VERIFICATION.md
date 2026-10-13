@@ -3474,3 +3474,53 @@ referenced.
 - **Nothing compares endpoints yet, still.** The cap's refusal sends an administrator looking for a
   reusable destination by hand; a route answering "which disabled endpoints point where I want" is
   what normalisation makes possible, and nobody has asked for it.
+
+## Two clocks, compared
+
+*2026-10-13, `npx vitest run` (105 files / 2,683 tests).*
+
+Not an increment — a CI failure run down to a mechanism. `build-and-test` went red on a commit
+that touched `package.json`, the workflow, the README and one assertion, in a test from a package
+none of those are in:
+
+```
+FAIL  packages/relay/src/sequence.contract.test.ts > crm.outbox.seq orders rows enqueued in one
+      transaction > claims a create before the transition that acts on it, every time
+AssertionError: expected [] to deeply equal [ 'create', 'transition:win' ]
+```
+
+An **empty** claim, where the test is about the ORDER two rows come back in. So the question is
+not "were they ordered wrongly" but "why did a correct claim return nothing", and there is exactly
+one way for that to happen to a correct implementation:
+
+- `crm.outbox.next_attempt_at` defaults to `now()` — **Postgres's** transaction timestamp;
+- `claimBatch` takes the current instant as an argument and claims `next_attempt_at <= $4`;
+- the test passed `new Date()` — **Node's** clock, in another process.
+
+Handing `claimBatch` a deliberately retarded clock reproduces the output exactly:
+
+```
+claim clock 0ms    → [ 'create', 'transition:win' ]
+claim clock -50ms  → []
+claim clock -2000ms → []
+```
+
+Fifty milliseconds is enough. **I cannot prove from here that skew is what happened on that run** —
+the job's log is served from a host the API cannot reach, and the annotation carried the assertion
+and not the clocks. What I can say is that no test in that file is about due-time: they are about
+order, and they do not need to depend on two clocks agreeing. The claim's instant now comes from
+the database — the same clock that stamped the rows — in that file and in the one other place the
+pattern appears (`relay.contract.test.ts`'s two-worker `SKIP LOCKED` test, which would have failed
+as "expected 0 to be 6" about two workers doing exactly the right thing).
+
+Two things make the next failure legible rather than a guess:
+
+- **`enqueuePair` asserts the enqueue happened.** `enqueueOutbox` is `ON CONFLICT DO NOTHING` on
+  `(tenant, entity, operation, target)`, so a row left behind by anything else makes it a silent
+  no-op — and an empty claim then looks like an ordering fault instead of a dirty tenant.
+- **The assertion carries the rows' own state.** On failure the message prints each row's
+  operation, state, `next_attempt_at` and the database's `now()`, so "nothing was due" and "they
+  came back in the wrong order" can never again look the same from a log.
+
+This is the same lesson as the `field-client` job's missing annotations, one layer down: a red
+square that cannot say why costs more than the bug.

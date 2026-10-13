@@ -68,11 +68,29 @@ describe("crm.outbox.seq orders rows enqueued in one transaction", () => {
     );
   });
 
+  /**
+   * THE CLAIM'S CLOCK IS THE DATABASE'S, not Node's, and this file used to pass `new Date()`.
+   *
+   * `crm.outbox.next_attempt_at` defaults to `now()` — Postgres's transaction timestamp — and
+   * `claimBatch` compares it against a `Date` the caller supplies. Comparing two clocks is not
+   * what any test in this file is about: they are about ORDER. If the supplied instant is even
+   * fifty milliseconds behind the database's, the claim returns an EMPTY LIST and the assertion
+   * fails as `expected [] to deeply equal [create, transition:win]` — demonstrated by handing
+   * `claimBatch` a deliberately retarded clock, which reproduces that exact output.
+   *
+   * CI produced that failure once, on a commit that touched nothing in this package. I cannot
+   * prove from here that skew is what happened on that run; what I can say is that this test did
+   * not need to depend on it, and now does not. The clock that stamps the rows is the clock that
+   * decides they are due.
+   */
+  const claimNow = (tx: PoolClient): Promise<Date> =>
+    tx.query<{ now: Date }>("SELECT now() AS now").then((r) => r.rows[0]!.now);
+
   /** Appends `operations` for one target record, in the order given, in ONE transaction. */
   async function enqueuePair(target: string, operations: readonly string[]): Promise<void> {
     await withTenantContext(admin, TENANT, async (tx) => {
       for (const operation of operations) {
-        await enqueueOutbox(tx, TENANT, {
+        const { enqueued } = await enqueueOutbox(tx, TENANT, {
           entity: "Opportunity",
           operation,
           payload: { name: "Deal", account_id: "A", amount: "10.00" },
@@ -80,7 +98,24 @@ describe("crm.outbox.seq orders rows enqueued in one transaction", () => {
           sourceTable: "crm.visit",
           sourceId: crypto.randomUUID(),
         });
+        // `enqueueOutbox` is ON CONFLICT DO NOTHING on (tenant, entity, operation, target), so a
+        // row left behind by anything else makes this a silent no-op — and an empty claim then
+        // looks like an ordering fault instead of a dirty tenant. Asserted rather than assumed.
+        expect(enqueued, `${target}/${operation} was not enqueued`).toBe(true);
       }
+    });
+  }
+
+  /** The rows as the claim sees them, for a failure message that says WHY nothing was claimed. */
+  async function outboxState(): Promise<string> {
+    return withTenantContext(admin, TENANT, async (tx) => {
+      const { rows } = await tx.query<{ line: string }>(
+        `SELECT operation || ' ' || state || ' due=' || next_attempt_at::text
+                || ' now=' || now()::text AS line
+           FROM crm.outbox WHERE tenant_id = $1 ORDER BY seq`,
+        [TENANT],
+      );
+      return rows.map((r) => r.line).join("; ") || "(no rows)";
     });
   }
 
@@ -124,10 +159,10 @@ describe("crm.outbox.seq orders rows enqueued in one transaction", () => {
       const target = `crm_seq_fwd_${round}`;
       await enqueuePair(target, [CREATE, WIN]);
 
-      const claimed = await withTenantContext(admin, TENANT, (tx) =>
-        claimBatch(tx, TENANT, "seq-worker", 10, new Date()),
+      const claimed = await withTenantContext(admin, TENANT, async (tx) =>
+        claimBatch(tx, TENANT, "seq-worker", 10, await claimNow(tx)),
       );
-      expect(claimed.map((r) => r.operation)).toEqual([CREATE, WIN]);
+      expect(claimed.map((r) => r.operation), await outboxState()).toEqual([CREATE, WIN]);
       expect(claimed.every((r) => r.target_record_id === target)).toBe(true);
     }
   });
@@ -171,8 +206,8 @@ describe("crm.outbox.seq orders rows enqueued in one transaction", () => {
       ),
     );
 
-    const claimed = await withTenantContext(admin, TENANT, (tx) =>
-      claimBatch(tx, TENANT, "seq-worker", 16, new Date()),
+    const claimed = await withTenantContext(admin, TENANT, async (tx) =>
+      claimBatch(tx, TENANT, "seq-worker", 16, await claimNow(tx)),
     );
     expect(claimed).toHaveLength(16);
     for (const target of targets) {
@@ -188,8 +223,8 @@ describe("crm.outbox.seq orders rows enqueued in one transaction", () => {
     // anyway is what separates "ordered by insertion" from "creates happen to sort first".
     await enqueuePair("crm_seq_rev", [WIN, CREATE]);
 
-    const claimed = await withTenantContext(admin, TENANT, (tx) =>
-      claimBatch(tx, TENANT, "seq-worker", 10, new Date()),
+    const claimed = await withTenantContext(admin, TENANT, async (tx) =>
+      claimBatch(tx, TENANT, "seq-worker", 10, await claimNow(tx)),
     );
     expect(claimed.map((r) => r.operation)).toEqual([WIN, CREATE]);
     expect(await seqOf("crm_seq_rev", WIN)).toBeLessThan(await seqOf("crm_seq_rev", CREATE));
@@ -228,8 +263,8 @@ describe("crm.outbox.seq orders rows enqueued in one transaction", () => {
       ),
     );
 
-    const claimed = await withTenantContext(admin, TENANT, (tx) =>
-      claimBatch(tx, TENANT, "seq-worker", 10, new Date()),
+    const claimed = await withTenantContext(admin, TENANT, async (tx) =>
+      claimBatch(tx, TENANT, "seq-worker", 10, await claimNow(tx)),
     );
     expect(claimed.map((r) => r.target_record_id)).toEqual(["crm_seq_later"]);
   });
@@ -271,16 +306,16 @@ describe("crm.outbox.seq orders rows enqueued in one transaction", () => {
       // Enqueued second, so it holds the HIGHER sequence value — and commits first.
       await enqueuePair("crm_seq_fast", [CREATE]);
 
-      const firstDrain = await withTenantContext(admin, TENANT, (tx) =>
-        claimBatch(tx, TENANT, "seq-worker", 10, new Date()),
+      const firstDrain = await withTenantContext(admin, TENANT, async (tx) =>
+        claimBatch(tx, TENANT, "seq-worker", 10, await claimNow(tx)),
       );
       expect(firstDrain.map((r) => r.target_record_id)).toEqual(["crm_seq_fast"]);
 
       commitNow();
       await slowTx;
 
-      const secondDrain = await withTenantContext(admin, TENANT, (tx) =>
-        claimBatch(tx, TENANT, "seq-worker", 10, new Date()),
+      const secondDrain = await withTenantContext(admin, TENANT, async (tx) =>
+        claimBatch(tx, TENANT, "seq-worker", 10, await claimNow(tx)),
       );
       expect(secondDrain.map((r) => r.target_record_id)).toEqual(["crm_seq_slow"]);
       expect(await seqOf("crm_seq_slow", CREATE)).toBeLessThan(await seqOf("crm_seq_fast", CREATE));

@@ -321,9 +321,18 @@ describe("concurrent workers and leases", () => {
     try {
       await a.query("SET ROLE crm_app");
       await b.query("SET ROLE crm_app");
+      // THE DATABASE'S CLOCK, not Node's, for the reason `sequence.contract.test.ts` records:
+      // `next_attempt_at` defaults to Postgres's `now()` and `claimBatch` compares it to the
+      // instant the caller supplies, so a Node clock even slightly behind the server's makes
+      // both claims return nothing and this test fail as "expected 0 to be 6" — about two
+      // workers that were doing exactly the right thing.
       const [first, second] = await Promise.all([
-        withTenantContext(a, TENANT, (tx) => claimBatch(tx, TENANT, "worker-a", 3, new Date())),
-        withTenantContext(b, TENANT, (tx) => claimBatch(tx, TENANT, "worker-b", 3, new Date())),
+        withTenantContext(a, TENANT, async (tx) =>
+          claimBatch(tx, TENANT, "worker-a", 3, (await tx.query<{ now: Date }>("SELECT now() AS now")).rows[0]!.now),
+        ),
+        withTenantContext(b, TENANT, async (tx) =>
+          claimBatch(tx, TENANT, "worker-b", 3, (await tx.query<{ now: Date }>("SELECT now() AS now")).rows[0]!.now),
+        ),
       ]);
       const ids = [...first, ...second].map((r) => r.id);
       expect(ids).toHaveLength(6);
