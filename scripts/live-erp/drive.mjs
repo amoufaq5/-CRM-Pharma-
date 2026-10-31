@@ -635,7 +635,8 @@ async function outboxState(id) {
   try {
     return await withTenantContext(conn, TENANT, async (tx) => {
       const { rows } = await tx.query(
-        `SELECT state, attempts, last_error, dead_reason, erp_response FROM crm.outbox WHERE id = $1`,
+        `SELECT state, attempts, last_error, dead_reason, erp_response, settled_by
+           FROM crm.outbox WHERE id = $1`,
         [id],
       );
       return rows[0];
@@ -1034,8 +1035,18 @@ expect(
 );
 expect(
   landedOut.row.last_error === null,
-  "PINNED GAP: a delivered row records no reason, so which mechanism settled it is not readable from the queue — `markDelivered` takes none (relay.ts / store.ts, not touched by this increment)",
+  "a delivered row records no last_error, because there is no error left to record",
   `last_error=${JSON.stringify(landedOut.row.last_error)}`,
+);
+// THE PINNED GAP, CLOSED (migration 0076). This assertion used to read "a delivered row records
+// no reason, so which mechanism settled it is not readable from the queue — `markDelivered` takes
+// none", and that was the thing worth knowing: the regex over the driver's sentence is still the
+// documented fallback, so a deployment resting on it looked identical to one that never used it.
+// `read_back` here is the probe having done the work, written down where it can be counted.
+expect(
+  landedOut.row.settled_by === "read_back",
+  "and it records WHICH mechanism settled it — the read-back, not the driver's sentence",
+  `settled_by=${JSON.stringify(landedOut.row.settled_by)}`,
 );
 const landedCount = (await raw(`/v1/leave-requests?limit=500`, goodToken)).body.data.filter(
   (r) => r.request_number === `RT-${stamp}-F`,

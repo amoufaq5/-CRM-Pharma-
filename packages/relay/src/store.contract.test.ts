@@ -117,7 +117,7 @@ describe("the outbox store", () => {
     it("cannot kill a write the ERP already accepted", async () => {
       await inTenant(async (tx) => {
         const id = await inFlight(tx);
-        expect(await markDelivered(tx, id, DUE, { ok: true })).toBe(true);
+        expect(await markDelivered(tx, id, DUE, { ok: true }, "accepted")).toBe(true);
 
         // Worker A's round trip finally returns with a permanent refusal. The write
         // landed; A's verdict is stale.
@@ -129,7 +129,7 @@ describe("the outbox store", () => {
     it("...and therefore records no death that never happened", async () => {
       await inTenant(async (tx) => {
         const id = await inFlight(tx);
-        await markDelivered(tx, id, DUE, { ok: true });
+        await markDelivered(tx, id, DUE, { ok: true }, "accepted");
         await markDead(tx, id, DUE, "403 forbidden");
 
         // The reason this guard is in the store and not left to the relay: 0036's trigger
@@ -173,7 +173,7 @@ describe("the outbox store", () => {
 
         // The one ordering left alone, deliberately: the write DID land, so the delivery
         // is the truth and the episode genuinely ended.
-        expect(await markDelivered(tx, id, at("2027-01-01T09:30:00Z"), { ok: true })).toBe(true);
+        expect(await markDelivered(tx, id, at("2027-01-01T09:30:00Z"), { ok: true }, "accepted")).toBe(true);
         expect(await stateOf(tx, id)).toBe("delivered");
 
         const history = await attemptHistory(tx, id);
@@ -231,7 +231,7 @@ describe("the outbox store", () => {
     it("reports a miss for an id that is not there", async () => {
       await inTenant(async (tx) => {
         const ghost = randomUUID();
-        expect(await markDelivered(tx, ghost, DUE, { ok: true })).toBe(false);
+        expect(await markDelivered(tx, ghost, DUE, { ok: true }, "accepted")).toBe(false);
         expect(await markRetry(tx, ghost, DUE, "503")).toBe(false);
         expect(await markDead(tx, ghost, DUE, "403")).toBe(false);
       });
@@ -285,7 +285,7 @@ describe("the outbox store", () => {
       await inTenant(async (tx) => {
         const first = await enqueueOutbox(tx, TENANT, sameWrite);
         await claimBatch(tx, TENANT, "worker-a", 10, DUE);
-        await markDelivered(tx, first.id, DUE, { ok: true });
+        await markDelivered(tx, first.id, DUE, { ok: true }, "accepted");
         expect(await enqueueOutbox(tx, TENANT, sameWrite)).toEqual({
           enqueued: false,
           id: first.id,
@@ -390,7 +390,7 @@ describe("the outbox store", () => {
         const delivered = await queued(tx, { entity: "Item" });
         await claimBatch(tx, TENANT, "worker-a", 10, DUE);
         await markDead(tx, dead, DUE, "403");
-        await markDelivered(tx, delivered, DUE, { ok: true });
+        await markDelivered(tx, delivered, DUE, { ok: true }, "accepted");
         await markRetry(tx, pending, DUE, "503");
 
         const lag = await outboxLag(tx, TENANT, new Date(DUE.getTime() + 3_600_000));
@@ -426,7 +426,7 @@ describe("the outbox store", () => {
         // the caller cannot forget. All three miss, and the row is untouched.
         expect(await markDead(tx, foreign, DUE, "403")).toBe(false);
         expect(await markRetry(tx, foreign, DUE, "503")).toBe(false);
-        expect(await markDelivered(tx, foreign, DUE, { ok: true })).toBe(false);
+        expect(await markDelivered(tx, foreign, DUE, { ok: true }, "accepted")).toBe(false);
         expect(await stateOf(tx, foreign)).toBeNull();
       });
 

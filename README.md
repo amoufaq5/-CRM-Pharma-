@@ -1454,8 +1454,17 @@ non-repeating; and a full outbox round trip — create, transition, replay, out-
 exists:
 
 - A duplicate record id does **not** answer 409. It answers `500 write_failed` carrying
-  node-postgres's message, so the replay-as-success guarantee rests on the ERP leaking that
-  string to clients. Pinned in both directions; in the ADR's open table as a decision.
+  node-postgres's message, so the replay-as-success guarantee used to rest on the ERP leaking
+  that string to clients. **The relay reads the record back now**: on a failure where the ERP
+  did not describe its own outcome — 500 and above, or no error body at all — it asks for the
+  target id it minted and settles on the answer, with the probe outranking the regex and a
+  probe that cannot answer raising the original failure unchanged, so nothing is dead-lettered
+  because a check failed. The regex remains as the fallback, and since 0076 every delivery
+  records WHICH mechanism settled it (`crm.outbox.settled_by`, paired with the state by a
+  CHECK), so a deployment resting on that sentence can see that it is: a non-zero
+  `duplicate_key_text` in `SELECT settled_by, count(*) FROM crm.outbox WHERE state =
+  'delivered' GROUP BY 1`, and in the drain's own log line. A **stable error code** from the
+  ERP would let the regex go entirely; that half is still the platform's to offer.
 - The ERP's JWT-vs-header tenant cross-check only fires **when the token carries a usable
   tenant claim**. Our minter's UUID check is what makes that condition hold, which promotes
   it from tidiness to a security control.

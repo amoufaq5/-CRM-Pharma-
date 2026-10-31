@@ -4370,3 +4370,143 @@ unlisted tenant holds no rows anywhere, so there was never any data of theirs to
 And `crm.tenant_is_registered` is that question in SQL, with exactly one caller. That is the
 honest number rather than a disappointing one: nothing else needs to ask, because everything else
 is answered by a key.
+
+## Which mechanism settled it
+
+*2026-10-31, migration 0076 against a real Postgres 16 over TCP with scram: `npx vitest run`
+(110 files / 2,724 tests) on the development database and on one built from nothing, `pnpm
+typecheck`, all 76 migrations through the runner, `pnpm client:verify` (334 checks). The live
+ERP gate was **not** run — see the last section, which says why.*
+
+ADR-0001 carried a row saying the CRM's idempotency guarantee "rests on the ERP leaking a driver
+message to clients", and that closing it meant "asking for a stable error code, or having the
+relay re-`GET` the target record on an ambiguous 500 — the second is a design change, not a
+defect fix, so it is a decision rather than a task".
+
+### The first finding was that the work was already done
+
+The re-`GET` exists. `dispatch` has `disambiguate`; `isAmbiguousWriteFailure` draws the line on
+whether the ERP **told** us an outcome rather than on a list of its codes — 500 and above, or a
+failure that is not an `ErpError` at all — with the reason written down in the function's own
+comment: "enumerating codes instead would be the same defect one layer up from the one this
+closes". `probeAnswersDelivery` restricts it to creates, because an `update`'s record existed
+before the write and a `transition`'s question is the record's state. The probe OUTRANKS the
+regex, and a probe that cannot answer raises the original error unchanged, so nothing is
+dead-lettered because a check failed.
+
+And `scripts/live-erp/drive.mjs` already pinned it with a control: byte-identical error bodies,
+one target id the ERP holds and one it does not, and the assertion "a landed write settles as
+already_delivered against an ERP that leaks nothing — THE OPEN ITEM, CLOSED".
+
+So the row was stale. The honest action on a row whose work shipped under another number is to
+close it and say when, which is what happened — not to build it again.
+
+### What was genuinely left is the gap that gate pinned in its own words
+
+```
+PINNED GAP: a delivered row records no reason, so which mechanism settled it is not readable
+from the queue — `markDelivered` takes none
+```
+
+That matters for exactly the reason the original row gave. The regex is still there, as the
+documented fallback for when the probe cannot answer — so a deployment settling every redelivery
+by a sentence the platform never promised to keep looks **identical** to one settling none that
+way. The dependency went from load-bearing to invisible. Better, and not the same as gone.
+
+So the question becomes a query:
+
+```sql
+SELECT settled_by, count(*) FROM crm.outbox WHERE state = 'delivered' GROUP BY 1;
+```
+
+Five values, each one something a reader can act on: `accepted` (the ERP answered this attempt),
+`read_back` (the probe asked and the ERP had it — evidence), `conflict_status` (a real 409 — a
+statement), `duplicate_key_text` (the regex — an inference from a sentence), and `unrecorded` for
+rows delivered before the column existed. That last one is **named rather than guessed**:
+backfilling `accepted` for rows whose mechanism nobody knows is the shape of lie the column
+exists to stop.
+
+### The pairing, and the five fixtures it caught
+
+`outbox_delivered_records_its_mechanism` pairs the state with the column in both directions: a
+delivery must say, and nothing else may.
+
+```
+UPDATE crm.outbox SET state = 'delivered'    WHERE id = … → outbox_delivered_records_its_mechanism
+UPDATE crm.outbox SET settled_by = 'accepted' WHERE id = … → the same constraint
+UPDATE … settled_by = 'probably_fine'                     → outbox_settled_by_vocabulary
+```
+
+It found four fixtures planting a delivered row by hand and one raw `UPDATE` in the api suite,
+each of which now supplies the pairing itself. That is the CHECK doing its job rather than
+obstructing: a fixture writing a state the schema forbids is a fixture modelling something that
+cannot happen.
+
+And the CHECK and the TypeScript union are asserted to be the **same list**, derived from
+`pg_constraint`, so a migration that widens one without the other fails on the day it is written.
+
+### The type had to carry the pairing, after the first version did not
+
+`Outcome` first gained an optional `settledBy`, which left the relay writing:
+
+```ts
+const settledBy = outcome.kind === "delivered" ? "accepted" : (outcome.settledBy ?? "duplicate_key_text");
+```
+
+A default that would have **misreported** the mechanism for any future branch that forgot to set
+one — the same lie the column exists to stop, one layer up, written while writing the thing that
+stops it. `Outcome` is a discriminated union now: both delivered kinds require the field, so the
+omission is a type error. That change also forced the `TargetConfirmedAbsentError` branch to say
+what it does when the classifier and the probe disagree about a fact — it refuses to settle on
+the contradiction and retries — where before the narrowing was implicit and unexamined.
+
+### The surface somebody reads
+
+`crm.outbox_settlement_exceptions(tenant)` counts the delivered rows whose mechanism was not
+`accepted`, under the caller's own row security, and the drain's log line appends
+`settled=read_back:3` only when there is something to say — the same rule the `LOST=` prefix
+follows, because a line that always carries a number nobody reads is a line nobody reads.
+`accepted` is excluded on purpose: it is the overwhelming majority of every queue, and a number
+that is always large sits badly next to the ones that matter.
+
+One diagnosis in this increment came from a stub rather than from the product, and it is worth
+the line: the scheduler suite's fake relay is cast through `unknown`, so adding `settlements` to
+`RelayResult` could not be caught by the compiler. The drain reported
+`TypeError: Cannot read properties of undefined (reading 'size')` as a **job error**, which read
+as "the relay is broken" until the job's own `last_error` was queried. Six stubs, one field.
+
+### Two scheduler tests, and the evidence that finally named the cause
+
+The loop tests failed in CI on the previous increment and the message said nothing useful:
+
+```
+Error: the scheduler never reached: a drain for any tenant (within 25000ms)
+```
+
+So `until` learned to report what the scheduler **did**, and the next run answered it in one
+read:
+
+```
+4526 tick(s), each seeing one of [1] tenant(s); 0 job event(s):
+```
+
+One tenant — so the pause the suite now performs worked and the loop was looking at the right
+registry — and not one job ever came due. The tests had been relying on `ensureJobs` to create
+`relay_drain` and on it being due immediately, which is the provisioning path's timing and not
+the loop's. They plant one due job now, `now() - interval '1 minute'`, which is this
+repository's own lesson rather than a flourish: `claimDueJobs` compares `next_run_at` against
+the instant the **scheduler** supplies — Node's clock, in another process — and a fixture that
+wrote Postgres's `now()` leaves the job not-quite-due on a server a few milliseconds ahead.
+
+### What was not run, and why
+
+The flipped assertion in `scripts/live-erp/drive.mjs` — `settled_by === "read_back"` in place of
+the sentence describing the gap — is the one thing in this increment that has **not** been
+executed. That gate needs CrossEngin installed and built, and this phase's instruction is to
+read that repository and not modify anything in it; it has no `node_modules` here, so the gate
+cannot run without changing it. The assertion is the live form of the one the contract suite
+proves against a real database, which is as safe as an unexecuted assertion gets — and it is
+unexecuted, which is the part worth writing down rather than leaving for somebody to discover.
+
+And the stable error code is still the ERP's to offer. With one, the regex could go entirely
+rather than remaining as a fallback that now, at least, counts itself.

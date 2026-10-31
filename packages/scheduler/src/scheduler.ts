@@ -458,6 +458,18 @@ export class Scheduler {
           // Prefixed rather than folded in, so a non-zero value is legible at a glance in a
           // line that is otherwise all zeroes on a healthy tenant.
           `${r.settleLost > 0 ? `LOST=${r.settleLost} ` : ""}` +
+          // HOW DELIVERIES WERE SETTLED, when any of them was settled by something other than
+          // the ERP accepting the write (0076). Appended only when there is something to say,
+          // for the reason the LOST prefix above gives: a line that always carries a number
+          // nobody reads is a line nobody reads. `duplicate_key_text` appearing here is the
+          // thing worth seeing — it means this deployment's idempotency guarantee is resting on
+          // a node-postgres message the ERP never promised to keep, which is the dependency
+          // ADR-0001 carried as "breaks silently and in the expensive direction".
+          `${
+            r.settlements.size > 0
+              ? `settled=${[...r.settlements].map(([k, n]) => `${k}:${String(n)}`).sort().join(",")} `
+              : ""
+          }` +
           // `oldest=-s` is not a duration, and this line is the operator's only view of a
           // drain. An empty queue says so in words.
           `pending=${r.lag.pending} oldest=` +

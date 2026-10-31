@@ -412,7 +412,7 @@ describe("mirroring sample movements to the ERP", () => {
         const movement = await receiveSamples(tx, TENANT, input);
         const { outboxId } = await enqueueErpMirror(tx, TENANT, movement, lot);
         const [row] = await claimBatch(tx, TENANT, "relay-worker-a", 10, RELAY_CLOCK);
-        expect(await markDelivered(tx, row!.id, RELAY_CLOCK, { ok: true })).toBe(true);
+        expect(await markDelivered(tx, row!.id, RELAY_CLOCK, { ok: true }, "accepted")).toBe(true);
         return { lot, input, outboxId };
       });
 

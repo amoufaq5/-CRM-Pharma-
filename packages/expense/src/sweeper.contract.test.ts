@@ -801,7 +801,7 @@ describe("the expense posting sweep", () => {
         const outboxId = await inTenant(async (tx) => {
           const [row] = await claimBatch(tx, TENANT, "relay-worker-a", 10, RELAY_CLOCK);
           if (settle !== null) {
-            expect(await markDelivered(tx, row!.id, RELAY_CLOCK, { ok: true })).toBe(true);
+            expect(await markDelivered(tx, row!.id, RELAY_CLOCK, { ok: true }, "accepted")).toBe(true);
           }
           return row!.id;
         });

@@ -10,6 +10,7 @@ import {
   claimBatch,
   markDead,
   markDelivered,
+  settlementExceptions,
   markRetry,
   outboxLag,
   reclaimStale,
@@ -69,6 +70,19 @@ export interface RelayResult {
    * had". Before the guards in `store.ts` these were counted as settlements that happened.
    */
   readonly settleLost: number;
+  /**
+   * How this tenant's deliveries were settled, EXCLUDING the ordinary `accepted` (0076).
+   *
+   * Cumulative over the tenant's whole queue rather than over this drain, and that is the
+   * useful shape: the question it answers is "is this deployment's idempotency guarantee
+   * resting on a driver message the platform never promised to keep", which is a property of
+   * the history and not of one batch. A non-zero `duplicate_key_text` is that dependency
+   * being exercised; `read_back` is the probe doing the work instead.
+   *
+   * `accepted` is left out because it is the overwhelming majority of every queue, and a
+   * number that is always large sits badly next to the ones that matter.
+   */
+  readonly settlements: ReadonlyMap<string, number>;
   readonly lag: OutboxLag;
 }
 
@@ -139,7 +153,12 @@ export class OutboxRelay {
               // the drain. Kept for the shape (every settlement is guarded, and a reader
               // should not have to remember which one is exempt) and noted so nobody takes
               // it for the race the other three answer.
-              if (!(await markDelivered(tx, row.id, this.now(), outcome.response))) {
+              // Taken from the outcome, never defaulted here (0076). `Outcome` is a union that
+              // REQUIRES `settledBy` on both delivered kinds, so there is nothing to fall back
+              // to — which is the point: the first version of this line read
+              // `outcome.settledBy ?? "duplicate_key_text"`, a default that would have
+              // misreported the mechanism for any future branch that forgot to set one.
+              if (!(await markDelivered(tx, row.id, this.now(), outcome.response, outcome.settledBy))) {
                 lost += 1;
                 this.options.onEvent?.({ type: "settle_lost", row, outcome });
                 return;
@@ -205,10 +224,21 @@ export class OutboxRelay {
         });
       }
 
-      const lag = await withTenantContext(client, tenantId, (tx) =>
-        outboxLag(tx, tenantId, this.now()),
-      );
-      return { claimed: rows.length, delivered, retried, dead, alarmed, unattributed, settleLost: lost, lag };
+      const { lag, settlements } = await withTenantContext(client, tenantId, async (tx) => ({
+        lag: await outboxLag(tx, tenantId, this.now()),
+        settlements: await settlementExceptions(tx, tenantId),
+      }));
+      return {
+        claimed: rows.length,
+        delivered,
+        retried,
+        dead,
+        alarmed,
+        unattributed,
+        settleLost: lost,
+        settlements,
+        lag,
+      };
     } finally {
       client.release();
     }
@@ -217,7 +247,7 @@ export class OutboxRelay {
   /** One dispatch attempt, reduced to an outcome. Never throws. */
   private async attempt(
     row: OutboxRow,
-  ): Promise<(Outcome & { response?: unknown }) | { kind: "delivered"; reason: string; response: unknown }> {
+  ): Promise<Outcome & { response?: unknown }> {
     let isTransition = false;
     try {
       // Parsed up front so a malformed operation dead-letters with a readable
@@ -233,7 +263,9 @@ export class OutboxRelay {
 
     try {
       const { response } = await dispatch(this.options.client, row);
-      return { kind: "delivered", reason: "ok", response };
+      // `accepted` here and nowhere else: this is the one path where the ERP answered THIS
+      // attempt. Every other delivered outcome is a recovery, and `classify` names which (0076).
+      return { kind: "delivered", reason: "ok", settledBy: "accepted", response };
     } catch (err) {
       const outcome = classify({ error: err, isTransition });
       return outcome.kind === "already_delivered" ? { ...outcome, response: null } : outcome;

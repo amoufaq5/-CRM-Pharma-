@@ -3360,6 +3360,85 @@ Concretely, and these specifics are the decision, not commentary on it:
     to rename or pause them, and nothing forces that, which is a judgement nobody but they can
     make.
 
+52. **Which mechanism settled it** (migration 0076) — and the row this closes was already closed
+    in the code, which is the finding that came first.
+
+    **THE RE-`GET` IS BUILT.** ADR-0001's row said the CRM's idempotency guarantee "rests on the
+    ERP leaking a driver message to clients" and that closing it meant "asking for a stable error
+    code, or having the relay re-`GET` the target record on an ambiguous 500 — the second is a
+    design change, not a defect fix, so it is a decision rather than a task". That decision was
+    taken and shipped in a later increment and the row was never updated: `dispatch` has
+    `disambiguate`, `isAmbiguousWriteFailure` (drawn on whether the ERP TOLD us an outcome — 500
+    and above, or no `ErpError` at all — rather than on a list of its codes, which would be the
+    same defect one layer up), `probeAnswersDelivery` (creates only, since an `update`'s record
+    existed before the write and a `transition`'s question is the STATE), and
+    `TargetAlreadyPresentError` / `TargetConfirmedAbsentError`, with the probe OUTRANKING the
+    regex and a failure to check raising the original error unchanged. `scripts/live-erp/drive.mjs`
+    even pins it with a control: byte-identical error bodies, one id the ERP holds and one it does
+    not, "a landed write settles as already_delivered against an ERP that leaks nothing — THE
+    OPEN ITEM, CLOSED". So the honest action on that row is to close it and say when, which this
+    item does.
+
+    **WHAT WAS GENUINELY LEFT is the gap that gate pinned in its own words**: "a delivered row
+    records no reason, so which mechanism settled it is not readable from the queue —
+    `markDelivered` takes none". That matters for exactly the reason the original row gave. The
+    regex is still there as the documented fallback for when the probe cannot answer, so a
+    deployment settling every redelivery by a sentence the platform never promised to keep looked
+    identical to one settling none that way. The dependency went from load-bearing to invisible,
+    which is better and is not the same as gone.
+
+    So `crm.outbox.settled_by` records it, and the question becomes a query:
+    `SELECT settled_by, count(*) FROM crm.outbox WHERE state = 'delivered' GROUP BY 1`. Five
+    values, each one something a reader can act on: `accepted` (the ERP answered this attempt),
+    `read_back` (the probe asked and the ERP had it — evidence), `conflict_status` (a real 409 —
+    a statement), `duplicate_key_text` (the regex — an inference from a sentence), and
+    `unrecorded` for rows delivered before the column existed. That last one is NAMED rather than
+    guessed: backfilling `accepted` for rows whose mechanism nobody knows is the shape of lie the
+    column exists to stop.
+
+    **PAIRED WITH THE STATE BY A CHECK**, in both directions: a delivery must say, and nothing
+    else may. `outbox_delivered_records_its_mechanism` is 0051's `undecided` and 0066's
+    `unverifiable` in a third subsystem — a column allowed to be silent is a column that will be.
+    That CHECK found four fixtures writing a delivered row by hand and one raw `UPDATE` in the
+    api suite, each of which now supplies the pairing itself.
+
+    **AND THE TYPE CARRIES THE PAIRING, after the first version did not.** `Outcome` gained an
+    optional `settledBy`, which left the relay writing `outcome.settledBy ?? "duplicate_key_text"`
+    — a default that would have MISREPORTED the mechanism for any future branch that forgot to set
+    one, which is the same lie one layer up. It is a discriminated union now: both delivered kinds
+    REQUIRE the field, so the omission is a type error. That change also forced the
+    `TargetConfirmedAbsentError` branch to say what it does when the classifier and the probe
+    disagree about a fact — it refuses to settle on the contradiction and retries — where before
+    the narrowing was implicit.
+
+    **THE SURFACE**: `crm.outbox_settlement_exceptions(tenant)` counts the delivered rows whose
+    mechanism was NOT `accepted`, and the drain's log line appends `settled=read_back:3` only when
+    there is something to say — the same rule the `LOST=` prefix follows, because a line that
+    always carries a number nobody reads is a line nobody reads. `accepted` is left out on
+    purpose: it is the overwhelming majority of every queue.
+
+    **Verified live** against a real Postgres over TCP: the pairing refuses a delivery with no
+    mechanism and a mechanism on a pending row, each by constraint name; the vocabulary CHECK
+    admits exactly the five values and refuses a sixth; the CHECK and the TypeScript union are
+    asserted to be the SAME list, derived from `pg_constraint`, so a migration that widens one
+    without the other fails; `classify` names `read_back`, `conflict_status` and
+    `duplicate_key_text` for the three shapes of failure, with the duplicate-key case built as the
+    live server really answers it (`unavailable` at 500 with the driver's sentence in `detail`,
+    which is why the conflict branch never fired); the count excludes `accepted` and is confined to
+    the caller's tenant; and a retry of a delivered row is refused by the pairing. Full suite green
+    on the backfilled database and on one built from nothing (110 files / 2,724 tests), `pnpm
+    typecheck` green, `pnpm client:verify` green at 334 checks, and all 76 migrations through the
+    runner idempotently.
+
+    **NOT verified live against the ERP, and that is recorded rather than glossed.** The one
+    assertion in this increment that has not been executed is the flipped pinned-gap check in
+    `scripts/live-erp/drive.mjs`, which now reads `settled_by === "read_back"` instead of
+    describing the gap. Running that gate needs CrossEngin installed and built, and this phase's
+    instruction is to read that repository and not modify anything in it; it has no `node_modules`
+    here, so the gate cannot run without changing it. The assertion is the live form of the one
+    the contract suite proves against a real database, which is as safe as an unexecuted assertion
+    gets — and it is unexecuted, which is the part worth writing down.
+
     **Verified.** 106 files / 2,699 tests, and the two corrections above were both found by that
     full run rather than by reading — the single-file run passed with the unrunnable index and the
     unsatisfiable plan premise still in place. `pnpm typecheck` green as one command (packages and
@@ -3737,7 +3816,7 @@ commit.
 | **No incremental polling is possible against `pack-erp-core` at all.** Measured from the captured baseline: 0 of 51 entities declare `updated_at` and 0 expose it as filterable. `PollingChangeSource` asks the schema and returns `mode: "full_sweep"` rather than sending a filter the ERP would silently drop, so every snapshot refresh is a full read of every entity. That is correct and expensive, and it is the strongest argument for Q9's `meta.webhook_deliveries` that exists — the alternative is the platform adding `updated_at` to the pack's filterable sets. | Platform | _set a date_ |
 | **34 of 51 entities expose no sortable fields**, so a `sort` on them silently falls back to the view's default order. Keyset pagination over an unordered view can revisit and skip rows, which means a paged full sweep of those entities is not provably complete. Nothing in the CRM pages them today; the snapshot refresher reads the entities that do sort. Worth knowing before anything new pages one. | Platform | _set a date_ |
 | **A channel with no sender in the running process now RETRIES rather than dead-letters**, which is right (a missing sender is a fact about the binary, not the destination, and the notification is deliverable the moment a process that has the channel takes a tick) and bounded (`markRetry` gives up at `MAX_ATTEMPTS`). But it means a channel nobody ever registers burns five attempts per delivery before dead-lettering, and nothing warns an operator that their endpoint's channel is unsendable until the first delivery is already late. A boot-time check against the distinct channels in `crm.notification_endpoint` would say it once, at the right moment. | Platform | _set a date_ |
-| **The CRM's idempotency guarantee rests on the ERP leaking a driver message to clients.** A redelivery of a write that already landed must read as success, or the relay retries to the cap and raises `erp_write_failed` at a rep for a write that is fine. The live server answers a duplicate record id `500 {"error":"write_failed","detail":"duplicate key value violates unique constraint …"}` — `handlers.ts` forwards `e.message` verbatim — which normalises to `unavailable`, not `conflict`, so `classify`'s own conflict branch never fires and only the `ALREADY_EXISTS` regex over `detail` saves it. Pinned in both directions by the live gate: with the driver text, `already_delivered`; same status and code with the text removed, `retry_transient`. **If the platform ever stops leaking that string — which it should — this breaks silently and in the expensive direction.** Closing it means asking for a stable error code, or having the relay re-`GET` the target record on an ambiguous 500; the second is a design change, not a defect fix, so it is a decision rather than a task. | Platform + us | _set a date_ |
+| **CLOSED — the re-`GET` was built and the row was never updated; 0076 closes what was genuinely left.** This row said closing it meant "asking for a stable error code, or having the relay re-`GET` the target record on an ambiguous 500". The second was done: `dispatch`'s `disambiguate` reads back the id the relay minted whenever the ERP failed to describe its own outcome, the probe OUTRANKS the regex, and a failure to check raises the original error unchanged so nothing is dead-lettered for a check that could not run. `drive.mjs` pins it with a control — byte-identical error bodies, one id the ERP holds and one it does not. What remained was the gap that gate pinned in its own words: a delivered row recorded no reason, so a deployment still resting on the driver's sentence looked identical to one that never used it. Migration 0076 adds `crm.outbox.settled_by`, paired with the state by a CHECK, counted per tenant and appended to the drain's log line when anything but `accepted` appears. The STABLE ERROR CODE is still the ERP's to offer, and would let the regex go entirely. | Platform + us | **closed 2026-10-31** |
 | **The ERP's JWT-vs-header tenant cross-check is conditional on the claim being present** (item 10's correction). A validly signed token with no usable `tenant_id` claim is accepted with `x-tenant-id` alone selecting the tenant, so one signing key plus a header reads any tenant. ERP-side defect, reported and deliberately not fixed — `/home/user/CrossEngin` is read-only this phase. We are not exposed because `mintServiceToken` refuses a non-UUID tenant, which means that check is now a security control and must be treated as one. | Platform | _set a date_ |
 | **One `waitFor` in the browser gate times out under load and the cause is one of two.** Attempt five of the contended loop died at "the missing-signature refusal" — either the message never appeared, because the click reached an earlier refusal first, or it appeared and a later render replaced it, and those want opposite fixes. Not reproduced in the seven attempts either side of it. Item 49 (c) made every `waitFor` timeout in this gate report the app's own message bar and a window of the body, so the next one names which. Left open rather than guessed at, and deliberately NOT papered over with a larger timeout: more seconds help only one of the two causes, and nothing yet says which. | us | _recurrence will now carry the sentence on screen_ |
 | **A transfer reached the ledger in CI from a device that should have had no network, and no local run reproduces it.** `field-client` §13 found a `transfer_out` of Grace's in `crm.sample_transaction` while her device still held the row `pending` with `attempts: 0` and her colleague's session was correctly refusing to send it. The ATTRIBUTION was right — the row is hers, and the route takes the sender from the token alone — so this is not the misattribution the chapter guards, and item 49 (b) replaced the absolute assertion with the delta and the by-id check. What is unexplained is how the request left a page that had gone offline before the row existed: `drain()` returns early with `state.online` false, and a probe confirmed the harness's offline emulation sets `navigator.onLine` false and holds it across the navigation that chapter performs. Fourteen runs here (two clean and twelve with six spinners on four cores) have not reproduced it. Recorded rather than closed, and recorded rather than re-run: the gate now prints every movement with `recorded_at` to the millisecond on both sides of the sync, so a recurrence says whether the row arrived during that sync or earlier — which is the fact that decides between a lost reply and something worse. | us | _recurrence will now carry its timestamp_ |

@@ -16,10 +16,50 @@ export type OutcomeKind =
   | "retry_period"
   | "dead";
 
-export interface Outcome {
-  readonly kind: OutcomeKind;
-  readonly reason: string;
-}
+/**
+ * WHICH MECHANISM settled a delivery (0076), recorded on the row so it can be counted.
+ *
+ * The idempotency guarantee used to rest on the ERP leaking a node-postgres message to
+ * clients, and the probe below closed that — but the regex is still here as the fallback for
+ * when the probe cannot answer, and nothing said whether it was still load-bearing. A
+ * deployment settling every redelivery by that sentence looked identical to one settling none
+ * that way. Now `SELECT settled_by, count(*) FROM crm.outbox WHERE state = 'delivered'` answers
+ * it, and a non-zero `duplicate_key_text` is the dependency being exercised today.
+ *
+ * `unrecorded` exists for rows delivered before the column did. It is not minted here — only
+ * migration 0076 writes it — and it is in the union so a reader of this type sees the whole
+ * vocabulary the column admits rather than a subset.
+ */
+export const SETTLED_BY = [
+  "accepted",
+  "read_back",
+  "conflict_status",
+  "duplicate_key_text",
+  "unrecorded",
+] as const;
+export type SettledBy = (typeof SETTLED_BY)[number];
+
+/**
+ * A UNION rather than one interface with an optional field, so the compiler carries the
+ * database's pairing.
+ *
+ * `outbox_delivered_records_its_mechanism` pairs `state = 'delivered'` with a non-null
+ * `settled_by`, and the first version of this type made `settledBy` optional — which left the
+ * relay writing `outcome.settledBy ?? "duplicate_key_text"`, a default that would have
+ * MISREPORTED the mechanism for any future branch that forgot to set it. That is the exact
+ * shape of lie this column exists to stop, reintroduced one layer up. A union makes the
+ * omission a type error instead.
+ */
+export type Outcome =
+  | {
+      readonly kind: "delivered" | "already_delivered";
+      readonly reason: string;
+      readonly settledBy: SettledBy;
+    }
+  | {
+      readonly kind: "retry_transient" | "retry_ordering" | "retry_period" | "dead";
+      readonly reason: string;
+    };
 
 /**
  * ERP write-guard codes. All of these arrive as HTTP **422** carrying the
@@ -153,6 +193,7 @@ export function classify(input: ClassifyInput): Outcome {
       reason:
         `the ERP already holds ${input.error.recordId} — read back from the ERP, ` +
         `not inferred from the error text`,
+      settledBy: "read_back",
     };
   }
 
@@ -164,6 +205,18 @@ export function classify(input: ClassifyInput): Outcome {
     // ERP demonstrably does not have. An answer beats a guess; a guess that
     // contradicts an answer is simply wrong.
     const inner = classifyFailure(input.error.writeError, input.isTransition, true);
+    // The suppression is what makes this narrowing sound rather than hopeful: with
+    // `targetConfirmedAbsent` on, the only branch that can return a delivered kind is skipped,
+    // because the ERP has just said it does not hold the record. A delivered kind here would
+    // mean the probe and the classifier disagree about a fact, which is a bug and not a state.
+    if (inner.kind === "delivered" || inner.kind === "already_delivered") {
+      return {
+        kind: "retry_transient",
+        reason:
+          `the classifier called this ${inner.kind} while the ERP says it does not hold ` +
+          `${input.error.recordId} — refusing to settle on a contradiction (${inner.reason})`,
+      };
+    }
     return {
       kind: inner.kind,
       reason: `${inner.reason} — and the ERP does not hold ${input.error.recordId}, so the write did not land`,
@@ -236,7 +289,15 @@ function classifyFailure(error: unknown, isTransition: boolean, targetConfirmedA
     // ambiguous has been read back from the ERP first, and lands here only if that
     // read could not answer. `targetConfirmedAbsent` is the case where it answered
     // NO, and an inference from a sentence must not overturn it.
-    return { kind: "already_delivered", reason: `already at the ERP: ${err.code}` };
+    // THE DISTINCTION THAT MAKES THE COLUMN WORTH HAVING. A real 409 is the ERP STATING that
+    // the record is there; the regex is a sentence it never promised to keep. Recording which
+    // of the two settled this row is what turns "the guarantee may be resting on a leak" from
+    // a worry in an ADR into a number somebody can read off the queue.
+    return {
+      kind: "already_delivered",
+      reason: `already at the ERP: ${err.code}`,
+      settledBy: err.kind === "conflict" ? "conflict_status" : "duplicate_key_text",
+    };
   }
 
   if (err.kind === "not_found") {

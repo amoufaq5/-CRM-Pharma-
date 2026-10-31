@@ -395,6 +395,18 @@ export const TENANT_ENDPOINT_CAP_OTHER = "f3710000-0000-4000-8000-000000000036";
 export const TENANT_STORAGE_BACKEND = "f4740000-0000-4000-8000-000000000037";
 
 /**
+ * packages/relay — which mechanism settled a delivery (migration 0076).
+ *
+ * Its own pair, because `crm.outbox_settlement_exceptions` counts a TENANT's whole delivered
+ * history, not one batch: a suite sharing a tenant with another would count that suite's
+ * settlements and the assertions would move with whatever ran first. The second tenant is the
+ * control — the count is per tenant, and one tenant's `duplicate_key_text` must say nothing
+ * about another's.
+ */
+export const TENANT_SETTLED_BY = "f5760000-0000-4000-8000-000000000038";
+export const TENANT_SETTLED_BY_OTHER = "f6760000-0000-4000-8000-000000000039";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding

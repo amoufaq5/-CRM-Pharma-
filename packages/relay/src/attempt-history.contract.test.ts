@@ -177,7 +177,7 @@ describe("a dead letter's per-attempt history", () => {
         await markRetry(tx, row.id, at("2027-01-01T09:05:00Z"), "502 from the ERP");
         expect(await attemptHistory(tx, row.id)).toHaveLength(0);
 
-        await markDelivered(tx, row.id, at("2027-01-01T09:10:00Z"), { ok: true });
+        await markDelivered(tx, row.id, at("2027-01-01T09:10:00Z"), { ok: true }, "accepted");
         expect(await attemptHistory(tx, row.id)).toHaveLength(0);
       });
     });
@@ -425,7 +425,7 @@ describe("a dead letter's per-attempt history", () => {
         await reviveDeadLetter(tx, row.id, REVIVER, at("2026-10-02T08:00:00Z"));
         await claimBatch(tx, TENANT, "worker-1", 10, at("2026-10-02T08:01:00Z"));
         // The revive worked: the row is delivered and is no longer a dead letter at all.
-        await markDelivered(tx, row.id, at("2026-10-02T08:02:00Z"), { ok: true });
+        await markDelivered(tx, row.id, at("2026-10-02T08:02:00Z"), { ok: true }, "accepted");
 
         const { rows: live } = await tx.query<{ n: string }>(
           "SELECT count(*) AS n FROM crm.dead_outbox_letters(NULL, 100)",

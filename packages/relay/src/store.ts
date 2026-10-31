@@ -1,5 +1,7 @@
 import type { PoolClient } from "pg";
 
+import type { SettledBy } from "./outcome.js";
+
 /**
  * The five states `crm.outbox.state`'s CHECK constraint admits.
  *
@@ -163,16 +165,45 @@ export async function markDelivered(
   id: string,
   now: Date,
   response: unknown,
+  /**
+   * WHICH MECHANISM settled it (0076). Required, not defaulted: the database pairs
+   * `state = 'delivered'` with a non-null `settled_by`, so a caller that did not decide would
+   * be refused by `outbox_delivered_records_its_mechanism` rather than writing a plausible
+   * guess. The live gate pinned this as a gap in its own words — "a delivered row records no
+   * reason, so which mechanism settled it is not readable from the queue" — and the reason it
+   * matters is that one of the five values means the idempotency guarantee is resting on a
+   * driver message the platform never promised to keep.
+   */
+  settledBy: SettledBy,
 ): Promise<boolean> {
   const { rowCount } = await tx.query(
     `UPDATE crm.outbox
         SET state = 'delivered', delivered_at = $2, last_error = NULL,
             claimed_at = NULL, claimed_by = NULL,
-            erp_response = $3::jsonb
+            erp_response = $3::jsonb, settled_by = $4
       WHERE id = $1`,
-    [id, now, JSON.stringify(response ?? null)],
+    [id, now, JSON.stringify(response ?? null), settledBy],
   );
   return (rowCount ?? 0) > 0;
+}
+
+/**
+ * The settlements that happened because something went wrong and was recovered from.
+ *
+ * `accepted` is deliberately excluded: it is the overwhelming majority of every queue, and a
+ * line reporting it would be a large number next to the numbers that matter. What a reader
+ * wants from the drain's log line is the exceptions — above all `duplicate_key_text`, which is
+ * the one value that says the guarantee is resting on a string today, on this deployment.
+ */
+export async function settlementExceptions(
+  tx: PoolClient,
+  tenantId: string,
+): Promise<ReadonlyMap<string, number>> {
+  const { rows } = await tx.query<{ settled_by: string; rows: string }>(
+    "SELECT settled_by, rows FROM crm.outbox_settlement_exceptions($1)",
+    [tenantId],
+  );
+  return new Map(rows.map((r) => [r.settled_by, Number(r.rows)]));
 }
 
 export async function markRetry(

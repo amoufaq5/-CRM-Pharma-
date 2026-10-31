@@ -2180,7 +2180,14 @@ describe("the API, end to end", () => {
       try {
         expect((await call("POST", `/v1/erp-writes/${outboxId}/retry`, { body: {} })).status).toBe(200);
         await withTenantContext(admin, TENANT, async (tx) => {
-          await tx.query("UPDATE crm.outbox SET state = 'delivered' WHERE id = $1", [outboxId]);
+          // `settled_by` with it (0076): a delivered row has to say which mechanism settled it,
+          // so moving the state alone is refused by
+          // `outbox_delivered_records_its_mechanism`. This fixture does not go through the
+          // relay, so it says so itself.
+          await tx.query(
+            "UPDATE crm.outbox SET state = 'delivered', settled_by = 'accepted' WHERE id = $1",
+            [outboxId],
+          );
         });
         // Gone from both dead-letter listings, by construction.
         expect((await call("GET", "/v1/erp-writes/failed")).body.data).toEqual([]);

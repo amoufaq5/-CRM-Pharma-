@@ -6,7 +6,15 @@ export {
   policyFor,
   type BackoffPolicy,
 } from "./backoff.js";
-export { classify, isTerminal, type ClassifyInput, type Outcome, type OutcomeKind } from "./outcome.js";
+export {
+  SETTLED_BY,
+  classify,
+  isTerminal,
+  type ClassifyInput,
+  type Outcome,
+  type OutcomeKind,
+  type SettledBy,
+} from "./outcome.js";
 export {
   UnknownOperationError,
   dispatch,

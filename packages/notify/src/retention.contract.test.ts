@@ -308,9 +308,13 @@ describe("notification retention", () => {
 
     const outboxRow = async (c: PoolClient, state: "dead" | "delivered"): Promise<string> => {
       const { rows } = await c.query<{ id: string }>(
+        // `settled_by` paired with the state (0076): a delivered row has to say which mechanism
+        // settled it, and NULL for every other state. This helper plants a row directly rather
+        // than draining one, so it supplies the pairing itself.
         `INSERT INTO crm.outbox (tenant_id, entity, operation, payload, target_record_id,
-                                 source_table, source_id, state)
-         VALUES ($1,'Item','create','{}'::jsonb,$2,'crm.visit',gen_random_uuid(),$3) RETURNING id`,
+                                 source_table, source_id, state, settled_by)
+         VALUES ($1,'Item','create','{}'::jsonb,$2,'crm.visit',gen_random_uuid(),$3,
+                 CASE WHEN $3 = 'delivered' THEN 'accepted' END) RETURNING id`,
         [TENANT, `crm_ret_${(seq += 1)}`, state],
       );
       return rows[0]!.id;

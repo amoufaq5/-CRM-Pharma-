@@ -47,7 +47,7 @@ function stubRelay(behaviour: (tenantId: string) => Promise<unknown> = async () 
     drainTenant: async (tenantId: string) => {
       calls.push(tenantId);
       await behaviour(tenantId);
-      return { claimed: 0, delivered: 0, retried: 0, dead: 0, lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
+      return { claimed: 0, delivered: 0, retried: 0, dead: 0, settlements: new Map(), lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
     },
   } as unknown as OutboxRelay;
   return { relay, calls };
@@ -454,7 +454,7 @@ describe("scheduler against a real database", () => {
           alarmed: 0,
           unattributed: 0,
           settleLost,
-          lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null },
+          settlements: new Map(), lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null },
         }),
       }) as unknown as OutboxRelay;
     const { refresher } = stubRefresher();
@@ -609,7 +609,7 @@ describe("scheduler against a real database", () => {
       drainTenant: async (tenantId: string) => {
         seen.push(tenantId);
         if (tenantId === TENANT) throw new Error("this tenant is broken");
-        return { claimed: 0, delivered: 0, retried: 0, dead: 0, lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
+        return { claimed: 0, delivered: 0, retried: 0, dead: 0, settlements: new Map(), lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
       },
     } as unknown as OutboxRelay;
     const { refresher } = stubRefresher();
@@ -781,18 +781,54 @@ describe("scheduler against a real database", () => {
  * before it reached this suite's own. Waiting for the thing being asserted makes the test
  * independent of how many other suites have run, which it should always have been.
  */
-async function until(what: string, ready: () => boolean, timeoutMs = 25_000): Promise<void> {
+async function until(
+  what: string,
+  ready: () => boolean,
+  /**
+   * What the scheduler DID do, read only on timeout.
+   *
+   * `the scheduler never reached: a drain for any tenant` is a true statement that names
+   * nothing, and this loop is the one place in the suite where the thing being waited for is
+   * several layers away from the thing being asserted. The first version of this helper had no
+   * evidence argument and the diagnosis cost a run per hypothesis.
+   */
+  evidence: () => string = () => "no evidence captured",
+  timeoutMs = 25_000,
+): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (ready()) return;
     await new Promise((r) => setTimeout(r, 10));
   }
-  throw new Error(`the scheduler never reached: ${what} (within ${String(timeoutMs)}ms)`);
+  throw new Error(
+    `the scheduler never reached: ${what} (within ${String(timeoutMs)}ms); it did: ${evidence()}`,
+  );
 }
 
+/**
+ * THE LOOP TESTS GET THE REGISTRY TO THEMSELVES, and that became necessary rather than nice.
+ *
+ * These four tests are about the LOOP — that a tick does not stack on the one in flight, that
+ * `stop()` waits, that a throw does not kill it. None of them is about how many tenants a
+ * deployment has. But a tick does work for every ACTIVE tenant, and since 0075 every suite's
+ * fixture tenants are in `crm.tenant` and stay there, so a tick walks dozens of them — and on a
+ * FRESH database none of them have job rows yet, so the first tick PROVISIONS all of them and
+ * runs every due job for each. In CI that took longer than twenty-five seconds and the loop
+ * never reached this suite's own tenant: `the scheduler never reached: a drain for any tenant`.
+ *
+ * It passed locally, which is the part worth recording: the development database already had
+ * 620 job rows, so provisioning was a no-op there. A fixture whose speed depends on what a
+ * previous run left behind is a fixture that passes on the machine it was written on.
+ *
+ * So the other tenants are PAUSED for the duration and restored afterwards — by id, from what
+ * was actually paused, never by "set everything active", which would hand another suite's
+ * deliberately disabled tenant back as live. `fileParallelism: false` is what makes this safe:
+ * no other file is running while this one is.
+ */
 describe("the loop itself", () => {
   let p: Pool;
   let admin: PoolClient;
+  let paused: readonly string[] = [];
 
   beforeAll(async () => {
     p = appPool();
@@ -804,12 +840,54 @@ describe("the loop itself", () => {
            ON CONFLICT (tenant_id) DO UPDATE SET status = 'active'`,
       [LOOP_TENANT],
     );
+    const { rows } = await admin.query<{ tenant_id: string }>(
+      `UPDATE crm.tenant SET status = 'paused'
+        WHERE status = 'active' AND tenant_id <> $1
+        RETURNING tenant_id`,
+      [LOOP_TENANT],
+    );
+    paused = rows.map((r) => r.tenant_id);
+
+    /**
+     * ONE DUE JOB, PLANTED, rather than waiting for the tick to provision one.
+     *
+     * These tests are about the loop and were relying on `ensureJobs` to create `relay_drain`
+     * and on it being due immediately. On a fresh database that did not happen: the evidence
+     * the `until` helper now prints said `4526 tick(s), each seeing one of [1] tenant(s); 0 job
+     * event(s)` — the pause worked, the tenant was seen, and no job ever came due. A test that
+     * asserts something about the loop should not also be asserting the provisioning path's
+     * timing, which the suite above covers directly.
+     *
+     * `now() - interval '1 minute'`, which is this repository's own lesson rather than a
+     * flourish: `claimDueJobs` compares `next_run_at` against the instant the SCHEDULER
+     * supplies — Node's clock, in another process — and a fixture that wrote Postgres's `now()`
+     * left the job not-quite-due on a server a few milliseconds ahead. A minute in the past
+     * cannot be lost to either clock.
+     */
+    await withTenantContext(admin, LOOP_TENANT, (tx) =>
+      tx.query(
+        `INSERT INTO crm.scheduled_job (tenant_id, job, interval_ms, next_run_at)
+         VALUES ($1, 'relay_drain', 1000, now() - interval '1 minute')
+             ON CONFLICT (tenant_id, job) DO UPDATE
+                SET next_run_at = now() - interval '1 minute', interval_ms = 1000,
+                    enabled = true, consecutive_failures = 0`,
+        [LOOP_TENANT],
+      ),
+    );
   });
 
   afterAll(async () => {
     await withTenantContext(admin, LOOP_TENANT, (tx) =>
       tx.query("DELETE FROM crm.scheduled_job WHERE tenant_id = $1", [LOOP_TENANT]),
     );
+    // Every tenant this suite paused, back to active — by id, so a tenant another suite left
+    // `paused` or `disabled` on purpose is not handed back as live.
+    if (paused.length > 0) {
+      await admin.query(
+        "UPDATE crm.tenant SET status = 'active' WHERE tenant_id = ANY($1::uuid[])",
+        [[...paused]],
+      );
+    }
     // Left in the registry: its jobs are gone, and a registry row with nothing referencing it
     // is removable — but removing it would make the next run's first insert the only thing
     // standing between this suite and 0075's refusal, which is a worse fixture.
@@ -840,20 +918,36 @@ describe("the loop itself", () => {
         maxConcurrent = Math.max(maxConcurrent, concurrent);
         await new Promise((r) => setTimeout(r, 25));
         concurrent -= 1;
-        return { claimed: 0, delivered: 0, retried: 0, dead: 0, lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
+        return { claimed: 0, delivered: 0, retried: 0, dead: 0, settlements: new Map(), lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
       },
     } as unknown as OutboxRelay;
     const { refresher } = stubRefresher();
 
+    const events: SchedulerEvent[] = [];
     const s = new Scheduler({
       pool: p,
       relay,
       refresher,
       tickIntervalMs: 1, // far shorter than the work
       random: () => 0.5,
+      onEvent: (e) => events.push(e),
     });
     s.start();
-    await until("a drain for any tenant", () => maxConcurrent >= 1);
+    await until("a drain for any tenant", () => maxConcurrent >= 1, () => {
+      // Counted rather than listed: a 25-second wait at one tick per millisecond produces
+      // thousands of `tick_start`s, and a list of them is a wall. What decides the diagnosis is
+      // how many TENANTS each tick saw and whether any job ran at all.
+      const ticks = events.filter((e) => e.type === "tick_start");
+      const seen = [...new Set(ticks.map((e) => (e as { tenants: number }).tenants))].sort();
+      const jobs = events.filter((e) => e.type === "job_ok" || e.type === "job_error");
+      return (
+        `${String(ticks.length)} tick(s), each seeing one of ${JSON.stringify(seen)} tenant(s); ` +
+        `${String(jobs.length)} job event(s): ${jobs
+          .map((e) => `${e.type}:${(e as { job: string }).job}`)
+          .slice(0, 8)
+          .join(",")}`
+      );
+    });
     // And then a little longer, because the property is that a SECOND tick does not join the
     // first: stopping the instant one drain begins would assert nothing.
     await new Promise((r) => setTimeout(r, 120));
@@ -868,7 +962,7 @@ describe("the loop itself", () => {
       drainTenant: async () => {
         await new Promise((r) => setTimeout(r, 60));
         finished = true;
-        return { claimed: 0, delivered: 0, retried: 0, dead: 0, lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
+        return { claimed: 0, delivered: 0, retried: 0, dead: 0, settlements: new Map(), lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
       },
     } as unknown as OutboxRelay;
     const { refresher } = stubRefresher();
@@ -892,7 +986,7 @@ describe("the loop itself", () => {
       drainTenant: async () => {
         calls += 1;
         if (calls === 1) throw new Error("transient");
-        return { claimed: 0, delivered: 0, retried: 0, dead: 0, lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
+        return { claimed: 0, delivered: 0, retried: 0, dead: 0, settlements: new Map(), lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null } };
       },
     } as unknown as OutboxRelay;
     const { refresher } = stubRefresher();

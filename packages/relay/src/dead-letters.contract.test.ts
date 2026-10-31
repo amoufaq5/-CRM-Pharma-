@@ -438,7 +438,14 @@ describe("dead letters", () => {
         // And here is the divergence that matters.
         expect(await deadLetter(tx, outboxId)).toBeNull();
 
-        await tx.query("UPDATE crm.outbox SET state = 'delivered' WHERE id = $1", [outboxId]);
+        // `settled_by` with it, because 0076 pairs the two: a delivered row has to say which
+        // mechanism settled it, and a raw UPDATE that moved the state alone is now refused by
+        // `outbox_delivered_records_its_mechanism`. This test does not go through the relay, so
+        // it has to say so itself — which is the pairing doing its job rather than obstructing.
+        await tx.query(
+          "UPDATE crm.outbox SET state = 'delivered', settled_by = 'accepted' WHERE id = $1",
+          [outboxId],
+        );
         expect(await outboxLetterOwner(tx, outboxId)).toMatchObject({ state: "delivered", rep_profile_id: REP });
       });
     });
