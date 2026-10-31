@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 
-import { appPool, TENANT_FK_A, TENANT_FK_B, withRegistryTriggersOff } from "./testing.js";
+import { appPool, TENANT_FK_A, TENANT_FK_B, withRegistryTriggersOff, registerFixtureTenant} from "./testing.js";
 import { withTenantContext } from "./tenant-context.js";
 
 /**
@@ -944,10 +944,22 @@ describe("a cross-tenant reference is refused by the database", () => {
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1 AND parent_id IS NOT NULL", [tenant]);
       await tx.query("DELETE FROM crm.territory WHERE tenant_id = $1", [tenant]);
       await tx.query("DELETE FROM crm.rep_profile WHERE tenant_id = $1", [tenant]);
-      // 0053: this suite stops its tenants to seed a 0052 receipt, so the row is undeletable
-      // until the guarantee is explicitly turned off.
+      // THE REGISTRY ROW STAYS, since 0075. It used to be deleted here — with
+      // `withRegistryTriggersOff`, because this suite stops its tenants to seed a 0052 receipt
+      // and 0053 makes a stopped tenant's row undeletable — and the delete is now the wrong
+      // move rather than a blocked one: every tenant-scoped table references the registry, so
+      // the next `seed()` would be inserting reps for a tenant that no longer exists. Which is
+      // exactly what happened on the first run after 0075, and the error named the key:
+      // `rep_profile_tenant_id_fkey`. The row is reset to `active` instead, which is all this
+      // teardown ever needed from it.
       await withRegistryTriggersOff(tx, () =>
-        tx.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [tenant]),
+        tx.query(
+          `UPDATE crm.tenant SET status = 'active', erp_tombstone_id = NULL,
+                  erp_tombstone_kind = NULL, erp_tombstone_deleted_at = NULL,
+                  erp_tombstone_proof_sha256 = NULL, erp_tombstone_observed_at = NULL
+            WHERE tenant_id = $1`,
+          [tenant],
+        ),
       );
       for (const t of SILENCED) {
         await tx.query(`ALTER TABLE crm.${t} ENABLE TRIGGER USER`);
@@ -958,6 +970,11 @@ describe("a cross-tenant reference is refused by the database", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT_FK_A, "db — TENANT_FK_A");
+    await registerFixtureTenant(client, TENANT_FK_B, "db — TENANT_FK_B");
     await unseed(TENANT_FK_A);
     await unseed(TENANT_FK_B);
     await seed(TENANT_FK_A, A);
@@ -1205,15 +1222,23 @@ describe("a cross-tenant reference is refused by the database", () => {
   });
 
   /**
-   * The absence itself, asserted — because this is now the one table in `crm.*` with no
-   * foreign key at all, and that is a choice rather than an oversight.
+   * The absence itself, asserted — because both references this table would plausibly carry
+   * were dropped on purpose (0046, 0048), and the guards moved into the context trigger.
+   *
+   * SINCE 0075 IT HAS EXACTLY ONE KEY, and it is the opposite kind: `tenant_id` into the
+   * registry. Every reference 0046 and 0048 removed was a PARENT whose deletion took the
+   * record with it — a delivery erased because somebody tidied up the destination it went
+   * to. `crm.tenant (tenant_id)` with `ON DELETE RESTRICT` can only stop the registry row
+   * going away. So the claim is unchanged and its wording is not: no parent, one registry
+   * reference, asserted by name so a third cannot appear quietly.
    */
-  it("notification_delivery declares no foreign key, and says so on purpose", async () => {
+  it("notification_delivery declares no PARENT key, only the registry's, on purpose", async () => {
     const { rows } = await client.query<{ conname: string }>(
       `SELECT conname FROM pg_constraint
-        WHERE conrelid = 'crm.notification_delivery'::regclass AND contype = 'f'`,
+        WHERE conrelid = 'crm.notification_delivery'::regclass AND contype = 'f'
+        ORDER BY conname`,
     );
-    expect(rows).toEqual([]);
+    expect(rows.map((r) => r.conname)).toEqual(["notification_delivery_tenant_id_fkey"]);
   });
 
   it("has no insert-time trigger on attachment_access, because the two composite keys are the guard", async () => {
@@ -1334,18 +1359,40 @@ describe("no reference in crm escapes its tenant", () => {
    * reference into the registry has to appear here with its own argument; one into anything
    * else still fails the guard.
    */
-  it("references the tenant registry by tenant_id, which is the one safe single-column shape", () => {
-    const byTenantId = live
-      .filter((f) => f.parent_cols === "tenant_id")
-      .map((f) => `${f.conname} -> ${f.parent}`)
-      .sort();
-    expect(byTenantId).toEqual(["tenant_tombstone_tenant_id_fkey -> tenant"]);
+  it("references the tenant registry by tenant_id, from EVERY tenant-scoped table (0075)", async () => {
+    const byTenantId = live.filter((f) => f.parent === "tenant" && f.parent_cols === "tenant_id");
 
-    // And it is RESTRICT, because CASCADE would make the delete succeed and take the receipts
-    // with it — the bypass 0053 closed, with extra steps. `confdeltype` is a single char here,
-    // which is how this row of the catalog reads.
-    const key = live.find((f) => f.conname === "tenant_tombstone_tenant_id_fkey");
-    expect(key?.on_delete).toBe("r");
+    // DERIVED, not listed. 0053 added the first of these and this test named it; 0075 added the
+    // other 45, and a list of 46 constraint names would be a maintenance chore that says less
+    // than the rule does. The rule is: every tenant-scoped table in `crm` has exactly one, and
+    // `crm.tenant` itself has none — it carries `tenant_id` as its PRIMARY KEY, which is why
+    // every catalog query here has to exclude it by name rather than by shape.
+    const { rows: scoped } = await client.query<{ relname: string }>(`
+      SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'crm' AND c.relkind = 'r' AND c.relname <> 'tenant'
+         AND EXISTS (SELECT 1 FROM pg_attribute a
+                      WHERE a.attrelid = c.oid AND a.attname = 'tenant_id'
+                        AND a.attnum > 0 AND NOT a.attisdropped)
+       ORDER BY c.relname`);
+    expect(scoped.length, "no tenant-scoped tables found, so this assertion would be vacuous")
+      .toBeGreaterThan(40);
+    expect(
+      byTenantId.map((f) => f.child).sort(),
+      "every tenant-scoped table must reference crm.tenant (tenant_id): a row for a tenant the " +
+        "registry has never heard of is unscanned by 0035's pre-flight, unserved by every " +
+        "per-tenant job, and UNERASABLE, since the erasure plan reads the registry for the " +
+        "status and the ERP tombstone",
+    ).toEqual(scoped.map((r) => r.relname));
+
+    // ALL RESTRICT, and 0053's reason is now 46 times as load-bearing: CASCADE would make one
+    // `DELETE FROM crm.tenant` destroy every tenant-scoped row in the schema with no
+    // attestation, no receipt and no four-eyes — the uncontrolled deletion 0051, 0052 and 0054
+    // exist to make impossible, reachable by a single statement. `confdeltype` is a single char
+    // here, which is how this row of the catalog reads.
+    expect(
+      [...new Set(byTenantId.map((f) => f.on_delete))],
+      "a registry reference that is not RESTRICT turns one DELETE into an unattested erasure",
+    ).toEqual(["r"]);
   });
 
   it("every hardened reference is still composite", () => {

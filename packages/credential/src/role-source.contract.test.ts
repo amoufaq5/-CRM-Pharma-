@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { appPool, TENANT_CREDENTIAL_A as TENANT_A, TENANT_CREDENTIAL_B as TENANT_B } from "@crm/db/testing";
+import { appPool, TENANT_CREDENTIAL_A as TENANT_A, TENANT_CREDENTIAL_B as TENANT_B, registerFixtureTenant} from "@crm/db/testing";
 import { InvalidTenantIdError, withTenantContext } from "@crm/db";
 
 import { PostgresServiceRoleSource, ServiceRoleUnavailableError } from "./role-source.js";
@@ -48,6 +48,11 @@ describe("the per-tenant ERP service role", () => {
   beforeAll(async () => {
     pool = appPool();
     fixture = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(fixture, TENANT_A, "credential — TENANT_A");
+    await registerFixtureTenant(fixture, TENANT_B, "credential — TENANT_B");
   });
 
   afterAll(async () => {

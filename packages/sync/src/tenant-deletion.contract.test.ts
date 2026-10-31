@@ -5,7 +5,7 @@ import {
   TENANT_DELETION_STOPPED as STOPPED_TENANT,
   appPool,
   withRegistryTriggersOff,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 import { TENANT_DELETION_TOMBSTONE_KIND, type TenantDeletionVerdict } from "@crm/acl";
 import { withTenantContext } from "@crm/db";
 
@@ -119,6 +119,11 @@ describe("tenant deletion signal (0050)", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, LIVE_TENANT, "sync — LIVE_TENANT");
+    await registerFixtureTenant(client, STOPPED_TENANT, "sync — STOPPED_TENANT");
   });
 
   afterAll(async () => {
@@ -222,15 +227,22 @@ describe("tenant deletion signal (0050)", () => {
    * here would leave every other job processing a deleted tenant's data with a `deleted` row
    * in the log saying all was well.
    */
-  it("refuses when a deletion lands on a tenant the registry does not list", async () => {
+  it("refuses when a deletion lands on a tenant the registry does not list, and records nothing", async () => {
     await expect(
       watchTenantDeletion(client, reader(() => Promise.resolve({ tenantId: STOPPED_TENANT, data: [
         { tombstoneId: "tomb_0123456789abcdef0123456789abcdef", kind: "tenant_deletion",
           deletedAt: "2026-10-06T12:00:00.000Z", proofSha256: SHA, chainEntryHash: CHAIN },
       ] })), STOPPED_TENANT),
     ).rejects.toThrow(TenantNotRegisteredError);
-    // And the observation is still on the record — the refusal is about the consequence.
-    expect((await checks(STOPPED_TENANT)).map((c) => c.verdict)).toEqual(["deleted"]);
+    // NOTHING RECORDED, which is the half 0075 changed. This used to assert the opposite — the
+    // observation was written and only the MARK was refused — and that is no longer reachable:
+    // `crm.tenant_deletion_check` is tenant-scoped, every tenant-scoped table references the
+    // registry, so the log entry for an unlisted tenant is refused by the key. The function
+    // therefore asks the registry BEFORE it writes, so the refusal is the named error rather
+    // than a driver's constraint message. Losing the record costs nothing: since 0075 an
+    // unlisted tenant holds no rows in this schema at all, so there was never any data of
+    // theirs to stop processing.
+    expect(await checks(STOPPED_TENANT)).toEqual([]);
   });
 
   // -------------------------------------------------------------------------

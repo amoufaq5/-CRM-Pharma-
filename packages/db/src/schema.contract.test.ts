@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { testPool, TENANT_DB_SCHEMA_A as TENANT_A, TENANT_DB_SCHEMA_B as TENANT_B } from "./testing.js";
+import { testPool, TENANT_DB_SCHEMA_A as TENANT_A, TENANT_DB_SCHEMA_B as TENANT_B, registerFixtureTenant} from "./testing.js";
 import { withTenantContext } from "./tenant-context.js";
 
 /**
@@ -17,6 +17,11 @@ describe("CRM schema invariants", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT_A, "db — TENANT_A");
+    await registerFixtureTenant(client, TENANT_B, "db — TENANT_B");
   });
 
   afterAll(async () => {

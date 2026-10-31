@@ -8,7 +8,7 @@ import {
   wipeConfigChanges,
   wipeEndpoints,
   withFixtureAttribution,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import { claimDue, settleOrphanedDeliveries } from "./dispatch.js";
@@ -152,6 +152,11 @@ describe("delivery retention", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "notify — TENANT");
+    await registerFixtureTenant(client, OTHER_TENANT, "notify — OTHER_TENANT");
     await clear();
     for (const [fn, tenant, rep, name] of [
       [inTenant, TENANT, REP, "Delivery Recipient"],
@@ -285,7 +290,7 @@ describe("delivery retention", () => {
       expect(row?.recipient_display_name).toBeNull();
     });
 
-    it("declares no foreign key to EITHER parent", async () => {
+    it("declares no foreign key to EITHER parent, only to the registry", async () => {
       // The structural claim behind every test above, asserted from the catalog rather than
       // from the migration text: what matters is the constraint the database enforces.
       const { rows } = await client.query<{ conname: string }>(
@@ -301,7 +306,12 @@ describe("delivery retention", () => {
       // somebody tidied up. Both tenant guards moved into the context trigger, which is
       // tighter than either key: a referential check runs with row security disabled and
       // would have found another tenant's parent.
-      expect(rows.map((r) => r.conname)).toEqual([]);
+      //
+      // 0075's registry reference is the one that remains, and it is not a parent in this
+      // sense at all: `ON DELETE RESTRICT` to `crm.tenant (tenant_id)` can only stop the
+      // registry row going away, never shorten this table's life. This file's claim was
+      // always about PARENTS whose deletion takes the record with them.
+      expect(rows.map((r) => r.conname)).toEqual(["notification_delivery_tenant_id_fkey"]);
     });
   });
 

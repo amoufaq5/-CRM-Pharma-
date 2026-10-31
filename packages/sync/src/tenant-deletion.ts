@@ -73,6 +73,31 @@ export async function recordTenantDeletionCheck(
   verdict: TenantDeletionVerdict,
 ): Promise<TenantDeletionWatchResult> {
   return await withTenantContext(client, tenantId, async (tx) => {
+    /**
+     * ASKED BEFORE ANYTHING IS WRITTEN, since 0075 — and the order is the whole change.
+     *
+     * The check log is tenant-scoped, and every tenant-scoped table now references
+     * `crm.tenant (tenant_id)`, so an INSERT for a tenant the registry does not list is
+     * refused by the key rather than recorded. That refusal is correct and its SENTENCE is
+     * not: a driver's `violates foreign key constraint
+     * "tenant_deletion_check_tenant_id_fkey"` tells an operator nothing about what happened,
+     * where this error says the ERP has deleted a tenant this CRM has no row for and names
+     * what did not happen as a result.
+     *
+     * The old shape recorded the observation and then let `watchTenantDeletion` notice that
+     * nothing had been marked. That is no longer reachable, and losing it costs nothing: a
+     * tenant with no registry row has, since 0075, no rows anywhere — there is no data to
+     * stop processing and nothing to erase, so the observation was a note about a tenant this
+     * deployment has never held anything for.
+     */
+    const { rows: registered } = await tx.query<{ listed: boolean }>(
+      "SELECT crm.tenant_is_registered($1) AS listed",
+      [tenantId],
+    );
+    // `!== true` rather than `=== false`: an answer that arrives in an unexpected shape is
+    // refused rather than admitted, which is this file's rule everywhere else too.
+    if (registered[0]?.listed !== true) throw new TenantNotRegisteredError(tenantId);
+
     const detail = verdict.verdict === "unknown" ? verdict.detail : null;
     await tx.query(
       `INSERT INTO crm.tenant_deletion_check (tenant_id, verdict, http_status, detail)
@@ -158,8 +183,10 @@ export async function tenantRegistryStatus(
 export class TenantNotRegisteredError extends Error {
   constructor(readonly tenantId: string) {
     super(
-      `tenant ${tenantId} has a tenant_deletion tombstone at the ERP and no row in crm.tenant, ` +
-        `so there is nothing to mark erp_deleted. The observation is recorded; the tenant is NOT stopped.`,
+      `tenant ${tenantId} has no row in crm.tenant, so there is nothing to mark erp_deleted ` +
+        `and nothing was recorded — since 0075 the check log itself references the registry. ` +
+        `A tenant the registry does not list holds no rows in this schema at all, so there is ` +
+        `no data to stop processing; register it if that is wrong.`,
     );
     this.name = "TenantNotRegisteredError";
   }
@@ -179,12 +206,11 @@ export async function watchTenantDeletion(
   tenantId: string,
 ): Promise<TenantDeletionWatchResult> {
   const verdict = await readTenantDeletionVerdict(reader, tenantId);
-  const result = await recordTenantDeletionCheck(client, tenantId, verdict);
-  if (result.verdict === "deleted" && !result.marked) {
-    const current = await tenantRegistryStatus(client, tenantId);
-    if (current === null) throw new TenantNotRegisteredError(tenantId);
-  }
-  return result;
+  // The refusal moved DOWN into `recordTenantDeletionCheck` (0075), which is where it belongs:
+  // that function is the one that knows it is about to write a tenant-scoped row. The check
+  // that used to live here — record, then notice nothing was marked — could only run after the
+  // write it was describing, which the registry reference now refuses first.
+  return await recordTenantDeletionCheck(client, tenantId, verdict);
 }
 
 /** One line for the scheduler's log. */

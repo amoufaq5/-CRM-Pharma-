@@ -5,7 +5,7 @@ import {
   TENANT_CONFIG_LOG_OTHER as OTHER,
   testPool,
   wipeConfigChanges,
-} from "./testing.js";
+  registerFixtureTenant,} from "./testing.js";
 import { withTenantContext } from "./tenant-context.js";
 import { ACTOR_SETTING, REASON_SETTING, UnattributedChangeError, withAttribution } from "./attribution.js";
 import { CONFIG_LOG_LIMIT, configChanges } from "./config-log.js";
@@ -62,6 +62,11 @@ describe("a configuration change is a record (0061)", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "db — TENANT");
+    await registerFixtureTenant(client, OTHER, "db — OTHER");
     await client.query("SET ROLE crm_app");
 
     await client.query("DROP TABLE IF EXISTS crm.config_probe");

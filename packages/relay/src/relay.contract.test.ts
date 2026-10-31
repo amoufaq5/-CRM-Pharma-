@@ -8,7 +8,7 @@ import { inbox } from "@crm/notify";
 import { OutboxRelay, type RelayEvent } from "./relay.js";
 import { claimBatch, outboxLag, reclaimStale } from "./store.js";
 
-import { appPool, TENANT_RELAY as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_RELAY as TENANT, registerFixtureTenant} from "@crm/db/testing";
 
 /**
  * `appPool()`, not `testPool()`: this pool is handed to code that opens its OWN
@@ -41,6 +41,10 @@ describe("outbox relay against a real database", () => {
   beforeAll(async () => {
     p = appPool();
     admin = await p.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(admin, TENANT, "relay — TENANT");
     await admin.query("SET ROLE crm_app");
   });
 
@@ -396,6 +400,10 @@ describe("tenant isolation of the relay itself", () => {
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
     for (const t of [TENANT, OTHER]) {
+      // Since 0075 `crm.outbox` references `crm.tenant (tenant_id)`, so the queue cannot hold a
+      // row for a tenant the registry has never heard of — which is the whole point, and is
+      // also what this fixture was quietly relying on not being true.
+      await registerFixtureTenant(admin, t, `relay isolation — ${t.slice(0, 8)}`);
       await withTenantContext(admin, t, async (tx) => {
         await tx.query("DELETE FROM crm.outbox WHERE tenant_id = $1", [t]);
         await tx.query(

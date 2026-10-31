@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_ENDPOINTS as TENANT, testPool, wipeEndpoints } from "@crm/db/testing";
+import { TENANT_ENDPOINTS as TENANT, testPool, wipeEndpoints, registerFixtureTenant} from "@crm/db/testing";
 
 import {
   ENDPOINT_CHANNELS,
@@ -36,6 +36,10 @@ describe("notification endpoints", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "notify — TENANT");
     await client.query("SET ROLE crm_app");
     // Two administrators, because since 0060 every write here names one — and because the
     // history has to be able to show two different people turning the same endpoint's knobs.

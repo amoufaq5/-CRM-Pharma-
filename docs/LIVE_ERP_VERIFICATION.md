@@ -4213,3 +4213,160 @@ aborted transaction leaves it behind — is invisible to this and to everything 
 That is the sweeper that header already asked for. A catalog test asserts `storage_backend` is
 the only column in `crm` naming a store, so the migration that adds a second one fails on the day
 it is written.
+
+## A tenant nobody registered
+
+*2026-10-31, migration 0075 against a real Postgres 16 over TCP with scram. Two databases on
+purpose: the development one, which had rows to backfill, and one built from nothing, which is
+the CI shape and the run that mattered. All 74 migrations through the runner, `npx vitest run`
+(109 files / 2,712 tests) on both, `pnpm typecheck`, `pnpm client:verify` (334 checks), and
+`scripts/verify-tenant-registry.sh`.*
+
+ADR-0001 has carried this row since 0035: a row whose `tenant_id` is absent from `crm.tenant`
+is invisible to the cross-tenant pre-flight, "because nothing can enumerate it: no table
+references the registry", and giving every tenant-scoped table a foreign key "would close it and
+is a much larger change". It was 45 keys. 0053 had added the first.
+
+### The first run found the defect it was written to close
+
+```
+NOTICE:  backfilled the registry from crm.account_assignment: 12 row(s) named a tenant it had
+         never heard of (for example 55555555-5555-4555-8555-555555555555)
+NOTICE:  backfilled the registry from crm.config_change: 175 row(s) …
+NOTICE:  backfilled the registry from crm.outbox_dead_letter: 36 row(s) …
+NOTICE:  backfilled the registry from crm.rep_profile: 19 row(s) …
+         … eleven tables in all …
+NOTICE:  tenant registry references: 45 added, 11 table(s) needed a backfill first
+```
+
+Eleven tables held rows for tenants the registry had never heard of. They were all fixture
+tenants, and that is not a mitigation: every one of those suites was writing a state the schema
+is supposed to forbid, and none of them noticed, because nothing could notice. That is the
+production hole in miniature.
+
+### The validation trap, which this migration would otherwise have walked into
+
+`ADD CONSTRAINT … FOREIGN KEY` validates existing rows. 0027 established what that costs here: a
+foreign key's **bulk validation scan is confined by row security**, and this migration runs as
+`crm_app`, which OWNS these tables and is FORCEd under their policies. With no tenant context the
+scan sees nothing, and the constraint is accepted on a vacuous pass.
+
+That is not a hypothetical in this migration, it is the exact defect being closed: the rows the
+constraint has to find are, by definition, rows nobody can enumerate. So FORCE is lifted per
+table for the check and restored immediately — 0027's pattern, and the only sanctioned use of it.
+Without that, a deployment holding orphan rows would have ended up with 45 constraints created,
+trusted and wrong.
+
+### Backfill, not refusal — and the argument was already in the repository
+
+The first draft refused: it counted the orphans, named the table and an example, and told a human
+to decide.
+
+```
+ERROR:  unregistered-tenant-rows: crm.account_assignment holds 12 row(s) whose tenant_id is not
+        in crm.tenant (for example 5555…). This migration cannot repair them… Register the
+        tenant, or erase it through crm-erasure, then migrate again.
+```
+
+Finding twelve on the first database is the strongest argument that the row was real, and also
+the argument against refusing. `packages/api/src/principal.ts` had carried the reason in its own
+words since 0050: refusing unregistered tenants "would be a different and much larger change — a
+real one, and arguably right — but making it a side effect of adding a deletion signal would lock
+out every such deployment on upgrade". A migration that cannot be applied leaves the hole open on
+exactly the deployments that have it.
+
+So the registry is backfilled from the data — 0073's measurement turned into a repair — with the
+one inference named rather than buried. Existence is **derived**: the rows are there.
+`status = 'active'` is **inferred**, and it is the only value that is not a regression, because
+every consumer of this registry filters on it (`activeTenants`, the channel-coverage check, the
+deletion watcher), so backfilling `paused` would register the tenant and leave its work undone —
+the state being fixed. The provenance goes in the display name, and a NOTICE names each one,
+because the scheduler will now do work it was silently skipping.
+
+### The fresh database is the run that mattered
+
+The development database passed the full suite after 27 suites were repaired. A database built
+from nothing then failed 20 more:
+
+```
+Test Files  20 failed | 89 passed (109)
+```
+
+Every one was a suite whose tenants the development database had already *backfilled*, so they
+never needed to register anything there. The backfilled database was being kinder than reality,
+which is the same trap as a fixture that is kinder than reality wearing different clothes. The
+only honest verification of a migration that changes what rows may exist is a database that never
+held the old ones.
+
+Forty-seven suites in total now register their tenants. Three classes of repair:
+
+- **Never registered at all** → `registerFixtureTenant`, which deliberately does not update an
+  existing row: a suite that set its tenant to `erp_deleted` must not have it quietly reset, since
+  the whole point of that status is that nothing walks it back.
+- **Deleted the registry row in teardown** → reset it instead. The delete is refused while the
+  tenant holds anything, and the first run after 0075 showed how badly the old shape failed:
+
+  ```
+  error: update or delete on table "tenant" violates foreign key constraint
+         "outbox_dead_letter_tenant_id_fkey" on table "outbox_dead_letter"
+  ```
+
+  and in the api suite, whose `afterEach` delete raised and left the tenant `erp_deleted`:
+
+  ```
+  AssertionError: expected 'tenant 8a11… has been deleted at the ERP…' to match /suspended/
+  Tests  201 failed | 27 passed (228)
+  ```
+
+  One broken teardown, 201 failures, all of them true statements about a tenant that should have
+  been handed back.
+- **Waited on a clock** → wait on the condition. One tick walks every ACTIVE tenant, and since
+  every suite's tenants stay registered, a tick now provisions dozens before it reaches the
+  scheduler suite's own — so a fixed 120ms wait stopped the loop before any drain happened. That
+  slowdown is a real operational fact and not only a test artefact: the backfill puts previously
+  invisible tenants onto the scheduler's list, which is the fix rather than a side effect.
+
+### The claims that had to be rewritten, because they were true and are now false
+
+Four assertions in this repository stated things 0075 makes impossible. Each was rewritten to
+assert the new truth rather than relaxed:
+
+- **"is served normally when the registry does not list it at all"** (the api suite) → **"cannot
+  be unlisted at all while it has a rep"**, asserted by the constraint that refuses the DELETE.
+  The old test existed so that "the next person to tighten the join would not lock out every
+  deployment that never filled the registry"; the backfill is what makes tightening safe.
+- **"carries no foreign key at all"** (`outbox_dead_letter`) and **"declares no foreign key to
+  EITHER parent"** (`notification_delivery`) → "names no PARENT whose lifetime could govern the
+  history", with the registry reference asserted by name. Every reference 0046 and 0048 removed
+  was a parent whose deletion took the record with it; `ON DELETE RESTRICT` to the registry can
+  only stop the registry row going away.
+- **0073's "finds a tenant that has data and no registry row"** → **"cannot be planted at all any
+  more"**, taking `23503` from `notification_policy_tenant_id_fkey`. That is the clearest
+  statement of what this closes: the function 0073 built to MEASURE the gap now has nothing to
+  find, and the test says why. It stays because it derives from `pg_catalog` and would still
+  catch a tenant-scoped table that acquired rows without the key.
+- And `scripts/verify-tenant-registry.sh`'s control was inverted the same way. It planted a row
+  and expected a sighting; it now expects the refusal, plus a separate non-vacuity check that the
+  derivation enumerates any tenants at all:
+
+  ```
+  NOTICE:  refused by insert or update on table "notification_policy" violates foreign key
+           constraint "notification_policy_tenant_id_fkey"
+  ok: and a tenant with data and no registry row cannot be planted at all (0075)
+  ok: and the derivation still enumerates tenants with data, so a clean verdict means something
+  ```
+
+### One production path changed, for the better
+
+`recordTenantDeletionCheck` now asks the registry **before** it writes. The check log is
+tenant-scoped, so an entry for an unlisted tenant is refused by the key — correct, with the wrong
+sentence: a driver's `violates foreign key constraint "tenant_deletion_check_tenant_id_fkey"`
+tells an operator nothing, where `TenantNotRegisteredError` says the ERP has deleted a tenant this
+CRM has no row for and names what did not happen as a result. The old shape recorded the
+observation and let `watchTenantDeletion` notice that nothing had been marked, which could only
+run after the write the key now refuses first. Losing that record costs nothing: since 0075 an
+unlisted tenant holds no rows anywhere, so there was never any data of theirs to stop processing.
+
+And `crm.tenant_is_registered` is that question in SQL, with exactly one caller. That is the
+honest number rather than a disappointing one: nothing else needs to ask, because everything else
+is answered by a key.

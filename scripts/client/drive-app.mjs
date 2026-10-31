@@ -2134,10 +2134,16 @@ async function main() {
     // The registry row the ERP's deletion would produce. `tenant_erp_deleted_needs_receipt`
     // makes the status unreachable without a receipt, so the fixture has to carry one —
     // which is the constraint doing its job even here.
-    sql(`INSERT INTO crm.tenant (tenant_id, display_name, status, erp_tombstone_id, erp_tombstone_kind,
-           erp_tombstone_deleted_at, erp_tombstone_proof_sha256, erp_tombstone_observed_at)
-         VALUES ('${tenant}', 'Live tenant', 'erp_deleted', 'tomb_live_tenant_0001', 'tenant_deletion',
-                 now(), repeat('a', 64), now())`);
+    //
+    // AN UPDATE SINCE 0075, not an INSERT. The row already exists: every tenant-scoped table
+    // references `crm.tenant (tenant_id)`, so the gate's seed had to register this tenant
+    // before it could write a single rep — which is what this chapter has always been about,
+    // arriving one step earlier. The INSERT it used to be now takes `tenant_pkey` instead.
+    sql(`UPDATE crm.tenant
+            SET status = 'erp_deleted', erp_tombstone_id = 'tomb_live_tenant_0001',
+                erp_tombstone_kind = 'tenant_deletion', erp_tombstone_deleted_at = now(),
+                erp_tombstone_proof_sha256 = repeat('a', 64), erp_tombstone_observed_at = now()
+          WHERE tenant_id = '${tenant}'`);
     ok("the ERP's tombstone is recorded against the tenant, which is the only way to reach that status");
 
     await page.offline(false);

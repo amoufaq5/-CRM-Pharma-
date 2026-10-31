@@ -48,24 +48,44 @@ WITH_DATA="$(q "SELECT count(*) FROM crm.tenants_with_data()")"
 REGISTERED="$(q "SELECT count(*) FROM crm.tenant")"
 ok "$WITH_DATA tenant(s) have rows in crm; the registry lists $REGISTERED"
 
-# THE CONTROL, which is what stops a clean verdict meaning "the query found nothing": plant a row
-# for a tenant the registry does not list, confirm the check SEES it, and roll it back. Without
-# this, a reconciliation whose derivation had silently broken would print "every tenant is
-# registered" on every deployment forever — the vacuous green 0066's live gate was corrected for.
-# `crm.notification_policy` is the probe's table because it is in the register and needs nothing
-# but a tenant id — every other candidate would have the control inventing a rep, a lot or a
-# receipt. ROLLBACK, always: this script is read-only to the deployment it is checking.
+# THE CONTROL, AND SINCE 0075 IT IS THE OTHER WAY ROUND.
+#
+# It used to plant a row for a tenant the registry does not list, confirm the check SAW it, and
+# roll back — because without a control a reconciliation whose derivation had silently broken
+# would print "every tenant is registered" on every deployment forever, which is the vacuous
+# green 0066's live gate was corrected for.
+#
+# That plant is now REFUSED by a key. Migration 0075 gave every tenant-scoped table a reference
+# to crm.tenant (tenant_id), so the state this script reports cannot be created — and the
+# refusal is a stronger control than the sighting was: it says the gap is closed structurally
+# rather than merely currently empty. The non-vacuity of the derivation is checked separately,
+# by asking it a question whose answer cannot be zero on a deployment that holds any data.
+# ROLLBACK, always: this script is read-only to the deployment it is checking.
 PROBE="$(psql -v ON_ERROR_STOP=1 -At <<'SQL'
 BEGIN;
-INSERT INTO crm.notification_policy (tenant_id) VALUES ('00000000-0000-4000-8000-0000000073de');
-SELECT 'probe=' || count(*) FROM crm.unregistered_tenants()
+SAVEPOINT plant;
+DO $$
+BEGIN
+  INSERT INTO crm.notification_policy (tenant_id) VALUES ('00000000-0000-4000-8000-0000000073de');
+  RAISE NOTICE 'accepted';
+EXCEPTION WHEN foreign_key_violation THEN
+  RAISE NOTICE 'refused by %', SQLERRM;
+END
+$$;
+SELECT 'planted=' || count(*) FROM crm.notification_policy
  WHERE tenant_id = '00000000-0000-4000-8000-0000000073de';
+ROLLBACK TO SAVEPOINT plant;
+SELECT 'enumerates=' || count(*) FROM crm.tenants_with_data();
 ROLLBACK;
 SQL
 )"
 case "$PROBE" in
-  *probe=1*) ok "and the check detects a planted unregistered tenant, so a clean verdict means something" ;;
-  *)   fail "the check did NOT see a tenant with data and no registry row: $PROBE" ;;
+  *planted=0*) ok "and a tenant with data and no registry row cannot be planted at all (0075)" ;;
+  *) fail "the schema ACCEPTED a row for an unregistered tenant, which 0075 must refuse: $PROBE" ;;
+esac
+case "$PROBE" in
+  *enumerates=0*) fail "the derivation found no tenants with data at all, so every verdict below would be vacuous: $PROBE" ;;
+  *) ok "and the derivation still enumerates tenants with data, so a clean verdict means something" ;;
 esac
 
 UNREGISTERED="$(psql -v ON_ERROR_STOP=1 -At -F'|' -c \

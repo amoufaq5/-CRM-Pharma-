@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { withTenantContext } from "@crm/db";
-import { TENANT_DISPOSAL_POLICY as TENANT, appPool, withFourEyes } from "@crm/db/testing";
+import { TENANT_DISPOSAL_POLICY as TENANT, appPool, withFourEyes, registerFixtureTenant} from "@crm/db/testing";
 
 import {
   DEFAULT_GRACE_DAYS,
@@ -57,6 +57,10 @@ describe("the disposal policy and its history", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "sample — TENANT");
     await inTenant(async (tx) => {
       for (const [id, subject, name] of [
         [OFFICER, "pol-officer", "The Compliance Officer"],

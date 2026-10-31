@@ -7,7 +7,7 @@ import { withTenantContext } from "@crm/db";
 import { OutboxRelay } from "./relay.js";
 import { claimBatch, enqueueOutbox } from "./store.js";
 
-import { appPool, TENANT_OUTBOX_SEQ as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_OUTBOX_SEQ as TENANT, registerFixtureTenant} from "@crm/db/testing";
 
 /**
  * `crm.outbox.seq` (migration 0027) and the claim order it buys.
@@ -50,6 +50,10 @@ describe("crm.outbox.seq orders rows enqueued in one transaction", () => {
   beforeAll(async () => {
     p = appPool();
     admin = await p.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(admin, TENANT, "relay — TENANT");
     await admin.query("SET ROLE crm_app");
   });
 

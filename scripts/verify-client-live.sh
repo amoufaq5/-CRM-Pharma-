@@ -135,6 +135,16 @@ BEGIN;
 SET ROLE crm_app;
 SELECT set_config('app.current_tenant_id', '$TENANT', true);
 
+-- THE TENANT IS REGISTERED FIRST, since migration 0075. Every tenant-scoped table references
+-- crm.tenant (tenant_id), so a rep for a tenant the registry has never heard of cannot exist --
+-- which is the point of that migration, and also what this gate was quietly relying on not
+-- being true. crm.tenant is the API's and the scheduler's view of this deployment, so this is
+-- not a fixture convenience: it is the step a real provisioning path has to perform before any
+-- of the rows below can be written.
+INSERT INTO crm.tenant (tenant_id, display_name, status)
+VALUES ('$TENANT', 'the field client gate', 'active')
+    ON CONFLICT (tenant_id) DO NOTHING;
+
 -- work_email_hint ON ADA AND NOWHERE ELSE (no backticks: this heredoc is UNQUOTED so $TENANT
 -- expands, which means a backtick here is command substitution — see the note at the seed), because chapter 23 needs both branches of the
 -- to-do list. 0003 carries this column as a RECONCILIATION HINT the ERP reconciler writes from

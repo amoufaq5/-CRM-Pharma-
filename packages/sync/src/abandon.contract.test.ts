@@ -164,10 +164,20 @@ describe("abandoning a stopped tenant's queued work (0068)", () => {
       });
     }
     // 0053 refuses to delete a stopped tenant's registry row, which is the guarantee rather than
-    // an obstacle — so a fixture handing back the tenants it borrowed says so.
+    // an obstacle. SINCE 0075 the row cannot be deleted at all while anything references it —
+    // this suite leaves dead letters behind on purpose, and `outbox_dead_letter_tenant_id_fkey`
+    // is what refused the old teardown. So the tenants are handed back by being RESET to active
+    // rather than removed, which is all the next run needs from them.
     await withRegistryTriggersOff(client, async () => {
       for (const tenant of [STOPPED, LIVE]) {
-        await client.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [tenant]);
+        await client.query(
+          `UPDATE crm.tenant
+              SET status = 'active', erp_tombstone_id = NULL, erp_tombstone_kind = NULL,
+                  erp_tombstone_deleted_at = NULL, erp_tombstone_proof_sha256 = NULL,
+                  erp_tombstone_chain_entry_hash = NULL, erp_tombstone_observed_at = NULL
+            WHERE tenant_id = $1`,
+          [tenant],
+        );
       }
     });
     client.release();

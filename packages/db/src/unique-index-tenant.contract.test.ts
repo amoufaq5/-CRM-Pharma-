@@ -212,6 +212,16 @@ describe("every unique index on a tenant-scoped table (0035, 0032, 0043)", () =>
 
     await client.query("BEGIN");
     try {
+      // Registered inside the transaction, because since 0075 `crm.rep_profile` references
+      // `crm.tenant (tenant_id)` — a probe tenant with no registry row cannot hold a rep at
+      // all. Both rows roll back with everything else below.
+      for (const t of [A, B]) {
+        await client.query(
+          `INSERT INTO crm.tenant (tenant_id, display_name, status)
+           VALUES ($1, 'unique-index probe (0074)', 'active') ON CONFLICT (tenant_id) DO NOTHING`,
+          [t],
+        );
+      }
       // THE PREDICATE IS NOT WHAT MAKES THIS SAFE — it is what stops the demonstration depending
       // on what other suites have committed. `crm.rep_profile` is shared, every suite numbers its
       // own reps from E1, so an unqualified unique index cannot even be CREATED here: the full

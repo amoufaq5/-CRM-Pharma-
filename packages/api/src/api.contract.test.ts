@@ -12,7 +12,7 @@ import {
   wipeProposals,
   wipeEndpoints,
   withFixtureAttribution,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 
 import { startApi, type RunningApi } from "./server.js";
 import type { JwksKey } from "./jwt.js";
@@ -68,6 +68,11 @@ describe("the API, end to end", () => {
   beforeAll(async () => {
     p = appPool();
     admin = await p.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(admin, TENANT, "api — TENANT");
+    await registerFixtureTenant(admin, OTHER, "api — OTHER");
     await admin.query("SET ROLE crm_app");
     api = await startApi({ pool: p, auth: { issuer: ISSUER, audience: AUDIENCE, jwks: KEYS } });
     baseUrl = `http://127.0.0.1:${api.port}`;
@@ -4937,29 +4942,63 @@ describe("the API, end to end", () => {
           WHERE tenant_id = $1`,
         [TENANT, TOMB, "a".repeat(64)],
       );
-    // 0053 makes a stopped tenant's row undeletable — it was deletable, and that was a bypass:
-    // removing it UN-stopped the tenant, because the join below treats an unlisted tenant as
-    // one to serve. This suite borrows the shared tenant id and has to hand it back, which is
-    // the one legitimate reason to turn the guarantee off.
-    const unregister = (): Promise<unknown> =>
+    /**
+     * RESET, NOT UNREGISTERED, since 0075 — and the change is the point rather than a chore.
+     *
+     * This used to DELETE the registry row, with `withRegistryTriggersOff` to get past 0053's
+     * terminality guard, because the suite borrows the shared tenant id and had to hand it back.
+     * It cannot any more: every tenant-scoped table references `crm.tenant (tenant_id)` with
+     * `ON DELETE RESTRICT`, and this tenant has reps, so the DELETE is refused. The suite reverts
+     * the STATUS instead, which is what it actually wanted — and the first run after 0075
+     * proved how badly the old shape failed: the delete raised, the `afterEach` threw, the
+     * tenant stayed `erp_deleted`, and 201 of this file's 228 tests failed with
+     * "has been deleted at the ERP".
+     *
+     * The triggers still come off, for 0053's reason unchanged: `erp_deleted` is terminal, and
+     * walking it back is exactly what nothing in the product may do.
+     */
+    const reactivate = (): Promise<unknown> =>
       withRegistryTriggersOff(admin, () =>
-        admin.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [TENANT]),
+        admin.query(
+          `UPDATE crm.tenant
+              SET status = 'active', erp_tombstone_id = NULL, erp_tombstone_kind = NULL,
+                  erp_tombstone_deleted_at = NULL, erp_tombstone_proof_sha256 = NULL,
+                  erp_tombstone_observed_at = NULL
+            WHERE tenant_id = $1`,
+          [TENANT],
+        ),
       );
 
     afterEach(async () => {
-      await unregister();
+      await reactivate();
     });
 
     /**
-     * THE FAIL-OPEN DEFAULT, asserted first because it is the risky half. `crm.tenant` is the
-     * scheduler's list of whose background work to do, not an authorisation list: it is empty
-     * in every test database and a deployment may never have populated it while serving this
-     * API perfectly well. So an unlisted tenant is served, and only an EXPLICIT `erp_deleted`
-     * refuses. Without this test the next person to "tighten" the join would lock out every
-     * deployment that never filled the registry.
+     * THE FAIL-OPEN DEFAULT IS GONE, and this test is what replaced it.
+     *
+     * It used to assert the opposite: that a tenant the registry does not list is served
+     * normally, because `crm.tenant` was "the scheduler's list of whose background work to do,
+     * not an authorisation list", and because refusing would have locked out every deployment
+     * that never populated it. Both halves were true and the state is now impossible — 0075
+     * gave every tenant-scoped table a reference to the registry, so a tenant with a REP has a
+     * registry row by construction, and the migration backfilled the rows that existed rather
+     * than refusing to apply. Nobody is locked out, and "unlisted but served" cannot happen.
+     *
+     * So the assertion is the structural one: the registry row cannot be removed while this
+     * tenant has data, named by the constraint that refuses it.
      */
-    it("is served normally when the registry does not list it at all", async () => {
-      expect((await admin.query("SELECT 1 FROM crm.tenant WHERE tenant_id = $1", [TENANT])).rowCount).toBe(0);
+    it("cannot be unlisted at all while it has a rep, which is what 0075 made true", async () => {
+      await register();
+      const refusal = await withRegistryTriggersOff(admin, () =>
+        admin
+          .query("DELETE FROM crm.tenant WHERE tenant_id = $1", [TENANT])
+          .then(() => null, (e: unknown) => e as { code?: string; constraint?: string }),
+      );
+      expect(refusal?.code).toBe("23503");
+      // WHICH table refuses is Postgres's choice — this tenant has reps, territories and
+      // account assignments, and the first referential check to run wins. The assertion is
+      // that it IS one of 0075's registry references, by name shape, not which one.
+      expect(refusal?.constraint).toMatch(/^[a-z_]+_tenant_id_fkey$/);
       expect((await call("GET", "/v1/me")).status).toBe(200);
     });
 

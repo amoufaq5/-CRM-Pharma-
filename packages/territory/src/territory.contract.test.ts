@@ -19,7 +19,7 @@ import { InvalidDateRangeError, OverlappingAssignmentError, TerritoryCycleError 
 // Ids come from @crm/db/testing, which reserves a block per test file — files
 // share a database, so picking your own is how two suites end up seeing each
 // other's rows.
-import { TENANT_TERRITORY_A as TENANT, TENANT_TERRITORY_B as OTHER } from "@crm/db/testing";
+import { TENANT_TERRITORY_A as TENANT, TENANT_TERRITORY_B as OTHER, registerFixtureTenant} from "@crm/db/testing";
 
 function pool(): Pool {
   return new Pool({
@@ -45,6 +45,11 @@ describe("territories and rep assignment", () => {
   beforeAll(async () => {
     p = pool();
     c = await p.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(c, TENANT, "territory — TENANT");
+    await registerFixtureTenant(c, OTHER, "territory — OTHER");
     await c.query("SET ROLE crm_app");
   });
 

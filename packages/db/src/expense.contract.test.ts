@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
-import { testPool, TENANT_DB_EXPENSE as TENANT_A } from "./testing.js";
+import { testPool, TENANT_DB_EXPENSE as TENANT_A, registerFixtureTenant} from "./testing.js";
 import { withTenantContext } from "./tenant-context.js";
 
 /**
@@ -19,6 +19,10 @@ describe("expense claim constraints", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT_A, "db — TENANT_A");
     await client.query("SET ROLE crm_app");
     await withTenantContext(client, TENANT_A, async (tx) => {
       await tx.query(

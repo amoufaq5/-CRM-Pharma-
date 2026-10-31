@@ -5,7 +5,7 @@ import {
   TENANT_FOUR_EYES_LONE as LONE,
   testPool,
   wipeProposals,
-} from "./testing.js";
+  registerFixtureTenant,} from "./testing.js";
 import { withTenantContext } from "./tenant-context.js";
 import { ConfigProposalError, ConfigFourEyesError, withAttribution } from "./attribution.js";
 import {
@@ -60,6 +60,11 @@ describe("two people for the dangerous ones (0062)", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "db — TENANT");
+    await registerFixtureTenant(client, LONE, "db — LONE");
     await client.query("SET ROLE crm_app");
 
     const rep = async (

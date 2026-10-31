@@ -941,7 +941,10 @@ replaced, because a referential check runs with row security disabled and would 
 accepted another tenant's parent as existing, where an invisible row reads as absent. The
 drift guard cannot see a column with no reference, so `composite-fk.contract.test.ts`
 asserts both replacements live instead, and asserts the absence itself — `crm.notification_delivery`
-is the one table in `crm.*` with no foreign key at all, which is a choice rather than an oversight.
+names no PARENT whose deletion could take it, which is a choice rather than an oversight. Since 0075
+it does carry one key, to the tenant REGISTRY, and that is the opposite kind of reference: `ON DELETE
+RESTRICT` to `crm.tenant (tenant_id)` can only stop the registry row going away, never shorten this
+table's life.
 
 0070's drop is the same move on the probe table, with one addition of its own: the hourly probe
 budget counts rows there, so a cascade did not only erase the record that a destination had been
@@ -1185,6 +1188,42 @@ The trigger is the layer doing the work today. The key only pins a tenant that h
 *erased*; the trigger pins one that has been *stopped*, which is every deleted tenant from the
 moment the watcher sees the tombstone until somebody runs the erasure — a window that stays
 open while the twenty-three undecided dispositions stay undecided.
+
+**And since 0075 the key is the layer doing the work, forty-six times over.** That paragraph
+described one foreign key into `crm.tenant` and called it "the first in this schema's history".
+There are now 46: **every tenant-scoped table references `crm.tenant (tenant_id)` with
+`ON DELETE RESTRICT`**, which closes the row ADR-0001 had carried since 0035 — a row whose
+`tenant_id` is absent from the registry was invisible to the cross-tenant pre-flight (it
+enumerates `crm.tenant`), unserved by every per-tenant job (the scheduler walks the registry,
+so its writes were never relayed and its expiries never swept), and **unerasable**, because
+`planTenantErasure` reads the registry for the status and the ERP tombstone. A tenant with no
+row could never be marked `erp_deleted`, so its data could never be lawfully destroyed.
+
+Single-column, and that is the one safe single-column shape: 0035's whole subject is that a
+reference naming a *row* by id alone can name another tenant's row, because a referential check
+runs with row security disabled — and here the referenced value *is* the tenant. `RESTRICT` and
+not `CASCADE`, with 0053's argument now 46 times as load-bearing: cascade would make one
+`DELETE FROM crm.tenant` destroy every tenant-scoped row in the schema with no attestation, no
+receipt and no four-eyes.
+
+**The migration backfills rather than refuses, and that is the decision in it.** The first draft
+counted the rows whose `tenant_id` is not in the registry, named the table and an example, and
+told a human to decide — and found twelve on the first database it ran against, which is the
+strongest argument that the row was real and also the argument against refusing.
+`packages/api/src/principal.ts` had carried the reason in its own words since 0050: refusing
+unregistered tenants "would be a different and much larger change — a real one, and arguably
+right — but making it a side effect of adding a deletion signal would lock out every such
+deployment on upgrade". A migration that cannot be applied leaves the hole open on exactly the
+deployments that have it. So the registry is backfilled from the data, with the one inference
+named rather than buried: existence is derived (the rows are there), and `status = 'active'` is
+the only value that is not a regression, because every consumer filters on it and backfilling
+`paused` would register a tenant and leave its work undone. The provenance goes in the display
+name and a NOTICE names each one, because the scheduler will start doing work it was silently
+skipping.
+
+**Forty-seven test suites had to be repaired, and that is the finding rather than the chore.**
+They were writing reps, outbox rows and policies for tenants that did not exist — the production
+hole in miniature — and none of them noticed, because nothing could notice.
 
 **It does not erase anything, and that is a decision rather than an omission.** Some of the
 CRM's copies may be records a jurisdiction requires us to keep; a deletion that destroys an

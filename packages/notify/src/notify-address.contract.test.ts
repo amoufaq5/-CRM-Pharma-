@@ -6,7 +6,7 @@ import {
   testPool,
   wipeConfigChanges,
   wipeEndpoints,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 import { UnattributedChangeError, withAttribution, withTenantContext } from "@crm/db";
 
 import { createEndpoint, InvalidEndpointError } from "./endpoints.js";
@@ -95,6 +95,11 @@ describe("where a person's notifications go (0065)", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "notify — TENANT");
+    await registerFixtureTenant(client, OTHER, "notify — OTHER");
     await client.query("SET ROLE crm_app");
     // Ada is the author every attributed write here names, and the ERP has an email for her
     // which nothing is allowed to send to until somebody confirms it.

@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { randomUUID } from "node:crypto";
 import { withTenantContext } from "@crm/db";
-import { TENANT_EXPENSE_LIFECYCLE as TENANT, appPool, wipeConfigChanges, withFixtureAttribution } from "@crm/db/testing";
+import { TENANT_EXPENSE_LIFECYCLE as TENANT, appPool, wipeConfigChanges, withFixtureAttribution, registerFixtureTenant} from "@crm/db/testing";
 
 import {
   EXPENSE_CLAIM_STATES,
@@ -107,6 +107,10 @@ describe("0044 — the expense claim lifecycle is in the database", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "expense — TENANT");
     await inTenant(async (tx) => {
       for (const [id, subject, employee, name] of [
         [REP, "lifecycle-rep", "E-LC-1", "Lifecycle Rep"],

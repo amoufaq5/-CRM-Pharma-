@@ -6,7 +6,7 @@ import {
   appPool,
   withFixtureAttribution,
   withFourEyes,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 import { claimBatch, markDead } from "@crm/relay";
 
 import { upsertAccountMapping } from "./accounts.js";
@@ -89,6 +89,10 @@ describe("expense claims", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "expense — TENANT");
     await inTenant(async (tx) => {
       for (const [id, subject, employee, name, erpId] of [
         [REP, "expensestore-rep", "E-EXPST-1", "Store Rep", "emp-expst-1"],

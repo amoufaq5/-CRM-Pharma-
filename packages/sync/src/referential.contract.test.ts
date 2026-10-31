@@ -5,7 +5,7 @@ import {
   TENANT_REFERENTIAL as TENANT,
   TENANT_REFERENTIAL_OTHER as OTHER,
   testPool,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 import { inbox } from "@crm/notify";
 
 import {
@@ -184,6 +184,11 @@ describe("the orphan check Q1 promised (0066)", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "sync — TENANT");
+    await registerFixtureTenant(client, OTHER, "sync — OTHER");
     await client.query("SET ROLE crm_app");
     rep = await seedRep(TENANT, "ref-rep", "A Rep");
     admin = await seedRep(TENANT, "ref-admin", "An Administrator");

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_EXPENSE_SWEEP as TENANT, appPool, wipeConfigChanges, withFixtureAttribution } from "@crm/db/testing";
+import { TENANT_EXPENSE_SWEEP as TENANT, appPool, wipeConfigChanges, withFixtureAttribution, registerFixtureTenant} from "@crm/db/testing";
 import { inbox } from "@crm/notify";
 import { claimBatch, markDead, markDelivered, raiseDeadLetterAlarm, reviveDeadLetter } from "@crm/relay";
 
@@ -55,6 +55,10 @@ describe("the expense posting sweep", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "expense — TENANT");
     sweepClient = await pool.connect();
     rivalClient = await pool.connect();
     await inTenant(async (tx) => {
@@ -875,8 +879,13 @@ describe("the expense posting sweep", () => {
   describe("the scheduled job itself", () => {
     it("accepts expense_post as a job name", async () => {
       await inTenant(async (tx) => {
+        // ON CONFLICT, because since 0075 this tenant is in `crm.tenant` for the whole run and
+        // the scheduler's own suite provisions every registered tenant's jobs when it ticks —
+        // so this row may already exist, written by another file. The claim here is that the
+        // CHECK ADMITS the name, which an existing row proves just as well as a new one.
         await tx.query(
-          `INSERT INTO crm.scheduled_job (tenant_id, job, interval_ms) VALUES ($1, $2, $3)`,
+          `INSERT INTO crm.scheduled_job (tenant_id, job, interval_ms) VALUES ($1, $2, $3)
+               ON CONFLICT DO NOTHING`,
           [TENANT, "expense_post", 5 * 60_000],
         );
         const { rows } = await tx.query<{ job: string }>(

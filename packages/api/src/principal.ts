@@ -68,16 +68,27 @@ export async function resolvePrincipal(
       // It is the deliberately RLS-exempt registry, so joining it inside the tenant context
       // is free and costs no second round trip on a path every request takes.
       //
-      // LEFT, and `tenant_status IS NULL` meaning "not listed" must NOT refuse — which is a
-      // fail-OPEN decision in a file whose whole argument is fail-closed, so it needs the
-      // reason stated. `crm.tenant` is the SCHEDULER's list of whose background work to do,
-      // not an authorisation list: it is empty in every test database (0035's pre-flight
-      // found that the hard way) and a deployment may never have populated it while serving
-      // the API perfectly well. Refusing unregistered tenants would be a different and much
-      // larger change — a real one, and arguably right — but making it a side effect of
-      // adding a deletion signal would lock out every such deployment on upgrade. So this
-      // refuses exactly one thing: an EXPLICIT `erp_deleted`, which 0050 lets nothing write
-      // without a tombstone in hand.
+      // LEFT rather than INNER, and since 0075 the two are EQUIVALENT here — which is worth
+      // saying because the comment this replaces argued at length for the difference.
+      //
+      // It said `tenant_status IS NULL` meaning "not listed" must not refuse, because
+      // `crm.tenant` was "the SCHEDULER's list of whose background work to do, not an
+      // authorisation list: it is empty in every test database and a deployment may never have
+      // populated it while serving the API perfectly well", and that "refusing unregistered
+      // tenants would be a different and much larger change — a real one, and arguably right —
+      // but making it a side effect of adding a deletion signal would lock out every such
+      // deployment on upgrade".
+      //
+      // 0075 made that change, deliberately and on its own: every tenant-scoped table
+      // references `crm.tenant (tenant_id)`, so a tenant with a REP has a registry row by
+      // construction, and the migration BACKFILLED the rows that existed rather than refusing
+      // to apply — which is what stops an upgrade locking anybody out. `r.tenant_id` here comes
+      // from a row that could not exist without one.
+      //
+      // The join stays LEFT because an INNER one would make this query's correctness depend on
+      // a key rather than state it, and a `tenant_status` of NULL would then be indistinguishable
+      // from no rep at all. What this still refuses is exactly one thing: an EXPLICIT
+      // `erp_deleted`, which 0050 lets nothing write without a tombstone in hand.
       `SELECT r.id, r.display_name, r.status, r.erp_employee_id, t.status AS tenant_status
          FROM crm.rep_profile r
          LEFT JOIN crm.tenant t ON t.tenant_id = r.tenant_id

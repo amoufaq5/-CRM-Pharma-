@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { withTenantContext } from "@crm/db";
-import { TENANT_WAREHOUSE as TENANT, TENANT_WAREHOUSE_UNSYNCED as UNSYNCED, appPool } from "@crm/db/testing";
+import { TENANT_WAREHOUSE as TENANT, TENANT_WAREHOUSE_UNSYNCED as UNSYNCED, appPool, registerFixtureTenant} from "@crm/db/testing";
 
 import {
   ACTIVE_WAREHOUSE_STATUS,
@@ -63,6 +63,11 @@ describe("the warehouse list", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "sample — TENANT");
+    await registerFixtureTenant(client, UNSYNCED, "sample — UNSYNCED");
   });
 
   beforeEach(async () => {

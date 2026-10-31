@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { withTenantContext } from "@crm/db";
-import { TENANT_INCOMING as TENANT, appPool } from "@crm/db/testing";
+import { TENANT_INCOMING as TENANT, appPool, registerFixtureTenant} from "@crm/db/testing";
 
 import { TRANSFER_PEER_LIMIT, incomingTransfers, transferPeers } from "./incoming.js";
 import { recallTransfer, recallableTransfers } from "./recall.js";
@@ -62,6 +62,10 @@ describe("the receiving side of a transfer", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "sample — TENANT");
     await inTenant(async (tx) => {
       for (const [id, subject, number, name, status] of [
         [ADA, "in-ada", "IN-1", "Ada Lovelace", "active"],

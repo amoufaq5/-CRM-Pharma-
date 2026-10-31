@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { appPool, TENANT_NOTIFY as TENANT, fixtureAuthor, wipeEndpoints } from "@crm/db/testing";
+import { appPool, TENANT_NOTIFY as TENANT, fixtureAuthor, wipeEndpoints, registerFixtureTenant} from "@crm/db/testing";
 
 import { NotificationDispatcher, MAX_ATTEMPTS, nextDelayMs } from "./dispatch.js";
 import { inbox, markAllRead, markRead, unreadCount } from "./inbox.js";
@@ -41,6 +41,10 @@ describe("notifications", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "notify — TENANT");
     await client.query("SET ROLE crm_app");
     await inTenant(async (tx) => {
       for (const [id, n] of [

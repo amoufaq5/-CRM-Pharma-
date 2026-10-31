@@ -3245,6 +3245,121 @@ Concretely, and these specifics are the decision, not commentary on it:
     catalog test asserts `storage_backend` is the only column in `crm` naming a store, so the
     migration that adds a second one fails on the day it is written.
 
+51. **A tenant nobody registered** (migration 0075). ADR-0001 has carried this since 0035: "A row
+    whose `tenant_id` is absent from `crm.tenant` is invisible to 0035's pre-flight, because
+    nothing can enumerate it: no table references the registry... Giving every tenant-scoped table
+    an FK to `crm.tenant` would close it and is a much larger change." This is that change, and it
+    is 45 foreign keys — 0053 had added the first, for `crm.tenant_tombstone`, where a vanishing
+    registry row was already doing damage.
+
+    **WHAT THE GAP COST, stated before the fix so the fix can be judged.** A row for a tenant the
+    registry has never heard of is unscanned by the cross-tenant pre-flight (it loops over
+    `crm.tenant`); unserved by every per-tenant job, because the scheduler walks the registry, so
+    its writes were never relayed, its expiries never swept and its deletions never noticed; and
+    **unerasable**, which matters most — `planTenantErasure` reads the registry for the status and
+    the ERP tombstone, so a tenant with no row could never be `erp_deleted` and its data could
+    never be lawfully destroyed. 0073 made the tenant set derivable and had to REFUSE rather than
+    answer, because enumeration across tenants is privileged; this makes the question unnecessary,
+    since the set of tenants with data and the set of registered tenants are now the same set by
+    construction.
+
+    **Single-column, and that is the one safe single-column shape.** 0035's whole subject is that a
+    reference naming a ROW by id alone can name another tenant's row, because a referential check
+    runs with row security disabled. Here the referenced value IS the tenant: there is no second
+    column to carry and nothing to escape, which is why `composite-fk.contract.test.ts` filters its
+    drift guard on `parent_cols = 'id'`. That file's assertion about this shape is now DERIVED —
+    every tenant-scoped table has exactly one, `crm.tenant` itself has none, and all of them are
+    `RESTRICT` — rather than a list of 46 names.
+
+    **ON DELETE RESTRICT, which is 0053's argument amplified.** CASCADE would make
+    `DELETE FROM crm.tenant` destroy every tenant-scoped row in the schema with no attestation, no
+    receipt and no four-eyes — the uncontrolled deletion 0051, 0052 and 0054 exist to make
+    impossible, reachable by one statement.
+
+    **THE VALIDATION TRAP, which this migration would otherwise have walked into.** `ADD
+    CONSTRAINT ... FOREIGN KEY` validates existing rows, and 0027 established that a foreign key's
+    bulk validation scan IS confined by row security. This runs as `crm_app`, which OWNS these
+    tables and is FORCEd under their policies, so with no tenant context the scan sees NOTHING and
+    the constraint is accepted on a vacuous pass — on a deployment that really holds orphan rows,
+    all 45 constraints would be created, trusted and wrong. That is not hypothetical; it is the
+    exact defect being closed, since the rows the constraint must find are rows nobody can
+    enumerate. So FORCE is lifted per table for the check and restored immediately, which is
+    0027's pattern and the only sanctioned use of it.
+
+    **IT BACKFILLS RATHER THAN REFUSES, and that is the decision.** The first draft counted the
+    orphans, named the table and an example, and told a human to decide. It found TWELVE on the
+    first database it ran against — the strongest possible argument that the row was real, and
+    also the argument against refusing. `packages/api/src/principal.ts` had carried the reason in
+    its own words since 0050: refusing unregistered tenants "would be a different and much larger
+    change — a real one, and arguably right — but making it a side effect of adding a deletion
+    signal would lock out every such deployment on upgrade". A migration that cannot be applied
+    leaves the hole open on exactly the deployments that have it. So the registry is backfilled
+    from the data, which is 0073's measurement turned into a repair, with the ONE INFERENCE named
+    rather than buried: existence is derived (the rows are there), and `status = 'active'` is the
+    only value that is not a regression, because every consumer filters on it and backfilling
+    `paused` would register the tenant and leave its work undone — the state being fixed. The
+    provenance goes in `display_name` and a NOTICE names each tenant, because the scheduler will
+    start doing work it was silently skipping.
+
+    **THE FAIL-OPEN DEFAULT IS GONE, and `principal.ts` said it would be arguably right.** An
+    unlisted tenant used to be served, by design. That state is no longer reachable — a tenant
+    with a rep has a registry row by construction — so the api suite's "is served normally when
+    the registry does not list it at all" became "cannot be unlisted at all while it has a rep",
+    asserted by the constraint that refuses the DELETE. And `recordTenantDeletionCheck` now asks
+    the registry BEFORE it writes: the check log is tenant-scoped, so an entry for an unlisted
+    tenant is refused by the key, and the named `TenantNotRegisteredError` is a better sentence
+    than `violates foreign key constraint "tenant_deletion_check_tenant_id_fkey"`. The old shape —
+    record the observation, then notice nothing was marked — could only run after the write the
+    key now refuses first. Losing the record costs nothing: since 0075 an unlisted tenant holds no
+    rows anywhere, so there was never any data of theirs to stop processing.
+
+    **FORTY-SEVEN TEST SUITES HAD TO BE REPAIRED, and that is the finding rather than the chore.**
+    They were writing reps, outbox rows and policies for tenants that did not exist — the
+    production hole in miniature — and none of them noticed, because nothing could notice. Three
+    classes of repair, each worth naming:
+
+    - Suites that never registered their tenant now call `registerFixtureTenant`, which does not
+      update an existing row: a suite that set its tenant to `erp_deleted` must not have it quietly
+      reset, since the whole point of that status is that nothing walks it back.
+    - Suites that DELETED their registry row in teardown now RESET it. The delete is refused while
+      the tenant holds anything, and the first run after 0075 showed how badly the old shape
+      failed: the api suite's `afterEach` delete raised, the tenant stayed `erp_deleted`, and 201
+      of that file's 228 tests failed with "has been deleted at the ERP".
+    - And two scheduler tests had to stop waiting on a clock. One tick now walks every ACTIVE
+      tenant, and since every suite registers its tenants and they stay registered, a tick
+      provisions dozens before it reaches the suite's own — so a fixed 120ms wait stopped the
+      scheduler before any drain happened. They wait for the CONDITION now, with a ceiling instead
+      of a cadence. That slowdown is a real operational fact and not only a test artefact: the
+      backfill puts previously invisible tenants onto the scheduler's list, which is the fix.
+
+    **0073's own test now asserts the opposite of what it did**, which is the clearest statement of
+    what this closes. It planted a row for an unregistered tenant to prove
+    `crm.unregistered_tenants()` could see one; the plant is refused by
+    `notification_policy_tenant_id_fkey`, so the test asserts the refusal and that the enumerator
+    finds nothing. The function stays and is not decorative: it derives from `pg_catalog`, so it
+    would find a tenant-scoped table that acquired rows without the reference — a migration
+    forgetting the key, which `composite-fk.contract.test.ts` guards from the other side.
+    `scripts/verify-tenant-registry.sh`'s control was inverted the same way: it used to plant and
+    expect a sighting, and now expects the refusal plus a separate non-vacuity check that the
+    derivation enumerates any tenants at all.
+
+    **Verified live** against a real Postgres over TCP: 45 constraints added and 11 tables
+    backfilled on the development database; 45 added and 0 backfilled on a FRESH one, with all 74
+    migrations applying through the runner idempotently and the cross-tenant pre-flight still
+    firing; the full suite green on both the backfilled database and a database built from nothing
+    (109 files / 2,712 tests — and the fresh run is the one that mattered, since it found 20 more
+    suites the backfilled database was masking); `pnpm typecheck` green; `pnpm client:verify` green
+    at 334 checks, after the gate's own seed learned to register its tenant first and the driver's
+    `INSERT INTO crm.tenant` became an UPDATE, because the row now exists before the first rep
+    does; and `scripts/verify-tenant-registry.sh` reporting the structural refusal.
+
+    **Left open.** `crm.tenant_is_registered` is the SQL half of this and has exactly one caller
+    (`recordTenantDeletionCheck`), which is the honest number: nothing else needs to ask, because
+    everything else is answered by a key. The historical rows this migration backfilled are now
+    registered as `active` with a display name saying where they came from — an operator may want
+    to rename or pause them, and nothing forces that, which is a judgement nobody but they can
+    make.
+
     **Verified.** 106 files / 2,699 tests, and the two corrections above were both found by that
     full run rather than by reading — the single-file run passed with the unrunnable index and the
     unsatisfiable plan premise still in place. `pnpm typecheck` green as one command (packages and
@@ -3634,8 +3749,8 @@ commit.
 | **A protocol refusal no longer reads to a probe in the sender's words — FIXED by decision item 42(c).** `SmtpSender` and `SmtpProber` drive the same `SmtpConversation`, so a no-STARTTLS or no-AUTH-mechanism refusal ended "Refusing to send" in a PROBE row, where nothing was ever going to be sent. This row called it "arguably an improvement" and recorded it "because it is a sentence an operator reads" — which is exactly why it was not: a probe row IS the sentence somebody reads to decide whether a relay is usable, and one implying a notification was lost sends them looking for it. The conversation now states the fact about the relay and stops; the sender appends "Refusing to send." and the probe "Nothing was sent — this was a test." One test asserts both sides, because the property is that they differ, and checks the sink received nothing so the sentence is true rather than reworded. | us | **closed 2026-10-13** |
 | **The channel-coverage check ran once at boot; it now runs per dispatch tick and reports only the TRANSITION.** The gap was real — an `email` endpoint created a minute after a webhook-only scheduler started was not noticed until the next restart, its deliveries retrying with a readable reason and nobody told. The reason this row said "recorded rather than chosen" was the objection, not the gap: a check per tick is a log line every thirty seconds per tenant, and a line that is always there is a line nobody reads. So the Scheduler remembers the last verdict per tenant and appends to the `notify_dispatch` summary only when it changes — a deployment that boots covered and stays covered says nothing more, the tick that notices an unsendable channel says so once with the reason, and a recovery is reported too because that is also news. Absent is treated as `covered`, so a deployment that boots unsendable is told by the boot check and not again. The check is injected as a function, so the Scheduler depends on the answer rather than on how it is obtained, and a failure to ASK is swallowed into the line (`coverage UNKNOWN: …`) rather than engaging the job's failure backoff — the same rule the probe runner already follows, for the same reason: the notifications went out. What it costs, stated: the dedup is per-process, so a restart re-reports a standing gap through the boot check, which is the right surface for it. | us | **closed 2026-10-06** |
 | **A probe's history is bounded at twenty per endpoint and is not an audit record.** The ring trims on insert, so "who tested this endpoint last March" is unanswerable by design. Stated because the alternative — a horizon — needs a scheduled job somebody still has to wire, which is how this schema grows its next open item. | Platform | _set a date_ |
-| **A row whose `tenant_id` is absent from `crm.tenant` is invisible to 0035's pre-flight**, because nothing can enumerate it: no table references the registry. Such a row is a defect in its own right, and writes are closed structurally either way. Giving every tenant-scoped table an FK to `crm.tenant` would close it and is a much larger change — and 0053 made a start by adding the FIRST reference into the registry (`crm.tenant_tombstone.tenant_id`), which is the one table where a vanishing registry row was already doing damage. The row below records why the cheaper fix, deriving the tenant set from the data, is not available to the application role at all. | Platform | _set a date_ |
-| **`crm.tenant` is empty in a test database, so 0035/0037's pre-flight scanned nothing — now exercised, and it works.** The `DO` block is the only thing standing between a composite key's blind bulk `VALIDATE` and a silently-wrong constraint, and it enumerates `crm.tenant`, which neither setup path populates: it looped zero times on every run and proved nothing. `scripts/verify-migration-runner.sh` now builds a database that really leaks — migrations to 0034, two registered tenants, and the leak this schema shipped once (a tenant-B `rep_role` naming a tenant-A profile through `granted_by`, single-column until 0035) — and asserts the row is visible inside tenant B and invisible without a context, that the migration refuses and names the table, the column and the tenant, and that the same database migrates once the leak is gone. Removing the leak needed `DISABLE TRIGGER USER`, because `crm.rep_role` is append-only: a leaked grant cannot be cleaned up in place, which is itself why 0035 refuses rather than repairing. What stays open is the narrower gap the migration's own header names: a row whose `tenant_id` is not in `crm.tenant` is still unscanned, because nothing can enumerate it. | us | **closed 2026-10-06** |
+| **CLOSED by decision item 51 (migration 0075): every tenant-scoped table references the registry.** This row said a row for an unregistered tenant "is invisible to 0035's pre-flight, because nothing can enumerate it: no table references the registry", and that giving every tenant-scoped table an FK "would close it and is a much larger change". It was 45 keys, all `ON DELETE RESTRICT`, with FORCE lifted per table for the validation — 0027's pattern, and necessary rather than tidy: a foreign key's bulk validation scan is confined by row security, so as the tables' owner every constraint would otherwise have been accepted on a vacuous pass against the very rows it had to find. The migration BACKFILLS from the data rather than refusing (it found twelve orphan rows on the first database it ran against), because `principal.ts` was right that refusing on upgrade would lock out the deployments that have the problem — and the one inference, `status = 'active'`, is named in item 51 rather than buried. Forty-seven test suites had to be repaired: they were writing rows for tenants that did not exist, which is the production hole in miniature. | us | **closed 2026-10-31** |
+| **`crm.tenant` is empty in a test database, so 0035/0037's pre-flight scanned nothing — now exercised, and it works.** The `DO` block is the only thing standing between a composite key's blind bulk `VALIDATE` and a silently-wrong constraint, and it enumerates `crm.tenant`, which neither setup path populates: it looped zero times on every run and proved nothing. `scripts/verify-migration-runner.sh` now builds a database that really leaks — migrations to 0034, two registered tenants, and the leak this schema shipped once (a tenant-B `rep_role` naming a tenant-A profile through `granted_by`, single-column until 0035) — and asserts the row is visible inside tenant B and invisible without a context, that the migration refuses and names the table, the column and the tenant, and that the same database migrates once the leak is gone. Removing the leak needed `DISABLE TRIGGER USER`, because `crm.rep_role` is append-only: a leaked grant cannot be cleaned up in place, which is itself why 0035 refuses rather than repairing. What stayed open was the narrower gap the migration's own header named — a row whose `tenant_id` is not in `crm.tenant`, unscanned because nothing could enumerate it — and **0075 closed that too**: every tenant-scoped table references the registry, so the pre-flight's enumeration of `crm.tenant` is now an enumeration of every tenant that has data. | us | **closed 2026-10-06, extended 2026-10-31** |
 | **Two referencing-side indexes are not tenant-prefixed**: `idx_attachment_supersedes (supersedes_attachment_id)` and `idx_notification_endpoint_probe_history (endpoint_id, seq DESC)`. Neither was before 0037 either, so nothing got slower, and 0035's rule stands — adding indexes inside a tenant-scoping migration is a different change wearing its clothes. If a `RESTRICT` check on `crm.attachment` ever shows up in a plan, these are the two to look at. | Platform | _set a date_ |
 | **Nothing bounded a tenant's total outbound probe volume until 0045.** The cooldown is per endpoint, which is the right scope (each endpoint is a different third party and a quiet one should not be rationed by a noisy one) — but endpoints per tenant are uncapped, so three endpoints meant three probes back to back inside one cooldown window. Each is one signed POST or one SMTP envelope walk, so the ceiling was low and the exposure an administrator-only route; the bound belonged "in the schema beside the cooldown if it is ever wanted, not in the route". That is where 0045 put it — the same trigger, under an advisory lock — and the row below records what building it turned up. | Platform | **closed 2026-10-06** |
 | **The rule is a test now, and it has teeth in both directions.** A `CHECK`'s validation scan and a UNIQUE INDEX's enforcement run with row security disabled, where ordinary DML and a FOREIGN KEY's bulk validation are confined — 0035, 0032 and 0043, three forms of one asymmetry, all learned the hard way and all written by someone who had learned it before. A rule like that only helps at the moment a key is chosen, so item 48 (a) makes it arrive then: `unique-index-tenant.contract.test.ts` derives all 83 unique indexes on tenant-scoped tables from `pg_index` and requires each to be tenant-prefixed, uuid-scoped, or declared with the reason its values cannot collide; one test creates the forbidden shape in a transaction and takes the cross-tenant `23505`; and 0043's repaired key is asserted by name, because the generic rule cannot see that what made it an oracle was a per-tenant ALLOCATOR. | us | **closed 2026-10-31** |

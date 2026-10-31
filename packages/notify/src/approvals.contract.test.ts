@@ -5,7 +5,7 @@ import {
   TENANT_APPROVAL_SWEEP_OTHER as OTHER,
   testPool,
   wipeProposals,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 import { proposeConfigChange, decideConfigProposal, withTenantContext } from "@crm/db";
 
 import { notifyPendingApprovals } from "./approvals.js";
@@ -90,6 +90,11 @@ describe("telling whoever can approve (0063)", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "notify — TENANT");
+    await registerFixtureTenant(client, OTHER, "notify — OTHER");
     await client.query("SET ROLE crm_app");
     ada = await rep(TENANT, "sweep-ada", "Ada Lovelace");
     grace = await rep(TENANT, "sweep-grace", "Grace Hopper");

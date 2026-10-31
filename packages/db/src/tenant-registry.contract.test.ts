@@ -74,33 +74,58 @@ describe("the tenant registry, reconciled against the data (0073)", () => {
     expect(Number(counted[0]!.n)).toBeGreaterThan(1);
   });
 
-  it("finds a tenant that has data and no registry row, and stops finding it once registered", async () => {
-    // Planted in the one register table that needs nothing but a tenant id, so the control does
-    // not have to invent a rep, a lot or a receipt.
-    await adminClient.query("INSERT INTO crm.notification_policy (tenant_id) VALUES ($1)", [PLANTED]);
+  /**
+   * THE DRIFT THIS FUNCTION WAS BUILT TO FIND CAN NO LONGER HAPPEN (0075), and the test that
+   * used to plant it now asserts that it cannot.
+   *
+   * 0073 could only MEASURE the gap ADR-0001 had carried since 0035: a row whose `tenant_id` is
+   * absent from `crm.tenant` is unscanned by the cross-tenant pre-flight, unserved by every
+   * per-tenant job, and unerasable. It measured it by planting exactly such a row, which is
+   * what this test did. 0075 gave every tenant-scoped table a reference to the registry, so the
+   * plant is refused by a key — and the refusal is the strongest possible form of the thing
+   * `crm.unregistered_tenants()` was written to report.
+   *
+   * THE FUNCTION STAYS, and is not now decorative. It derives from `pg_catalog`, so it would
+   * find a table that acquired rows without the reference — a migration adding a tenant-scoped
+   * table and forgetting the key, which `composite-fk.contract.test.ts` also guards from the
+   * other direction. Two independent checks on one invariant is the shape 0052's receipt rules
+   * already use: the database refuses, and something else asks whether the refusal is still in
+   * place.
+   */
+  it("cannot be planted at all any more, which is 0075's claim about 0073's finding", async () => {
+    const refusal = await adminClient
+      .query("INSERT INTO crm.notification_policy (tenant_id) VALUES ($1)", [PLANTED])
+      .then(() => null, (e: unknown) => e as { code?: string; constraint?: string });
+    expect(refusal?.code).toBe("23503");
+    expect(refusal?.constraint).toBe("notification_policy_tenant_id_fkey");
 
-    const unregistered = async (): Promise<number> => {
-      const { rows } = await adminClient.query<{ n: string }>(
-        "SELECT count(*) AS n FROM crm.unregistered_tenants() WHERE tenant_id = $1",
-        [PLANTED],
-      );
-      return Number(rows[0]!.n);
-    };
-    expect(await unregistered()).toBe(1);
+    // And the enumerator agrees: nothing to find, because nothing can be there.
+    const { rows } = await adminClient.query<{ n: string }>(
+      "SELECT count(*) AS n FROM crm.unregistered_tenants()",
+    );
+    expect(Number(rows[0]!.n)).toBe(0);
+  });
 
-    // And the count of tables it appears in is reported, because "one table" and "nine tables"
-    // are different situations for whoever has to decide what to do about it.
+  it("still reports the tables a tenant appears in, for the one case that remains", async () => {
+    // Registered FIRST, which is the only order the schema now allows, and then the row. The
+    // shape of the answer is what this asserts — `tables_with_rows` is what tells an operator
+    // whether a reconciliation finding is one table or nine — and it is worth keeping because
+    // the function's remaining job is to catch a tenant-scoped table that was added without
+    // the registry reference.
+    await adminClient.query(
+      `INSERT INTO crm.tenant (tenant_id, display_name) VALUES ($1, 'Planted by 0073 suite')
+       ON CONFLICT (tenant_id) DO NOTHING`,
+      [PLANTED],
+    );
+    await adminClient.query(
+      "INSERT INTO crm.notification_policy (tenant_id) VALUES ($1) ON CONFLICT DO NOTHING",
+      [PLANTED],
+    );
     const { rows } = await adminClient.query<{ tables_with_rows: number }>(
-      "SELECT tables_with_rows FROM crm.unregistered_tenants() WHERE tenant_id = $1",
+      "SELECT tables_with_rows FROM crm.tenants_with_data() WHERE tenant_id = $1",
       [PLANTED],
     );
     expect(rows[0]!.tables_with_rows).toBe(1);
-
-    await adminClient.query(
-      "INSERT INTO crm.tenant (tenant_id, display_name) VALUES ($1, 'Planted by 0073 suite')",
-      [PLANTED],
-    );
-    expect(await unregistered()).toBe(0);
   });
 
   it("reports a registry row with no data as the other direction, not as a defect", async () => {

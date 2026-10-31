@@ -8,7 +8,7 @@ import { PROJECTIONS } from "./projection.js";
 import { SnapshotRefresher } from "./refresh.js";
 import { evaluateStaleness, readFreshness } from "./snapshot-store.js";
 
-import { appPool, TENANT_SYNC as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_SYNC as TENANT, registerFixtureTenant} from "@crm/db/testing";
 
 /**
  * `appPool()`, not `testPool()`: this pool is handed to code that opens its OWN
@@ -110,6 +110,10 @@ describe("snapshot refresh against a real database", () => {
   beforeAll(async () => {
     p = appPool();
     admin = await p.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(admin, TENANT, "sync — TENANT");
     await admin.query("SET ROLE crm_app");
   });
 

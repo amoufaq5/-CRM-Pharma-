@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_SUPERVISION as TENANT, testPool } from "@crm/db/testing";
+import { TENANT_SUPERVISION as TENANT, testPool, registerFixtureTenant} from "@crm/db/testing";
 
 import { canSupervise, managedRepIds, teamRoster } from "./supervision.js";
 
@@ -36,6 +36,10 @@ describe("supervision", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "territory — TENANT");
     await client.query("SET ROLE crm_app");
     await inTenant(async (tx) => {
       for (const [id, n] of [

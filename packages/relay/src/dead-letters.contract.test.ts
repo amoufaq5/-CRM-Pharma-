@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_DEAD_LETTERS as TENANT, testPool } from "@crm/db/testing";
+import { TENANT_DEAD_LETTERS as TENANT, testPool, registerFixtureTenant} from "@crm/db/testing";
 import { inbox } from "@crm/notify";
 
 import {
@@ -41,6 +41,10 @@ describe("dead letters", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "relay — TENANT");
     await client.query("SET ROLE crm_app");
     await inTenant(async (tx) => {
       for (const [id, n] of [

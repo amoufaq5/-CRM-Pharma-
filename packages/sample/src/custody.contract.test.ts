@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { TENANT_SAMPLE as TENANT, testPool } from "@crm/db/testing";
+import { TENANT_SAMPLE as TENANT, testPool, registerFixtureTenant} from "@crm/db/testing";
 
 import {
   IncompleteRecordError,
@@ -116,6 +116,10 @@ describe("sample custody", () => {
   beforeAll(async () => {
     pool = testPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "sample — TENANT");
     await client.query("SET ROLE crm_app");
     await inTenant(async (tx) => {
       for (const [id, subject, number] of [

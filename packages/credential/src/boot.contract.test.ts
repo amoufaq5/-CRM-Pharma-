@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createPublicKey, verify as cryptoVerify } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
-import { appPool, TENANT_CREDENTIAL_BOOT as TENANT } from "@crm/db/testing";
+import { appPool, TENANT_CREDENTIAL_BOOT as TENANT, registerFixtureTenant} from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import { buildServiceCredential } from "./boot.js";
@@ -54,6 +54,10 @@ describe("the service credential, end to end", () => {
   beforeAll(async () => {
     pool = appPool();
     fixture = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(fixture, TENANT, "credential — TENANT");
   });
 
   afterAll(async () => {

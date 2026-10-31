@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { appPool } from "@crm/db/testing";
+import { appPool, registerFixtureTenant } from "@crm/db/testing";
 
 import { attemptHistory, summariseAttemptHistory } from "./attempt-history.js";
 import {
@@ -58,6 +58,10 @@ describe("the outbox store", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture writing rows
+    // for a tenant the registry has never heard of is writing a state the schema forbids.
+    await registerFixtureTenant(client, TENANT, "relay — TENANT");
+    await registerFixtureTenant(client, OTHER_TENANT, "relay — OTHER_TENANT");
   });
 
   const reset = async (): Promise<void> => {

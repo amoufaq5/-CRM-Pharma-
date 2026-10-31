@@ -9,7 +9,7 @@ import {
   wipeConfigChanges,
   wipeEndpoints,
   withFixtureAttribution,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 
 import {
   DEFAULT_ENDPOINT_CAP,
@@ -63,6 +63,11 @@ describe("the endpoint cap", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "notify — TENANT");
+    await registerFixtureTenant(client, OTHER, "notify — OTHER");
     for (const [tenant, id, subject] of [
       [TENANT, AUTHOR, "cap-author"],
       [OTHER, OTHER_AUTHOR, "cap-author-other"],

@@ -408,6 +408,35 @@ export const TENANT_STORAGE_BACKEND = "f4740000-0000-4000-8000-000000000037";
  * alone can call it every time. It is deliberately NOT a suite's main rep: a fixture author
  * with its own subject cannot be mistaken for one of the people a test is actually about.
  */
+/**
+ * Registers a fixture tenant, because since 0075 a tenant-scoped row cannot exist without one.
+ *
+ * Every tenant-scoped table now references `crm.tenant (tenant_id)`, which closed the ADR-0001
+ * row carried since 0035: a row for a tenant the registry has never heard of is unscanned by
+ * the cross-tenant pre-flight, unserved by every per-tenant job, and UNERASABLE, since
+ * `planTenantErasure` reads the registry for the status and the ERP tombstone.
+ *
+ * TWENTY-FIVE SUITES NEEDED THIS, which is the finding rather than the chore. They were writing
+ * reps, outbox rows and policies for tenants that did not exist — the production hole in
+ * miniature, and none of them noticed, because nothing could notice. A fixture modelling a
+ * state the schema now forbids is a fixture kinder than reality, and this is the repair.
+ *
+ * Idempotent, and deliberately does NOT update an existing row: a suite that has set its
+ * tenant's status to `erp_deleted` (which 0050 makes terminal) must not have it quietly reset
+ * by a later `beforeEach` — the whole point of that status is that nothing walks it back.
+ */
+export async function registerFixtureTenant(
+  client: PoolClient,
+  tenantId: string,
+  displayName = "fixture tenant",
+): Promise<void> {
+  await client.query(
+    `INSERT INTO crm.tenant (tenant_id, display_name, status)
+     VALUES ($1, $2, 'active') ON CONFLICT (tenant_id) DO NOTHING`,
+    [tenantId, displayName],
+  );
+}
+
 export async function fixtureAuthor(tx: PoolClient, tenantId: string): Promise<string> {
   const { rows } = await tx.query<{ id: string }>(
     `INSERT INTO crm.rep_profile (tenant_id, subject, employee_number, display_name, status)

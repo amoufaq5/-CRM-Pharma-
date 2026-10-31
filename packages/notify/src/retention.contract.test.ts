@@ -8,7 +8,7 @@ import {
   wipeConfigChanges,
   wipeEndpoints,
   withFixtureAttribution,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 import { withTenantContext } from "@crm/db";
 
 import {
@@ -96,6 +96,12 @@ describe("notification retention", () => {
   beforeAll(async () => {
     pool = appPool();
     tx = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(tx, TENANT_PRUNE_GUARD, "notify — TENANT_PRUNE_GUARD");
+    await registerFixtureTenant(tx, OTHER, "notify — OTHER");
+    await registerFixtureTenant(tx, TENANT, "notify — TENANT");
     await inTenant(async (c) => {
       for (const [id, n] of [
         [REP, "Recipient"],
@@ -641,6 +647,11 @@ describe("notification retention", () => {
     // goes through a view — so this is worth asserting rather than assuming.
     await inTenant((c) => notify(c, { createdDaysAgo: 400, read: true }));
     const other = "d5000000-0000-4000-8000-00000000000a";
+    // Registered first: `pruneNotifications` writes this tenant's policy row, and since 0075
+    // `crm.notification_policy` references `crm.tenant (tenant_id)` like everything else that
+    // is tenant-scoped. An unregistered "other tenant" is no longer a tenant that can hold
+    // anything, which is the point of the key rather than an obstacle to the test.
+    await registerFixtureTenant(tx, other, "notify — the other tenant of the prune test");
     const r = await withTenantContext(tx, other, (c) => pruneNotifications(c, other, { asOf: NOW }));
     expect(r.deletedRead + r.deletedUnread).toBe(0);
     expect(await remaining()).toBe(1);

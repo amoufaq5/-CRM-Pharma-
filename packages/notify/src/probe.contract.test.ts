@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool, PoolClient } from "pg";
 import { SET_TENANT_CONTEXT_SQL, withTenantContext } from "@crm/db";
-import { appPool, TENANT_CHANNEL_COVERAGE as TENANT, fixtureAuthor, wipeConfigChanges, wipeEndpoints, withFixtureAttribution } from "@crm/db/testing";
+import { appPool, TENANT_CHANNEL_COVERAGE as TENANT, fixtureAuthor, wipeConfigChanges, wipeEndpoints, withFixtureAttribution, registerFixtureTenant} from "@crm/db/testing";
 
 import { NOTIFICATION_KINDS } from "./kinds.js";
 import { verifyWebhook, type FetchLike } from "./sender.js";
@@ -77,6 +77,11 @@ describe("the endpoint probe", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "notify — TENANT");
+    await registerFixtureTenant(client, OTHER_TENANT, "notify — OTHER_TENANT");
     await client.query("SET ROLE crm_app");
     for (const [tenant, admin, subject] of [
       [TENANT, ADMIN, "probe-admin"],
@@ -819,15 +824,21 @@ describe("the endpoint probe", () => {
      * schema's convention for an audit child — a probe whose requester has been deleted is a
      * probe nobody asked for.
      */
-    it("depends on its author and on nothing else", async () => {
+    it("depends on its author and on nothing whose deletion could take it", async () => {
       const { rows } = await client.query<{ target: string; action: string }>(
         `SELECT confrelid::regclass::text AS target, confdeltype AS action
            FROM pg_constraint
           WHERE conrelid = 'crm.notification_endpoint_probe'::regclass AND contype = 'f'
           ORDER BY 1`,
       );
-      expect(rows.map((r) => r.target).sort()).toEqual(["crm.rep_profile"]);
+      // 0075 added the registry reference, and it is the OPPOSITE of the hazard this test is
+      // about: every other reference here is a PARENT whose deletion could carry the probe
+      // away with it, where `crm.tenant (tenant_id)` with `ON DELETE RESTRICT` is a guarantee
+      // that the tenant cannot vanish from under it. Listed rather than filtered out, so a
+      // third reference has to argue for itself here.
+      expect(rows.map((r) => r.target).sort()).toEqual(["crm.rep_profile", "crm.tenant"]);
       expect(rows.find((r) => r.target === "crm.rep_profile")!.action).toBe("r");
+      expect(rows.find((r) => r.target === "crm.tenant")!.action).toBe("r");
       expect(rows.map((r) => r.target)).not.toContain("crm.notification");
       expect(rows.map((r) => r.target)).not.toContain("crm.notification_endpoint");
     });

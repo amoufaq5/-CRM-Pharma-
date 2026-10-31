@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
-import { appPool } from "@crm/db/testing";
+import { appPool, registerFixtureTenant } from "@crm/db/testing";
 
 /**
  * A reserved tenant of this file's own, derived from the `e…` block in
@@ -60,6 +60,10 @@ describe("a dead letter's per-attempt history", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture writing rows
+    // for a tenant the registry has never heard of is writing a state the schema forbids.
+    await registerFixtureTenant(client, TENANT, "relay — TENANT");
+    await registerFixtureTenant(client, OTHER_TENANT, "relay — OTHER_TENANT");
     await inTenant(async (tx) => {
       await tx.query(
         `INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name)
@@ -1070,19 +1074,27 @@ describe("a dead letter's per-attempt history", () => {
       expect(rows[0]!.secdef).toBe(false);
     });
 
-    it("carries no foreign key at all, so nothing else's lifetime governs the history", async () => {
+    it("names no PARENT whose lifetime could govern the history", async () => {
       // The precedent not to recreate: `crm.notification_delivery` cascades from
       // `crm.notification`, which is why delivery history cannot outlive the notification
       // it describes (ADR-0001). Neither reference here is enforced — not `outbox_id`,
       // and not `revived_by`, which as a RESTRICT handed this table a veto over deleting
       // a rep profile and broke an unrelated suite's teardown.
+      //
+      // 0075 ADDED ONE, and it is not of that kind: `tenant_id -> crm.tenant` is a reference
+      // to the REGISTRY, with `ON DELETE RESTRICT`, which cannot shorten this table's
+      // lifetime — it lengthens the registry's. The claim was never "no constraint", it was
+      // "no parent that can take these rows with it", which is why the test now says that.
       const { rows } = await client.query<{ conname: string; target: string }>(
         `SELECT c.conname, f.relname AS target FROM pg_constraint c
            JOIN pg_class t ON t.oid = c.conrelid
            JOIN pg_class f ON f.oid = c.confrelid
-          WHERE t.relname = 'outbox_dead_letter' AND c.contype = 'f'`,
+          WHERE t.relname = 'outbox_dead_letter' AND c.contype = 'f'
+          ORDER BY c.conname`,
       );
-      expect(rows).toEqual([]);
+      expect(rows).toEqual([
+        { conname: "outbox_dead_letter_tenant_id_fkey", target: "tenant" },
+      ]);
     });
 
     it("accepts a reviver from ANOTHER tenant, and resolves no name for them", async () => {

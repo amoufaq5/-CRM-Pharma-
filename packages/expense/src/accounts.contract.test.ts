@@ -6,7 +6,7 @@ import {
   appPool,
   wipeProposals,
   withFourEyes,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 
 import {
   activeAccountMapping,
@@ -63,6 +63,10 @@ describe("expense account map", () => {
   beforeAll(async () => {
     pool = appPool();
     client = await pool.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(client, TENANT, "expense — TENANT");
     await unsigned(async (tx) => {
       await tx.query(
         `INSERT INTO crm.rep_profile (id, tenant_id, subject, employee_number, display_name)

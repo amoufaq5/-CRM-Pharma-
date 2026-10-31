@@ -19,7 +19,7 @@ import {
   TENANT_SCHEDULER_RESULT as RESULT_TENANT,
   appPool,
   withFixtureAttribution,
-} from "@crm/db/testing";
+  registerFixtureTenant,} from "@crm/db/testing";
 
 /**
  * `appPool()`, not `testPool()`: this pool is handed to code that opens its OWN
@@ -72,11 +72,24 @@ describe("scheduler against a real database", () => {
   beforeAll(async () => {
     p = appPool();
     admin = await p.connect();
+    // Since 0075 every tenant-scoped table references crm.tenant, so a fixture that writes
+    // rows for a tenant the registry has never heard of is writing a state the schema now
+    // forbids — which is the production hole this suite was quietly modelling.
+    await registerFixtureTenant(admin, TENANT, "scheduler — TENANT");
+    await registerFixtureTenant(admin, OTHER, "scheduler — OTHER");
+    await registerFixtureTenant(admin, LOOP_TENANT, "scheduler — LOOP_TENANT");
+    await registerFixtureTenant(admin, RESULT_TENANT, "scheduler — RESULT_TENANT");
     await admin.query("SET ROLE crm_app");
   });
 
   afterAll(async () => {
-    await admin.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1::uuid[])", [[TENANT, OTHER]]);
+    // The registry rows STAY, for 0075's reason: they cannot be removed while this suite's
+    // tenants hold anything, and a fixture tenant left in the registry is exactly the state
+    // the schema now says a tenant with data must be in. Reset rather than removed.
+    await admin.query(
+      "UPDATE crm.tenant SET status = 'active' WHERE tenant_id = ANY($1::uuid[])",
+      [[TENANT, OTHER]],
+    );
     await admin.query("RESET ROLE");
     admin.release();
     await p.end();
@@ -88,9 +101,19 @@ describe("scheduler against a real database", () => {
         await tx.query("DELETE FROM crm.scheduled_job WHERE tenant_id = $1", [t]);
       });
     }
-    await admin.query("DELETE FROM crm.tenant WHERE tenant_id = ANY($1::uuid[])", [[TENANT, OTHER]]);
+    // UPSERT, not delete-and-insert, since 0075. The old shape deleted the registry row to get
+    // a clean slate for `crm.tenant`'s own columns, and that is no longer possible: every
+    // tenant-scoped table references the registry with ON DELETE RESTRICT, and this suite's
+    // tenants have disposal policies, so the delete is refused — `update or delete on table
+    // "tenant" violates foreign key constraint "disposal_policy_tenant_id_fkey"`. The columns
+    // this suite actually cares about are `status` and `display_name`, and resetting them is
+    // what the delete was standing in for. The status matters: tests below set `paused` and
+    // `disabled`, and each one must start from `active`.
     await admin.query(
-      "INSERT INTO crm.tenant (tenant_id, display_name) VALUES ($1,'Tenant A'), ($2,'Tenant B')",
+      `INSERT INTO crm.tenant (tenant_id, display_name, status)
+       VALUES ($1,'Tenant A','active'), ($2,'Tenant B','active')
+           ON CONFLICT (tenant_id) DO UPDATE
+              SET display_name = EXCLUDED.display_name, status = 'active'`,
       [TENANT, OTHER],
     );
   });
@@ -224,7 +247,16 @@ describe("scheduler against a real database", () => {
       onEvent: (e) => events.push(e),
     }).tick();
 
-    const ok = events.find((e) => e.type === "job_ok" && e.job === "expiry_sweep");
+    // FILTERED BY TENANT, not just by job. The tick runs this job for every active tenant, and
+    // `find` takes whichever came first — which is `crm.tenant.created_at` order, a property
+    // of when each fixture row was first written. The old `beforeEach` deleted and re-created
+    // both rows every time and so fixed that order by accident; since 0075 the rows are
+    // upserted (they cannot be deleted while the tenant has data), the original `created_at`
+    // survives, and this picked up the OTHER tenant's empty summary. Asserting on the tenant
+    // the fixture wrote to is what the test meant all along.
+    const ok = events.find(
+      (e) => e.type === "job_ok" && e.job === "expiry_sweep" && e.tenantId === TENANT,
+    );
     expect(ok).toBeDefined();
     expect((ok as { detail: string }).detail).toContain("expired=1");
     expect((ok as { detail: string }).detail).toContain("opened=1");
@@ -327,7 +359,16 @@ describe("scheduler against a real database", () => {
       onEvent: (e) => events.push(e),
     }).tick();
 
-    const ok = events.find((e) => e.type === "job_ok" && e.job === "notify_prune");
+    // FILTERED BY TENANT, not just by job. The tick runs this job for every active tenant, and
+    // `find` takes whichever came first — which is `crm.tenant.created_at` order, a property
+    // of when each fixture row was first written. The old `beforeEach` deleted and re-created
+    // both rows every time and so fixed that order by accident; since 0075 the rows are
+    // upserted (they cannot be deleted while the tenant has data), the original `created_at`
+    // survives, and this picked up the OTHER tenant's empty summary. Asserting on the tenant
+    // the fixture wrote to is what the test meant all along.
+    const ok = events.find(
+      (e) => e.type === "job_ok" && e.job === "notify_prune" && e.tenantId === TENANT,
+    );
     expect(ok).toBeDefined();
     const detail = (ok as { detail: string }).detail;
     // Two taken (the plain old one and the unrecognised-subject one), one held back
@@ -420,7 +461,10 @@ describe("scheduler against a real database", () => {
 
     const lost: SchedulerEvent[] = [];
     await new Scheduler({ pool: p, relay: result(2), refresher, random: () => 0.5, onEvent: (e) => lost.push(e) }).tick();
-    const lostLine = lost.find((e) => e.type === "job_ok" && e.job === "relay_drain") as { detail: string };
+    // By tenant, for the reason given on the prune above.
+    const lostLine = lost.find(
+      (e) => e.type === "job_ok" && e.job === "relay_drain" && e.tenantId === TENANT,
+    ) as { detail: string };
     expect(lostLine.detail).toContain("LOST=2");
 
     await withTenantContext(admin, TENANT, (tx) =>
@@ -428,7 +472,9 @@ describe("scheduler against a real database", () => {
     );
     const clean: SchedulerEvent[] = [];
     await new Scheduler({ pool: p, relay: result(0), refresher, random: () => 0.5, onEvent: (e) => clean.push(e) }).tick();
-    const cleanLine = clean.find((e) => e.type === "job_ok" && e.job === "relay_drain") as { detail: string };
+    const cleanLine = clean.find(
+      (e) => e.type === "job_ok" && e.job === "relay_drain" && e.tenantId === TENANT,
+    ) as { detail: string };
     // Absent rather than `LOST=0`: a healthy line is read a thousand times for every
     // unhealthy one, and a zero that is always there is a zero nobody sees.
     expect(cleanLine.detail).not.toContain("LOST");
@@ -725,6 +771,25 @@ describe("scheduler against a real database", () => {
   });
 });
 
+/**
+ * Waits for a condition the LOOP has to reach, instead of for a wall-clock interval.
+ *
+ * A fixed `setTimeout` was enough when a test database held four or five tenants. It is not
+ * any more, and 0075 is why: `activeTenants` reads `crm.tenant`, and since every tenant-scoped
+ * table references the registry, every suite registers its tenants and they stay registered —
+ * so one tick now walks dozens of them and the 120ms these tests waited stopped the scheduler
+ * before it reached this suite's own. Waiting for the thing being asserted makes the test
+ * independent of how many other suites have run, which it should always have been.
+ */
+async function until(what: string, ready: () => boolean, timeoutMs = 25_000): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (ready()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`the scheduler never reached: ${what} (within ${String(timeoutMs)}ms)`);
+}
+
 describe("the loop itself", () => {
   let p: Pool;
   let admin: PoolClient;
@@ -733,21 +798,38 @@ describe("the loop itself", () => {
     p = appPool();
     admin = await p.connect();
     await admin.query("SET ROLE crm_app");
-    await admin.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [LOOP_TENANT]);
-    await admin.query("INSERT INTO crm.tenant (tenant_id, display_name) VALUES ($1,'A')", [LOOP_TENANT]);
+    // Upserted rather than deleted and re-inserted: see the note on the suite above (0075).
+    await admin.query(
+      `INSERT INTO crm.tenant (tenant_id, display_name, status) VALUES ($1,'A','active')
+           ON CONFLICT (tenant_id) DO UPDATE SET status = 'active'`,
+      [LOOP_TENANT],
+    );
   });
 
   afterAll(async () => {
     await withTenantContext(admin, LOOP_TENANT, (tx) =>
       tx.query("DELETE FROM crm.scheduled_job WHERE tenant_id = $1", [LOOP_TENANT]),
     );
-    await admin.query("DELETE FROM crm.tenant WHERE tenant_id = $1", [LOOP_TENANT]);
+    // Left in the registry: its jobs are gone, and a registry row with nothing referencing it
+    // is removable — but removing it would make the next run's first insert the only thing
+    // standing between this suite and 0075's refusal, which is a worse fixture.
     await admin.query("RESET ROLE");
     admin.release();
     await p.end();
   });
 
-  it("does not stack ticks when the work outruns the interval", async () => {
+  /**
+   * THIRTY SECONDS, not vitest's default five, and the reason is 0075 rather than slowness.
+   *
+   * One tick walks every ACTIVE tenant, and since every tenant-scoped table references
+   * `crm.tenant` each suite registers its tenants and they stay registered — so by the time
+   * this file runs, a tick provisions and runs jobs for dozens of them before it reaches this
+   * suite's own. That is correct behaviour (those tenants have data, and before 0075 their work
+   * was silently never done), and it is a real operational fact worth knowing: the backfill
+   * puts previously invisible tenants onto the scheduler's list. The test waits for the
+   * CONDITION, so the number is a ceiling rather than a cadence.
+   */
+  it("does not stack ticks when the work outruns the interval", { timeout: 30_000 }, async () => {
     // setInterval would pile the next tick onto the running one until the
     // process died. Run-then-wait self-throttles instead.
     let concurrent = 0;
@@ -771,6 +853,9 @@ describe("the loop itself", () => {
       random: () => 0.5,
     });
     s.start();
+    await until("a drain for any tenant", () => maxConcurrent >= 1);
+    // And then a little longer, because the property is that a SECOND tick does not join the
+    // first: stopping the instant one drain begins would assert nothing.
     await new Promise((r) => setTimeout(r, 120));
     await s.stop();
 
@@ -800,7 +885,7 @@ describe("the loop itself", () => {
     expect(finished).toBe(true);
   });
 
-  it("survives a tick that throws and keeps going", async () => {
+  it("survives a tick that throws and keeps going", { timeout: 30_000 }, async () => {
     const events: SchedulerEvent[] = [];
     let calls = 0;
     const relay = {
@@ -818,7 +903,11 @@ describe("the loop itself", () => {
 
     const s = new Scheduler({ pool: p, relay, refresher, tickIntervalMs: 5, random: () => 0.5, onEvent: (e) => events.push(e) });
     s.start();
-    await new Promise((r) => setTimeout(r, 80));
+    // Two ticks is the property: the first throws, and the loop has to come back for another.
+    await until(
+      "a second tick after the first one threw",
+      () => events.filter((e) => e.type === "tick_start").length > 1,
+    );
     await s.stop();
 
     // Dying in the loop would silently stop every tenant, so it must not.
