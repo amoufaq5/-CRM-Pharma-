@@ -1549,9 +1549,12 @@ What it settles is the part that was a guess. Everything built for an offline de
 ids minted before a network exists (0012), `POST /v1/sync/visits` answering per row, the
 upsert that makes a replay idempotent, `tenant_deleted` carrying its own problem type so a
 queue knows to stop rather than spin — had never been consumed by anything. It is now,
-and `pnpm client:verify` proves it the only way that means anything: **329 checks in six
-real Chromium profiles — six devices, two reps — taken offline mid-session, against the
-real API binary, counting rows in Postgres.** The sequence it drives:
+and `pnpm client:verify` proves it the only way that means anything: **every check below in
+real Chromium profiles — six devices, two reps — taken offline mid-session, against the real
+API binary, counting rows in Postgres.** No count here: this said 329 while the gate ran 331
+and then 334, which is the same staleness `dbbf7c8` removed from the deploy gate's sentence,
+for the same reason — what the gate asserts is the list, not its length. The sequence it
+drives:
 
 - a visit recorded with the network down lands in IndexedDB, pending, with a device-minted
   v7 id — and **nothing** in `crm.visit`;

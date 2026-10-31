@@ -234,6 +234,22 @@ export async function newPage(browser) {
       await page.evaluate(`window.dispatchEvent(new Event(${isOffline ? '"offline"' : '"online"'})); return true;`);
     },
 
+    /**
+     * Poll an expression until it is `true`, and on timeout SAY WHAT THE SCREEN SAID.
+     *
+     * `last value: false` is a true statement about the expression and tells nobody
+     * anything: every one of these waits is for a sentence the app was supposed to show,
+     * so the useful fact is which sentence it showed instead. A contended run timed out
+     * at "the missing-signature refusal" with nothing but that `false`, and the whole
+     * question — did the message never appear, or appear and get overwritten — was
+     * unanswerable from the failure. The evidence is read AFTER the loop, so it costs a
+     * passing run nothing.
+     *
+     * The app's own message bar first, because that is where a refusal goes, then a
+     * window of the body. Normalised, truncated, and wrapped so that a page which throws
+     * while being inspected reports that rather than replacing the timeout with a
+     * different error.
+     */
     async waitFor(expression, { timeoutMs = 10_000, label = expression } = {}) {
       const started = Date.now();
       let last;
@@ -242,7 +258,20 @@ export async function newPage(browser) {
         if (last === true) return;
         await new Promise((r) => setTimeout(r, 100));
       }
-      throw new Error(`timed out waiting for ${label} (last value: ${JSON.stringify(last)})`);
+      let screen = "unreadable";
+      try {
+        screen = await page.evaluate(`
+          const squash = (t) => (t ?? "").replace(/\\s+/g, " ").trim();
+          const bar = squash(document.querySelector(".message, [role='status'], .banner")?.textContent);
+          const body = squash(document.body?.textContent).slice(0, 400);
+          return JSON.stringify({ message: bar === "" ? null : bar.slice(0, 300), body });`);
+      } catch (err) {
+        screen = `could not be read: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`;
+      }
+      throw new Error(
+        `timed out after ${String(Math.round((Date.now() - started) / 1000))}s waiting for ${label} ` +
+          `(last value: ${JSON.stringify(last)}); the screen said ${screen}`,
+      );
     },
 
     async textOf(selector) {

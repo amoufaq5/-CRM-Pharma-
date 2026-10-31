@@ -3920,3 +3920,158 @@ around: Docker Hub answers `429`, and an in-container build fails `SELF_SIGNED_C
 behind the TLS-intercepting proxy. CI is the only place `scripts/verify-deploy-smoke.sh` runs, so
 CI's own record is the evidence, and the annotations are what make that record readable at all —
 the job logs are served from a blob host the API cannot reach.
+
+## Two races in a browser, and the one that got away
+
+*2026-10-31, `pnpm client:verify` (334 checks — three more than before), plus twelve
+further runs of the same gate with six spinners on four cores, which is the only way this
+box resembles a two-core runner.*
+
+The run after the previous chapter went red in `field-client` with six failures, and the
+annotations the chapter before closed its row on did exactly what that row promised: every
+one arrived as a sentence.
+
+```
+FAIL: and pressing Sync as the other rep sends nothing of hers — the row is held, not filed
+      under the wrong name — expected 0, got 1
+FAIL: the second transfer is in the ledger, which is why it can only be recalled
+      — expected 1, got 2
+FAIL: the queued recall names the transfer it takes back
+      — expected "01a19303-cd3d-71d4-811f-a9b7ef7685b8", got "01a19303-d110-75c4-86c3-257769a9ff6a"
+FAIL: with the receiver untouched — they never had it — expected "3.000|0.000", got "2.000|1.000"
+FAIL: and she holds the three she accepted — expected "3.000|0.000", got "2.000|1.000"
+FAIL: her balance is down by what she sent back — expected "2.000|0.000", got "1.000|1.000"
+```
+
+Six sentences, one cause: a `transfer_out` of 1.000 belonging to the second rep existed in
+`crm.sample_transaction` when §13 said it should not. Every one of the other five is
+downstream of it — §14 picks "the transfer of 1.000" out of the ledger, got hers instead of
+the sender's, and compared the recall's id against the wrong row; and her balance carries
+1.000 in transit for the rest of the run.
+
+### What the evidence proves, and it is not what the assertion said
+
+`POST /v1/samples/transfers` sets the sender from `ctx.principal.repProfileId` and from
+nowhere else — the body cannot name a sender. The row was attributed to **rep-grace**, so it
+went out under *her own* credentials. The misattribution §13 is named for — her record filed
+under the colleague who happened to be signed in on her device — **did not happen**. Three
+assertions on the same run confirm the other half: her device still held the row, `pending`,
+with `attempts: 0`, and the screen read "Held for another sign-in".
+
+So the chapter's property held and the assertion standing in for it did not, because the
+assertion was an absolute claim (*no transfer of hers exists anywhere*) doing duty for a claim
+about one sync (*this sync sent nothing of hers*).
+
+### How it got out is not established, and that is recorded rather than guessed
+
+The code says it should be impossible. §13 goes offline before she saves; `drain()` returns
+early when `state.online` is false; the save's own `void drain({ manual: false })` therefore
+does nothing. A purpose-built probe of the harness settled the one assumption that mattered:
+
+```
+before    navigator.onLine = true
+offline   navigator.onLine = false
+after nav navigator.onLine = false
+back      navigator.onLine = true
+```
+
+`Network.emulateNetworkConditions` does make the page believe it is offline, and keeps it
+believing that across the navigation §13 performs mid-chapter — so the page that re-boots
+there boots offline too, and `state.online = navigator.onLine` is false. That mattered because
+the harness's own comment says Chromium does not fire the `online`/`offline` events itself,
+which left open whether it changes the renderer's state at all. It does.
+
+The one state this repository already knows can produce "in the ledger and still queued" is
+the one §14's own comment names: *a reply lost after the row was written*. Nothing in §13
+should be able to issue that request. Twelve contended runs and two clean ones have not
+reproduced it. So it is an open row, not a closed one.
+
+### The three assertions now state their properties
+
+Each change replaces a proxy with the thing it stood for:
+
+- **The ledger is snapshotted before the sync and the assertion is the delta** — "pressing Sync
+  as the other rep adds nothing of hers" — narrowed to her rows, because the other device is
+  live and online throughout the chapter and a whole-ledger count would be a claim about its
+  queue too.
+- **Her queued row's id is read before the sync**, and the misattribution property is asserted
+  directly. `upsert-by-device-id` makes that id the ledger's primary key, so "her row under his
+  name" is a question about one id and is caught however long ago the row arrived. That check is
+  EMPTY on a passing run, so it carries a guard on the guard: the id is asserted to *be* an id
+  first, since an `undefined` would match nothing and report clean for the same reason a broken
+  query does.
+- **§14 identifies the sender's transfer by rep and quantity**, not by quantity alone. That is
+  what turned one unexplained row into four wrong-looking assertions.
+
+And `ledgerMovements()` exists for the failure message rather than for an assertion: every
+movement with its `recorded_at` to the millisecond, printed on both sides of the sync.
+
+```
+ok: and pressing Sync as the other rep adds nothing of hers to the ledger (before:
+    [{"kind":"transfer_in","rep":"rep-grace","quantity":"3.000","at":"17:50:14.135",
+      "id":"01a19315-6025-7ac6-9437-ef89b9cbc0f4"}] / after: [ … the same row … ])
+ok: her record is never filed under the wrong name ([])
+```
+
+The question the next occurrence answers in one read — did the row arrive during this sync or
+minutes earlier — is the question `expected 0, got 1` could not answer either way.
+
+### The second race, reproduced under load and fixed
+
+The contended loop did not reproduce §13. It reproduced something else, on the fourth attempt:
+
+```
+FAIL: the rep is told where their own signals go (Where your notifications are emailed
+      Nowhere. Everything this app tells you is in the list above and nothing is emailed )
+      — expected true, got false
+FAIL: and the "nowhere" wording is gone now that there is somewhere — expected false, got true
+```
+
+The address had been written — `notifyAddressRows()` showed it, the heading moved to
+`Notification addresses (1/2)`, and the rep left the to-do list, all on the same run. What was
+stale was one section of one snapshot.
+
+`setNotifyAddress` sets its confirmation message and then awaits `refreshReference()` **without
+rendering in between**, so that sentence reaches the screen on whichever render comes first.
+Any concurrent render will do — and this chapter dispatches an `online` event a few lines
+earlier, which starts a drain whose `state.syncing = true; render()` paints the message while
+the refresh is still in flight. The gate read the section at that instant, and "Nowhere.
+Everything this app tells you is in the list above" was a true statement about that snapshot
+and a false one about the tenant.
+
+The app is not at fault: it does refresh, and the administrator's assertions after this one
+passed on the same run, which is what shows it. The gate now polls the section for the address
+instead of reading it once — the same correction §14 already carries in its own words: "Polled
+on the SCREEN, not on the store. The queue is written before the render that reflects it, so a
+loop that waits for IndexedDB to be empty and then reads the DOM is racing a repaint."
+
+### The third race, and the thing that made it unreadable
+
+Attempt five of the same loop died differently — not a failed assertion but a dead run:
+
+```
+Error: timed out waiting for the missing-signature refusal (last value: false)
+    at Object.waitFor (scripts/client/cdp.mjs:245)
+    at async main (scripts/client/drive-app.mjs:567)
+```
+
+`last value: false` is a true statement about the expression and tells nobody anything. Every
+one of this gate's forty-odd waits is for a **sentence the app was supposed to show**, so the
+useful fact is which sentence it showed instead — and that decides between the two possible
+causes, which want opposite fixes: the message never appeared (the click went somewhere else,
+or an earlier refusal fired first) or it appeared and a later render replaced it.
+
+So `waitFor` now reads the screen after the loop and says so. The app's own message bar first,
+because that is where a refusal goes, then a window of the body; normalised, truncated, and
+wrapped so that a page which throws while being inspected reports *that* rather than replacing
+the timeout with a different error. Read after the loop, so a passing run pays nothing. Proven
+against a page that says the wrong thing on purpose:
+
+```
+timed out after 1s waiting for the missing-signature refusal (last value: false);
+the screen said {"message":"Type a quantity first.","body":"Type a quantity first.rest of…"}
+```
+
+That is the difference between a diagnosis and another loop. The timeout itself is **not**
+"fixed": its cause is one of the two above and the gate could not say which, which is the
+same position as §13 and recorded the same way.

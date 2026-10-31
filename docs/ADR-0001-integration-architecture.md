@@ -3090,6 +3090,83 @@ Concretely, and these specifics are the decision, not commentary on it:
     fails and says why is a gate, not a mystery — so the row goes from *watched* to closed, and the
     §6 cause it could not confirm stays recorded in case it ever returns.
 
+49. **Two races in the browser gate: one reproduced and fixed, one instrumented and left open.**
+    The run after item 48 went red in `field-client` with six failures, and the annotations item
+    48 (c) closed its row on did their job — every one arrived as a sentence. What they said is
+    that the gate asserts ABSOLUTE STATE in three places where the property is a TRANSITION, and
+    that is a defect in the gate rather than in the app.
+
+    **(a) The rep's own notification line was read from a snapshot the confirmation does not
+    certify — reproduced under load and fixed.** `setNotifyAddress` sets its "Set. Signals your
+    tenant sends by email now reach that person" message and then awaits `refreshReference()`
+    *without rendering in between*, so that sentence reaches the screen on whichever render comes
+    first. Any concurrent render will do, and this chapter dispatches an `online` event a few
+    lines earlier, which starts a drain whose `state.syncing = true; render()` paints the message
+    while the refresh is still in flight. The section then still reads "Nowhere. Everything this
+    app tells you is in the list above" — true of that snapshot, false of the tenant.
+    Reproduced on the fourth attempt of a loop run with six spinners on four cores, where the
+    administrator's own assertions on the SAME run passed (`Notification addresses (1/2)`), which
+    is what shows the app refreshes and the gate was early. It now polls the section for the
+    address instead of reading it once.
+
+    **(b) A transfer of Grace's reached the ledger in CI by a path no local run reproduces, and
+    the attribution was RIGHT.** The row the gate found was `transfer_out`, quantity 1.000,
+    attributed to **rep-grace**. `POST /v1/samples/transfers` takes the sender from
+    `ctx.principal.repProfileId` and from nowhere else, so that record went out under Grace's own
+    credentials — the misattribution this chapter is named for did NOT happen. Her device still
+    held the row, `pending`, `attempts: 0`, and the screen said "Held for another sign-in", so
+    Ada's sync had not touched it either. What failed was an assertion reading
+    `transferRows().filter(rep === "rep-grace").length === 0`: a claim about the whole run
+    standing in for a claim about one sync.
+
+    How the row got out is **not established** and is recorded as open rather than guessed at.
+    Twelve contended runs of the gate — six spinners on four cores — and two clean ones did
+    not reproduce it. The code
+    says it should be impossible: §13 goes offline before Grace saves, `drain()` returns early
+    when `state.online` is false, and a probe confirmed that this harness's
+    `Network.emulateNetworkConditions` does make `navigator.onLine` false and keeps it false
+    across a navigation — so the page that re-boots mid-chapter boots offline too. The one state
+    the repository already knows can produce "in the ledger and still queued" is the one §14's
+    own comment names: a reply lost after the row was written. Nothing in §13 should be able to
+    issue that request.
+
+    **So the assertions now state the properties, and the next occurrence carries the fact the
+    last one could not.** Three changes, each replacing a proxy with the thing it stood for:
+
+    - The ledger is snapshotted BEFORE Ada's sync and the assertion is the **delta** — "pressing
+      Sync as the other rep adds nothing of hers" — narrowed to her rows, because Ada's device is
+      live throughout the chapter and a whole-ledger count would be a claim about her colleague's
+      queue too.
+    - Her queued row's **id** is read before the sync, and the misattribution property is asserted
+      directly: `upsert-by-device-id` makes that id the ledger's primary key, so a row of hers
+      filed under ADA's name is a question about one id and is caught however long ago it arrived.
+      That check is EMPTY in the passing case, so it carries a guard on the guard — the id is
+      asserted to be an id first, since an `undefined` would match nothing and report clean for
+      the same reason a broken query does.
+    - §14 identifies Ada's transfer by **sender and quantity** rather than by quantity alone. That
+      is what turned one unexplained row into four wrong-looking assertions: `sentAgain[0]` picked
+      the earlier 1.000 row, which was Grace's, and the recall's id comparison then reported a
+      mismatch that said nothing about recalls.
+
+    And `ledgerMovements()` exists for the failure message rather than for an assertion: every
+    movement with its `recorded_at` to the millisecond, printed on both sides of the sync. The
+    question the next occurrence will answer in one read — did the row arrive during this sync or
+    minutes earlier — is the question `expected 0, got 1` could not answer either way.
+
+    **(c) And a third race, found by the same loop, which was unreadable for a reason worth
+    fixing once.** Attempt five died rather than failed:
+    `timed out waiting for the missing-signature refusal (last value: false)`. That is a true
+    statement about the expression and tells nobody anything — and every one of this gate's
+    waits is for a SENTENCE the app was supposed to show, so the useful fact is which sentence
+    it showed instead. It decides between the two candidate causes, which want opposite fixes:
+    the message never appeared (the click reached a different refusal first), or it appeared and
+    a later render replaced it. `waitFor` now reads the screen after its loop and reports the
+    app's own message bar plus a window of the body, wrapped so a page that throws while being
+    inspected says that rather than replacing the timeout with a different error, and read
+    after the loop so a passing run pays nothing. Proven against a page that says the wrong
+    thing on purpose: *"the screen said {"message":"Type a quantity first.", …}"*. The timeout
+    itself is NOT fixed, and is recorded the same way as (b).
+
     **Verified.** 106 files / 2,699 tests, and the two corrections above were both found by that
     full run rather than by reading — the single-file run passed with the unrunnable index and the
     unsatisfiable plan premise still in place. `pnpm typecheck` green as one command (packages and
@@ -3469,6 +3546,8 @@ commit.
 | **A channel with no sender in the running process now RETRIES rather than dead-letters**, which is right (a missing sender is a fact about the binary, not the destination, and the notification is deliverable the moment a process that has the channel takes a tick) and bounded (`markRetry` gives up at `MAX_ATTEMPTS`). But it means a channel nobody ever registers burns five attempts per delivery before dead-lettering, and nothing warns an operator that their endpoint's channel is unsendable until the first delivery is already late. A boot-time check against the distinct channels in `crm.notification_endpoint` would say it once, at the right moment. | Platform | _set a date_ |
 | **The CRM's idempotency guarantee rests on the ERP leaking a driver message to clients.** A redelivery of a write that already landed must read as success, or the relay retries to the cap and raises `erp_write_failed` at a rep for a write that is fine. The live server answers a duplicate record id `500 {"error":"write_failed","detail":"duplicate key value violates unique constraint …"}` — `handlers.ts` forwards `e.message` verbatim — which normalises to `unavailable`, not `conflict`, so `classify`'s own conflict branch never fires and only the `ALREADY_EXISTS` regex over `detail` saves it. Pinned in both directions by the live gate: with the driver text, `already_delivered`; same status and code with the text removed, `retry_transient`. **If the platform ever stops leaking that string — which it should — this breaks silently and in the expensive direction.** Closing it means asking for a stable error code, or having the relay re-`GET` the target record on an ambiguous 500; the second is a design change, not a defect fix, so it is a decision rather than a task. | Platform + us | _set a date_ |
 | **The ERP's JWT-vs-header tenant cross-check is conditional on the claim being present** (item 10's correction). A validly signed token with no usable `tenant_id` claim is accepted with `x-tenant-id` alone selecting the tenant, so one signing key plus a header reads any tenant. ERP-side defect, reported and deliberately not fixed — `/home/user/CrossEngin` is read-only this phase. We are not exposed because `mintServiceToken` refuses a non-UUID tenant, which means that check is now a security control and must be treated as one. | Platform | _set a date_ |
+| **One `waitFor` in the browser gate times out under load and the cause is one of two.** Attempt five of the contended loop died at "the missing-signature refusal" — either the message never appeared, because the click reached an earlier refusal first, or it appeared and a later render replaced it, and those want opposite fixes. Not reproduced in the seven attempts either side of it. Item 49 (c) made every `waitFor` timeout in this gate report the app's own message bar and a window of the body, so the next one names which. Left open rather than guessed at, and deliberately NOT papered over with a larger timeout: more seconds help only one of the two causes, and nothing yet says which. | us | _recurrence will now carry the sentence on screen_ |
+| **A transfer reached the ledger in CI from a device that should have had no network, and no local run reproduces it.** `field-client` §13 found a `transfer_out` of Grace's in `crm.sample_transaction` while her device still held the row `pending` with `attempts: 0` and her colleague's session was correctly refusing to send it. The ATTRIBUTION was right — the row is hers, and the route takes the sender from the token alone — so this is not the misattribution the chapter guards, and item 49 (b) replaced the absolute assertion with the delta and the by-id check. What is unexplained is how the request left a page that had gone offline before the row existed: `drain()` returns early with `state.online` false, and a probe confirmed the harness's offline emulation sets `navigator.onLine` false and holds it across the navigation that chapter performs. Fourteen runs here (two clean and twelve with six spinners on four cores) have not reproduced it. Recorded rather than closed, and recorded rather than re-run: the gate now prints every movement with `recorded_at` to the millisecond on both sides of the sync, so a recurrence says whether the row arrived during that sync or earlier — which is the fact that decides between a lost reply and something worse. | us | _recurrence will now carry its timestamp_ |
 | **A replay resolves three different ways depending on timing, and the ADR names only one.** Within one ERP process lifetime the same `Idempotency-Key` returns `201` with an **empty body** (the gateway's in-memory store), so `ErpClient` returns null and `erp_response` is stored null; after a restart the same replay hits the unique violation above; and a genuine first delivery returns the record. All three are handled, none is wrong, and nothing documented that there were three. **Extended 2026-10-05:** that store answers a FAILURE the same way — status without body — which is how a revived row's second refusal became `unrecognised_error_shape` instead of the ERP's sentence (item 6's correction). A key per episode means a revive no longer takes the first path; a retry inside one episode still does, deliberately. | Platform | _set a date_ |
 | **A non-string `detail` fails both error parses.** `invalid_settings` puts an array in `detail`, which satisfies neither `HandlerErrorSchema` nor the problem-details shape, so it normalises to `unrecognised_error_shape` — which classifies as a transient retry and would burn the attempt cap. Unreachable from the outbox today (no outbox operation can provoke it), which is why the mapper was not widened on an unverified path. Worth closing the moment anything can reach it. | Platform | _set a date_ |
 | **`WhtCertificate` is routed by the ERP with empty `access` lists on all five operations**, so no role can reach it and it 403s to everybody. Found while asserting that all 51 declared slugs route. ERP-side, reported not acted on. It matters to us only if withholding-tax certificates ever enter the CRM's read set; recorded so nobody debugs it twice. | Platform | _set a date_ |

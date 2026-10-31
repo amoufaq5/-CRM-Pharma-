@@ -86,6 +86,29 @@ const READ_OUTBOX = `
   const rows = await new Promise((res) => { const t = db.transaction("outbox", "readonly").objectStore("outbox").getAll(); t.onsuccess = () => res(t.result); });`;
 
 /**
+ * Every custody movement with WHEN it was recorded, for a failure message rather than an
+ * assertion.
+ *
+ * `transferRows` answers "what is in the ledger"; this answers "and when did it get there",
+ * which is the one fact a run cannot reconstruct afterwards. CI once reported a transfer of
+ * Grace's in the ledger that fourteen local runs have not reproduced — twelve of them with
+ * six spinners on four cores — and the whole
+ * diagnosis turned on whether it arrived during the sync under test or minutes earlier —
+ * a question the assertion's `expected 0, got 1` could not answer either way.
+ */
+function ledgerMovements() {
+  const out = sql(
+    `SELECT t.kind, r.subject, t.quantity, to_char(t.recorded_at, 'HH24:MI:SS.MS'), t.id
+       FROM crm.sample_transaction t JOIN crm.rep_profile r ON r.id = t.rep_profile_id
+      WHERE t.tenant_id = '${tenant}' ORDER BY t.recorded_at, t.id`,
+  );
+  return out === "" ? [] : out.split("\n").map((line) => {
+    const [kind, rep, quantity, at, id] = line.split("|");
+    return { kind, rep, quantity, at, id };
+  });
+}
+
+/**
  * The transfer side of the ledger, joined to the names a transfer is about.
  *
  * Joined here rather than asserted on ids because the ids are minted by the device and
@@ -787,15 +810,51 @@ async function main() {
       await grace.offline(false);
       await grace.waitFor(`/Held for another sign-in/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the held notice" });
       ok("and once it can ask, it says plainly that it is holding somebody else's record");
+      // NAMED BEFORE THE SYNC, because every assertion below is about what that sync DID and
+      // an absolute count cannot say that. `upsert-by-device-id` means the id this row carries
+      // is the ledger's primary key too, so "her row, under Ada's name" is a question about one
+      // id rather than about a total — which is the misattribution this chapter exists to catch,
+      // stated directly instead of through a proxy that assumes nothing of hers was ever sent.
+      const hers = await grace.evaluate(`${READ_OUTBOX}
+        return rows.map((r) => ({ id: r.id, kind: r.kind, state: r.state, attempts: r.attempts }));`);
+      is(hers.length, 1, "exactly one row of hers is on this device before the other rep syncs");
+      const herRowId = hers[0]?.id ?? null;
+      // THE GUARD ON THE GUARD. The by-id check below is EMPTY in the passing case — her row
+      // never reaches the ledger — so a `herRowId` of `undefined` would match nothing and the
+      // assertion would report a clean result for the same reason a broken query does. The id
+      // is checked for being an id first, which is what makes the empty answer mean something.
+      is(typeof herRowId === "string" && /^[0-9a-f-]{36}$/.test(herRowId), true,
+        `and the id those assertions look for is a real one rather than an undefined that matches nothing (${String(herRowId)})`);
+      // Hers alone: Ada's device is live and online throughout this chapter, so a whole-ledger
+      // count would be a claim about her colleague's queue as well and could move for reasons
+      // this section is not about. A row of hers filed under ADA's name is caught by id below,
+      // not by this count, which is why narrowing it loses nothing.
+      const beforeSync = ledgerMovements().filter((m) => m.rep === "rep-grace");
+
       await grace.click("#sync");
       await grace.waitFor(`/will not send|Nothing to send|sent/.test(document.body.textContent ?? "")`, { timeoutMs: 20_000, label: "the sync verdict" });
-      // The proof is in the database, not on the screen: Grace's transfer is still the
-      // only one she never sent, and no transfer_out exists from her.
-      is(transferRows().filter((r) => r.rep === "rep-grace").length, 0,
-        "and pressing Sync as the other rep sends nothing of hers — the row is held, not filed under the wrong name");
-      const stillQueued = await grace.evaluate(`
-        const db = await new Promise((res) => { const r = indexedDB.open("crm-field", 1); r.onsuccess = () => res(r.result); });
-        const rows = await new Promise((res) => { const t = db.transaction("outbox", "readonly").objectStore("outbox").getAll(); t.onsuccess = () => res(t.result); });
+
+      // THE PROPERTY, in two halves, and both are about the sync rather than about the run.
+      //
+      // First: nothing arrived while Ada pressed Sync. A count taken only afterwards cannot
+      // tell a row this sync sent from one that was already there — and CI reported exactly
+      // that ambiguity once, with a transfer of Grace's in the ledger ATTRIBUTED TO GRACE,
+      // which means it went out under her own credentials and not Ada's. The chapter's
+      // property held; the assertion standing in for it did not, because it asserted an
+      // absolute state. Fourteen local runs, twelve of them contended, have not reproduced the
+      // arrival, so the cause is not established and the delta is what the gate asserts now.
+      const everything = ledgerMovements();
+      const afterSync = everything.filter((m) => m.rep === "rep-grace");
+      is(afterSync.length, beforeSync.length,
+        `and pressing Sync as the other rep adds nothing of hers to the ledger (before: ${JSON.stringify(beforeSync)} / after: ${JSON.stringify(afterSync)})`);
+      // Second: if her row IS in the ledger, it is hers. This is the half that cannot be
+      // satisfied by luck — a row filed under ADA's name carries Grace's device id and would
+      // be found here no matter when it arrived, which is the failure the chapter is named for.
+      const filedAs = everything.filter((m) => m.id === herRowId);
+      is(filedAs.filter((m) => m.rep !== "rep-grace"), [],
+        `her record is never filed under the wrong name (${JSON.stringify(filedAs)})`);
+
+      const stillQueued = await grace.evaluate(`${READ_OUTBOX}
         return rows.map((r) => ({ kind: r.kind, state: r.state, attempts: r.attempts }));`);
       is(stillQueued.length, 1, "her record is still on the device");
       is(stillQueued[0]?.state, "pending", "pending, not refused — there is nothing wrong with it");
@@ -846,7 +905,11 @@ async function main() {
     is(atRecall.unsend, false,
       `and it is no longer offered as a cancel (queue: ${JSON.stringify(atRecall.queue)})`);
     is(atRecall.recall, true, "while the recall stays on offer, because the server is the one holding it now");
-    const sentAgain = transferRows().filter((r) => r.quantity === "1.000");
+    // BY SENDER AND QUANTITY, not quantity alone. Ada is the only rep whose transfers this
+    // section is about, and a stray 1.000 from anybody else would otherwise be picked as
+    // `sentAgain[0]` and compared against the id the recall below names — which is how one CI
+    // failure turned a single unexplained row into four assertions reading as wrong.
+    const sentAgain = transferRows().filter((r) => r.quantity === "1.000" && r.rep === "rep-ada");
     is(sentAgain.length, 1, "the second transfer is in the ledger, which is why it can only be recalled");
 
     // Decided with no signal, like everything else a rep decides. The recall is queued
@@ -2015,9 +2078,24 @@ async function main() {
 
     // THE REP'S OWN LINE, which is the half an administrator cannot see. Any rep may ask, and
     // the id comes from the token, so there is nobody else to name.
-    const mine = await page.evaluate(`
-      const h = [...document.querySelectorAll("h2")].find((x) => /Where your notifications are emailed/.test(x.textContent ?? ""));
-      return h?.parentElement?.textContent?.replace(/\\s+/g, " ").trim() ?? null;`);
+    //
+    // POLLED, because the confirmation above does not certify this section. `setNotifyAddress`
+    // sets the message and then awaits `refreshReference()` WITHOUT rendering in between, so
+    // the sentence reaches the screen on whichever render comes first — and any concurrent
+    // render will do, including the one `drain()` performs when it sets `syncing` (this chapter
+    // dispatches an `online` event a few lines above, which starts exactly that drain). Under
+    // CPU contention that render lands before the refresh and this section still reads
+    // "Nowhere", which is a true statement about a snapshot and a false one about the tenant.
+    // Reproduced four attempts into a contended loop, and the app is not at fault: it refreshes,
+    // and the assertions after this one — the count moving to 1/2 — were passing on the same run.
+    let mine = null;
+    for (let i = 0; i < 100; i += 1) {
+      mine = await page.evaluate(`
+        const h = [...document.querySelectorAll("h2")].find((x) => /Where your notifications are emailed/.test(x.textContent ?? ""));
+        return h?.parentElement?.textContent?.replace(/\\s+/g, " ").trim() ?? null;`);
+      if (/ada\.lovelace@field\.example\.test/.test(String(mine))) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
     is(/ada\.lovelace@field\.example\.test/.test(String(mine)), true,
       `the rep is told where their own signals go (${String(mine).slice(0, 120)})`);
     is(/cannot set your own/.test(String(mine)), false,
