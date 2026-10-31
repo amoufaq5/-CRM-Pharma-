@@ -479,6 +479,53 @@ describe("scheduler against a real database", () => {
     // unhealthy one, and a zero that is always there is a zero nobody sees.
     expect(cleanLine.detail).not.toContain("LOST");
     expect(cleanLine.detail).toContain("claimed=3");
+    // And nothing about settlements while they are all ordinary, for the same reason (0076).
+    expect(cleanLine.detail).not.toContain("settled=");
+  });
+
+  /**
+   * AND THE SETTLEMENT MECHANISMS REACH THE LINE (0076), which is the whole point of recording
+   * them: `crm.outbox.settled_by` answers "is this deployment's idempotency guarantee resting on
+   * a driver message the ERP never promised to keep", and a column nobody reads answers nothing.
+   *
+   * Driven from the relay's result rather than from real rows, because what is under test here
+   * is the LINE. `settled-by.contract.test.ts` is where the counts themselves are asserted
+   * against a real database, per tenant and under row security.
+   */
+  it("names how deliveries were settled when any of them was not simply accepted", async () => {
+    const withSettlements = (settlements: ReadonlyMap<string, number>) =>
+      ({
+        drainTenant: async () => ({
+          claimed: 1,
+          delivered: 1,
+          retried: 0,
+          dead: 0,
+          alarmed: 0,
+          unattributed: 0,
+          settleLost: 0,
+          settlements,
+          lag: { pending: 0, inFlight: 0, dead: 0, oldestPendingAgeSeconds: null },
+        }),
+      }) as unknown as OutboxRelay;
+    const { refresher } = stubRefresher();
+
+    await withTenantContext(admin, TENANT, (tx) =>
+      tx.query("UPDATE crm.scheduled_job SET next_run_at = now() - interval '1 minute' WHERE tenant_id = $1", [TENANT]),
+    );
+    const events: SchedulerEvent[] = [];
+    await new Scheduler({
+      pool: p,
+      relay: withSettlements(new Map([["read_back", 3], ["duplicate_key_text", 1]])),
+      refresher,
+      random: () => 0.5,
+      onEvent: (e) => events.push(e),
+    }).tick();
+    const line = events.find(
+      (e) => e.type === "job_ok" && e.job === "relay_drain" && e.tenantId === TENANT,
+    ) as { detail: string };
+    // Sorted, so two runs of the same deployment produce comparable lines rather than lines
+    // whose order depends on which mechanism the map happened to see first.
+    expect(line.detail).toContain("settled=duplicate_key_text:1,read_back:3");
   });
 
   /**
