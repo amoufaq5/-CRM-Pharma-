@@ -38,11 +38,13 @@ export {
   canonicalAttestationManifest,
   computeContentManifestSha256,
   computeProofSha256,
+  describeUncoveredBackend,
   newCrmTombstoneId,
   verifyTombstone,
   type AttestationOutcome,
   type CrmTombstone,
   type TableAttestation,
+  type UncoveredStorageBackend,
 } from "./tombstone.js";
 
 export { eraseDeleteOrder } from "./plan.js";

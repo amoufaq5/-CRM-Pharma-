@@ -1247,6 +1247,34 @@ moments and the figures are what a tombstone will eventually commit to by hash. 
 tables are deliberately **not** counted: putting "crm.visit: 4,312 rows" in front of somebody
 invites the decision this register exists to collect from a lawyer.
 
+**And the completeness claim now reaches one place that is not a table** (0074). Everything
+above derives from `pg_catalog`, which is complete about Postgres and says nothing about a
+bucket. `crm.attachment_blob` holds the attachment bytes today — a doctor's signature, a
+photographed receipt — so erasing that table really does destroy them and the attestation is
+honest; the moment they move to object storage, the register stops being complete and nothing
+would say so. So `crm.attachment.storage_backend` is no longer a `CHECK` with one value in it
+but a **reference to a registry**, and every row in that registry must declare exactly one of
+two things: the `crm` table whose attestation destroys its bytes, or the subsystem it owes an
+attestation of its own under. Never neither — that is a gap wearing a declaration — and never
+both, because two different things cannot have destroyed the same bytes.
+
+`crm.uncovered_storage_backends(tenant)` then derives the gap from the tenant's **own**
+attachment rows, and an uncovered backend refuses the plan *and* refuses
+`assembleTombstone` — before anything is deleted, and again before anything is signed. It
+**refuses rather than answering zero** when the tenant's context is missing or names somebody
+else: every row it counts is under FORCE row-level security, so "I could not look" would
+otherwise read as "there is nothing there", which here is a signed receipt that is silent
+about the most sensitive data in the system.
+
+What is deliberately **not** built is the subsystem attestation format. The field that matters
+in it — what the object store destroyed — can only be written by something that can destroy
+objects, and a record shape with no producer is the "built and unreachable" failure this
+repository has had to admit to four times. The guard is what makes the format unavoidable the
+day a bucket appears: the first deployment to register an object store cannot sign a receipt
+until somebody writes it. What the guard still cannot see is an object left in a bucket with no
+attachment row — the orphan 0033's own header predicts an S3 store will produce — which is the
+sweeper that header already asked for, named again so this is not mistaken for covering it.
+
 The three retained today are `expense_claim` (`financial_transactions_7y` — the case 0050's
 header named), and `tenant` plus `tenant_deletion_check`, both `deletion_evidence`, because
 erasing them would destroy the only CRM-side proof that the deletion was observed and acted

@@ -4075,3 +4075,141 @@ the screen said {"message":"Type a quantity first.","body":"Type a quantity firs
 That is the difference between a diagnosis and another loop. The timeout itself is **not**
 "fixed": its cause is one of the two above and the gate could not say which, which is the
 same position as §13 and recorded the same way.
+
+## The bytes that are not a table
+
+*2026-10-31, migration 0074 against a real Postgres 16 over TCP with scram: all 74 migrations
+applied through the runner on a fresh database, `npx vitest run` (109 files / 2,711 tests),
+`pnpm typecheck`, and `pnpm client:verify` (334 checks) on a database built from nothing.*
+
+ADR-0001 carried a row saying the erasure receipt is complete about 41 **tables** and would go
+silent about an object store the moment one existed, because `crm.undeclared_tenant_tables()`
+enumerates `pg_catalog` and a bucket is not a table. The row asked for a subsystem attestation
+*and* the guard that refuses a tombstone while it is missing. This is the guard.
+
+### The column stopped being a list
+
+`CHECK (storage_backend IN ('postgres'))` was the right thing to write in 0033 and the wrong
+thing to keep: widening it is a one-word edit nothing would make anybody think about. It is now
+a reference into `crm.attachment_storage_backend`, whose own CHECK demands exactly one of two
+answers per row, and refuses both the other outcomes by constraint name:
+
+```
+INSERT … ('probe_neither', note, declared_by)           → attachment_storage_backend_covered_xor_subsystem
+INSERT … ('probe_both', 'attachment_blob', 'object_storage', …) → the same constraint
+```
+
+and a trigger refuses a covering table that could not do the covering:
+
+```
+ERROR: storage-backend-unknown-table: there is no table crm.no_such_table — a backend claiming
+       to be covered by a table that does not exist is a gap wearing a declaration
+ERROR: storage-backend-not-tenant-scoped: crm.data_disposition has no tenant_id, so erasing a
+       tenant does not erase anything in it and it cannot cover a backend
+```
+
+That second probe names `crm.data_disposition` and the first draft named `crm.tenant`, which is
+the mistake worth recording: the tenant registry is keyed **by** `tenant_id`, so it passes a
+column check while being just as unerasable. A platform table is not "a table without the word
+tenant in it".
+
+And the reference is enforced, which is the half that matters:
+
+```
+INSERT INTO crm.attachment (… storage_backend 's3_unregistered' …)
+  → 23503, attachment_storage_backend_fkey
+```
+
+Enforcement, not validation. The migration records the distinction rather than discovering it:
+this ran as `crm_app`, which **owns** `crm.attachment`, and 0027 established that a foreign
+key's bulk validation scan is confined by row security — so with no tenant context the scan saw
+nothing and the constraint was accepted on a vacuous pass. It is safe here for a reason that
+will not hold next time: the CHECK being dropped allowed exactly one value, so no row could have
+failed. The refusal above is a different mechanism and is not confined.
+
+### The gap is derived, and the function refuses rather than answering zero
+
+```
+SELECT * FROM crm.uncovered_storage_backends('f474…0037');
+ERROR:  storage-backend-scan-unscoped: asked about tenant f474…0037 while app.current_tenant_id
+        is unset. Every row this counts is under FORCE row-level security, so the answer without
+        the context is ZERO uncovered backends — which is not an error, it is a signed receipt
+        that is silent about the bytes.
+```
+
+0066's `unverifiable`, 0067's `self_test_failed` and 0073's refusal, in a fourth place. It
+refuses an unset context *and* a context naming a different tenant, which is the subtler
+version: the context is set, nothing looks wrong, and every row the count reaches belongs to
+somebody else.
+
+With a probe subsystem backend registered inside a transaction that rolls back, and one
+attachment naming it:
+
+```
+ backend        | reason            | subsystem      | objects
+----------------+-------------------+----------------+---------
+ objstore_probe | no_covering_table | object_storage |       1
+```
+
+the plan becomes unactionable and says so in the words an operator has to act on — "objstore_probe
+holds 1 of this tenant's attachment(s) and nothing in Postgres destroys its objects, so the
+object_storage it belongs to owes an attestation of its own… a bucket is not a table" — and
+`assembleTombstone` refuses the same case independently, before anything is signed.
+
+The second reason is the one nothing else would have noticed. Mark `crm.attachment_blob` a
+receipt store — one column, which 0054 excludes from every receipt's scope — and `postgres` stops
+being covered: the bytes are still destroyed, but no attestation in the receipt says so.
+
+```
+ backend  | reason
+----------+-----------------------------
+ postgres | covering_table_not_in_scope
+```
+
+### Four things the probes taught, all of them by failing
+
+- **`seq` is `GENERATED ALWAYS`.** The first probe supplied it and got `428C9`, which replaced the
+  `23503` the test was written to assert. A probe that supplies a column it should not is a probe
+  asserting the wrong error.
+- **`attachment_purpose_subject` wants `crm.expense_claim`, not `expense_claim`.** The subject
+  table is stored schema-qualified.
+- **`uploaded_by` is a real reference.** A probe cannot invent an uploader, so the suite commits
+  one rep and attributes every planted attachment to it.
+- **The triggers cannot be re-enabled in the same transaction.** `crm.attachment` carries a
+  `DEFERRABLE INITIALLY DEFERRED` self-reference, so after an INSERT the transaction has pending
+  trigger events and `ALTER TABLE … ENABLE TRIGGER` is refused outright. `DISABLE TRIGGER` is
+  transactional, so the rollback is what restores them — and the suite's last test asserts that
+  from `pg_trigger` rather than trusting it, because triggers left off would stop
+  `crm.attachment` validating its subject and being append-only for every suite that runs after,
+  a failure nobody would trace back here. The first version also wrapped the re-enable in a
+  `finally`, which ran inside an aborted transaction on the probe that is *supposed* to fail,
+  raised `25P02`, and swallowed the refusal on its way out. Savepoints now isolate each probe.
+
+### And three of this repository's own guards failed on it
+
+That is the part worth keeping. `schema.contract.test.ts` refused the new platform table until it
+was argued for in `PLATFORM_WIDE`. `subject-coverage.contract.test.ts` refused the removal of the
+CHECK it was asserting — and now asserts the **registry** against `ATTACHMENT_STORAGE_BACKENDS`,
+which is a stronger coupling than before: a backend registered in SQL with no `BlobStore` behind
+it is a value an attachment row could carry and nothing could read, which is rule 29's "a channel
+that cannot be constructed is not a channel" one subsystem over. And the one-migration-per-table
+grep matched `crm.attachment_storage_backend` by prefix, so it now asserts the creations **by
+name** rather than by count — a count can be satisfied by two creations of one table and none of
+another.
+
+### What is not built, and what the guard cannot see
+
+The subsystem attestation format is not built. The field that matters in it — what the object
+store destroyed — can only be written by something that can destroy objects, and a record shape
+with no producer is the built-and-unreachable failure this repository has recorded four times. A
+manifest `v3` whose only possible content today is "postgres, covered by attachment_blob" would
+be a version bump carrying a fact the attestation list already implies. The guard is what makes
+the format unavoidable the day a bucket appears.
+
+And the gap is derived from `crm.attachment.storage_backend`, so it sees backends that this
+tenant's **surviving** rows name. An object left in a bucket with no attachment row — the orphan
+0033's own header predicts an S3 store will produce, since its object lands before the row and an
+aborted transaction leaves it behind — is invisible to this and to everything else in Postgres.
+That is the sweeper that header already asked for. A catalog test asserts `storage_backend` is
+the only column in `crm` naming a store, so the migration that adds a second one fails on the day
+it is written.

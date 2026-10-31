@@ -88,11 +88,40 @@ describe("attachment subject coverage", () => {
     );
   });
 
-  it("admits exactly the statuses and backends this package knows", async () => {
+  it("admits exactly the statuses this package knows", async () => {
     expect([...(await admitted("attachment_status_check"))].sort()).toEqual([...ATTACHMENT_STATUSES].sort());
-    expect([...(await admitted("attachment_storage_backend_check"))].sort()).toEqual(
-      [...ATTACHMENT_STORAGE_BACKENDS].sort(),
+  });
+
+  /**
+   * The backends come from a REGISTRY now, not a CHECK (0074), and the coupling is the point.
+   *
+   * `CHECK (storage_backend IN ('postgres'))` was a list, and widening it was a one-word edit
+   * nothing made anybody think about — which is how a byte ends up outside an erasure receipt.
+   * `crm.attachment.storage_backend` references `crm.attachment_storage_backend`, whose CHECK
+   * demands, for every row, either the table whose attestation destroys its bytes or the
+   * subsystem it owes one under.
+   *
+   * ASSERTED AGAINST THE TYPESCRIPT UNION ANYWAY, and the direction that matters is the new
+   * one: a backend registered in SQL with no `BlobStore` behind it would be a value an
+   * attachment row could carry and nothing could read — rule 29's "a channel that cannot be
+   * constructed is not a channel", one subsystem over. So registering a store means shipping
+   * one, and this test is what says so.
+   */
+  it("admits exactly the backends this package has a store for", async () => {
+    const { rows } = await client.query<{ backend: string }>(
+      "SELECT backend FROM crm.attachment_storage_backend ORDER BY backend",
     );
+    expect(rows, "the backend registry is empty, so this assertion would be vacuous").not.toHaveLength(0);
+    expect(rows.map((r) => r.backend)).toEqual([...ATTACHMENT_STORAGE_BACKENDS].sort());
+
+    // And the CHECK it replaced is gone rather than left beside it: two sources of truth for
+    // the same question is how one of them stops being true without anybody noticing.
+    const { rows: leftovers } = await client.query<{ conname: string }>(
+      `SELECT conname FROM pg_constraint
+        WHERE conrelid = 'crm.attachment'::regclass AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%storage_backend%'`,
+    );
+    expect(leftovers.map((r) => r.conname)).toEqual([]);
   });
 
   /**
@@ -307,7 +336,7 @@ describe("attachment subject coverage", () => {
    * two migrations creating `crm.attachment` would leave whichever ran second failing on a
    * fresh database, which is a failure nobody sees until CI builds one from nothing.
    */
-  it("is created by exactly one migration", () => {
+  it("creates each attachment table in exactly one migration", () => {
     // Was ripgrep; a GitHub runner has none (`spawnSync rg ENOENT`). `grepRepo` scans in
     // Node and, like `rg`, throws rather than returning nothing — which here would turn
     // "exactly one migration creates it" into "no migration mentions it, fine".
@@ -316,8 +345,22 @@ describe("attachment subject coverage", () => {
       dir: "db/migrations",
       pattern: /CREATE TABLE crm\.attachment/,
     });
-    expect(hits).toHaveLength(3);
-    for (const hit of hits) expect(hit).toMatch(/^db\/migrations\/0033_attachments\.sql:/);
+    // By NAME rather than by count, which is what the claim actually is: a second migration
+    // creating one of these would show up as a repeated name, where a count can be satisfied
+    // by two creations of one table and none of another. 0074 adds the backend registry, so
+    // the pattern — deliberately a prefix — now reaches two files.
+    const created = hits.map((hit) => /CREATE TABLE (crm\.\w+)/.exec(hit)?.[1] ?? hit);
+    expect([...created].sort()).toEqual([
+      "crm.attachment",
+      "crm.attachment_access",
+      "crm.attachment_blob",
+      "crm.attachment_storage_backend",
+    ]);
+    for (const hit of hits) {
+      expect(hit).toMatch(
+        /^db\/migrations\/(0033_attachments|0074_the_bytes_that_are_not_a_table)\.sql:/,
+      );
+    }
   });
 
   it("is reading the repository it is part of", () => {

@@ -234,6 +234,18 @@ describe("CRM schema invariants", () => {
         "the verdict of an erasure-receipt verification sweep (0067), which spans every tenant " +
         "and is read when the tenants it concerns no longer exist. Holds counts, version " +
         "cohorts and receipt ids — deliberately nothing from inside a receipt",
+      // 0074, and the same argument as `data_disposition` and `erp_reference_register` above:
+      // which STORE holds a kind of byte is a property of the deployment, identical for every
+      // tenant by construction. A per-tenant copy would be one row multiplied by every tenant,
+      // and the first time two disagreed one tenant's receipt would be silent about data the
+      // other's accounted for. It holds a backend name, a table name and a sentence — nothing
+      // for a policy to confine. And a tenant that could declare its own backends covered would
+      // be a tenant whose bytes are not accounted for, which is `four_eyes_rule`'s argument
+      // again.
+      attachment_storage_backend:
+        "which attachment storage backends exist and, for each, either the crm table whose " +
+        "attestation destroys its bytes or the subsystem it owes one under (0074). A statement " +
+        "about the deployment, and not relaxable by the tenants whose bytes it accounts for",
     };
     const { rows } = await client.query<{ relname: string }>(`
       SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

@@ -138,16 +138,27 @@ describe("PostgresBlobStore", () => {
 
   beforeEach(clear);
 
-  it("names the backend the metadata column records", async () => {
+  it("names a backend the registry has registered, and says who destroys its bytes", async () => {
     expect(store.backend).toBe("postgres");
-    const admitted = await inTenant(async (tx) => {
-      const { rows } = await tx.query<{ def: string }>(
-        `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
-          WHERE conrelid = 'crm.attachment'::regclass AND conname = 'attachment_storage_backend_check'`,
+    // 0074 replaced `CHECK (storage_backend IN ('postgres'))` with a reference to a registry,
+    // so the question this test asks is no longer "is the value admitted" but "is this store's
+    // backend declared, and declared as covered by a table rather than as a subsystem". The
+    // second half is what makes the erasure receipt honest about these bytes: `attachment_blob`
+    // is erased per tenant, and its attestation IS the statement about them.
+    const declared = await inTenant(async (tx) => {
+      const { rows } = await tx.query<{
+        erasure_covered_by_table: string | null;
+        subsystem: string | null;
+      }>(
+        `SELECT erasure_covered_by_table, subsystem FROM crm.attachment_storage_backend
+          WHERE backend = $1`,
+        [store.backend],
       );
-      return rows[0]?.def ?? "";
+      return rows[0] ?? null;
     });
-    expect(admitted).toContain(store.backend);
+    expect(declared, `${store.backend} is not in crm.attachment_storage_backend`).not.toBeNull();
+    expect(declared?.erasure_covered_by_table).toBe("attachment_blob");
+    expect(declared?.subsystem).toBeNull();
   });
 
   it("round-trips bytes unchanged", async () => {

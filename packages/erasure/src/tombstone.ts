@@ -35,6 +35,42 @@ export interface TableAttestation {
   readonly retainedReference?: string;
 }
 
+/**
+ * A place this tenant's attachment bytes are that no per-table attestation can speak for.
+ *
+ * Derived by `crm.uncovered_storage_backends` from the tenant's OWN attachment rows (0074),
+ * never from a list here: `crm.attachment.storage_backend` references a registry whose CHECK
+ * demands, for every backend, either the table whose attestation destroys its bytes or the
+ * subsystem it must attest under. One of the two, never neither.
+ *
+ * `postgres` is covered by `crm.attachment_blob`, so today this is always empty and the
+ * receipt is honest — which is exactly the state that makes the guard worth having before a
+ * bucket exists rather than after.
+ */
+export interface UncoveredStorageBackend {
+  readonly backend: string;
+  readonly reason: "no_covering_table" | "covering_table_not_in_scope";
+  /** The subsystem it owes an attestation under, when the registry names one. */
+  readonly subsystem: string | null;
+  /** How many of this tenant's attachments name it. At least 1, or it would not be reported. */
+  readonly objects: number;
+  /** The registry's own sentence, so a refusal reads as the declaration did. */
+  readonly note: string;
+}
+
+export function describeUncoveredBackend(b: UncoveredStorageBackend): string {
+  const where =
+    b.reason === "no_covering_table"
+      ? `nothing in Postgres destroys its objects, so the ${b.subsystem ?? "subsystem"} it belongs ` +
+        `to owes an attestation of its own`
+      : `the table the registry says covers it is not in this receipt's scope, so its attestation ` +
+        `cannot speak for these bytes`;
+  return (
+    `${b.backend} holds ${String(b.objects)} of this tenant's attachment(s) and ${where}. ` +
+    `Declared as: ${b.note}`
+  );
+}
+
 export interface CrmTombstone {
   readonly id: string;
   readonly tenantId: string;
@@ -225,6 +261,16 @@ export function assembleTombstone(input: {
   readonly approvedBy: string;
   readonly inScope: readonly string[];
   readonly attestations: readonly TableAttestation[];
+  /**
+   * Places this tenant's bytes are that no table in `inScope` can attest about (0074).
+   *
+   * REQUIRED, not optional with an empty default, and that is the whole point: a default
+   * would be a fail-OPEN default, and the one thing this field exists to prevent is a
+   * receipt assembled by a caller who never considered object storage. A new call site has
+   * to answer the question, which is the same reason `inScope` is passed in rather than
+   * derived here.
+   */
+  readonly uncoveredBackends: readonly UncoveredStorageBackend[];
   /** Receipt stores: tables this receipt may not speak about because it is them (0054). */
   readonly excludedTables?: readonly string[];
   readonly id?: string;
@@ -280,6 +326,27 @@ export function assembleTombstone(input: {
   }
 
   for (const a of input.attestations) assertAttestationWellFormed(a);
+
+  /**
+   * AND THE BYTES THAT ARE NOT A TABLE (0074). ADR-0317's rule one level out: the per-table
+   * attestations above are complete about the TABLES, and a receipt that is complete about
+   * the tables while silent about an object store is a correct proof of a false claim.
+   *
+   * Refused here as well as in the plan, and the duplication is deliberate for the reason
+   * `assertAttestationWellFormed` gives: the plan refuses before anything is deleted, which
+   * is where an operator wants to be told, and this refuses before anything is SIGNED, which
+   * is where a future second caller gets told. The two disagreeing is a bug somebody finds
+   * in a test rather than in a transaction that has already destroyed things.
+   */
+  if (input.uncoveredBackends.length > 0) {
+    throw new TombstoneInvalidError(
+      `${String(input.uncoveredBackends.length)} storage backend(s) hold this tenant's attachment ` +
+        `bytes and no table in scope attests about them: ` +
+        input.uncoveredBackends.map((b) => describeUncoveredBackend(b)).join(" | ") +
+        `. Refusing to sign a receipt that is complete about 41 tables and silent about the most ` +
+        `sensitive data in the system.`,
+    );
+  }
 
   const contentManifestSha256 = computeContentManifestSha256(
     input.attestations,

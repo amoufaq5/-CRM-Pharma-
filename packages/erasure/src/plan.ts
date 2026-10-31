@@ -2,6 +2,8 @@ import type { PoolClient } from "pg";
 import { withTenantContext } from "@crm/db";
 
 import type { Disposition, RetentionObligation } from "./obligations.js";
+import type { UncoveredStorageBackend } from "./tombstone.js";
+import { describeUncoveredBackend } from "./tombstone.js";
 
 /**
  * What would happen to every row this CRM holds for one tenant, and why.
@@ -58,7 +60,22 @@ export type PlanRefusal =
       readonly edges: readonly { child: string; parent: string; onDelete: string }[];
     }
   /** A cycle in the FK graph among the tables to erase, so no delete order exists. */
-  | { readonly kind: "cyclic_erase_order"; readonly tables: readonly string[] };
+  | { readonly kind: "cyclic_erase_order"; readonly tables: readonly string[] }
+  /**
+   * Bytes of this tenant's in a store no table in scope can speak for (0074).
+   *
+   * The register is complete about Postgres because `crm.undeclared_tenant_tables()`
+   * enumerates `pg_catalog`, and a bucket is not a table. So this asks the only question that
+   * reaches outside: which storage backends do this tenant's own attachment rows name, and is
+   * each one either destroyed by a table in this receipt's scope or owed an attestation
+   * nothing here can write? An uncovered backend refuses the plan rather than annotating it,
+   * because a receipt that is complete about the tables and silent about an object store is
+   * ADR-0317's "correct proof of a false claim" exactly.
+   */
+  | {
+      readonly kind: "uncovered_storage_backend";
+      readonly backends: readonly UncoveredStorageBackend[];
+    };
 
 export interface ErasurePlan {
   readonly tenantId: string;
@@ -93,6 +110,13 @@ export interface ErasurePlan {
    * transaction that signs an attestation about them is the one that writes their rows.
    */
   readonly excludedTables: readonly string[];
+  /**
+   * Carried on the plan so the EXECUTOR can hand it to `assembleTombstone` rather than
+   * re-asking. One snapshot, taken inside the transaction that does the deleting, which is
+   * the same rule the row counts follow: a figure taken at a different instant cannot be
+   * reconciled with the one the hash commits to.
+   */
+  readonly uncoveredBackends: readonly UncoveredStorageBackend[];
 }
 
 interface DispositionRow {
@@ -207,6 +231,33 @@ export async function planTenantErasureWithin(
   );
   if (orphans.length > 0) refusals.push({ kind: "orphaned", tables: orphans.map((r) => r.t) });
 
+  /**
+   * Asked INSIDE the tenant's context, which the assertion at the top of this function has
+   * already established — and the function itself refuses rather than answering zero if that
+   * is ever untrue, because under FORCE row-level security a caller who cannot see this
+   * tenant's attachments would be told there is nothing uncovered, which is the one wrong
+   * answer that lets a receipt be signed.
+   */
+  const { rows: uncovered } = await client.query<{
+    backend: string;
+    reason: UncoveredStorageBackend["reason"];
+    subsystem: string | null;
+    objects: string;
+    note: string;
+  }>("SELECT backend, reason, subsystem, objects, note FROM crm.uncovered_storage_backends($1)", [
+    tenantId,
+  ]);
+  const uncoveredBackends: UncoveredStorageBackend[] = uncovered.map((r) => ({
+    backend: r.backend,
+    reason: r.reason,
+    subsystem: r.subsystem,
+    objects: Number(r.objects),
+    note: r.note,
+  }));
+  if (uncoveredBackends.length > 0) {
+    refusals.push({ kind: "uncovered_storage_backend", backends: uncoveredBackends });
+  }
+
   const { rows: register } = await client.query<DispositionRow>(
     `SELECT table_name, disposition, obligation, obligation_note, retained_reference, question,
             is_receipt_store
@@ -278,6 +329,7 @@ export async function planTenantErasureWithin(
     eraseOrder,
     inScope: governed.map((r) => r.table_name),
     excludedTables,
+    uncoveredBackends,
   };
 }
 
@@ -349,5 +401,15 @@ export function describeRefusal(r: PlanRefusal): string {
       );
     case "cyclic_erase_order":
       return `the tables to erase contain a foreign-key cycle, so no delete order exists: ${r.tables.join(", ")}`;
+    case "uncovered_storage_backend":
+      return (
+        `${String(r.backends.length)} storage backend(s) hold this tenant's attachment bytes and no ` +
+        `table in scope attests about them: ` +
+        r.backends.map((b) => describeUncoveredBackend(b)).join(" | ") +
+        `. The register is complete about Postgres and a bucket is not a table, so a receipt ` +
+        `assembled now would be complete about every table and silent about these. Write the ` +
+        `subsystem attestation, or declare in crm.attachment_storage_backend which table ` +
+        `destroys these bytes.`
+      );
   }
 }

@@ -152,6 +152,10 @@ export async function executeTenantErasure(
       approvedBy: options.approvedBy,
       inScope: plan.inScope,
       attestations,
+      // From the PLAN, which took it inside this transaction, rather than re-asked here. The
+      // plan is actionable, so this is empty — and it is still passed, because the signing
+      // guard must be answered by whoever assembles a receipt and not by a default (0074).
+      uncoveredBackends: plan.uncoveredBackends,
       excludedTables: plan.excludedTables,
       id: newId(),
     });

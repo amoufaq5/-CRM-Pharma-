@@ -382,6 +382,19 @@ export const TENANT_ENDPOINT_CAP = "f2710000-0000-4000-8000-000000000035";
 export const TENANT_ENDPOINT_CAP_OTHER = "f3710000-0000-4000-8000-000000000036";
 
 /**
+ * packages/erasure — the storage-backend guard (migration 0074).
+ *
+ * Its own tenant because the guard's probes REGISTER A BACKEND, which is a platform-wide row
+ * with a primary key: two files doing that in parallel collide on the key rather than on data,
+ * and a file that shared a tenant with the plan suite would also change what that suite's plan
+ * refuses. Every probe here runs inside a transaction that rolls back, so the registry is a
+ * single seeded row again by the time anything else looks — which the file asserts rather than
+ * assumes, because an escaped probe row would make the next suite's plan refuse for a reason
+ * nobody wrote.
+ */
+export const TENANT_STORAGE_BACKEND = "f4740000-0000-4000-8000-000000000037";
+
+/**
  * A rep to attribute a fixture's configuration write to.
  *
  * Two rules need one. 0060 refuses a notification endpoint that names nobody, because adding

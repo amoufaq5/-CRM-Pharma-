@@ -41,6 +41,10 @@ const assemble = (over: Partial<Parameters<typeof assembleTombstone>[0]> = {}) =
     approvedBy: "compliance:bob",
     inScope: ["a_table", "b_table", "c_table"],
     attestations: [erased("a_table"), nothing("b_table"), retained("c_table")],
+    // The fixture's default, so every test below is about what it is about. 0074's guard has
+    // its own tests, and they pass a backend here rather than relying on a default that could
+    // drift to "empty" and take the guard with it.
+    uncoveredBackends: [],
     id: "crmtomb_00000000000000000000000000000001",
     ...over,
   });
