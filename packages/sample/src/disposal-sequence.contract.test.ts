@@ -418,6 +418,90 @@ describe("ordering two disposal obligations written in one transaction", () => {
       });
     });
 
+    /**
+     * AND THE ACCESS PATH CANNOT DECIDE IT EITHER, which is as close to the claim the removed
+     * version was reaching for as is deterministically reachable.
+     *
+     * ADR-0001 carried the retired attempt as an open row: "invariant under an arbitrary physical
+     * rearrangement" is not testable from inside a transaction, because an UPDATE relocates a
+     * tuple only when its page is full and that depends on whichever suite ran first. True, and
+     * it leaves a question a reader will ask — did anybody try making the PLAN vary instead of
+     * the heap? This is that. `crm.open_disposal_obligations` is a SQL function, so it inlines
+     * and `EXPLAIN` shows the real scans; `enable_seqscan` is a session knob, so two genuinely
+     * different plans can be produced inside one transaction with no DDL and nothing committed.
+     *
+     * The plans are compared as evidence rather than asserted as a premise. If a future
+     * arrangement cannot produce two different ones the test still holds — the answer is `seq`
+     * order under both — and the message carries the plans so the next reader can see which
+     * case they are in, rather than inheriting a premise that fails for its own reasons.
+     */
+    it("returns the same order under a forced sequential scan and a forced index scan", async () => {
+      await inTenant(async (tx) => {
+        const lotA = await heldStock(tx, { expiry: "2026-03-31" });
+        const lotB = await heldStock(tx, { expiry: "2026-03-30" });
+        await insertObligation(tx, { id: HIGH_UUID, lotId: lotA.id, dueBy: "2026-05-10" });
+        await insertObligation(tx, { id: LOW_UUID, lotId: lotB.id, dueBy: "2026-05-10" });
+
+        const chase = async (): Promise<readonly string[]> => {
+          const { rows } = await tx.query<{ id: string }>(
+            "SELECT id FROM crm.open_disposal_obligations($1, '2026-04-10'::date)",
+            [REP],
+          );
+          return rows.map((r) => r.id);
+        };
+        const plan = async (): Promise<string> => {
+          const { rows } = await tx.query<{ line: string }>(
+            `EXPLAIN SELECT id FROM crm.open_disposal_obligations($1, '2026-04-10'::date)`,
+            [REP],
+          );
+          // `QUERY PLAN` is the column name EXPLAIN returns; read positionally so a server that
+          // spells it differently does not turn this into an empty string.
+          return rows.map((r) => Object.values(r)[0] as string).join(" | ");
+        };
+
+        // The default plan first. On this fixture the planner chooses index scans and an
+        // INCREMENTAL sort, which matters below: the two runs differ in their sort strategy as
+        // well as their access paths.
+        const indexPlan = await plan();
+        const underIndex = await chase();
+
+        // AND NOW THE HEAP. `enable_seqscan = off` is the wrong knob here and trying it is how
+        // this test was first written: the planner had already chosen index scans, so turning
+        // seqscan off changed nothing and the two plans came back character for character
+        // identical — the retired version's unsatisfiable premise, in a new costume. Disabling
+        // the INDEX paths is the direction that moves it, because a plain table always has a
+        // sequential path to fall back to.
+        //
+        // SET LOCAL, so all three settings die with the transaction and no other suite inherits
+        // a planner with its index paths switched off.
+        await tx.query("SET LOCAL enable_indexscan = off");
+        await tx.query("SET LOCAL enable_indexonlyscan = off");
+        await tx.query("SET LOCAL enable_bitmapscan = off");
+        const heapPlan = await plan();
+        const underHeap = await chase();
+
+        expect(underIndex).toEqual([HIGH_UUID, LOW_UUID]);
+        expect(
+          underHeap,
+          `the heap plan returned a different order.\n  index: ${indexPlan}\n  heap: ${heapPlan}`,
+        ).toEqual(underIndex);
+        // AND THE PREMISE IS STILL NOT ASSERTED, which this test learned the same way the heap
+        // version did — by failing. Asserting "the two plans differ" passed when the file ran
+        // alone, against tables holding a run's worth of rows, and failed in the full suite where
+        // every table is freshly wiped: with one row in each, the planner chooses a sequential
+        // scan whatever the index knobs say, so both runs produce the identical plan. That is
+        // ADR-0001's own point arriving a second way — the heap premise depends on page fullness,
+        // the plan premise depends on what the planner can see, and neither is ours to fix.
+        //
+        // So the plans are REPORTED and not required to differ, and what is asserted instead is
+        // the mechanism: the ORDER BY survives into both plans as a sort key, on all three terms,
+        // in order. A plan that had lost the tie-break would show a shorter key.
+        const SORT_KEY = "Sort Key: o.due_by, rp.display_name, o.seq";
+        expect(indexPlan, `the sort key is missing from the default plan: ${indexPlan}`).toContain(SORT_KEY);
+        expect(heapPlan, `the sort key is missing from the index-free plan: ${heapPlan}`).toContain(SORT_KEY);
+      });
+    });
+
     it("still puts the sooner deadline first — the tie-break is the LAST term", async () => {
       await inTenant(async (tx) => {
         const lotA = await heldStock(tx, { expiry: "2026-03-31" });

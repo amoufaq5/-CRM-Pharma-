@@ -904,6 +904,34 @@ rather than passing for it. It carries a `pg_constraint` drift guard too: a tabl
 month by someone who does not know this rule fails a test instead of quietly reopening the
 class.
 
+**A unique index is the other half of that class, and it had already bitten us** (0074). A
+referential check runs with row security disabled; so does **a unique index's enforcement** and
+**a CHECK's validation scan**. The difference matters: ordinary DML and a foreign key's bulk
+validation are confined by RLS, which is why 0027 had to lift FORCE to validate one — but a
+unique key is compared across *every* tenant's rows whether the writer can see them or not. 0043
+found that live. `uq_outbox_dead_letter_attempt (outbox_id, attempt)` was an existence oracle,
+because `attempt` was allocated by **counting the rows the allocator could see** — a per-tenant
+counter behind a global key, so tenant B's second attempt collided with tenant A's and the
+refusal said so.
+
+So `packages/db/src/unique-index-tenant.contract.test.ts` derives every unique index on a
+tenant-scoped `crm` table from `pg_index` — eighty-three today, derived and never listed, with
+the count asserted only as “more than sixty” so a new index is not a maintenance chore — and
+requires each
+one to be prefixed with `tenant_id`, or keyed on a `uuid` (which cannot repeat across tenants),
+or **declared in `CONFINED_BY_CONSTRUCTION` with the sentence that says why**. Two are declared:
+`uq_disposal_obligation_seq`, whose `seq` comes from one sequence for the whole table rather than
+a per-tenant counter — exactly the distinction 0043 turned on — and `tenant_tombstone_pkey`,
+whose `text` id is a uuid wearing a `crmtomb_` prefix, listed rather than inferred because the
+rule reads types and `text` is what a per-tenant code would also be. 0043's repaired key is
+asserted **by name** (`tenant_id,outbox_id,attempt`), because the generic rule cannot see that a
+rename undid the repair. And the asymmetry is demonstrated rather than asserted: creating
+`CREATE UNIQUE INDEX … ON crm.rep_profile (employee_number)` and inserting the same employee
+number as two different tenants under `withTenantContext` is refused `23505` by name, with the
+index dropped and the transaction rolled back. Seven partial unique indexes are listed too, with
+the assertion that **no predicate mentions `tenant_id`** — a predicate is not confinement, and
+nobody should start believing it is.
+
 0046, 0048 and 0070 dropped three of the original 46 — **both** of
 `crm.notification_delivery`'s and `crm.notification_endpoint_probe`'s endpoint reference — on
 retention grounds, and did not weaken the rule: a reference that *exists* in `crm.*` is

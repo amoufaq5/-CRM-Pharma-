@@ -3773,3 +3773,150 @@ With the fix — the draft keyed per form id, every `form[id]` on screen capture
 - **An empty capture does not replace a draft.** `render()` captures before it rewrites, and its
   booting and fatal branches return before any form exists — so a capture that found nothing has
   to leave the previous draft alone rather than clear it.
+
+## Three carried lessons, and the premise that failed a third time
+
+*2026-10-31, `npx vitest run` (108 files / 2,699 tests), `pnpm typecheck`, against a real
+Postgres 16 over TCP with scram — the CI-shaped path, not the socket.*
+
+Three rows in ADR-0001's open table had been carried for weeks not because they were hard but
+because none of them was a build: one recorded a premise that had already failed, one recorded a
+distinction nobody had turned into a guard, and one recorded a red CI job whose cause was never
+named. Carrying a lesson is not closing it, so each was either converted into something that
+fails a test or closed on evidence.
+
+### The asymmetry that had already bitten us, now derived from the catalog
+
+A referential check runs with row security disabled. That sentence has been in this document
+since 0027 and it is only half the story. **A unique index's enforcement and a CHECK's
+validation scan run with row security disabled too** — but ordinary DML and a foreign key's bulk
+validation do *not*, which is precisely why 0027 had to lift FORCE to validate one. The practical
+consequence is narrow and sharp: a unique key is compared across every tenant's rows whether the
+writer can see them or not.
+
+0043 found that live, before this guard existed.
+`uq_outbox_dead_letter_attempt (outbox_id, attempt)` was an existence oracle, because `attempt`
+was allocated by **counting the rows the allocator could see**. A per-tenant counter behind a
+global key: tenant B's second attempt collided with tenant A's, and the `23505` said so.
+
+So the rule is now derived rather than remembered.
+`packages/db/src/unique-index-tenant.contract.test.ts` reads every unique index on a
+tenant-scoped `crm` table out of `pg_index` — 83 of them today — and requires each one to be
+prefixed with `tenant_id`, or keyed on a `uuid`, or **declared in `CONFINED_BY_CONSTRUCTION` with
+the sentence that says why**:
+
+```sql
+SELECT count(*) FROM pg_index i
+  JOIN pg_class ic ON ic.oid = i.indexrelid
+  JOIN pg_class tc ON tc.oid = i.indrelid
+  JOIN pg_namespace n ON n.oid = tc.relnamespace
+ WHERE n.nspname = 'crm' AND i.indisunique
+   AND EXISTS (SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = tc.oid AND a.attname = 'tenant_id'
+                  AND a.attnum > 0 AND NOT a.attisdropped);
+-- 83
+```
+
+Two indexes are declared, and the declarations are the content of the guard rather than an
+escape from it. `uq_disposal_obligation_seq` is confined because `seq` is
+`nextval('crm.disposal_obligation_seq_seq')` — **one sequence for the whole table**, not a
+per-tenant counter, which is exactly the distinction 0043 turned on. `tenant_tombstone_pkey` is a
+`text` column holding `crmtomb_` followed by the 32 hex digits of a random uuid — a uuid wearing a
+prefix, so the uuid argument applies; it is listed rather than inferred because the rule reads
+*types*, and `text` is the type a per-tenant code would also have.
+
+0043's repaired key is asserted **by name** — `tenant_id,outbox_id,attempt` — because the generic
+rule cannot see that a rename undid the repair, and a rename is the failure mode a by-name
+assertion exists for. (It caught one immediately: the first draft asserted
+`uq_outbox_dead_letter_attempt`, which 0043 itself had renamed.)
+
+Four more things keep it from being decorative:
+
+- **The guard on the guard.** A `pg_index` query that matched nothing would report a clean
+  schema, which is the vacuous green this repository has been bitten by twice. So the file first
+  asserts that it found more than sixty rows, `rep_profile_pkey` among them.
+- **One list, not one failure per index.** The message names the offending index, its columns, and
+  *both* ways out, because the reader is somebody who just added a key and wants to be told what
+  to do about it.
+- **Unused declarations fail too.** An index named in `CONFINED_BY_CONSTRUCTION` that does not
+  exist, or that the generic rule would have passed anyway, fails the test — a registry that
+  silently accumulates stale entries stops being evidence of anything.
+- **Partial indexes are listed with the opposite assertion.** Seven exist, and **no predicate
+  mentions `tenant_id`** — asserted, because a predicate is evaluated with row security disabled
+  as well, and a predicate that reads like a per-tenant statement is not one. Nobody should start
+  believing it is.
+
+And the asymmetry is demonstrated, not described. Inside a transaction that rolls back:
+
+```sql
+CREATE UNIQUE INDEX uq_probe_employee_number ON crm.rep_profile (employee_number)
+  WHERE tenant_id = ANY (ARRAY['…ff01'::uuid, '…ff02'::uuid]);
+-- tenant …ff01 inserts employee_number 'E1'  → ok
+-- tenant …ff02 inserts employee_number 'E1'  → 23505, uq_probe_employee_number
+```
+
+with both the SQLSTATE and the constraint name asserted, so a CHECK or a trigger firing first
+fails the test rather than passing for it, and with `pg_class` asserted clean afterwards.
+
+**The probe's predicate is not what makes it safe — it is what stops the demonstration depending
+on other suites' rows.** `crm.rep_profile` is shared and every suite numbers its reps from `E1`,
+so the unqualified index this started as **cannot even be created** in a full run:
+
+```
+ERROR:  could not create unique index "uq_probe_employee_number"
+DETAIL:  Duplicate keys exist.
+```
+
+It created fine when the file ran alone. That is the same premise-that-depends-on-the-shared-table
+trap the next section was corrected for twice, found by the full run rather than by reading, on
+the same afternoon.
+
+### The ordering claim: the unachievable half stays unachievable
+
+ADR-0001 carried a row saying `crm.open_disposal_obligations`'s tie-break order could not be
+proven invariant, because the obvious demonstration — force a heap move and re-read — depends on a
+page being full, which depends on whichever suite ran first. That is still true and the row is
+still right about it.
+
+What the row never asked is whether the **plan** could be varied instead. It can:
+`open_disposal_obligations` is a SQL function, so it inlines, and the planner can be pushed off
+its chosen path inside one transaction. The test now reads the answer twice — once under the
+default plan, once with `enable_indexscan`, `enable_indexonlyscan` and `enable_bitmapscan` set
+`off` by `SET LOCAL` — and asserts the two answers equal and
+`Sort Key: o.due_by, rp.display_name, o.seq` present in **both** plans, printing both plans in
+every failure message.
+
+It took two corrections to get there, and both are the row's own lesson arriving again.
+
+1. **`enable_seqscan = off` moved nothing.** The planner had already chosen index scans, so the
+   knob that reads like "vary the plan" was a no-op. Disabling the index paths is what moves it.
+2. **Asserting that the two plans DIFFER passed alone and failed in the full suite.** On freshly
+   wiped tables the planner picks a sequential scan whatever the knobs say:
+
+   ```
+   FAIL: the two runs produced the SAME plan, so this test proves nothing
+   ```
+
+   A premise about the shared database, for the third time in this one row's history. So the
+   plans are **reported, never required to differ**, and what is asserted is the sort key and the
+   equal answers — properties of the function, which is what the test was about.
+
+Both corrections came from the full run, not from re-reading the file. That is the honest summary
+of this section: the repository's own suite did the reviewing twice in one afternoon, and the
+carried row turned out to be righter than it knew.
+
+### The deploy gate's red, closed on evidence rather than on silence
+
+The third row recorded that `deploy-stack` had gone red once with no cause named. Closing it by
+noticing it had not recurred would have been exactly the move this document exists to refuse, so
+the history was queried instead: **93 runs on this branch, 66 green `deploy-stack`, five
+failures — and every one of the five is attributed to a named step with a found cause**, including
+one that happened *after* the per-job annotations landed, was diagnosed from them, and was fixed
+in the same pass. (That is the fix in the previous chapter but one: "running" is not "listening on
+TLS".) The remaining non-green runs never reached the job.
+
+The gate itself cannot be exercised in this container and that is recorded rather than worked
+around: Docker Hub answers `429`, and an in-container build fails `SELF_SIGNED_CERT_IN_CHAIN`
+behind the TLS-intercepting proxy. CI is the only place `scripts/verify-deploy-smoke.sh` runs, so
+CI's own record is the evidence, and the annotations are what make that record readable at all —
+the job logs are served from a blob host the API cannot reach.
